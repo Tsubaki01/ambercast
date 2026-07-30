@@ -1,0 +1,23 @@
+{
+  "name": "ambercast",
+  "version": "0.0.1",
+  "description": "Prompt-native E2E testing: AI compiles natural-language test prompts into a deterministic, lockfile-like execution plan, replayed with zero AI calls. Under active development.",
+  "keywords": [
+    "e2e",
+    "testing",
+    "ai",
+    "prompt",
+    "automation",
+    "deterministic"
+  ],
+  "license": "MIT",
+  "bin": {
+    "ambercast": "bin/ambercast.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
