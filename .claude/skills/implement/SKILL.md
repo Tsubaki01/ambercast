@@ -14,10 +14,13 @@ Path: `.claude/impl/issue-<N>.state` (gitignored). One `key=value` per line:
 ```
 issue=<N>
 branch=issues/<N>
+layers=<slug1>,<slug2>
 step01_issue=done
 ...
 step17_merged=done
 ```
+
+`branch=` is `issues/<N>` for single-PR work. For stacked work, set `branch=` to the bottom layer branch (`issues/<N>-<slug1>`) and list every layer slug bottom-to-top in `layers=` (omit `layers=` for single-PR work). All layer branches of an issue share this one state file — the hooks resolve any `issues/<N>-<slug>` branch to `issue-<N>.state`.
 
 Artifacts live next to it: `.claude/impl/issue-<N>-plan.md` and `.claude/impl/issue-<N>-reviews/`.
 
@@ -40,10 +43,10 @@ Reviews are independent: performed by OpenAI Codex CLI per the user-level codex-
 11. **Code** — Implement until the ENTIRE suite passes (green), then refactor with the suite kept green. Do not weaken or delete tests to pass; if a test is wrong, fix it with justification recorded in the plan file. → `step11_code=done`
 12. **Code review** — Codex review of the implementation (correctness, best practices, consistency with comments/plan). → `step12_code_review=done`
 13. **Push** — Single PR: push the branch. Stack: `gh stack push`. → `step13_push=done`
-14. **CI** — Watch CI (`gh run watch` / `gh pr checks`); fix until everything is green (every layer PR in a stack). → `step14_ci=done`
-15. **PR** — Single PR: open it referencing the issue (`Closes #<N>`), summarizing plan, reviews, and test coverage. Stack: `gh stack submit --auto --open`, then `gh pr edit` each layer PR so the bottom layer closes the issue and every body explains its layer's scope. → `step15_pr=done`
+14. **PR** — Single PR: open it referencing the issue (`Closes #<N>`), summarizing plan, reviews, and test coverage. Stack: `gh stack submit --auto --open`, then `gh pr edit` each layer PR so the bottom layer closes the issue and every body explains its layer's scope. → `step14_pr=done`
+15. **CI** — Watch the PR checks (`gh pr checks` / `gh run watch`); fix until everything is green on every PR (each layer in a stack). CI runs against pull requests, so this step must follow PR creation. → `step15_ci=done`
 16. **CodeRabbit** — Wait for the CodeRabbit review on every PR (poll `gh pr view --comments`), address every finding, resolve all conversations. In a stack, fix findings on the layer they belong to (`gh stack checkout <branch>`), then `gh stack rebase --upstack` and `gh stack push`. → `step16_coderabbit=done`
-17. **Merge** — Single PR: merge via GitHub (branch protection requires the PR checks and resolved conversations). Stack: `gh stack merge --yes` (bottom-to-top, all-or-nothing; `gh pr merge` does not work on stacked PRs), or merge reviewed lower layers first — upper PRs retarget automatically. Afterwards `gh stack sync --prune`, delete branches. → `step17_merged=done`
+17. **Merge** — Single PR: merge via GitHub (branch protection requires the PR checks and resolved conversations). Stack: never use `gh pr merge` on stacked PRs — use `gh stack merge --yes` to land the whole stack bottom-to-top, or `gh stack merge <PR-number> --yes` to land only the reviewed lower layers (upper PRs retarget automatically). Direct stack merges are all-or-nothing, but if the base branch uses a merge queue, PRs are queued together and may land in separate groups. Verify every PR reports `MERGED` (`gh stack view --json`) before `gh stack sync --prune` and branch deletion. → `step17_merged=done`
 
 ## Hard rules
 
