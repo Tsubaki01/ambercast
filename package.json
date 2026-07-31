@@ -11,6 +11,14 @@
     "deterministic"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Tsubaki01/ambercast.git"
+  },
+  "homepage": "https://github.com/Tsubaki01/ambercast#readme",
+  "bugs": {
+    "url": "https://github.com/Tsubaki01/ambercast/issues"
+  },
   "bin": {
     "ambercast": "bin/ambercast.js"
   },
