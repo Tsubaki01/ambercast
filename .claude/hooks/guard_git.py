@@ -44,10 +44,11 @@ if branch == "main":
     )
     sys.exit(2)
 
-if is_commit and not re.fullmatch(r"issues/\d+", branch):
+if is_commit and not re.fullmatch(r"issues/\d+(-[a-z0-9][a-z0-9-]*)?", branch):
     print(
-        f"BLOCKED: branch '{branch}' does not match issues/<N>. "
-        "The /implement flow requires one branch per GitHub issue.",
+        f"BLOCKED: branch '{branch}' does not match issues/<N> or issues/<N>-<slug>. "
+        "The /implement flow requires one branch per GitHub issue "
+        "(stack layers use the issues/<N>-<slug> form).",
         file=sys.stderr,
     )
     sys.exit(2)

@@ -41,6 +41,8 @@ All implementation goes through the **`/implement` skill** (`.claude/skills/impl
 
 Enforcement is layered: GitHub branch protection (PRs only, conversations resolved), PreToolUse hooks (`.claude/hooks/`) that block commits on `main` and block src/test edits until the per-issue state file records the prerequisite steps, and the binding rules in `.claude/rules/implementation-flow.md`. Do not bypass or edit the guards; if a guard blocks you incorrectly, stop and tell the maintainer.
 
+**Stacked pull requests** (GitHub native, public preview): when an issue splits into independently reviewable layers, plan a stack at step 3 and use layer branches `issues/<N>-<slug>` (e.g. `issues/12-schema` → `issues/12-serializer`). Manage stacks exclusively with `gh stack` following the official skill in `.agents/skills/gh-stack/SKILL.md` (non-interactive rules: always `--json`, `submit --auto`, positional branch names; `gh pr merge` does not work on stacks — use `gh stack merge --yes`). One issue per stack; unrelated work gets its own issue and branch.
+
 ## Commands
 
 - `node bin/ambercast.js` — run the placeholder CLI

@@ -44,11 +44,12 @@ if res.returncode != 0:
     sys.exit(0)
 branch = res.stdout.strip()
 
-m = re.fullmatch(r"issues/(\d+)", branch)
+m = re.fullmatch(r"issues/(\d+)(?:-[a-z0-9][a-z0-9-]*)?", branch)
 if not m:
     print(
         f"BLOCKED: source/test edits are only allowed on an issues/<N> branch "
-        f"(current: {branch}). Start the /implement flow.",
+        f"or a stack layer issues/<N>-<slug> (current: {branch}). "
+        "Start the /implement flow.",
         file=sys.stderr,
     )
     sys.exit(2)
