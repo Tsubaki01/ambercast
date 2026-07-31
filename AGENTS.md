@@ -35,6 +35,12 @@ Pre-implementation. The current package is a 0.0.1 placeholder that reserves the
 - Validation: zod for runtime schemas (discriminated unions for step types), JSON Schema for the public spec.
 - Keep diffs minimal and reviewable; the IR's git-diff quality is a product feature, treat serialization changes as breaking.
 
+## Development workflow (enforced)
+
+All implementation goes through the **`/implement` skill** (`.claude/skills/implement/SKILL.md`) — a mandatory 17-step flow: GitHub issue → `issues/<N>` branch → plan → 7-perspective parallel review → docs-first coding (comments/JSDoc as the design spec, 5W1H substance with emphasis on How/Why) → comprehensive tests → implementation → independent reviews at each gate → CI → PR → CodeRabbit → merge.
+
+Enforcement is layered: GitHub branch protection (PRs only, conversations resolved), PreToolUse hooks (`.claude/hooks/`) that block commits on `main` and block src/test edits until the per-issue state file records the prerequisite steps, and the binding rules in `.claude/rules/implementation-flow.md`. Do not bypass or edit the guards; if a guard blocks you incorrectly, stop and tell the maintainer.
+
 ## Commands
 
 - `node bin/ambercast.js` — run the placeholder CLI
