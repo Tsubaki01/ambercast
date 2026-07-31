@@ -2,7 +2,9 @@
 """PreToolUse hook (Write/Edit): gate source and test edits on /implement progress.
 
 Rules (exit 2 blocks the edit):
-- src/ or test files may only be edited on an `issues/<N>` branch
+- src/ or test files may only be edited on an `issues/<N>` branch or a
+  stack layer `issues/<N>-<slug>` (same grammar as guard_git.py; all
+  layers of an issue share the issue's state file)
 - the branch's state file `.claude/impl/issue-<N>.state` must exist
 - src/ and test edits require `step05_plan_revised=done` (plan reviewed & revised)
 - test edits additionally require `step08_docs_review=done` (docs-first reviewed)
@@ -44,11 +46,12 @@ if res.returncode != 0:
     sys.exit(0)
 branch = res.stdout.strip()
 
-m = re.fullmatch(r"issues/(\d+)", branch)
+m = re.fullmatch(r"issues/([0-9]+)(?:-[a-z0-9]+)*", branch)
 if not m:
     print(
         f"BLOCKED: source/test edits are only allowed on an issues/<N> branch "
-        f"(current: {branch}). Start the /implement flow.",
+        f"or a stack layer issues/<N>-<slug> (current: {branch}). "
+        "Start the /implement flow.",
         file=sys.stderr,
     )
     sys.exit(2)
