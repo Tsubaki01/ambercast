@@ -9,4 +9,12 @@ dist/
 .claude/impl/
 CLAUDE.local.md
 
+# product runtime artifacts (run results, screenshots — see AGENTS.md)
+.runs/
+
+.env
+.env.*
+!.env.example
+coverage/
+
 .DS_Store
