@@ -1,0 +1,24 @@
+name: pr-title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+jobs:
+  conventional-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          node -e '
+            const title = process.env.PR_TITLE || "";
+            const valid = /^(feat|fix|docs|refactor|test|chore)(\([a-z0-9][a-z0-9._\/-]*\))?!?: \S.*$/;
+            if (!valid.test(title)) {
+              console.error(`PR title must be a Conventional Commit — (feat|fix|docs|refactor|test|chore)(scope)?!?: summary — got: "${title}"`);
+              process.exit(1);
+            }
+          '

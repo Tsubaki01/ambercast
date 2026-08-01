@@ -1,0 +1,10 @@
+language: en-US
+reviews:
+  poem: false
+  commit_status: true
+  fail_commit_status: true
+  request_changes_workflow: true
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: true
