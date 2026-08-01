@@ -1,0 +1,48 @@
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Publishing runs as a follow-up job here (not on release.published):
+  # releases created with GITHUB_TOKEN intentionally do not trigger other
+  # workflows, so a separate release-triggered workflow would never fire.
+  publish:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # OIDC trusted publishing: npm authenticates this workflow directly,
+      # no NPM_TOKEN secret is stored anywhere.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing requires npm >= 11.5.1; the runner's bundled npm
+      # may lag behind, so pin to latest explicitly.
+      - run: npm install -g npm@latest
+      # Build and test steps are added here once the toolchain lands.
+      - run: npm publish
