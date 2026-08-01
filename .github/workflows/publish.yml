@@ -1,0 +1,26 @@
+name: publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  # OIDC trusted publishing: npm authenticates this workflow directly,
+  # no NPM_TOKEN secret is stored anywhere.
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing requires npm >= 11.5.1; the runner's bundled npm
+      # may lag behind, so pin to latest explicitly.
+      - run: npm install -g npm@latest
+      # Build and test steps are added here once the toolchain lands.
+      - run: npm publish
