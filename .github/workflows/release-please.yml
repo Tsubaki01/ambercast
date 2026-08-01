@@ -47,5 +47,6 @@ jobs:
           # publishing, so no separate npm upgrade step is needed.
           node-version: 24.18.1
           registry-url: https://registry.npmjs.org
-      # Build and test steps are added here once the toolchain lands.
+      - run: npm ci
+      - run: npm run build
       - run: npm publish

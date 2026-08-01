@@ -14,8 +14,9 @@ Pre-implementation. The current package is a 0.0.1 placeholder that reserves the
 
 ## Repository layout
 
-- `bin/` — CLI entry point (placeholder)
-- `package.json` — `files: ["bin"]` limits what gets published; keep agent/config files out of the tarball
+- `bin/` — CLI entry point (placeholder), a thin shim to the built `dist/`
+- `src/` — TypeScript sources, compiled by `tsdown` to `dist/` (gitignored, built on demand)
+- `package.json` — `files: ["bin", "dist"]` limits what gets published; keep agent/config files and sources out of the tarball
 - `AGENTS.md` / `CLAUDE.md` — agent guidance (this file is canonical)
 
 ## Core design decisions (fixed — do not re-litigate in code)
@@ -30,7 +31,7 @@ Pre-implementation. The current package is a 0.0.1 placeholder that reserves the
 ## Conventions
 
 - English-native: all code, comments, docs, commit messages, and identifiers are in English.
-- TypeScript, Node >= 18.
+- TypeScript, Node >= 22.14, ESM-only (`"type": "module"`). Built with `tsdown`.
 - **TDD is mandatory**: write a failing test first (red), implement minimally (green), refactor. Cover normal, error, boundary, and edge cases. Run the full test suite before declaring any task done.
 - Validation: zod for runtime schemas (discriminated unions for step types), JSON Schema for the public spec.
 - Keep diffs minimal and reviewable; the IR's git-diff quality is a product feature, treat serialization changes as breaking.
@@ -47,7 +48,12 @@ Enforcement is layered: GitHub branch protection (PRs only, conversations resolv
 
 ## Commands
 
-- `node bin/ambercast.js` — run the placeholder CLI
-- `npm pack --dry-run` — verify publish contents (must stay: package.json, README, LICENSE, bin/)
+- `npm run build` — compile `src/` to `dist/` via `tsdown`
+- `npm run typecheck` — `tsc --noEmit`
+- `npm test` — build (via `pretest`) then run the Vitest suite
+- `node bin/ambercast.js` — run the CLI (requires `npm run build` first)
+- `node scripts/verify-pack.mjs` — authoritative, automated check that the
+  packed tarball contains `dist/`, `bin/ambercast.js`, and that the bin file
+  is executable; run this instead of eyeballing `npm pack --dry-run` output
 
-Build/test commands will be added here as the toolchain lands. Keep this file updated as the implementation grows.
+Keep this file updated as the implementation grows.
