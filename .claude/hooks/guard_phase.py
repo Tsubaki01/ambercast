@@ -2,9 +2,10 @@
 """PreToolUse hook (Write/Edit): gate source and test edits on /implement progress.
 
 Rules (exit 2 blocks the edit):
-- src/ or test files may only be edited on an `issues/<N>` branch or a
-  stack layer `issues/<N>-<slug>` (same grammar as guard_git.py; all
-  layers of an issue share the issue's state file)
+- src/, bin/, or test files may only be edited on an `issues/<N>` branch or
+  a stack layer `issues/<N>-<slug>` (same grammar as guard_git.py; all
+  layers of an issue share the issue's state file). During a rebase
+  (detached HEAD) the original branch is resolved from .git/rebase-*/head-name
 - the branch's state file `.claude/impl/issue-<N>.state` must exist
 - src/ and test edits require `step05_plan_revised=done` (plan reviewed & revised)
 - test edits additionally require `step08_docs_review=done` (docs-first reviewed)
@@ -22,7 +23,8 @@ try:
 except Exception:
     sys.exit(0)
 
-path = (data.get("tool_input") or {}).get("file_path", "") or ""
+ti = data.get("tool_input") or {}
+path = ti.get("file_path") or ti.get("notebook_path") or ""
 proj = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
 try:
     rel = os.path.relpath(os.path.abspath(path), os.path.abspath(proj))
@@ -31,20 +33,43 @@ except ValueError:
 if rel.startswith(".."):
     sys.exit(0)
 
-in_src = rel.startswith("src" + os.sep)
+in_src = rel.startswith("src" + os.sep) or rel.startswith("bin" + os.sep)
 in_tests = rel.startswith("tests" + os.sep) or bool(
     re.search(r"\.(test|spec)\.[cm]?[jt]sx?$", rel)
 )
 if not (in_src or in_tests):
     sys.exit(0)
 
+if subprocess.run(
+    ["git", "-C", proj, "rev-parse", "--git-dir"],
+    capture_output=True, text=True,
+).returncode != 0:
+    sys.exit(0)
+
 res = subprocess.run(
-    ["git", "-C", proj, "rev-parse", "--abbrev-ref", "HEAD"],
+    ["git", "-C", proj, "symbolic-ref", "--short", "HEAD"],
     capture_output=True, text=True,
 )
-if res.returncode != 0:
-    sys.exit(0)
-branch = res.stdout.strip()
+if res.returncode == 0:
+    branch = res.stdout.strip()
+else:
+    # Detached HEAD. Mid-rebase (gh stack rebase/sync) the flow is still on
+    # a stack layer — recover the branch being rebased; otherwise block.
+    branch = ""
+    for d in ("rebase-merge", "rebase-apply"):
+        try:
+            with open(os.path.join(proj, ".git", d, "head-name"), encoding="utf-8") as f:
+                branch = f.read().strip().removeprefix("refs/heads/")
+            break
+        except OSError:
+            continue
+    if not branch:
+        print(
+            "BLOCKED: detached HEAD outside a rebase — source/test edits are "
+            "only allowed on an issues/<N> branch. See /implement.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
 m = re.fullmatch(r"issues/([0-9]+)(?:-[a-z0-9]+)*", branch)
 if not m:

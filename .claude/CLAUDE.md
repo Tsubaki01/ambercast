@@ -9,3 +9,5 @@ Shared Claude Code configuration for this repository (committed; local state is 
 - `settings.json` — wires the hooks (PreToolUse)
 - `impl/` (gitignored) — per-issue state files, plans, and review artifacts
 - `logs/`, `todos/` (gitignored) — personal orchestration state
+
+Related: `../.agents/skills/` holds vendored cross-agent skills shared by Claude Code and Codex (currently gh-stack, installed via `gh skill install`).

@@ -31,6 +31,17 @@ is_push = re.search(r"\bgit\b[^|;&]*\bpush\b", command)
 if not (is_commit or is_push):
     sys.exit(0)
 
+# The branch is sampled BEFORE the command runs, so a compound command that
+# switches branches and then commits would be judged against the wrong branch.
+if re.search(r"\bgit\s+(checkout|switch)\b", command):
+    print(
+        "BLOCKED: branch switching and commit/push in one command hides the "
+        "real target branch from this guard. Run the switch first, then "
+        "commit/push as a separate command.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
 proj = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
 res = subprocess.run(
     ["git", "-C", proj, "rev-parse", "--abbrev-ref", "HEAD"],
