@@ -6,7 +6,7 @@
 // .claude/impl/issue-10-plan.md, "Affected files" / scripts/verify-pack.mjs).
 import { execFileSync } from 'node:child_process';
 
-const REQUIRED_FILES = ['dist/index.js', 'dist/cli.js', 'bin/ambercast.js'];
+const REQUIRED_FILES = ['dist/index.js', 'dist/index.d.ts', 'dist/cli.js', 'bin/ambercast.js'];
 const EXECUTABLE_FILES = ['bin/ambercast.js'];
 
 const output = execFileSync('npm', ['pack', '--dry-run', '--json'], {

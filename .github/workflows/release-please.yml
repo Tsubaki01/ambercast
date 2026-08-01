@@ -49,4 +49,5 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm ci
       - run: npm run build
+      - run: node scripts/verify-pack.mjs
       - run: npm publish
