@@ -26,14 +26,21 @@ command = (data.get("tool_input") or {}).get("command", "")
 if not re.search(r"\bgit\b", command):
     sys.exit(0)
 
-is_commit = re.search(r"\bgit\b[^|;&]*\bcommit\b", command)
-is_push = re.search(r"\bgit\b[^|;&]*\bpush\b", command)
+# Subcommand detection: hyphen guards keep branch names like
+# issues/6-fix-commit-msg from being mistaken for a `commit` subcommand.
+def has_git_sub(text, names):
+    return bool(re.search(rf"\bgit\b[^|;&]*?(?<!-)\b(?:{names})\b(?!-)", text))
+
+
+is_commit = has_git_sub(command, "commit")
+is_push = has_git_sub(command, "push")
 if not (is_commit or is_push):
     sys.exit(0)
 
 # The branch is sampled BEFORE the command runs, so a compound command that
-# switches branches and then commits would be judged against the wrong branch.
-if re.search(r"\bgit\s+(checkout|switch)\b", command):
+# switches branches and then commits would be judged against the wrong
+# branch. Standalone switches (no commit/push in the command) pass through.
+if has_git_sub(command, "checkout|switch"):
     print(
         "BLOCKED: branch switching and commit/push in one command hides the "
         "real target branch from this guard. Run the switch first, then "

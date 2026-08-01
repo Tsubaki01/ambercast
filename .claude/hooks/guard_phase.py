@@ -55,10 +55,16 @@ if res.returncode == 0:
 else:
     # Detached HEAD. Mid-rebase (gh stack rebase/sync) the flow is still on
     # a stack layer — recover the branch being rebased; otherwise block.
+    # Resolve the git dir through git itself: in linked worktrees .git is a
+    # file and rebase metadata lives in the worktree-specific git dir.
+    gitdir = subprocess.run(
+        ["git", "-C", proj, "rev-parse", "--absolute-git-dir"],
+        capture_output=True, text=True,
+    ).stdout.strip()
     branch = ""
     for d in ("rebase-merge", "rebase-apply"):
         try:
-            with open(os.path.join(proj, ".git", d, "head-name"), encoding="utf-8") as f:
+            with open(os.path.join(gitdir, d, "head-name"), encoding="utf-8") as f:
                 branch = f.read().strip().removeprefix("refs/heads/")
             break
         except OSError:
