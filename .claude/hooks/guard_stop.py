@@ -71,22 +71,43 @@ TERMINAL_TASK_STATUSES = {
     "completed", "failed", "cancelled", "canceled", "killed", "done", "error",
 }
 
+# Task types whose completion re-invokes the session, i.e. delegated work
+# it is legitimately waiting on. `shell` is included because background
+# shells re-invoke on exit and are this repository's Codex delegation
+# vehicle — but a never-ending shell (dev server, tail -f) would idle the
+# flow forever, so SKILL.md forbids parking those mid-flow. A monitor
+# watches indefinitely and cannot promise a completion wake-up, and an
+# unknown type must not lift the guard (schema drift would otherwise
+# silently disable it), so neither is listed.
+DELEGATED_TASK_TYPES = {
+    "teammate", "subagent", "workflow", "cloud session", "mcp task", "shell",
+}
+
+
+def _normalize_task_type(value):
+    return " ".join(
+        str(value or "").lower().replace("_", " ").replace("-", " ").split()
+    )
+
 
 def has_live_background(tasks):
-    """True when the session is waiting on live background work.
+    """True when the session is waiting on live delegated background work.
 
     Claude Code v2.1.145+ passes `background_tasks` in the Stop input
     precisely so hooks can distinguish "session is done" from "session is
     paused waiting for background work to wake it back up". A session with
-    live delegated work (teammate, subagent, background shell) may stop:
-    the completion notification re-wakes it, and the guard re-engages then.
-    Without this, an orchestrator sharing the branch with an implementing
-    teammate would be blocked into doing the teammate's job itself.
+    live delegated work (teammate, subagent, workflow, background shell)
+    may stop: the completion notification re-wakes it, and the guard
+    re-engages then. Without this, an orchestrator sharing the branch with
+    an implementing teammate would be blocked into doing the teammate's
+    job itself.
     """
     if not isinstance(tasks, list):
         return False
     for task in tasks:
         if not isinstance(task, dict):
+            continue
+        if _normalize_task_type(task.get("type")) not in DELEGATED_TASK_TYPES:
             continue
         status = str(task.get("status") or "").strip().lower()
         if status not in TERMINAL_TASK_STATUSES:

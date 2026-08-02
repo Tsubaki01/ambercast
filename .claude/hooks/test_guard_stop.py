@@ -313,31 +313,58 @@ class HasLiveBackgroundTest(unittest.TestCase):
     notification re-wakes it. This is how an orchestrator sharing the branch
     with an implementing teammate idles without being blocked."""
 
-    def test_running_task_is_live(self):
+    def test_running_delegated_task_is_live(self):
+        for task_type in ("teammate", "subagent", "workflow", "cloud session",
+                          "MCP task", "shell", "Cloud_Session", "mcp-task"):
+            with self.subTest(type=task_type):
+                self.assertTrue(
+                    guard_stop.has_live_background(
+                        [{"id": "t1", "type": task_type, "status": "running"}]
+                    )
+                )
+
+    def test_unknown_status_on_delegated_task_counts_as_live(self):
+        # A listed delegated task without an explicitly terminal status is
+        # still being waited on.
         self.assertTrue(
             guard_stop.has_live_background(
-                [{"id": "t1", "type": "teammate", "status": "running"}]
+                [{"type": "teammate", "status": "pending"}]
             )
         )
+        self.assertTrue(guard_stop.has_live_background([{"type": "subagent"}]))
 
-    def test_unknown_status_counts_as_live(self):
-        # Being listed at all means the session is waiting on it; only an
-        # explicitly terminal status proves otherwise.
-        self.assertTrue(guard_stop.has_live_background([{"status": "pending"}]))
-        self.assertTrue(guard_stop.has_live_background([{"id": "t1"}]))
+    def test_persistent_or_unknown_types_are_not_live(self):
+        # A monitor watches indefinitely and cannot promise a completion
+        # wake-up; unknown or missing types stay conservative so schema
+        # drift cannot silently disable the guard.
+        self.assertFalse(
+            guard_stop.has_live_background(
+                [{"type": "monitor", "status": "running"}]
+            )
+        )
+        self.assertFalse(
+            guard_stop.has_live_background(
+                [{"type": "laser", "status": "running"}]
+            )
+        )
+        self.assertFalse(guard_stop.has_live_background([{"status": "running"}]))
+        self.assertFalse(guard_stop.has_live_background([{"id": "t1"}]))
 
     def test_terminal_statuses_are_not_live(self):
         for status in ("completed", "failed", "cancelled", "canceled",
                        "killed", "done", "error", "COMPLETED", " Done "):
             with self.subTest(status=status):
                 self.assertFalse(
-                    guard_stop.has_live_background([{"status": status}])
+                    guard_stop.has_live_background(
+                        [{"type": "teammate", "status": status}]
+                    )
                 )
 
-    def test_mixed_list_is_live_when_any_task_is(self):
+    def test_mixed_list_is_live_when_any_delegated_task_is(self):
         self.assertTrue(
             guard_stop.has_live_background(
-                [{"status": "completed"}, {"status": "running"}]
+                [{"type": "teammate", "status": "completed"},
+                 {"type": "shell", "status": "running"}]
             )
         )
 
@@ -412,13 +439,74 @@ class EndToEndTest(unittest.TestCase):
             res = self._run_hook(
                 json.dumps({
                     "hook_event_name": "Stop",
-                    "background_tasks": [{"id": "t1", "status": "completed"}],
+                    "background_tasks": [
+                        {"id": "t1", "type": "teammate", "status": "completed"}
+                    ],
                 }),
                 {"CLAUDE_PROJECT_DIR": proj},
             )
             self.assertEqual(res.returncode, 0)
             payload = json.loads(res.stdout)
             self.assertEqual(payload["decision"], "block")
+
+    def test_persistent_monitor_does_not_lift_the_guard(self):
+        with self._git_repo("issues/7") as proj:
+            write_state(Path(proj), "7", "step01_issue=done\n")
+            res = self._run_hook(
+                json.dumps({
+                    "hook_event_name": "Stop",
+                    "background_tasks": [
+                        {"id": "m1", "type": "monitor", "status": "running"}
+                    ],
+                }),
+                {"CLAUDE_PROJECT_DIR": proj},
+            )
+            self.assertEqual(res.returncode, 0)
+            payload = json.loads(res.stdout)
+            self.assertEqual(payload["decision"], "block")
+
+    def test_guard_re_engages_after_delegated_work_finishes(self):
+        # Lifecycle: blocked stops seed the stall counter; a live-teammate
+        # stop passes through without touching the sidecar; once the work
+        # is finished the guard re-engages and the counter resumes.
+        with self._git_repo("issues/7") as proj:
+            write_state(Path(proj), "7", "step01_issue=done\n")
+            base = {"hook_event_name": "Stop"}
+            for _ in range(2):
+                res = self._run_hook(
+                    json.dumps(base), {"CLAUDE_PROJECT_DIR": proj}
+                )
+                self.assertEqual(
+                    json.loads(res.stdout)["decision"], "block"
+                )
+            side = Path(guard_stop.sidecar_path(proj, "7"))
+            before = side.read_text(encoding="utf-8")
+            res = self._run_hook(
+                json.dumps({
+                    **base,
+                    "background_tasks": [
+                        {"id": "t1", "type": "teammate", "status": "running"}
+                    ],
+                }),
+                {"CLAUDE_PROJECT_DIR": proj},
+            )
+            self.assertEqual(res.stdout.strip(), "")
+            self.assertEqual(side.read_text(encoding="utf-8"), before)
+            res = self._run_hook(
+                json.dumps({
+                    **base,
+                    "background_tasks": [
+                        {"id": "t1", "type": "teammate", "status": "completed"}
+                    ],
+                }),
+                {"CLAUDE_PROJECT_DIR": proj},
+            )
+            self.assertEqual(json.loads(res.stdout)["decision"], "block")
+            self.assertEqual(
+                json.loads(side.read_text(encoding="utf-8"))
+                ["consecutive_blocks"],
+                3,
+            )
 
     def test_malformed_background_tasks_still_block(self):
         with self._git_repo("issues/7") as proj:
