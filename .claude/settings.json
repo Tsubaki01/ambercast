@@ -27,6 +27,13 @@
             "type": "command",
             "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/guard_stop.py",
             "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/watch_progress.py",
+            "async": true,
+            "asyncRewake": true,
+            "timeout": 21600
           }
         ]
       }
