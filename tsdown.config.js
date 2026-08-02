@@ -11,6 +11,7 @@ export default defineConfig({
   entry: {
     index: 'src/index.ts',
     cli: 'src/cli/main.ts',
+    'schema-gen': 'src/build-tools/generate-json-schema.ts',
   },
   format: 'esm',
   outExtensions: () => ({ js: '.js' }),

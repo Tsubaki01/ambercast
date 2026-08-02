@@ -13,12 +13,15 @@
  * confines Node filesystem dependencies to direct execution, while the
  * injected writer lets tests compare output bytes without touching disk.
  */
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import * as url from 'node:url';
+import { getGroundingJsonSchema, getPlanJsonSchema } from '../core/ir/json-schema.js';
 
 /**
  * Writes both public IR JSON Schema documents through an injected file writer.
  *
- * The eventual helper obtains the two schema objects from the pure core
+ * This helper obtains the two schema objects from the pure core
  * getters, serializes each with exactly `JSON.stringify(...)`, and calls
  * `deps.writeFile` once for each output within `deps.outDir`. It accepts the
  * writer rather than importing `node:fs` so a unit test can capture `(path,
@@ -34,8 +37,8 @@ export function writeJsonSchemaFiles(deps: {
   writeFile: (path: string, content: string) => void;
   outDir: string;
 }): void {
-  void deps;
-  throw new Error('not implemented');
+  deps.writeFile(join(deps.outDir, 'plan.schema.json'), JSON.stringify(getPlanJsonSchema()));
+  deps.writeFile(join(deps.outDir, 'grounding.schema.json'), JSON.stringify(getGroundingJsonSchema()));
 }
 
 /**
@@ -43,10 +46,14 @@ export function writeJsonSchemaFiles(deps: {
  * schema files. The main-program guard prevents test imports from creating
  * side effects, and resolving the output from `import.meta.url` rather than
  * `process.cwd()` keeps its location independent of the caller's directory.
- * The eventual entry recreates the directory recursively because tsdown
+ * The entry recreates the directory recursively because tsdown
  * cleans `dist/` before each build.
  */
 if (import.meta.url === url.pathToFileURL(process.argv[1] ?? '').href) {
   const outDir = url.fileURLToPath(new URL('./schema', import.meta.url));
-  void outDir;
+  mkdirSync(outDir, { recursive: true });
+  writeJsonSchemaFiles({
+    outDir,
+    writeFile: (path, content) => writeFileSync(path, content),
+  });
 }

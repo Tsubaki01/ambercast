@@ -9,7 +9,7 @@
  * conversion here means they cannot acquire divergent handwritten schema
  * definitions.
  *
- * The eventual schemas target JSON Schema 2020-12 through zod's default
+ * The schemas target JSON Schema 2020-12 through zod's default
  * conversion and include `$schema` accordingly. Structural constraints are
  * intentionally represented through strict objects, literals, regexes, and
  * discriminated unions in `schema.ts` so they survive this conversion. The
@@ -17,12 +17,13 @@
  * step-ID check, which JSON Schema 2020-12 cannot express.
  */
 import { z } from 'zod';
+import { GroundingDocument, PlanDocument } from './schema.js';
 
 /**
  * Returns a newly derived JSON Schema 2020-12 document for the complete plan
  * artifact.
  *
- * The eventual getter derives a new document with
+ * This getter derives a new document with
  * `z.toJSONSchema(PlanDocument)` on every invocation. It must not cache,
  * mutate, pretty-print, write, or hand-author the result: callers need a pure
  * object suitable for independent AJV compilation, while the build tool alone
@@ -32,19 +33,19 @@ import { z } from 'zod';
  * false`; it intentionally cannot encode cross-step ID uniqueness.
  */
 export function getPlanJsonSchema(): z.core.JSONSchema.BaseSchema {
-  throw new Error('not implemented');
+  return z.toJSONSchema(PlanDocument);
 }
 
 /**
  * Returns a newly derived JSON Schema 2020-12 document for the grounding
  * cache artifact.
  *
- * The eventual getter derives `z.toJSONSchema(GroundingDocument)` and returns
+ * This getter derives `z.toJSONSchema(GroundingDocument)` and returns
  * the unmodified object. As with {@link getPlanJsonSchema}, this function is
  * filesystem-free and deterministic so tests can compile it under strict AJV
  * and the build tool can serialize precisely the same value for external
  * consumers.
  */
 export function getGroundingJsonSchema(): z.core.JSONSchema.BaseSchema {
-  throw new Error('not implemented');
+  return z.toJSONSchema(GroundingDocument);
 }
