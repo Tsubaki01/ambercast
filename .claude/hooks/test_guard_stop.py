@@ -308,6 +308,47 @@ class EvaluateTest(unittest.TestCase):
         self.assertFalse(os.path.islink(self.side()))
 
 
+class HasLiveBackgroundTest(unittest.TestCase):
+    """A session waiting on live background work may stop: the completion
+    notification re-wakes it. This is how an orchestrator sharing the branch
+    with an implementing teammate idles without being blocked."""
+
+    def test_running_task_is_live(self):
+        self.assertTrue(
+            guard_stop.has_live_background(
+                [{"id": "t1", "type": "teammate", "status": "running"}]
+            )
+        )
+
+    def test_unknown_status_counts_as_live(self):
+        # Being listed at all means the session is waiting on it; only an
+        # explicitly terminal status proves otherwise.
+        self.assertTrue(guard_stop.has_live_background([{"status": "pending"}]))
+        self.assertTrue(guard_stop.has_live_background([{"id": "t1"}]))
+
+    def test_terminal_statuses_are_not_live(self):
+        for status in ("completed", "failed", "cancelled", "canceled",
+                       "killed", "done", "error", "COMPLETED", " Done "):
+            with self.subTest(status=status):
+                self.assertFalse(
+                    guard_stop.has_live_background([{"status": status}])
+                )
+
+    def test_mixed_list_is_live_when_any_task_is(self):
+        self.assertTrue(
+            guard_stop.has_live_background(
+                [{"status": "completed"}, {"status": "running"}]
+            )
+        )
+
+    def test_empty_or_malformed_input_is_not_live(self):
+        self.assertFalse(guard_stop.has_live_background([]))
+        self.assertFalse(guard_stop.has_live_background(None))
+        self.assertFalse(guard_stop.has_live_background("oops"))
+        self.assertFalse(guard_stop.has_live_background({"status": "running"}))
+        self.assertFalse(guard_stop.has_live_background([1, "x", None]))
+
+
 class EndToEndTest(unittest.TestCase):
     """Run the hook as Claude Code does: a subprocess fed JSON on stdin."""
 
@@ -345,6 +386,53 @@ class EndToEndTest(unittest.TestCase):
             )
         self.assertEqual(res.returncode, 0)
         self.assertEqual(res.stdout.strip(), "")
+
+    def test_live_background_task_allows_stop(self):
+        # Orchestrator case: same branch, incomplete steps, but a teammate is
+        # still working — the guard must let this session idle.
+        with self._git_repo("issues/7") as proj:
+            write_state(Path(proj), "7", "step01_issue=done\n")
+            res = self._run_hook(
+                json.dumps({
+                    "hook_event_name": "Stop",
+                    "background_tasks": [
+                        {"id": "t1", "type": "teammate", "status": "running"}
+                    ],
+                }),
+                {"CLAUDE_PROJECT_DIR": proj},
+            )
+        self.assertEqual(res.returncode, 0)
+        self.assertEqual(res.stdout.strip(), "")
+
+    def test_terminal_background_tasks_still_block(self):
+        # The original stall pattern: the delegated work finished, nothing is
+        # running, steps remain — the guard must push the agent back in.
+        with self._git_repo("issues/7") as proj:
+            write_state(Path(proj), "7", "step01_issue=done\n")
+            res = self._run_hook(
+                json.dumps({
+                    "hook_event_name": "Stop",
+                    "background_tasks": [{"id": "t1", "status": "completed"}],
+                }),
+                {"CLAUDE_PROJECT_DIR": proj},
+            )
+            self.assertEqual(res.returncode, 0)
+            payload = json.loads(res.stdout)
+            self.assertEqual(payload["decision"], "block")
+
+    def test_malformed_background_tasks_still_block(self):
+        with self._git_repo("issues/7") as proj:
+            write_state(Path(proj), "7", "step01_issue=done\n")
+            res = self._run_hook(
+                json.dumps({
+                    "hook_event_name": "Stop",
+                    "background_tasks": "oops",
+                }),
+                {"CLAUDE_PROJECT_DIR": proj},
+            )
+            self.assertEqual(res.returncode, 0)
+            payload = json.loads(res.stdout)
+            self.assertEqual(payload["decision"], "block")
 
     def test_incomplete_flow_blocks_via_stdout_json(self):
         with self._git_repo("issues/7") as proj:

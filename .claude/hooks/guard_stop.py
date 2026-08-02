@@ -12,6 +12,10 @@ Scope and escape hatches:
 - fires only when the current branch matches issues/<N> or issues/<N>-<slug>
   AND .claude/impl/issue-<N>.state exists (grammar shared with guard_git.py
   and guard_phase.py); any other branch or a detached HEAD passes through
+- a session with live background work (teammate, subagent, background shell;
+  Stop input `background_tasks`, v2.1.145+) may stop — the completion
+  notification re-wakes it. This keeps orchestrator sessions that share the
+  branch with an implementing teammate from being blocked into implementing
 - `paused=true` in the state file -> allow the stop and reset the stall
   counter (intentional pause; remove the line to resume with a fresh budget)
 - stall protection: .claude/impl/.guard-stop-issue-<N>.json records a
@@ -59,6 +63,35 @@ STEPS = [
 ]
 
 BRANCH_RE = re.compile(r"issues/([0-9]+)(?:-[a-z0-9]+)*")
+
+# Statuses that prove a listed background task is finished. Anything else —
+# including an unknown or missing status — counts as live, because merely
+# being listed means the session is waiting on it.
+TERMINAL_TASK_STATUSES = {
+    "completed", "failed", "cancelled", "canceled", "killed", "done", "error",
+}
+
+
+def has_live_background(tasks):
+    """True when the session is waiting on live background work.
+
+    Claude Code v2.1.145+ passes `background_tasks` in the Stop input
+    precisely so hooks can distinguish "session is done" from "session is
+    paused waiting for background work to wake it back up". A session with
+    live delegated work (teammate, subagent, background shell) may stop:
+    the completion notification re-wakes it, and the guard re-engages then.
+    Without this, an orchestrator sharing the branch with an implementing
+    teammate would be blocked into doing the teammate's job itself.
+    """
+    if not isinstance(tasks, list):
+        return False
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        status = str(task.get("status") or "").strip().lower()
+        if status not in TERMINAL_TASK_STATUSES:
+            return True
+    return False
 
 
 def issue_from_branch(branch):
@@ -301,6 +334,8 @@ def main():
         if not isinstance(data, dict):
             return 0
         if os.environ.get("AMBERCAST_GUARD_STOP") == "0":
+            return 0
+        if has_live_background(data.get("background_tasks")):
             return 0
         proj = (
             os.environ.get("CLAUDE_PROJECT_DIR")
