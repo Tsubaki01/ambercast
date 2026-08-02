@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 // Automated replacement for eyeballing `npm pack --dry-run` output by hand.
 // Fails the build if the packed tarball is missing the built CLI/library
-// output or if bin/ambercast.js loses its executable bit again (the exact
-// regression issue #10 fixed once already — see
-// .claude/impl/issue-10-plan.md, "Affected files" / scripts/verify-pack.mjs).
+// output or if bin/ambercast.js loses its executable bit, guarding the
+// packaging regression fixed in issue #10.
 import { execFileSync } from 'node:child_process';
 
 const REQUIRED_FILES = [

@@ -1,20 +1,14 @@
 /**
  * Converts the zod-owned IR document definitions into public JSON Schema.
  *
- * This core module is deliberately pure: it imports the plan and grounding
- * schemas from `schema.ts`, calls zod's JSON Schema conversion, and returns
- * the result without reading files, choosing paths, serializing text, or
- * mutating global state. Its consumers are the build tool that publishes
- * static schema files and unit tests that compare AJV with zod. Keeping the
- * conversion here means they cannot acquire divergent handwritten schema
- * definitions.
+ * This core module is pure: it returns converted values without filesystem
+ * access, path selection, text serialization, or global mutation. Keeping
+ * conversion here prevents the build tool and AJV-equivalence tests from
+ * acquiring divergent handwritten schema definitions.
  *
- * The schemas target JSON Schema 2020-12 through zod's default
- * conversion and include `$schema` accordingly. Structural constraints are
- * intentionally represented through strict objects, literals, regexes, and
- * discriminated unions in `schema.ts` so they survive this conversion. The
- * only documented zod-only exception is PlanDocument's projected duplicate
- * step-ID check, which JSON Schema 2020-12 cannot express.
+ * Zod's default conversion targets JSON Schema 2020-12. Structural
+ * constraints survive the conversion; {@link PlanDocument}'s projected
+ * duplicate step-ID check remains the intentional zod-only exception.
  */
 import { z } from 'zod';
 import { GroundingDocument, PlanDocument } from './schema.js';
@@ -23,14 +17,9 @@ import { GroundingDocument, PlanDocument } from './schema.js';
  * Returns a newly derived JSON Schema 2020-12 document for the complete plan
  * artifact.
  *
- * This getter derives a new document with
- * `z.toJSONSchema(PlanDocument)` on every invocation. It must not cache,
- * mutate, pretty-print, write, or hand-author the result: callers need a pure
- * object suitable for independent AJV compilation, while the build tool alone
- * owns file serialization. The conversion retains all structural rules from
- * `PlanDocument`,
- * including nested action/check `oneOf` branches and `additionalProperties:
- * false`; it intentionally cannot encode cross-step ID uniqueness.
+ * Each call returns a pure, unmodified value suitable for independent AJV
+ * compilation; the build tool alone owns file serialization. Cross-step ID
+ * uniqueness remains zod-only because JSON Schema cannot express it.
  */
 export function getPlanJsonSchema(): z.core.JSONSchema.BaseSchema {
   return z.toJSONSchema(PlanDocument);
@@ -40,11 +29,8 @@ export function getPlanJsonSchema(): z.core.JSONSchema.BaseSchema {
  * Returns a newly derived JSON Schema 2020-12 document for the grounding
  * cache artifact.
  *
- * This getter derives `z.toJSONSchema(GroundingDocument)` and returns
- * the unmodified object. As with {@link getPlanJsonSchema}, this function is
- * filesystem-free and deterministic so tests can compile it under strict AJV
- * and the build tool can serialize precisely the same value for external
- * consumers.
+ * Like {@link getPlanJsonSchema}, this filesystem-free, deterministic getter
+ * gives strict-AJV tests and the build tool the same derived value.
  */
 export function getGroundingJsonSchema(): z.core.JSONSchema.BaseSchema {
   return z.toJSONSchema(GroundingDocument);

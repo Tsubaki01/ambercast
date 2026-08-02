@@ -135,10 +135,14 @@ describe('TargetDefinition', () => {
   it('accepts the Chromium HTTP(S) target definition', () => {
     expectAccepted(TargetDefinition, TARGET_DEFINITION);
     expectAccepted(TargetDefinition, { baseUrl: 'http://example.test', browser: 'chromium' });
+    expectAccepted(TargetDefinition, { baseUrl: 'https://example.test/path?query=value#section', browser: 'chromium' });
   });
 
-  it('rejects non-HTTP URLs, unsupported browsers, wrong field types, and unknown properties', () => {
+  it('rejects malformed or non-HTTP URLs, unsupported browsers, wrong field types, and unknown properties', () => {
     expectRejected(TargetDefinition, { baseUrl: 'ftp://example.test', browser: 'chromium' });
+    for (const hostlessUrl of ['https://?', 'https:///path', 'http://', 'http://#fragment']) {
+      expectRejected(TargetDefinition, { baseUrl: hostlessUrl, browser: 'chromium' });
+    }
     expectRejected(TargetDefinition, { baseUrl: 'https://example.test', browser: 'firefox' });
     expectRejected(TargetDefinition, { baseUrl: 42, browser: 'chromium' });
     expectRejected(TargetDefinition, { ...TARGET_DEFINITION, unexpected: true });
