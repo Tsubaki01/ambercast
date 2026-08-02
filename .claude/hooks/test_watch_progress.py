@@ -9,9 +9,12 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 
 HOOKS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(HOOKS_DIR))
@@ -161,32 +164,75 @@ class WatchLoopTest(unittest.TestCase):
 
 
 class LockTest(unittest.TestCase):
+    """The lock must be atomic (no check-then-write race), immune to pid
+    reuse, and self-releasing when the holder dies — flock semantics."""
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.proj = Path(self._tmp.name)
         (self.proj / ".claude" / "impl").mkdir(parents=True)
 
     def tearDown(self):
+        for issue in ("13", "77"):
+            watch_progress.release_lock(str(self.proj), issue)
         self._tmp.cleanup()
 
-    def test_stale_lock_with_dead_pid_is_reacquired(self):
+    def test_leftover_pidfile_from_dead_process_is_reacquired(self):
+        # A pidfile left by a crashed watchdog holds no lock (the kernel
+        # released it with the process) — even if its recorded pid has
+        # been recycled by an unrelated live process.
         lock = Path(watch_progress.lock_path(str(self.proj), "13"))
-        # A dead pid: fork-less best guess — use a pid far above pid_max
-        # fallback: spawn a process that exits immediately and reuse its pid.
-        proc = subprocess.run([sys.executable, "-c", "pass"])
-        lock.write_text(str(proc.returncode * 0 + 99999999), encoding="utf-8")
+        lock.write_text(str(os.getpid()), encoding="utf-8")
         self.assertTrue(watch_progress.acquire_lock(str(self.proj), "13"))
         self.assertEqual(lock.read_text(encoding="utf-8"), str(os.getpid()))
 
-    def test_live_lock_is_respected(self):
-        lock = Path(watch_progress.lock_path(str(self.proj), "13"))
-        lock.write_text(str(os.getpid()), encoding="utf-8")
+    def test_held_lock_is_respected_until_released(self):
+        self.assertTrue(watch_progress.acquire_lock(str(self.proj), "13"))
         self.assertFalse(watch_progress.acquire_lock(str(self.proj), "13"))
+        watch_progress.release_lock(str(self.proj), "13")
+        self.assertTrue(watch_progress.acquire_lock(str(self.proj), "13"))
 
-    def test_corrupt_lock_is_reacquired(self):
+    def test_corrupt_pidfile_is_reacquired(self):
         lock = Path(watch_progress.lock_path(str(self.proj), "13"))
         lock.write_text("not a pid", encoding="utf-8")
         self.assertTrue(watch_progress.acquire_lock(str(self.proj), "13"))
+
+    def test_concurrent_acquisition_has_exactly_one_winner(self):
+        barrier = threading.Barrier(8, timeout=5)
+
+        def attempt(_):
+            barrier.wait()
+            return watch_progress.acquire_lock(str(self.proj), "77")
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(attempt, range(8)))
+        self.assertEqual(sum(results), 1)
+
+
+class EnvFloatTest(unittest.TestCase):
+    def test_invalid_overrides_fall_back_to_default(self):
+        for raw in ("0", "-5", "nan", "inf", "-inf", "abc", ""):
+            with self.subTest(raw=raw):
+                with mock.patch.dict(os.environ, {"WD_TEST_VAR": raw}):
+                    self.assertEqual(
+                        watch_progress._env_float("WD_TEST_VAR", 60.0), 60.0
+                    )
+
+    def test_valid_override_is_used(self):
+        with mock.patch.dict(os.environ, {"WD_TEST_VAR": "0.05"}):
+            self.assertEqual(
+                watch_progress._env_float("WD_TEST_VAR", 60.0), 0.05
+            )
+
+    def test_missing_override_uses_default(self):
+        os.environ.pop("WD_TEST_VAR", None)
+        self.assertEqual(watch_progress._env_float("WD_TEST_VAR", 60.0), 60.0)
+
+    def test_max_runtime_is_clamped_under_the_hook_timeout(self):
+        # A max runtime above the hook timeout would let the runner kill
+        # the process before its re-arm wake ever fires.
+        self.assertEqual(watch_progress.clamp_max_runtime(50000.0), 21000.0)
+        self.assertEqual(watch_progress.clamp_max_runtime(600.0), 600.0)
 
 
 class EndToEndTest(unittest.TestCase):
@@ -256,6 +302,39 @@ class EndToEndTest(unittest.TestCase):
             res = self._run(proj, stdin="not json")
         self.assertEqual(res.returncode, 2)
         self.assertIn("watchdog", res.stderr)
+
+    def test_branch_switch_ends_the_watch_quietly(self):
+        # The arming turn's issue branch may be left behind (merge done,
+        # switch to main, next issue) while the watchdog still runs; it
+        # must notice and bow out instead of waking with stale advice.
+        with self._git_repo("issues/7") as proj:
+            write_state(Path(proj), "7", "step01_issue=done\n")
+            first = subprocess.Popen(
+                [sys.executable, self.HOOK],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+                env=self._env(proj, {
+                    "AMBERCAST_WATCHDOG_STALE_SEC": "20",
+                    "AMBERCAST_WATCHDOG_MAX_RUNTIME_SEC": "20",
+                }),
+            )
+            first.stdin.write('{"hook_event_name":"Stop"}')
+            first.stdin.close()
+            deadline = time.time() + 5
+            lock = Path(watch_progress.lock_path(proj, "7"))
+            while not lock.exists() and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(lock.exists(), "watchdog never locked")
+            subprocess.run(
+                ["git", "-C", proj, "symbolic-ref", "HEAD",
+                 "refs/heads/main"],
+                check=True, capture_output=True,
+            )
+            self.assertEqual(first.wait(timeout=10), 0)
+            err = first.stderr.read()
+            self.assertEqual(err.strip(), "")
+            first.stdout.close()
+            first.stderr.close()
 
     def test_second_instance_yields_to_a_live_lock(self):
         with self._git_repo("issues/7") as proj:

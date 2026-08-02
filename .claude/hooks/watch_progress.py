@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """asyncRewake watchdog: revive the /implement flow when teammates go idle.
 
-Upstream Claude Code bug family (anthropics/claude-code#23415, closed stale
-without a fix): an in-process teammate waiting on background work can go
-idle and never be re-woken — no turn ever starts, so the Stop-hook guard
-(guard_stop.py, which fires at turn end) cannot reach it. The only
-documented mechanism that force-wakes an idle session is an asyncRewake
-hook exiting with code 2, and a SendMessage from the lead reliably
-re-engages an idle teammate ("idle rows are hidden, not stopped").
+Upstream Claude Code bug family around teammates going idle and never
+resuming (anthropics/claude-code#23415, tmux-backend inbox variant,
+closed stale without a fix; #29163 duplicate; we hit an in-process
+variant where a background completion never re-wakes the teammate): no
+turn ever starts, so the Stop-hook guard (guard_stop.py, which fires at
+turn end) cannot reach it. The only documented mechanism that
+force-wakes an idle session is an asyncRewake hook exiting with code 2,
+and a SendMessage from the lead re-engages an idle in-process teammate
+("idle rows are hidden, not stopped") — empirically 100% here.
 
 This script is registered as an async Stop hook with asyncRewake: true.
 It outlives the turn that armed it: while the branch's flow stays active
@@ -28,7 +30,9 @@ Knobs (environment):
 A pidfile (.claude/impl/.watchdog-issue-<N>.pid) keeps one watchdog per
 issue: every turn end tries to arm one, and extras yield to a live lock.
 """
+import fcntl
 import json
+import math
 import os
 import sys
 import time
@@ -39,52 +43,62 @@ import guard_stop  # noqa: E402
 DEFAULT_INTERVAL_SEC = 60.0
 DEFAULT_STALE_SEC = 720.0
 DEFAULT_MAX_RUNTIME_SEC = 20000.0
+# Keep the process lifetime safely under the 21600s hook timeout so the
+# re-arm wake always fires before the runner kills the process.
+MAX_RUNTIME_CEILING_SEC = 21000.0
+
+# Open file descriptors of locks this process holds, keyed by lock path.
+# flock ties the lock to the descriptor: the kernel releases it the moment
+# the process dies, so a crashed watchdog can never wedge future arming.
+_HELD_LOCKS = {}
 
 
 def lock_path(proj, issue):
     return os.path.join(proj, ".claude", "impl", f".watchdog-issue-{issue}.pid")
 
 
-def _pid_alive(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
-
-
 def acquire_lock(proj, issue):
-    """Take the per-issue watchdog lock unless a live holder exists."""
+    """Take the per-issue watchdog lock atomically (flock, non-blocking).
+
+    flock removes the check-then-write race between two hook processes,
+    is immune to pid reuse (the pidfile content is informational only),
+    and self-releases when the holder dies.
+    """
     path = lock_path(proj, issue)
-    try:
-        with open(path, encoding="utf-8") as f:
-            holder = int(f.read().strip())
-        if _pid_alive(holder):
-            return False
-    except (OSError, ValueError):
-        pass
+    if path in _HELD_LOCKS:
+        return False
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(str(os.getpid()))
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
     except OSError:
         return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return False
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+    except OSError:
+        pass
+    _HELD_LOCKS[path] = fd
     return True
 
 
 def release_lock(proj, issue):
-    path = lock_path(proj, issue)
-    try:
-        with open(path, encoding="utf-8") as f:
-            holder = f.read().strip()
-        if holder == str(os.getpid()):
-            os.remove(path)
-    except OSError:
-        pass
+    # The pidfile stays behind on purpose: reusing one path keeps every
+    # contender flocking the same inode (removing it would let two
+    # processes lock different inodes of the same path).
+    fd = _HELD_LOCKS.pop(lock_path(proj, issue), None)
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def _read_state(proj, issue):
@@ -102,9 +116,10 @@ def _stale_message(issue, elapsed, nxt):
     return (
         f"watchdog: /implement flow for issue {issue} has made no progress "
         f"for {minutes} minutes; next step is {key} ({desc}). Teammates may "
-        "be idle without a wake-up (upstream claude-code#23415). Check Codex "
-        "jobs and teammate status, re-engage idle teammates by name via "
-        "SendMessage (idle teammates are hidden, not stopped), then continue "
+        "be idle without a wake-up (upstream claude-code#23415 family). "
+        "Check Codex jobs and teammate status, re-engage idle teammates by "
+        "name via SendMessage (idle teammates are hidden, not stopped); if "
+        "one stays unresponsive, surface it to the maintainer. Then continue "
         "the flow. To pause intentionally, append `paused=true` to "
         f".claude/impl/issue-{issue}.state."
     )
@@ -133,6 +148,14 @@ def watch(proj, issue, interval, stale_after, max_runtime,
         sleep_fn(interval)
         now = now_fn()
 
+        # The checkout may have moved on (merge done, next issue). A
+        # resolvable branch that no longer maps to the watched issue ends
+        # the watch; an unresolvable one (detached HEAD mid-rebase, git
+        # hiccup) is tolerated so a transient state cannot kill it.
+        branch = guard_stop.current_branch(proj)
+        if branch is not None and guard_stop.issue_from_branch(branch) != issue:
+            return 0, ""
+
         state = _read_state(proj, issue)
         if state is None or guard_stop.is_paused(state):
             return 0, ""
@@ -152,10 +175,18 @@ def watch(proj, issue, interval, stale_after, max_runtime,
 
 
 def _env_float(name, default):
+    """Env override, accepted only when finite and positive."""
     try:
-        return float(os.environ.get(name, ""))
+        value = float(os.environ.get(name, ""))
     except (ValueError, TypeError):
         return default
+    if not math.isfinite(value) or value <= 0:
+        return default
+    return value
+
+
+def clamp_max_runtime(value):
+    return min(value, MAX_RUNTIME_CEILING_SEC)
 
 
 def main():
@@ -198,10 +229,10 @@ def main():
                 stale_after=_env_float(
                     "AMBERCAST_WATCHDOG_STALE_SEC", DEFAULT_STALE_SEC
                 ),
-                max_runtime=_env_float(
+                max_runtime=clamp_max_runtime(_env_float(
                     "AMBERCAST_WATCHDOG_MAX_RUNTIME_SEC",
                     DEFAULT_MAX_RUNTIME_SEC,
-                ),
+                )),
             )
         finally:
             release_lock(proj, issue)
