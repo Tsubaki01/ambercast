@@ -19,6 +19,17 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/guard_stop.py",
+            "timeout": 15
+          }
+        ]
+      }
     ]
   }
 }
