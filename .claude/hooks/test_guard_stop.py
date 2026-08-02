@@ -389,6 +389,39 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0)
         self.assertEqual(res.stdout.strip(), "")
 
+    def test_detached_head_passes_through(self):
+        with self._git_repo("issues/7") as proj:
+            write_state(Path(proj), "7", "step01_issue=done\n")
+            git = ["git", "-C", proj]
+            subprocess.run(
+                [*git, "-c", "user.email=t@t", "-c", "user.name=t",
+                 "commit", "-q", "--allow-empty", "-m", "init"],
+                check=True, capture_output=True,
+            )
+            sha = subprocess.run(
+                [*git, "rev-parse", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            subprocess.run(
+                [*git, "checkout", "-q", sha], check=True, capture_output=True
+            )
+            res = self._run_hook(
+                json.dumps({"hook_event_name": "Stop"}),
+                {"CLAUDE_PROJECT_DIR": proj},
+            )
+        self.assertEqual(res.returncode, 0)
+        self.assertEqual(res.stdout.strip(), "")
+
+    def test_missing_git_executable_fails_open(self):
+        with tempfile.TemporaryDirectory() as proj:
+            write_state(Path(proj), "7", "step01_issue=done\n")
+            res = self._run_hook(
+                json.dumps({"hook_event_name": "Stop", "cwd": proj}),
+                {"PATH": "/nonexistent"},
+            )
+        self.assertEqual(res.returncode, 0)
+        self.assertEqual(res.stdout.strip(), "")
+
 
 if __name__ == "__main__":
     unittest.main()

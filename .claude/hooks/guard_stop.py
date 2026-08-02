@@ -125,22 +125,29 @@ def _hash_dir_listing(h, directory):
     h.update(b"\0")
 
 
+def _git_stdout(proj, args):
+    # A guard hook must not hang or crash on a broken git: bound every call
+    # and treat any failure as "no output" so the hook stays fail-open.
+    try:
+        res = subprocess.run(
+            ["git", "-C", proj, *args],
+            capture_output=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return b""
+    return res.stdout
+
+
 def _hash_git(h, proj):
     # Tracked-file edits show up in the diff against HEAD; brand-new files
     # show up as untracked paths, hashed with their stat so ongoing edits to
     # them keep counting as progress. Outside a git repo these commands fail
     # and contribute nothing, which is fine — the flow always runs in one.
     for args in (["rev-parse", "HEAD"], ["diff", "HEAD"]):
-        res = subprocess.run(
-            ["git", "-C", proj, *args], capture_output=True
-        )
-        h.update(res.stdout)
+        h.update(_git_stdout(proj, args))
         h.update(b"\0")
-    res = subprocess.run(
-        ["git", "-C", proj, "ls-files", "--others", "--exclude-standard"],
-        capture_output=True,
-    )
-    for line in res.stdout.decode(errors="replace").splitlines():
+    out = _git_stdout(proj, ["ls-files", "--others", "--exclude-standard"])
+    for line in out.decode(errors="replace").splitlines():
         # .claude/ artifacts (state, todos, plan, logs) are already hashed
         # explicitly above — and the stall sidecar lives there too, so
         # including them here would let the guard's own bookkeeping count
@@ -280,11 +287,9 @@ def evaluate(proj, branch, session_id=""):
 
 
 def current_branch(proj):
-    res = subprocess.run(
-        ["git", "-C", proj, "symbolic-ref", "--short", "HEAD"],
-        capture_output=True, text=True,
-    )
-    return res.stdout.strip() if res.returncode == 0 else None
+    out = _git_stdout(proj, ["symbolic-ref", "--short", "HEAD"])
+    branch = out.decode(errors="replace").strip()
+    return branch or None
 
 
 def main():
