@@ -1,0 +1,12 @@
+{
+  "document": "plan",
+  "expected": "valid",
+  "value": {
+    "schemaVersion": 1,
+    "source": { "inputsDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    "targets": { "app": { "baseUrl": "https://example.test", "browser": "chromium" } },
+    "steps": [
+      { "id": "welcome-visible", "kind": "assert", "check": "text-visible", "text": "Welcome" }
+    ]
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "document": "grounding",
+  "expected": "valid",
+  "value": {
+    "schemaVersion": 1,
+    "planDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "entries": {
+      "login-flow": {
+        "fingerprint": { "algorithm": "a11y-neighborhood-v1", "hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
+        "trace": [
+          { "type": "click", "target": { "strategy": "accessibility", "role": "button", "name": "Start" } },
+          { "type": "navigate", "url": "https://example.test/login" },
+          { "type": "press", "target": { "strategy": "accessibility", "role": "textbox", "name": "Email" }, "key": "Tab" },
+          { "type": "fill", "target": { "strategy": "accessibility", "role": "textbox", "name": "Email" }, "value": "person@example.test" },
+          { "type": "fill-secret", "target": { "strategy": "accessibility", "role": "textbox", "name": "Password" }, "secretRef": "{{secrets.app.password}}" }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "document": "plan",
+  "expected": "invalid",
+  "value": {
+    "schemaVersion": 1,
+    "source": { "inputsDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    "targets": {},
+    "steps": [{ "id": "missing-kind", "action": "navigate", "url": "https://example.test" }]
+  }
+}

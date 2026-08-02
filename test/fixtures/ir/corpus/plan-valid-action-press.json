@@ -1,0 +1,12 @@
+{
+  "document": "plan",
+  "expected": "valid",
+  "value": {
+    "schemaVersion": 1,
+    "source": { "inputsDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    "targets": { "app": { "baseUrl": "https://example.test", "browser": "chromium" } },
+    "steps": [
+      { "id": "press-enter", "kind": "action", "action": "press", "target": { "strategy": "accessibility", "role": "textbox", "name": "Search" }, "key": "Enter" }
+    ]
+  }
+}

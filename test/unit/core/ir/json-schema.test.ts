@@ -1,0 +1,87 @@
+import { readdirSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { Ajv2020 } from 'ajv/dist/2020.js';
+import { describe, expect, it } from 'vitest';
+import { getGroundingJsonSchema, getPlanJsonSchema } from '../../../../src/core/ir/json-schema.js';
+import { GroundingDocument, PlanDocument } from '../../../../src/core/ir/schema.js';
+
+type DocumentKind = 'plan' | 'grounding';
+type ExpectedVerdict = 'valid' | 'invalid';
+
+interface CorpusFixture {
+  document: DocumentKind;
+  expected: ExpectedVerdict;
+  value: unknown;
+}
+
+interface NamedCorpusFixture extends CorpusFixture {
+  name: string;
+}
+
+const corpusDirectory = fileURLToPath(new URL('../../../fixtures/ir/corpus/', import.meta.url));
+
+function isCorpusFixture(value: unknown): value is CorpusFixture {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+
+  const candidate = value as Record<string, unknown>;
+  return (candidate.document === 'plan' || candidate.document === 'grounding')
+    && (candidate.expected === 'valid' || candidate.expected === 'invalid')
+    && 'value' in candidate;
+}
+
+function loadCorpus(): NamedCorpusFixture[] {
+  return readdirSync(corpusDirectory)
+    .filter((fileName) => fileName.endsWith('.json'))
+    .sort()
+    .map((fileName) => {
+      const parsed: unknown = JSON.parse(readFileSync(new URL(fileName, `${new URL('../../../fixtures/ir/corpus/', import.meta.url).href}`), 'utf8'));
+
+      if (!isCorpusFixture(parsed)) {
+        throw new TypeError(`Invalid IR corpus fixture: ${fileName}`);
+      }
+
+      return { ...parsed, name: fileName };
+    });
+}
+
+const corpus = loadCorpus();
+
+describe('IR JSON Schema corpus equivalence', () => {
+  it('contains valid and invalid fixtures for plan and grounding documents', () => {
+    expect(corpus).not.toHaveLength(0);
+
+    for (const document of ['plan', 'grounding'] as const) {
+      const fixtures = corpus.filter((fixture) => fixture.document === document);
+      expect(fixtures.some((fixture) => fixture.expected === 'valid')).toBe(true);
+      expect(fixtures.some((fixture) => fixture.expected === 'invalid')).toBe(true);
+    }
+  });
+
+  it.each(corpus)('$name has the expected zod and AJV verdict', (fixture) => {
+    const expected = fixture.expected === 'valid';
+    const zodSchema = fixture.document === 'plan' ? PlanDocument : GroundingDocument;
+    const zodVerdict = zodSchema.safeParse(fixture.value).success;
+
+    expect(zodVerdict).toBe(expected);
+
+    const jsonSchema = fixture.document === 'plan' ? getPlanJsonSchema() : getGroundingJsonSchema();
+    const ajvVerdict = new Ajv2020({ strict: true }).compile(jsonSchema)(fixture.value);
+
+    expect(ajvVerdict).toBe(expected);
+    expect(ajvVerdict).toBe(zodVerdict);
+  });
+});
+
+describe('IR JSON Schema documents', () => {
+  it.each([
+    ['plan', getPlanJsonSchema],
+    ['grounding', getGroundingJsonSchema],
+  ] as const)('returns a strict-compilable JSON Schema 2020-12 document for %s', (_document, getSchema) => {
+    const schema = getSchema();
+
+    expect(schema.$schema).toBe('https://json-schema.org/draft/2020-12/schema');
+    expect(() => new Ajv2020({ strict: true }).compile(schema)).not.toThrow();
+  });
+});
