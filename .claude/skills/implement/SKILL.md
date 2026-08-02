@@ -53,3 +53,10 @@ Reviews are independent: performed by OpenAI Codex CLI per the user-level codex-
 - Steps run in order; never parallelize across steps (parallelism happens inside a step, e.g. the 7 review perspectives).
 - Fixed design decisions in `AGENTS.md` are binding — do not re-litigate them in code or plans; propose changes to the human instead.
 - If a step fails repeatedly or the plan proves wrong mid-flow, go back to step 3, revise the plan, and re-run reviews for what changed — do not improvise forward.
+
+## Autonomous continuation
+
+- After completing each step, update the state file and state the progress in one line of the reply (e.g. "issue-13: step10_tests_review done, next: step11_code").
+- After handling ANY background-task completion notification (Codex jobs, subagents, monitors), do not end the turn there: verify the result, update the state file and logs, then continue with the next incomplete step in the same turn. End a turn mid-flow only when the maintainer's input is strictly required.
+- To pause the flow intentionally, append `paused=true` to the issue's state file (remove the line to resume). The Stop hook `.claude/hooks/guard_stop.py` blocks turn-ends while incomplete steps remain, names the next step, and backs off automatically after 3 consecutive blocks without progress.
+- To disable the Stop hook entirely, set `AMBERCAST_GUARD_STOP=0` in the environment.
