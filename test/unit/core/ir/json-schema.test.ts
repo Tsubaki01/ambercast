@@ -63,13 +63,11 @@ describe('IR JSON Schema corpus equivalence', () => {
     const expected = fixture.expected === 'valid';
     const zodSchema = fixture.document === 'plan' ? PlanDocument : GroundingDocument;
     const zodVerdict = zodSchema.safeParse(fixture.value).success;
-
-    expect(zodVerdict).toBe(expected);
-
     const jsonSchema = fixture.document === 'plan' ? getPlanJsonSchema() : getGroundingJsonSchema();
     const ajvVerdict = new Ajv2020({ strict: true }).compile(jsonSchema)(fixture.value);
 
-    expect(ajvVerdict).toBe(expected);
+    expect.soft(zodVerdict).toBe(expected);
+    expect.soft(ajvVerdict).toBe(expected);
     expect(ajvVerdict).toBe(zodVerdict);
   });
 });

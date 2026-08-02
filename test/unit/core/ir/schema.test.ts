@@ -66,6 +66,7 @@ function plan(steps: unknown[], targets: Record<string, unknown> = { app: TARGET
 describe('IR primitive schemas', () => {
   it('accepts whole secret references and rejects malformed secret references', () => {
     expectAccepted(SecretRef, '{{secrets.production.password}}');
+    expectAccepted(SecretRef, '{{secrets.prod_config.api_key_2}}');
 
     for (const malformed of [
       'secrets.production.password',
@@ -80,6 +81,7 @@ describe('IR primitive schemas', () => {
 
   it('accepts whole run references and rejects malformed run references', () => {
     expectAccepted(RunRef, '{{run.profile.name}}');
+    expectAccepted(RunRef, '{{run.prod_config.api_key_2}}');
 
     for (const malformed of [
       'run.profile.name',
@@ -132,6 +134,7 @@ describe('IR primitive schemas', () => {
 describe('TargetDefinition', () => {
   it('accepts the Chromium HTTP(S) target definition', () => {
     expectAccepted(TargetDefinition, TARGET_DEFINITION);
+    expectAccepted(TargetDefinition, { baseUrl: 'http://example.test', browser: 'chromium' });
   });
 
   it('rejects non-HTTP URLs, unsupported browsers, wrong field types, and unknown properties', () => {
@@ -186,11 +189,56 @@ describe('ActionStep', () => {
     expectAccepted(Step, value);
   });
 
-  it('rejects unknown or missing action discriminants and action-specific wrong field types', () => {
+  it('rejects unknown or missing action discriminants', () => {
     expectRejected(ActionStep, { id: 'scroll', kind: 'action', action: 'scroll' });
     expectRejected(ActionStep, { id: 'missing-action', kind: 'action', url: 'https://example.test' });
-    expectRejected(PressAction, { id: 'press-enter', kind: 'action', action: 'press', target: TARGET, key: 'Space' });
-    expectRejected(NavigateAction, { id: 'navigate-home', kind: 'action', action: 'navigate', url: 42 });
+  });
+
+  it.each([
+    ['ClickAction.target', ClickAction, [
+      { id: 'click-submit', kind: 'action', action: 'click', target: 'Submit' },
+      { id: 'click-submit', kind: 'action', action: 'click' },
+    ]],
+    ['NavigateAction.url', NavigateAction, [
+      { id: 'navigate-home', kind: 'action', action: 'navigate', url: 42 },
+      { id: 'navigate-home', kind: 'action', action: 'navigate', url: 'https://{{secrets.app.password}}' },
+      { id: 'navigate-home', kind: 'action', action: 'navigate' },
+    ]],
+    ['PressAction.target', PressAction, [
+      { id: 'press-enter', kind: 'action', action: 'press', target: 'Submit', key: 'Enter' },
+      { id: 'press-enter', kind: 'action', action: 'press', key: 'Enter' },
+    ]],
+    ['PressAction.key', PressAction, [
+      { id: 'press-enter', kind: 'action', action: 'press', target: TARGET, key: 1 },
+      { id: 'press-enter', kind: 'action', action: 'press', target: TARGET, key: 'Space' },
+      { id: 'press-enter', kind: 'action', action: 'press', target: TARGET },
+    ]],
+    ['FillAction.target', FillAction, [
+      { id: 'fill-email', kind: 'action', action: 'fill', target: 'Email', value: 'person@example.test' },
+      { id: 'fill-email', kind: 'action', action: 'fill', value: 'person@example.test' },
+    ]],
+    ['FillAction.value', FillAction, [
+      { id: 'fill-email', kind: 'action', action: 'fill', target: TARGET, value: 42 },
+      { id: 'fill-email', kind: 'action', action: 'fill', target: TARGET, value: 'Use {{secrets.app.password}}' },
+      { id: 'fill-email', kind: 'action', action: 'fill', target: TARGET },
+    ]],
+    ['FillSecretAction.target', FillSecretAction, [
+      { id: 'fill-password', kind: 'action', action: 'fill-secret', target: 'Password', secretRef: '{{secrets.app.password}}' },
+      { id: 'fill-password', kind: 'action', action: 'fill-secret', secretRef: '{{secrets.app.password}}' },
+    ]],
+    ['FillSecretAction.secretRef', FillSecretAction, [
+      { id: 'fill-password', kind: 'action', action: 'fill-secret', target: TARGET, secretRef: 42 },
+      { id: 'fill-password', kind: 'action', action: 'fill-secret', target: TARGET, secretRef: 'hunter2' },
+      { id: 'fill-password', kind: 'action', action: 'fill-secret', target: TARGET },
+    ]],
+  ] as const)('rejects wrong or missing values for %s', (_field, schema, invalidValues) => {
+    for (const invalidValue of invalidValues) {
+      expectRejected(schema, invalidValue);
+    }
+  });
+
+  it.each(['Enter', 'Tab', 'Escape', 'ArrowDown', 'ArrowUp'] as const)('accepts the %s PressAction key enum value', (key) => {
+    expectAccepted(PressAction, { id: 'press-key', kind: 'action', action: 'press', target: TARGET, key });
   });
 
   it('rejects literal, malformed, and embedded secret text in fill-secret fields', () => {
@@ -238,10 +286,48 @@ describe('AssertStep', () => {
     expectAccepted(Step, value);
   });
 
-  it('rejects unknown or missing check discriminants and wrong check field types', () => {
+  it('rejects unknown or missing check discriminants', () => {
     expectRejected(AssertStep, { id: 'page-ready', kind: 'assert', check: 'page-ready' });
     expectRejected(AssertStep, { id: 'missing-check', kind: 'assert', text: 'Ready' });
-    expectRejected(TextVisibleCheck, { id: 'welcome-visible', kind: 'assert', check: 'text-visible', text: 42 });
+  });
+
+  it.each([
+    ['TextVisibleCheck.text', TextVisibleCheck, [
+      { id: 'welcome-visible', kind: 'assert', check: 'text-visible', text: 42 },
+      { id: 'welcome-visible', kind: 'assert', check: 'text-visible', text: 'Use {{secrets.app.password}}' },
+      { id: 'welcome-visible', kind: 'assert', check: 'text-visible' },
+    ]],
+    ['ElementVisibleCheck.target', ElementVisibleCheck, [
+      { id: 'dashboard-visible', kind: 'assert', check: 'element-visible', target: 'Dashboard' },
+      { id: 'dashboard-visible', kind: 'assert', check: 'element-visible' },
+    ]],
+    ['TextEqualsCheck.target', TextEqualsCheck, [
+      { id: 'heading-text', kind: 'assert', check: 'text-equals', target: 'Heading', text: 'Welcome' },
+      { id: 'heading-text', kind: 'assert', check: 'text-equals', text: 'Welcome' },
+    ]],
+    ['TextEqualsCheck.text', TextEqualsCheck, [
+      { id: 'heading-text', kind: 'assert', check: 'text-equals', target: TARGET, text: 42 },
+      { id: 'heading-text', kind: 'assert', check: 'text-equals', target: TARGET, text: 'Use {{secrets.app.password}}' },
+      { id: 'heading-text', kind: 'assert', check: 'text-equals', target: TARGET },
+    ]],
+    ['UrlMatchesCheck.pattern', UrlMatchesCheck, [
+      { id: 'dashboard-url', kind: 'assert', check: 'url-matches', pattern: 42 },
+      { id: 'dashboard-url', kind: 'assert', check: 'url-matches', pattern: 'Use {{secrets.app.password}}' },
+      { id: 'dashboard-url', kind: 'assert', check: 'url-matches' },
+    ]],
+    ['ElementCountCheck.target', ElementCountCheck, [
+      { id: 'zero-alerts', kind: 'assert', check: 'element-count', target: 'Alert', count: 0 },
+      { id: 'zero-alerts', kind: 'assert', check: 'element-count', count: 0 },
+    ]],
+    ['ElementCountCheck.count', ElementCountCheck, [
+      { id: 'zero-alerts', kind: 'assert', check: 'element-count', target: TARGET, count: '0' },
+      { id: 'zero-alerts', kind: 'assert', check: 'element-count', target: TARGET, count: -1 },
+      { id: 'zero-alerts', kind: 'assert', check: 'element-count', target: TARGET },
+    ]],
+  ] as const)('rejects wrong or missing values for %s', (_field, schema, invalidValues) => {
+    for (const invalidValue of invalidValues) {
+      expectRejected(schema, invalidValue);
+    }
   });
 
   it('enforces a non-negative integer element count', () => {
@@ -268,9 +354,28 @@ describe('CaptureStep and AiStep', () => {
     expectAccepted(Step, ai);
   });
 
-  it('rejects wrong capture fields, secret interpolation in AI instructions, and AI unknown properties', () => {
-    expectRejected(CaptureStep, { id: 'capture-welcome', kind: 'capture', target: TARGET, variable: 'WelcomeText' });
-    expectRejected(AiStep, { id: 'secret-instruction', kind: 'ai', instruction: 'Use {{secrets.app.password}}' });
+  it.each([
+    ['CaptureStep.target', CaptureStep, [
+      { id: 'capture-welcome', kind: 'capture', target: 'Welcome message', variable: 'welcomeText' },
+      { id: 'capture-welcome', kind: 'capture', variable: 'welcomeText' },
+    ]],
+    ['CaptureStep.variable', CaptureStep, [
+      { id: 'capture-welcome', kind: 'capture', target: TARGET, variable: 42 },
+      { id: 'capture-welcome', kind: 'capture', target: TARGET, variable: 'WelcomeText' },
+      { id: 'capture-welcome', kind: 'capture', target: TARGET },
+    ]],
+    ['AiStep.instruction', AiStep, [
+      { id: 'find-settings', kind: 'ai', instruction: 42 },
+      { id: 'find-settings', kind: 'ai', instruction: 'Use {{secrets.app.password}}' },
+      { id: 'find-settings', kind: 'ai' },
+    ]],
+  ] as const)('rejects wrong or missing values for %s', (_field, schema, invalidValues) => {
+    for (const invalidValue of invalidValues) {
+      expectRejected(schema, invalidValue);
+    }
+  });
+
+  it('rejects AI unknown properties', () => {
     expectRejected(AiStep, { id: 'find-settings', kind: 'ai', instruction: 'Open settings', unexpected: true });
   });
 
@@ -298,11 +403,56 @@ describe('TraceAction and Trace', () => {
     expectAccepted(TraceAction, value);
   });
 
-  it('rejects unknown or missing trace discriminants, wrong types, and literal secret text', () => {
+  it('rejects unknown or missing trace discriminants', () => {
     expectRejected(TraceAction, { type: 'scroll' });
     expectRejected(TraceAction, { url: 'https://example.test' });
-    expectRejected(TracePress, { type: 'press', target: TARGET, key: 1 });
-    expectRejected(TraceFillSecret, { type: 'fill-secret', target: TARGET, secretRef: 'hunter2' });
+  });
+
+  it.each([
+    ['TraceClick.target', TraceClick, [
+      { type: 'click', target: 'Submit' },
+      { type: 'click' },
+    ]],
+    ['TraceNavigate.url', TraceNavigate, [
+      { type: 'navigate', url: 42 },
+      { type: 'navigate', url: 'https://{{secrets.app.password}}' },
+      { type: 'navigate' },
+    ]],
+    ['TracePress.target', TracePress, [
+      { type: 'press', target: 'Submit', key: 'Enter' },
+      { type: 'press', key: 'Enter' },
+    ]],
+    ['TracePress.key', TracePress, [
+      { type: 'press', target: TARGET, key: 1 },
+      { type: 'press', target: TARGET, key: 'Space' },
+      { type: 'press', target: TARGET },
+    ]],
+    ['TraceFill.target', TraceFill, [
+      { type: 'fill', target: 'Email', value: 'person@example.test' },
+      { type: 'fill', value: 'person@example.test' },
+    ]],
+    ['TraceFill.value', TraceFill, [
+      { type: 'fill', target: TARGET, value: 42 },
+      { type: 'fill', target: TARGET, value: 'Use {{secrets.app.password}}' },
+      { type: 'fill', target: TARGET },
+    ]],
+    ['TraceFillSecret.target', TraceFillSecret, [
+      { type: 'fill-secret', target: 'Password', secretRef: '{{secrets.app.password}}' },
+      { type: 'fill-secret', secretRef: '{{secrets.app.password}}' },
+    ]],
+    ['TraceFillSecret.secretRef', TraceFillSecret, [
+      { type: 'fill-secret', target: TARGET, secretRef: 42 },
+      { type: 'fill-secret', target: TARGET, secretRef: 'hunter2' },
+      { type: 'fill-secret', target: TARGET },
+    ]],
+  ] as const)('rejects wrong or missing values for %s', (_field, schema, invalidValues) => {
+    for (const invalidValue of invalidValues) {
+      expectRejected(schema, invalidValue);
+    }
+  });
+
+  it.each(['Enter', 'Tab', 'Escape', 'ArrowDown', 'ArrowUp'] as const)('accepts the %s TracePress key enum value', (key) => {
+    expectAccepted(TracePress, { type: 'press', target: TARGET, key });
   });
 
   it('accepts a populated trace and an empty trace', () => {
