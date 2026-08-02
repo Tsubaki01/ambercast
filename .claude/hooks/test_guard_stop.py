@@ -86,9 +86,16 @@ class StepQueriesTest(unittest.TestCase):
         key, _ = guard_stop.first_incomplete(state)
         self.assertEqual(key, "step02_branch")
 
-    def test_last_completed_with_gap(self):
+    def test_last_completed_is_contiguous_prefix_end(self):
+        # A gap must not report a later step as "last completed": that would
+        # contradict the "next step" guidance in the block reason.
         state = "step01_issue=done\nstep04_plan_review=done\n"
-        self.assertEqual(guard_stop.last_completed(state), "step04_plan_review")
+        self.assertEqual(guard_stop.last_completed(state), "step01_issue")
+
+    def test_last_completed_full_prefix(self):
+        self.assertEqual(
+            guard_stop.last_completed(ISSUE13_PARTIAL), "step09_tests"
+        )
 
     def test_last_completed_empty(self):
         self.assertIsNone(guard_stop.last_completed("issue=13\n"))
@@ -105,7 +112,13 @@ class EvaluateTest(unittest.TestCase):
         self.proj = Path(self._tmp.name)
 
     def tearDown(self):
+        impl = self.proj / ".claude" / "impl"
+        if impl.exists():
+            os.chmod(impl, 0o700)
         self._tmp.cleanup()
+
+    def side(self) -> Path:
+        return Path(guard_stop.sidecar_path(str(self.proj), "13"))
 
     def test_non_issue_branch_allows_stop(self):
         write_state(self.proj, "13", ISSUE13_PARTIAL)
@@ -118,12 +131,29 @@ class EvaluateTest(unittest.TestCase):
         write_state(self.proj, "13", ISSUE13_PARTIAL + "paused=true\n")
         self.assertIsNone(guard_stop.evaluate(str(self.proj), "issues/13"))
 
+    def test_pause_resets_an_exhausted_stall_counter(self):
+        # Pausing must clear the sidecar; otherwise resuming an issue whose
+        # counter was already exhausted would leave the guard disabled.
+        write_state(self.proj, "13", ISSUE13_PARTIAL)
+        for _ in range(3):
+            self.assertIsNotNone(guard_stop.evaluate(str(self.proj), "issues/13"))
+        self.assertIsNone(guard_stop.evaluate(str(self.proj), "issues/13"))
+        write_state(self.proj, "13", ISSUE13_PARTIAL + "paused=true\n")
+        self.assertIsNone(guard_stop.evaluate(str(self.proj), "issues/13"))
+        self.assertFalse(self.side().exists())
+        write_state(self.proj, "13", ISSUE13_PARTIAL)
+        payload = guard_stop.evaluate(str(self.proj), "issues/13")
+        self.assertIsNotNone(payload)
+        self.assertEqual(
+            json.loads(self.side().read_text())["consecutive_blocks"], 1
+        )
+
     def test_all_done_allows_stop_and_removes_sidecar(self):
         write_state(self.proj, "13", ALL_DONE)
-        side = Path(guard_stop.sidecar_path(str(self.proj), "13"))
-        side.write_text("{}", encoding="utf-8")
+        self.side().parent.mkdir(parents=True, exist_ok=True)
+        self.side().write_text("{}", encoding="utf-8")
         self.assertIsNone(guard_stop.evaluate(str(self.proj), "issues/13"))
-        self.assertFalse(side.exists())
+        self.assertFalse(self.side().exists())
 
     def test_incomplete_state_blocks_with_next_step(self):
         write_state(self.proj, "13", ISSUE13_PARTIAL)
@@ -142,9 +172,7 @@ class EvaluateTest(unittest.TestCase):
         for expected_blocks in (1, 2, 3):
             payload = guard_stop.evaluate(str(self.proj), branch)
             self.assertIsNotNone(payload, f"block #{expected_blocks} expected")
-            side = json.loads(
-                Path(guard_stop.sidecar_path(str(self.proj), "13")).read_text()
-            )
+            side = json.loads(self.side().read_text())
             self.assertEqual(side["consecutive_blocks"], expected_blocks)
         self.assertIsNone(guard_stop.evaluate(str(self.proj), branch))
         # Still stalled: later stops keep passing through until progress resumes.
@@ -160,10 +188,9 @@ class EvaluateTest(unittest.TestCase):
         payload = guard_stop.evaluate(str(self.proj), branch)
         self.assertIsNotNone(payload)
         self.assertIn("step11_code", payload["reason"])
-        side = json.loads(
-            Path(guard_stop.sidecar_path(str(self.proj), "13")).read_text()
+        self.assertEqual(
+            json.loads(self.side().read_text())["consecutive_blocks"], 1
         )
-        self.assertEqual(side["consecutive_blocks"], 1)
 
     def test_todo_file_change_counts_as_progress(self):
         write_state(self.proj, "13", ISSUE13_PARTIAL)
@@ -176,17 +203,109 @@ class EvaluateTest(unittest.TestCase):
             guard_stop.evaluate(str(self.proj), branch)
         self.assertIsNone(guard_stop.evaluate(str(self.proj), branch))
         todo.write_text("- [x] L6. implement schema.ts\n", encoding="utf-8")
-        payload = guard_stop.evaluate(str(self.proj), branch)
+        self.assertIsNotNone(guard_stop.evaluate(str(self.proj), branch))
+
+    def test_plan_file_change_counts_as_progress(self):
+        write_state(self.proj, "13", ISSUE13_PARTIAL)
+        branch = "issues/13"
+        plan = self.proj / ".claude" / "impl" / "issue-13-plan.md"
+        plan.write_text("# plan\n", encoding="utf-8")
+        for _ in range(3):
+            guard_stop.evaluate(str(self.proj), branch)
+        self.assertIsNone(guard_stop.evaluate(str(self.proj), branch))
+        plan.write_text("# plan\n## review outcomes\n", encoding="utf-8")
+        self.assertIsNotNone(guard_stop.evaluate(str(self.proj), branch))
+
+    def test_log_activity_counts_as_progress(self):
+        write_state(self.proj, "13", ISSUE13_PARTIAL)
+        branch = "issues/13"
+        logs = self.proj / ".claude" / "logs"
+        logs.mkdir(parents=True)
+        for _ in range(3):
+            guard_stop.evaluate(str(self.proj), branch)
+        self.assertIsNone(guard_stop.evaluate(str(self.proj), branch))
+        (logs / "2026-08-03_guard.md").write_text("progress\n", encoding="utf-8")
+        self.assertIsNotNone(guard_stop.evaluate(str(self.proj), branch))
+
+    def test_source_edit_in_git_repo_counts_as_progress(self):
+        subprocess.run(
+            ["git", "init", "-q", "-b", "issues/13", str(self.proj)],
+            check=True, capture_output=True,
+        )
+        write_state(self.proj, "13", ISSUE13_PARTIAL)
+        branch = "issues/13"
+        for _ in range(3):
+            guard_stop.evaluate(str(self.proj), branch)
+        self.assertIsNone(guard_stop.evaluate(str(self.proj), branch))
+        src = self.proj / "src"
+        src.mkdir()
+        (src / "schema.ts").write_text("export const x = 1;\n", encoding="utf-8")
+        self.assertIsNotNone(guard_stop.evaluate(str(self.proj), branch))
+
+    def test_new_session_resets_the_stall_counter(self):
+        write_state(self.proj, "13", ISSUE13_PARTIAL)
+        branch = "issues/13"
+        for _ in range(3):
+            guard_stop.evaluate(str(self.proj), branch, session_id="s1")
+        self.assertIsNone(guard_stop.evaluate(str(self.proj), branch, session_id="s1"))
+        payload = guard_stop.evaluate(str(self.proj), branch, session_id="s2")
         self.assertIsNotNone(payload)
+        self.assertEqual(
+            json.loads(self.side().read_text())["consecutive_blocks"], 1
+        )
 
     def test_corrupted_sidecar_is_rebuilt(self):
         write_state(self.proj, "13", ISSUE13_PARTIAL)
-        side = Path(guard_stop.sidecar_path(str(self.proj), "13"))
-        side.parent.mkdir(parents=True, exist_ok=True)
-        side.write_text("not json", encoding="utf-8")
+        self.side().parent.mkdir(parents=True, exist_ok=True)
+        self.side().write_text("not json", encoding="utf-8")
         payload = guard_stop.evaluate(str(self.proj), "issues/13")
         self.assertIsNotNone(payload)
-        self.assertEqual(json.loads(side.read_text())["consecutive_blocks"], 1)
+        self.assertEqual(
+            json.loads(self.side().read_text())["consecutive_blocks"], 1
+        )
+
+    def test_non_object_json_sidecar_is_rebuilt(self):
+        write_state(self.proj, "13", ISSUE13_PARTIAL)
+        self.side().parent.mkdir(parents=True, exist_ok=True)
+        self.side().write_text("[]", encoding="utf-8")
+        payload = guard_stop.evaluate(str(self.proj), "issues/13")
+        self.assertIsNotNone(payload)
+        self.assertEqual(
+            json.loads(self.side().read_text())["consecutive_blocks"], 1
+        )
+
+    def test_invalid_utf8_state_does_not_crash(self):
+        impl = self.proj / ".claude" / "impl"
+        impl.mkdir(parents=True)
+        (impl / "issue-13.state").write_bytes(
+            b"step01_issue=done\n\xff\xfe garbage\n"
+        )
+        payload = guard_stop.evaluate(str(self.proj), "issues/13")
+        self.assertIsNotNone(payload)
+        self.assertIn("step02_branch", payload["reason"])
+
+    @unittest.skipIf(os.geteuid() == 0, "permission checks are void as root")
+    def test_unwritable_sidecar_dir_fails_open(self):
+        # If the stall counter cannot be durably recorded, the local backoff
+        # could never advance — so the guard must allow the stop instead.
+        write_state(self.proj, "13", ISSUE13_PARTIAL)
+        impl = self.proj / ".claude" / "impl"
+        os.chmod(impl, 0o500)
+        try:
+            self.assertIsNone(guard_stop.evaluate(str(self.proj), "issues/13"))
+        finally:
+            os.chmod(impl, 0o700)
+
+    def test_symlinked_sidecar_target_is_not_truncated(self):
+        write_state(self.proj, "13", ISSUE13_PARTIAL)
+        target = self.proj / "target.json"
+        target.write_text('{"precious": true}', encoding="utf-8")
+        self.side().parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, self.side())
+        payload = guard_stop.evaluate(str(self.proj), "issues/13")
+        self.assertIsNotNone(payload)
+        self.assertEqual(target.read_text(encoding="utf-8"), '{"precious": true}')
+        self.assertFalse(os.path.islink(self.side()))
 
 
 class EndToEndTest(unittest.TestCase):
@@ -211,9 +330,11 @@ class EndToEndTest(unittest.TestCase):
         )
 
     def test_invalid_stdin_exits_zero_silently(self):
-        res = self._run_hook("not json", {})
-        self.assertEqual(res.returncode, 0)
-        self.assertEqual(res.stdout.strip(), "")
+        for stdin in ("not json", "[]", "null", "42", '"str"', ""):
+            with self.subTest(stdin=stdin):
+                res = self._run_hook(stdin, {})
+                self.assertEqual(res.returncode, 0)
+                self.assertEqual(res.stdout.strip(), "")
 
     def test_kill_switch_disables_the_guard(self):
         with self._git_repo("issues/7") as proj:
@@ -229,7 +350,7 @@ class EndToEndTest(unittest.TestCase):
         with self._git_repo("issues/7") as proj:
             write_state(Path(proj), "7", "step01_issue=done\n")
             res = self._run_hook(
-                json.dumps({"hook_event_name": "Stop"}),
+                json.dumps({"hook_event_name": "Stop", "session_id": "s1"}),
                 {"CLAUDE_PROJECT_DIR": proj},
             )
             self.assertEqual(res.returncode, 0)
