@@ -8,18 +8,17 @@
  * schemas, never maintained as a hand-written parallel definition. The
  * eventual implementation must use `z.strictObject` for every object so zod
  * and the generated JSON Schema agree that unknown properties are invalid.
- * It must also use structural zod constructs only: regexes, literals, strict
- * objects, arrays, records, and discriminated unions. Except for duplicate
+ * It must also use structural zod constructs such as regexes, literals,
+ * strict objects, arrays, records, discriminated unions, recursive lazies,
+ * ordinary unions, enums, optionals, and numeric bounds. Except for duplicate
  * plan-step identifiers (which JSON Schema 2020-12 cannot express), no
  * `.refine()` or `.superRefine()` may encode a constraint that would vanish
  * when this module is converted to JSON Schema.
  *
- * This docs-first scaffold intentionally exports `z.never()` for each future
- * schema. That makes every premature runtime use reject rather than silently
- * accept an under-specified document. The succeeding implementation phase
- * will replace only the schema bodies described below, keep the export
- * surface and inferred aliases, and add the one documented duplicate-ID
- * `PlanDocument` refinement after its red tests have been reviewed.
+ * The `z.never()` placeholders fail closed, so an early runtime use rejects
+ * rather than silently accepts an under-specified document. Their replacements
+ * preserve the documented export surface and inferred aliases, including the
+ * one duplicate-ID `PlanDocument` refinement that JSON Schema cannot express.
  */
 import { z } from 'zod';
 
@@ -43,6 +42,22 @@ export const SecretRef = z.never();
  * by parsing untrusted data through the schema rather than casting strings.
  */
 export type SecretRef = z.infer<typeof SecretRef>;
+
+/**
+ * Validates the canonical lowercase SHA-256 digest encoding shared by IR
+ * provenance fields.
+ *
+ * The eventual regex is `/^[0-9a-f]{64}$/`. {@link Fingerprint},
+ * {@link PlanDocument}, and {@link GroundingDocument} reuse this schema for
+ * fields with different provenance roles, so one definition prevents their
+ * shared digest syntax from drifting during schema evolution.
+ */
+export const HexSha256 = z.never();
+
+/**
+ * The static digest type accepted by {@link HexSha256}.
+ */
+export type HexSha256 = z.infer<typeof HexSha256>;
 
 /**
  * Validates free text that may interpolate `{{run.*}}` values but may never
@@ -119,8 +134,7 @@ export type ElementRef = z.infer<typeof ElementRef>;
  * grounding entry.
  *
  * The future strict object has algorithm literal `'a11y-neighborhood-v1'` and
- * a lowercase, exactly 64-character SHA-256-shaped hash
- * (`/^[0-9a-f]{64}$/`). This captures a local neighborhood rather than a
+ * `hash: {@link HexSha256}`. This captures a local neighborhood rather than a
  * page-wide hash, avoiding cache misses from unrelated UI changes. Naming the
  * algorithm makes a future fingerprint-format change explicit and versioned.
  */
@@ -537,10 +551,14 @@ export type JsonValueT =
 /**
  * Validates {@link JsonValueT} recursively for `compilerMeta` values.
  *
- * The implementation phase must use `z.lazy` around a union of string,
- * number, boolean, null, arrays of itself, and records of itself. It must not
- * use `z.unknown()`: metadata is non-canonical for plan hashing, but it still
- * lives in a committed JSON artifact and must be representable as JSON.
+ * The eventual `z.lazy()` initializer must give this exported const an
+ * explicit `z.ZodType<JsonValueT>` annotation. Strict TypeScript can
+ * otherwise recurse through the self-referential initializer and report a
+ * circular implicit-`any`; the annotation fixes the recursive boundary while
+ * the lazy union validates strings, numbers, booleans, null, arrays, and
+ * records. It must not use `z.unknown()`: metadata is non-canonical for plan
+ * hashing, but it still lives in a committed JSON artifact and must be
+ * representable as JSON.
  */
 export const JsonValue = z.never();
 
@@ -549,9 +567,9 @@ export const JsonValue = z.never();
  * committed beside its source test prompt.
  *
  * The final strict object has `schemaVersion: 1`; `source` as a strict object
- * with a lowercase 64-hex `inputsDigest`; optional
- * `compilerMeta: Record<string, JsonValue>`; named `targets` records whose
- * values are {@link TargetDefinition}; and ordered `steps` of {@link Step}.
+ * with `inputsDigest: {@link HexSha256}`; optional `compilerMeta:
+ * Record<string, JsonValue>`; named `targets` records whose values are
+ * {@link TargetDefinition}; and ordered `steps` of {@link Step}.
  * Its sole `.superRefine()` walks `steps`, records seen IDs, and adds a custom
  * issue at each later duplicate's `['steps', index, 'id']` path. Projected
  * uniqueness cannot be represented by JSON Schema 2020-12 (`uniqueItems`
@@ -570,12 +588,12 @@ export type PlanDocument = z.infer<typeof PlanDocument>;
 /**
  * Validates the committed grounding cache associated with one plan digest.
  *
- * The final strict object has `schemaVersion: 1`, a lowercase 64-hex
- * `planDigest`, and an `entries` record keyed by {@link StepId}. Each entry is
- * itself a strict object with required {@link Fingerprint} and optional
- * {@link Trace}. The record key ensures grounding belongs to descriptive plan
- * steps instead of fragile positions, and the plan digest makes stale
- * grounding detectable by the later pure provenance helper.
+ * The final strict object has `schemaVersion: 1`, `planDigest:
+ * {@link HexSha256}`, and an `entries` record keyed by {@link StepId}. Each
+ * entry is itself a strict object with required {@link Fingerprint} and
+ * optional {@link Trace}. The record key ensures grounding belongs to
+ * descriptive plan steps instead of fragile positions, and the plan digest
+ * makes stale grounding detectable by the later pure provenance helper.
  */
 export const GroundingDocument = z.never();
 
