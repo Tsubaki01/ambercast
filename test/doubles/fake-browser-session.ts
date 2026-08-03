@@ -4,15 +4,31 @@ import type {
   AssertOutcome,
   BrowserSession,
   CaptureMode,
+  GroundedResolution,
   PageSnapshot,
   PerformableAction,
 } from '../../src/ports/browser.js';
 
+/**
+ * The current state used to arrange one grounded element for a session fake.
+ *
+ * The fake derives the resolution result from this state instead of accepting
+ * a precomputed verdict, so tests exercise the production-facing comparison
+ * and not-found precedence rules.
+ */
 export interface FakeBrowserSessionEntry {
   readonly currentFingerprint: Fingerprint;
   readonly exists: boolean;
 }
 
+/**
+ * Scripted browser results and observation hooks for one fake session.
+ *
+ * Capture values are keyed by {@link elementRefKey}, which allows a test to
+ * use equivalent element-reference objects without depending on object
+ * identity. An absent scripted capture deliberately reads as an empty string
+ * so shape-oriented contracts can use an otherwise unconfigured session.
+ */
 export interface FakeBrowserSessionOptions {
   readonly captureValues?: ReadonlyMap<string, { readonly text: string; readonly value: string }>;
   readonly assertOutcome?: AssertOutcome;
@@ -22,10 +38,22 @@ export interface FakeBrowserSessionOptions {
   readonly onClose?: () => void;
 }
 
+/**
+ * Encoders remain exhaustive as the IR gains element-reference strategies.
+ *
+ * A JSON array preserves field boundaries even when accessibility names
+ * contain punctuation that would make a delimiter-based key ambiguous.
+ */
 const elementRefKeyEncoders = {
   accessibility: (ref: ElementRef): string => JSON.stringify([ref.strategy, ref.role, ref.name]),
 } satisfies Record<ElementRef['strategy'], (ref: ElementRef) => string>;
 
+/**
+ * Creates the structural lookup key shared by fake grounding and capture data.
+ *
+ * @param ref - The element reference whose fields identify the fixture entry.
+ * @returns A collision-safe key for the reference's declared strategy.
+ */
 export function elementRefKey(ref: ElementRef): string {
   switch (ref.strategy) {
     case 'accessibility':
@@ -35,38 +63,78 @@ export function elementRefKey(ref: ElementRef): string {
   throw new Error('unsupported element reference strategy');
 }
 
-export function fingerprintsEqual(_left: Fingerprint, _right: Fingerprint): boolean {
-  throw new Error('not implemented');
+/**
+ * Compares the complete persisted fingerprint rather than its object identity.
+ *
+ * @param left - One recorded or current fingerprint.
+ * @param right - The other fingerprint to compare.
+ * @returns Whether the algorithm and hash agree exactly.
+ */
+export function fingerprintsEqual(left: Fingerprint, right: Fingerprint): boolean {
+  return left.algorithm === right.algorithm && left.hash === right.hash;
 }
 
+/**
+ * Builds a deterministic browser-session double from current-page fixtures.
+ *
+ * The double keeps all state inside this factory and treats a missing element
+ * as more informative than a fingerprint mismatch, matching the hard
+ * grounding gate that protects callers from a wrong-element pass.
+ *
+ * @param entries - Current element state indexed by {@link elementRefKey}.
+ * @param options - Optional scripted results and call-observation hooks.
+ * @returns A browser session that follows the public port contract.
+ */
 export function createFakeBrowserSession(
-  _entries: ReadonlyMap<string, FakeBrowserSessionEntry>,
-  _options: FakeBrowserSessionOptions = {},
+  entries: ReadonlyMap<string, FakeBrowserSessionEntry>,
+  options: FakeBrowserSessionOptions = {},
 ): BrowserSession {
+  const assertOutcome = options.assertOutcome ?? { passed: true };
+  const snapshot = options.snapshot ?? {
+    accessibilityTree: {},
+    screenshot: new Uint8Array(),
+  };
+  let closed = false;
+
   return {
-    async perform(_action): Promise<void> {
-      throw new Error('not implemented');
+    async perform(action): Promise<void> {
+      options.onPerform?.(action);
     },
-    async evaluateAssert(_check): Promise<AssertOutcome> {
-      throw new Error('not implemented');
+    async evaluateAssert(check): Promise<AssertOutcome> {
+      options.onEvaluateAssert?.(check);
+      return assertOutcome;
     },
-    async captureValue(_target: ElementRef, _mode: CaptureMode): Promise<string> {
-      throw new Error('not implemented');
+    async captureValue(target: ElementRef, mode: CaptureMode): Promise<string> {
+      return options.captureValues?.get(elementRefKey(target))?.[mode] ?? '';
     },
-    async resolveGrounded(_ref: ElementRef, _fp: Fingerprint) {
-      throw new Error('not implemented');
+    async resolveGrounded(ref: ElementRef, fp: Fingerprint): Promise<GroundedResolution> {
+      const entry = entries.get(elementRefKey(ref));
+      if (entry === undefined || !entry.exists) {
+        return { kind: 'miss', reason: 'element-not-found' };
+      }
+
+      if (!fingerprintsEqual(fp, entry.currentFingerprint)) {
+        return { kind: 'miss', reason: 'fingerprint-mismatch' };
+      }
+
+      return { kind: 'hit', ref };
     },
     async snapshotForResolution(): Promise<PageSnapshot> {
-      throw new Error('not implemented');
+      return snapshot;
     },
     async screenshot(): Promise<Uint8Array> {
-      throw new Error('not implemented');
+      return snapshot.screenshot;
     },
     async accessibilitySnapshot() {
-      throw new Error('not implemented');
+      return snapshot.accessibilityTree;
     },
     async close(): Promise<void> {
-      throw new Error('not implemented');
+      if (closed) {
+        return;
+      }
+
+      closed = true;
+      options.onClose?.();
     },
   };
 }
