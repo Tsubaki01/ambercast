@@ -5,8 +5,8 @@
  * Digest inputs form a deliberately closed contract: a plan changes when its
  * normalized prompt, schema, compiler instructions, or named targets change.
  * The type is the structural half of that containment guarantee; the
- * call-site restriction that completes it is an ESLint rule deferred to
- * issue #2. Hashing uses the canonical JSON bytes shared with artifact
+ * separate static rule that restricts callers completes it (Issue #2).
+ * Hashing uses the canonical JSON bytes shared with artifact
  * serialization, so construction order never changes a provenance value.
  */
 import type { NormalizedTestMd } from './normalize.js';
@@ -63,6 +63,14 @@ export interface DigestInputs {
 /**
  * Computes the canonical SHA-256 provenance digest for compiler inputs.
  *
+ * @remarks Before canonical serialization, the implementation constructs a
+ * fresh, fixed-shape preimage containing exactly `normalizedTestMd`,
+ * `schemaVersion`, `compilerPromptTemplateFingerprint`, and
+ * `targetDefinitions`. It deliberately does not hash the received `inputs`
+ * object directly: a structurally wider runtime object can carry extra
+ * properties, and letting those silently influence the digest would defeat
+ * `DigestInputs` as a closed, declared contract.
+ *
  * @param inputs - The complete declared input contract for one compilation.
  * @returns The lowercase hexadecimal digest embedded in a compiled plan.
  */
@@ -74,12 +82,12 @@ export function computeInputsDigest(inputs: DigestInputs): string {
  * Computes the canonical SHA-256 digest that grounding uses to identify a
  * plan's replay-relevant content.
  *
+ * @remarks Compiler metadata describes how a plan was produced rather than
+ * what it replays, so it remains outside this digest. The calculation derives
+ * its digest view without mutating the caller's plan.
+ *
  * @param plan - A schema-valid compiled plan.
  * @returns The lowercase hexadecimal digest recorded by grounding artifacts.
- *
- * Compiler metadata describes how a plan was produced rather than what it
- * replays, so it remains outside this digest. The calculation derives its
- * digest view without mutating the caller's plan.
  */
 export function computePlanDigest(plan: PlanDocument): string {
   throw new Error('not implemented');
@@ -88,13 +96,13 @@ export function computePlanDigest(plan: PlanDocument): string {
 /**
  * Answers whether grounding provenance matches a supplied plan digest.
  *
+ * @remarks This is a narrow, pure equality helper. It does not decide how to
+ * handle a stale cache; errors, exits, and local-versus-CI policy remain
+ * outside the IR trust kernel.
+ *
  * @param grounding - The grounding cache whose recorded provenance is read.
  * @param planDigest - The digest calculated for the plan under consideration.
  * @returns `true` only when both provenance values are identical.
- *
- * This is a narrow, pure equality helper. It does not decide how to handle a
- * stale cache; errors, exits, and local-versus-CI policy remain outside the IR
- * trust kernel.
  */
 export function isPlanDigestCurrent(
   grounding: GroundingDocument,
