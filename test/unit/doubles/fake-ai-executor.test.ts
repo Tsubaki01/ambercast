@@ -69,4 +69,12 @@ describe('createFakeAiExecutor', () => {
     await expect(createFakeAiExecutor({ available: true }).isAvailable()).resolves.toBe(true);
     await expect(createFakeAiExecutor({ available: false }).isAvailable()).resolves.toBe(false);
   });
+
+  it('keeps canned responses isolated between executor instances', async () => {
+    const first = createFakeAiExecutor({ cannedResponses: new Map([['shared-step', FIRST_RESULT]]) });
+    const second = createFakeAiExecutor({ cannedResponses: new Map([['shared-step', SECOND_RESULT]]) });
+
+    await expect(first.execute(request('shared-step'))).resolves.toBe(FIRST_RESULT);
+    await expect(second.execute(request('shared-step'))).resolves.toBe(SECOND_RESULT);
+  });
 });

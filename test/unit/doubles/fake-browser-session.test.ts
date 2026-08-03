@@ -10,7 +10,7 @@ const REF: ElementRef = { strategy: 'accessibility', role: 'button', name: 'Subm
 const OTHER_REF: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Email' };
 const FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v1', hash: 'a'.repeat(64) };
 const OTHER_FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v1', hash: 'b'.repeat(64) };
-const REF_KEY = 'accessibility:button:Submit';
+const REF_KEY = JSON.stringify(['accessibility', 'button', 'Submit']);
 
 function entries(exists = true, currentFingerprint: Fingerprint = FINGERPRINT): ReadonlyMap<string, {
   readonly currentFingerprint: Fingerprint;
@@ -25,6 +25,13 @@ describe('createFakeBrowserSession', () => {
     expect(elementRefKey({ ...REF })).toBe(REF_KEY);
     expect(fingerprintsEqual(FINGERPRINT, { ...FINGERPRINT })).toBe(true);
     expect(fingerprintsEqual(FINGERPRINT, OTHER_FINGERPRINT)).toBe(false);
+  });
+
+  it('uses an unambiguous key when role and name contain colons', () => {
+    const first: ElementRef = { strategy: 'accessibility', role: 'button:a', name: 'b' };
+    const second: ElementRef = { strategy: 'accessibility', role: 'button', name: 'a:b' };
+
+    expect(elementRefKey(first)).not.toBe(elementRefKey(second));
   });
 
   it('exposes every BrowserSession operation as callable', async () => {
@@ -76,13 +83,21 @@ describe('createFakeBrowserSession', () => {
     });
   });
 
-  it('captures both modes, including empty values', async () => {
+  it('captures distinct configured values for text and value modes', async () => {
     const session = createFakeBrowserSession(entries(), {
-      captureValues: new Map([[REF_KEY, { text: '', value: '' }]]),
+      captureValues: new Map([[REF_KEY, { text: 'Submit', value: 'submit-button-1' }]]),
+    });
+
+    await expect(session.captureValue(REF, 'text')).resolves.toBe('Submit');
+    await expect(session.captureValue(REF, 'value')).resolves.toBe('submit-button-1');
+  });
+
+  it('preserves an empty configured capture value', async () => {
+    const session = createFakeBrowserSession(entries(), {
+      captureValues: new Map([[REF_KEY, { text: '', value: 'submit-button-1' }]]),
     });
 
     await expect(session.captureValue(REF, 'text')).resolves.toBe('');
-    await expect(session.captureValue(REF, 'value')).resolves.toBe('');
   });
 
   it('records materialized action and assertion arguments through callbacks', async () => {
@@ -116,11 +131,12 @@ describe('createFakeBrowserSession', () => {
     expect(secondActions).toEqual([secondAction]);
   });
 
-  it('runs its close callback exactly when close completes', async () => {
+  it('allows repeated close calls while running its close callback only once', async () => {
     const closes: string[] = [];
     const session = createFakeBrowserSession(entries(), { onClose: () => closes.push('closed') });
 
-    await session.close();
+    await expect(session.close()).resolves.toBeUndefined();
+    await expect(session.close()).resolves.toBeUndefined();
 
     expect(closes).toEqual(['closed']);
   });

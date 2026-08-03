@@ -7,37 +7,70 @@ import type {
   AiExecuteResult,
   AiExecutor,
 } from '../../src/ports/ai.js';
-import type { PageSnapshot } from '../../src/ports/browser.js';
+import type { AssertCheck, PageSnapshot, PerformableAction } from '../../src/ports/browser.js';
+
+export type AiExecutorContractAgenticScript = AiAgenticResult | (
+  (request: AiAgenticRequest) => AiAgenticResult | Promise<AiAgenticResult>
+);
 
 export interface AiExecutorContractScript {
   readonly execute: AiExecuteResult<unknown>;
-  readonly executeAgentic: AiAgenticResult;
+  readonly executeAgentic: AiExecutorContractAgenticScript;
 }
 
 export interface AiExecutorContractHarness {
   createExecutor(scripted: AiExecutorContractScript): AiExecutor | Promise<AiExecutor>;
-  executeRequests(): readonly AiExecuteRequest[];
-  agenticRequests(): readonly AiAgenticRequest[];
+  createActionController(overrides: Partial<AiActionController>): AiActionController;
   dispose?(): void | Promise<void>;
 }
 
 const RESPONSE_SCHEMA = { type: 'object', required: ['ok'] };
-const EXECUTE_RESULT: AiExecuteResult<unknown> = { data: { ok: true }, raw: '{"ok":true}' };
+const EXECUTE_RESULT: AiExecuteResult<unknown> = {
+  data: { ok: true },
+  raw: '{"ok":true}',
+  usage: { inputTokens: 13, outputTokens: 8 },
+};
 const AGENTIC_RESULT: AiAgenticResult = { trace: [], outcome: 'success' };
 const EMPTY_SNAPSHOT: PageSnapshot = { accessibilityTree: {}, screenshot: new Uint8Array() };
-const CONTROLLER: AiActionController = {
-  async perform(): Promise<void> {},
-  async evaluateAssert() {
-    return { passed: true } as const;
-  },
-  async snapshotForResolution(): Promise<PageSnapshot> {
-    return EMPTY_SNAPSHOT;
-  },
-};
+const ACTION_A: PerformableAction = { type: 'click', target: { strategy: 'accessibility', role: 'button', name: 'Submit' } };
+const ACTION_B: PerformableAction = { type: 'navigate', url: 'https://example.test/second-action' };
+const CHECK: AssertCheck = { check: 'element-visible', target: ACTION_A.target };
+
+interface RecordingController {
+  readonly controller: AiActionController;
+  readonly performed: PerformableAction[];
+  readonly evaluated: AssertCheck[];
+  readonly snapshots: [][];
+}
+
+function createRecordingController(harness: AiExecutorContractHarness): RecordingController {
+  const performed: PerformableAction[] = [];
+  const evaluated: AssertCheck[] = [];
+  const snapshots: [][] = [];
+
+  return {
+    controller: harness.createActionController({
+      perform: async (action) => {
+        performed.push(action);
+      },
+      evaluateAssert: async (check) => {
+        evaluated.push(check);
+        return { passed: true };
+      },
+      snapshotForResolution: async (...argumentsReceived: []) => {
+        snapshots.push(argumentsReceived);
+        return EMPTY_SNAPSHOT;
+      },
+    }),
+    performed,
+    evaluated,
+    snapshots,
+  };
+}
 
 export function registerAiExecutorContract(harness: AiExecutorContractHarness): void {
   describe('AiExecutor contract', () => {
-    it('returns a scripted structured result and forwards the prompt and response schema unchanged', async () => {
+    it('returns the scripted structured result by value', async () => {
       try {
         const executor = await harness.createExecutor({ execute: EXECUTE_RESULT, executeAgentic: AGENTIC_RESULT });
         const request: AiExecuteRequest = {
@@ -46,26 +79,66 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
           context: { step: 'compile' },
         };
 
-        await expect(executor.execute<unknown>(request)).resolves.toBe(EXECUTE_RESULT);
-        expect(harness.executeRequests().at(-1)).toBe(request);
+        const result = await executor.execute<unknown>(request);
+
+        expect(result.data).toEqual(EXECUTE_RESULT.data);
+        expect(result.raw).toEqual(EXECUTE_RESULT.raw);
+        expect(result.usage).toEqual(EXECUTE_RESULT.usage);
       } finally {
         await harness.dispose?.();
       }
     });
 
-    it('receives the complete narrow agentic controller surface', async () => {
+    it('forwards the agentic controller behavior without requiring reference identity', async () => {
       try {
-        const executor = await harness.createExecutor({ execute: EXECUTE_RESULT, executeAgentic: AGENTIC_RESULT });
-        const request: AiAgenticRequest = { instructionPrompt: 'Complete the sign-in.', controller: CONTROLLER };
+        const recording = createRecordingController(harness);
+        const executor = await harness.createExecutor({
+          execute: EXECUTE_RESULT,
+          executeAgentic: async (request) => {
+            await request.controller.perform(ACTION_A);
+            await request.controller.evaluateAssert(CHECK);
+            await request.controller.snapshotForResolution();
+            return { trace: [ACTION_A], outcome: 'success' };
+          },
+        });
 
-        await expect(executor.executeAgentic(request)).resolves.toBe(AGENTIC_RESULT);
-        const received = harness.agenticRequests().at(-1);
+        const result = await executor.executeAgentic({
+          instructionPrompt: 'Complete the sign-in.',
+          controller: recording.controller,
+          priorTrace: [ACTION_B],
+        });
 
-        expect(received).toBeDefined();
-        expect(received?.controller).toBe(CONTROLLER);
-        expect(typeof received?.controller.perform).toBe('function');
-        expect(typeof received?.controller.evaluateAssert).toBe('function');
-        expect(typeof received?.controller.snapshotForResolution).toBe('function');
+        expect(recording.performed).toEqual([ACTION_A]);
+        expect(recording.evaluated).toEqual([CHECK]);
+        expect(recording.snapshots).toEqual([[]]);
+        expect(result.trace).toEqual(recording.performed);
+        expect(result.outcome).toBe('success');
+      } finally {
+        await harness.dispose?.();
+      }
+    });
+
+    it('returns only the action performed before an agentic failure', async () => {
+      try {
+        const recording = createRecordingController(harness);
+        const executor = await harness.createExecutor({
+          execute: EXECUTE_RESULT,
+          executeAgentic: async (request) => {
+            await request.controller.perform(ACTION_A);
+            return { trace: [ACTION_A], outcome: 'failure' };
+          },
+        });
+
+        const result = await executor.executeAgentic({
+          instructionPrompt: 'Complete the sign-in.',
+          controller: recording.controller,
+          priorTrace: [ACTION_B],
+        });
+
+        expect(recording.performed).toEqual([ACTION_A]);
+        expect(result.trace).toEqual(recording.performed);
+        expect(result.trace).not.toContainEqual(ACTION_B);
+        expect(result.outcome).toBe('failure');
       } finally {
         await harness.dispose?.();
       }

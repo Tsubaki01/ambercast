@@ -23,6 +23,28 @@ const DIFFERENT_FINGERPRINT: Fingerprint = {
   hash: 'b'.repeat(64),
 };
 
+function isJsonValue(value: unknown): boolean {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') {
+    return true;
+  }
+
+  if (typeof value === 'number') {
+    return Number.isFinite(value);
+  }
+
+  if (Array.isArray(value)) {
+    return value.every(isJsonValue);
+  }
+
+  if (typeof value === 'object') {
+    const prototype = Object.getPrototypeOf(value);
+    return (prototype === Object.prototype || prototype === null)
+      && Object.values(value).every(isJsonValue);
+  }
+
+  return false;
+}
+
 async function withSession(
   harness: BrowserSessionContractHarness,
   setup: BrowserSessionContractSetup,
@@ -61,23 +83,43 @@ export function registerBrowserSessionContract(harness: BrowserSessionContractHa
       });
     });
 
-    it('exposes callable browser-session operations', async () => {
+    it('reports a missing element even when its fingerprint matches', async () => {
+      await withSession(harness, { ref: REF, currentFingerprint: MATCHING_FINGERPRINT, exists: false }, async (session) => {
+        await expect(session.resolveGrounded(REF, MATCHING_FINGERPRINT)).resolves.toEqual({
+          kind: 'miss',
+          reason: 'element-not-found',
+        });
+      });
+    });
+
+    it('exposes browser-session operations with their public result shapes', async () => {
       await withSession(harness, { ref: REF, currentFingerprint: MATCHING_FINGERPRINT, exists: true }, async (session) => {
         expect(typeof session.perform).toBe('function');
         expect(typeof session.evaluateAssert).toBe('function');
         expect(typeof session.captureValue).toBe('function');
+        expect(typeof session.snapshotForResolution).toBe('function');
         expect(typeof session.screenshot).toBe('function');
         expect(typeof session.accessibilitySnapshot).toBe('function');
         expect(typeof session.close).toBe('function');
 
-        await expect(Promise.all([
-          session.perform({ type: 'click', target: REF }),
-          session.evaluateAssert({ check: 'element-visible', target: REF }),
-          session.captureValue(REF, 'text'),
-          session.screenshot(),
-          session.accessibilitySnapshot(),
-          session.close(),
-        ])).resolves.toHaveLength(6);
+        await expect(session.perform({ type: 'click', target: REF })).resolves.toBeUndefined();
+
+        const assertion = await session.evaluateAssert({ check: 'element-visible', target: REF });
+        expect(assertion).toEqual(expect.objectContaining({ passed: expect.any(Boolean) }));
+        if (!assertion.passed) {
+          expect(typeof assertion.message).toBe('string');
+        }
+
+        expect(typeof await session.captureValue(REF, 'text')).toBe('string');
+
+        const resolutionSnapshot = await session.snapshotForResolution();
+        expect(resolutionSnapshot.screenshot).toBeInstanceOf(Uint8Array);
+        expect(isJsonValue(resolutionSnapshot.accessibilityTree)).toBe(true);
+
+        expect(await session.screenshot()).toBeInstanceOf(Uint8Array);
+        expect(isJsonValue(await session.accessibilitySnapshot())).toBe(true);
+
+        await expect(session.close()).resolves.toBeUndefined();
       });
     });
   });

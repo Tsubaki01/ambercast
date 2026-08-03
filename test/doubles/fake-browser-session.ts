@@ -22,8 +22,17 @@ export interface FakeBrowserSessionOptions {
   readonly onClose?: () => void;
 }
 
-export function elementRefKey(_ref: ElementRef): string {
-  throw new Error('not implemented');
+const elementRefKeyEncoders = {
+  accessibility: (ref: ElementRef): string => JSON.stringify([ref.strategy, ref.role, ref.name]),
+} satisfies Record<ElementRef['strategy'], (ref: ElementRef) => string>;
+
+export function elementRefKey(ref: ElementRef): string {
+  switch (ref.strategy) {
+    case 'accessibility':
+      return elementRefKeyEncoders.accessibility(ref);
+  }
+
+  throw new Error('unsupported element reference strategy');
 }
 
 export function fingerprintsEqual(_left: Fingerprint, _right: Fingerprint): boolean {

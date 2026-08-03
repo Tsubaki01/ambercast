@@ -14,6 +14,9 @@ describe('createRecordingEventSink', () => {
   it('records one event and many events in their exact call order', () => {
     const recording = createRecordingEventSink();
     recording.sink.emit(START);
+
+    expect(recording.emitted()).toEqual([START]);
+
     recording.sink.emit(RESULT);
     recording.sink.emit(AI_CALL);
 

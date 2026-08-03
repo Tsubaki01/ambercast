@@ -7,8 +7,8 @@ import type {
 } from '../../src/ports/ai.js';
 
 export interface FakeAiExecutorOptions {
-  readonly execute?: (request: AiExecuteRequest) => AiExecuteResult<unknown>;
-  readonly executeAgentic?: (request: AiAgenticRequest) => AiAgenticResult;
+  readonly execute?: (request: AiExecuteRequest) => AiExecuteResult<unknown> | Promise<AiExecuteResult<unknown>>;
+  readonly executeAgentic?: (request: AiAgenticRequest) => AiAgenticResult | Promise<AiAgenticResult>;
   readonly cannedResponses?: ReadonlyMap<string, AiExecuteResult<unknown>>;
   readonly available?: boolean;
 }

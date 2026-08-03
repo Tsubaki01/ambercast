@@ -1,4 +1,3 @@
-import type { AiAgenticRequest, AiExecuteRequest } from '../../../src/ports/ai.js';
 import type { BrowserSession } from '../../../src/ports/browser.js';
 import { registerAiExecutorContract } from '../../contracts/ai-executor.contract.js';
 import { registerBrowserDriverContract } from '../../contracts/browser-driver.contract.js';
@@ -13,14 +12,15 @@ import { createFixedClock } from '../../doubles/create-fixed-clock.js';
 import { createFixedRandom } from '../../doubles/create-fixed-random.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
 import { createRecordingEventSink } from '../../doubles/create-recording-event-sink.js';
+import { createFakeAiActionController } from '../../doubles/fake-ai-action-controller.js';
 import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
 import { createFakeBrowserDriver } from '../../doubles/fake-browser-driver.js';
-import { createFakeBrowserSession } from '../../doubles/fake-browser-session.js';
+import { createFakeBrowserSession, elementRefKey } from '../../doubles/fake-browser-session.js';
 import { createFakeEnvironmentInfo } from '../../doubles/fake-environment-info.js';
 import { createFakeSecretsProvider } from '../../doubles/fake-secrets-provider.js';
 
 function sessionKey(ref: { readonly strategy: 'accessibility'; readonly role: string; readonly name: string }): string {
-  return `${ref.strategy}:${ref.role}:${ref.name}`;
+  return elementRefKey(ref);
 }
 
 function createContractSession(): BrowserSession {
@@ -38,23 +38,15 @@ registerBrowserDriverContract({
   createDriver: () => createFakeBrowserDriver(createContractSession),
 });
 
-const executeRequests: AiExecuteRequest[] = [];
-const agenticRequests: AiAgenticRequest[] = [];
-
 registerAiExecutorContract({
   createExecutor: (scripted) => createFakeAiExecutor({
-    execute: (request) => {
-      executeRequests.push(request);
-      return scripted.execute;
-    },
-    executeAgentic: (request) => {
-      agenticRequests.push(request);
-      return scripted.executeAgentic;
-    },
+    execute: () => scripted.execute,
+    executeAgentic: (request) => typeof scripted.executeAgentic === 'function'
+      ? scripted.executeAgentic(request)
+      : scripted.executeAgentic,
     available: true,
   }),
-  executeRequests: () => executeRequests,
-  agenticRequests: () => agenticRequests,
+  createActionController: createFakeAiActionController,
 });
 
 registerStorageContract({

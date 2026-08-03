@@ -68,11 +68,17 @@ describe('createInMemoryStorage', () => {
     await expect(storage.exists('missing.txt')).resolves.toBe(false);
   });
 
-  it('rejects text and binary reads for a missing file', async () => {
+  it('rejects missing reads while allowing the same paths to be read after writing', async () => {
     const storage = createInMemoryStorage();
 
     await expect(storage.readText('missing.txt')).rejects.toThrow(Error);
     await expect(storage.readBinary('missing.bin')).rejects.toThrow(Error);
+
+    await storage.writeText('missing.txt', 'now present');
+    await storage.writeBinary('missing.bin', new Uint8Array([1]));
+
+    await expect(storage.readText('missing.txt')).resolves.toBe('now present');
+    await expect(storage.readBinary('missing.bin')).resolves.toEqual(new Uint8Array([1]));
   });
 
   it('keeps two storage instances isolated', async () => {

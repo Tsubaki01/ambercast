@@ -26,6 +26,15 @@ export function registerStorageContract(harness: StorageContractHarness): void {
       });
     });
 
+    it('encodes text as UTF-8 when reading it through the binary view', async () => {
+      await withStorage(harness, async (storage) => {
+        const text = 'hello, 世界';
+        await storage.writeText('artifacts/summary.txt', text);
+
+        await expect(storage.readBinary('artifacts/summary.txt')).resolves.toEqual(new TextEncoder().encode(text));
+      });
+    });
+
     it('round-trips binary data', async () => {
       await withStorage(harness, async (storage) => {
         const bytes = new Uint8Array([0, 1, 255]);
@@ -74,10 +83,28 @@ export function registerStorageContract(harness: StorageContractHarness): void {
       });
     });
 
+    it('overwrites binary content with the latest write', async () => {
+      await withStorage(harness, async (storage) => {
+        await storage.writeBinary('artifact.bin', new Uint8Array([1, 2, 3]));
+        const replacement = new Uint8Array([4, 5]);
+        await storage.writeBinary('artifact.bin', replacement);
+
+        await expect(storage.readBinary('artifact.bin')).resolves.toEqual(replacement);
+      });
+    });
+
     it('creates missing parent directories while writing', async () => {
       await withStorage(harness, async (storage) => {
         await expect(storage.writeText('new/parent/file.txt', 'created')).resolves.toBeUndefined();
         await expect(storage.readText('new/parent/file.txt')).resolves.toBe('created');
+      });
+    });
+
+    it('creates missing parent directories while writing binary content', async () => {
+      await withStorage(harness, async (storage) => {
+        const bytes = new Uint8Array([4, 2]);
+        await expect(storage.writeBinary('new/parent/file.bin', bytes)).resolves.toBeUndefined();
+        await expect(storage.readBinary('new/parent/file.bin')).resolves.toEqual(bytes);
       });
     });
 
@@ -88,10 +115,25 @@ export function registerStorageContract(harness: StorageContractHarness): void {
       });
     });
 
-    it('rejects both text and binary reads for a missing path', async () => {
+    it('rejects missing paths while allowing the same paths to be read immediately after writing', async () => {
       await withStorage(harness, async (storage) => {
         await expect(storage.readText('missing.txt')).rejects.toBeInstanceOf(Error);
         await expect(storage.readBinary('missing.bin')).rejects.toBeInstanceOf(Error);
+
+        await storage.writeText('missing.txt', 'now present');
+        await storage.writeBinary('missing.bin', new Uint8Array([1]));
+
+        await expect(storage.readText('missing.txt')).resolves.toBe('now present');
+        await expect(storage.readBinary('missing.bin')).resolves.toEqual(new Uint8Array([1]));
+      });
+    });
+
+    it('rejects both text and binary reads for a directory path', async () => {
+      await withStorage(harness, async (storage) => {
+        await storage.ensureDir('directory');
+
+        await expect(storage.readText('directory')).rejects.toBeInstanceOf(Error);
+        await expect(storage.readBinary('directory')).rejects.toBeInstanceOf(Error);
       });
     });
   });
