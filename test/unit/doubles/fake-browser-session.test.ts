@@ -100,6 +100,25 @@ describe('createFakeBrowserSession', () => {
     await expect(session.captureValue(REF, 'text')).resolves.toBe('');
   });
 
+  it('returns its configured assertion outcome', async () => {
+    const outcome = { passed: false, message: 'The form is incomplete.' } as const;
+    const session = createFakeBrowserSession(entries(), { assertOutcome: outcome });
+
+    await expect(session.evaluateAssert({ check: 'element-visible', target: REF })).resolves.toBe(outcome);
+  });
+
+  it('returns each configured snapshot view from the same snapshot', async () => {
+    const snapshot = {
+      accessibilityTree: { role: 'document', name: 'Sign in' },
+      screenshot: new Uint8Array([137, 80, 78, 71]),
+    } as const;
+    const session = createFakeBrowserSession(entries(), { snapshot });
+
+    await expect(session.snapshotForResolution()).resolves.toBe(snapshot);
+    await expect(session.screenshot()).resolves.toBe(snapshot.screenshot);
+    await expect(session.accessibilitySnapshot()).resolves.toBe(snapshot.accessibilityTree);
+  });
+
   it('records materialized action and assertion arguments through callbacks', async () => {
     const performed: unknown[] = [];
     const evaluated: unknown[] = [];

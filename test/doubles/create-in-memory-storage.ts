@@ -14,9 +14,6 @@ function parentPath(path: string): string | undefined {
   return separator < 0 ? undefined : path.slice(0, separator);
 }
 
-/**
- * Extracts a file's final lexical segment for `listFiles` results.
- */
 function fileName(path: string): string {
   const separator = path.lastIndexOf('/');
   return separator < 0 ? path : path.slice(separator + 1);
@@ -50,9 +47,6 @@ function ensureParentDirectories(
   }
 }
 
-/**
- * Creates one directory together with its parents, preserving idempotence.
- */
 function ensureDirectory(
   directory: string,
   directories: Set<string>,
@@ -103,6 +97,7 @@ export function createInMemoryStorage(): StorageAdapter {
         throw new Error(`Cannot read non-file path: ${path}`);
       }
 
+      // Callers must not be able to mutate this fake's stored bytes through a read result.
       return new Uint8Array(content);
     },
     async writeBinary(path: string, content: Uint8Array): Promise<void> {
@@ -111,6 +106,7 @@ export function createInMemoryStorage(): StorageAdapter {
         throw new Error(`Cannot write a directory path: ${path}`);
       }
 
+      // The fake takes ownership of its stored bytes so later caller mutations cannot rewrite a file.
       files.set(path, new Uint8Array(content));
     },
     async exists(path: string): Promise<boolean> {

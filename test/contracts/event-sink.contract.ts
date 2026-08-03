@@ -20,7 +20,13 @@ export function registerEventSinkContract(harness: EventSinkContractHarness): vo
     it('records events in emission order', async () => {
       try {
         const recording = await harness.createSink();
+
+        expect(recording.emitted()).toEqual([]);
+
         recording.sink.emit(START_EVENT);
+
+        expect(recording.emitted()).toEqual([START_EVENT]);
+
         recording.sink.emit(RESULT_EVENT);
 
         expect(recording.emitted()).toEqual([START_EVENT, RESULT_EVENT]);

@@ -46,6 +46,8 @@ describe('createFakeAiActionController', () => {
     const controller = createFakeAiActionController();
 
     await expect(controller.perform(ACTION)).rejects.toThrow(/override|configured|unscripted/i);
+    await expect(controller.evaluateAssert(CHECK)).rejects.toThrow(/override|configured|unscripted/i);
+    await expect(controller.snapshotForResolution()).rejects.toThrow(/override|configured|unscripted/i);
   });
 
   it('keeps overrides from separately created controllers isolated', async () => {

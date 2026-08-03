@@ -6,7 +6,7 @@ import type { BrowserDriver, BrowserSession } from '../../src/ports/browser.js';
  * an independently arranged session.
  *
  * @param sessionFactory - Creates the session returned from each launch.
- * @returns A Chromium driver, the only engine currently defined by the IR.
+ * @returns A Chromium driver, the only engine the IR defines.
  */
 export function createFakeBrowserDriver(sessionFactory: () => BrowserSession): BrowserDriver {
   return {

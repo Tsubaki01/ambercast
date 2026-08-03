@@ -12,7 +12,9 @@ import type {
   PerformableAction,
 } from '../../../src/ports/browser.js';
 
-type ResolveGroundedIsRequired = {} extends Pick<BrowserSession, 'resolveGrounded'> ? true : false; // eslint-disable-line @typescript-eslint/no-empty-object-type -- {} here means zero-required-properties, needed for the optionality check.
+// Optionality probe: {} is assignable to Pick<BrowserSession, 'resolveGrounded'> exactly when nothing in that pick is required.
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
+type ResolveGroundedIsRequired = {} extends Pick<BrowserSession, 'resolveGrounded'> ? true : false;
 
 describe('browser port shapes', () => {
   it('defines the materialized action, assertion, evidence, and grounding shapes', () => {

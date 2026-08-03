@@ -65,6 +65,14 @@ describe('createFakeAiExecutor', () => {
     expect(receivedController).toBe(controller);
   });
 
+  it('rejects an unscripted agentic request instead of silently returning a result', async () => {
+    const controller = createFakeAiActionController();
+    const executor = createFakeAiExecutor();
+
+    await expect(executor.executeAgentic({ instructionPrompt: 'Complete sign-in.', controller }))
+      .rejects.toThrow(/override|configured|unscripted/i);
+  });
+
   it('reports each configured availability value', async () => {
     await expect(createFakeAiExecutor({ available: true }).isAvailable()).resolves.toBe(true);
     await expect(createFakeAiExecutor({ available: false }).isAvailable()).resolves.toBe(false);

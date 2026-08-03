@@ -25,6 +25,21 @@ describe('createInMemoryStorage', () => {
     await expect(storage.readBinary('empty.bin')).resolves.toEqual(new Uint8Array());
   });
 
+  it('keeps binary writes and reads isolated from caller mutations', async () => {
+    const storage = createInMemoryStorage();
+    const written = new Uint8Array([1, 2, 3]);
+
+    await storage.writeBinary('artifacts/data.bin', written);
+    written[0] = 255;
+
+    await expect(storage.readBinary('artifacts/data.bin')).resolves.toEqual(new Uint8Array([1, 2, 3]));
+
+    const read = await storage.readBinary('artifacts/data.bin');
+    read[1] = 255;
+
+    await expect(storage.readBinary('artifacts/data.bin')).resolves.toEqual(new Uint8Array([1, 2, 3]));
+  });
+
   it('uses the second write as the complete replacement content', async () => {
     const storage = createInMemoryStorage();
 

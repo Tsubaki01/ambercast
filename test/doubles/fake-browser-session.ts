@@ -35,6 +35,12 @@ export interface FakeBrowserSessionOptions {
   readonly snapshot?: PageSnapshot;
   readonly onPerform?: (action: PerformableAction) => void;
   readonly onEvaluateAssert?: (check: AssertCheck) => void;
+  /**
+   * Observes the first successful `close` call.
+   *
+   * Closing is idempotent, so later calls are no-ops and never invoke this
+   * hook again; shared teardown can therefore close safely without duplicate signals.
+   */
   readonly onClose?: () => void;
 }
 
@@ -47,6 +53,11 @@ export interface FakeBrowserSessionOptions {
 const elementRefKeyEncoders = {
   accessibility: (ref: ElementRef): string => JSON.stringify([ref.strategy, ref.role, ref.name]),
 } satisfies Record<ElementRef['strategy'], (ref: ElementRef) => string>;
+
+const fingerprintComparisons = {
+  algorithm: (left: Fingerprint, right: Fingerprint): boolean => left.algorithm === right.algorithm,
+  hash: (left: Fingerprint, right: Fingerprint): boolean => left.hash === right.hash,
+} satisfies Record<keyof Fingerprint, (left: Fingerprint, right: Fingerprint) => boolean>;
 
 /**
  * Creates the structural lookup key shared by fake grounding and capture data.
@@ -64,14 +75,17 @@ export function elementRefKey(ref: ElementRef): string {
 }
 
 /**
- * Compares the complete persisted fingerprint rather than its object identity.
+ * Compares every persisted fingerprint field rather than object identity.
+ *
+ * The exhaustive comparison table makes a fingerprint-schema addition fail to
+ * compile here until its equality semantics are explicitly chosen.
  *
  * @param left - One recorded or current fingerprint.
  * @param right - The other fingerprint to compare.
  * @returns Whether the algorithm and hash agree exactly.
  */
 export function fingerprintsEqual(left: Fingerprint, right: Fingerprint): boolean {
-  return left.algorithm === right.algorithm && left.hash === right.hash;
+  return Object.values(fingerprintComparisons).every((compare) => compare(left, right));
 }
 
 /**
