@@ -1,9 +1,13 @@
 /**
- * Supplies dependency-cruiser's ESM rule set by translating the layer and
- * external-specifier data from tools/architecture-policy.mjs. This avoids a
- * second independently maintained boundary matrix. The resulting rules check
- * configured external specifiers and statically resolvable module-graph
- * edges; they do not claim to resolve arbitrary computed dynamic imports.
+ * Supplies dependency-cruiser's ESM rule set by translating every role in
+ * `LAYERS` from tools/architecture-policy.mjs. This avoids a second,
+ * independently maintained boundary matrix. Every role receives an internal
+ * default-deny rule derived from `mayImport`; `adapters-http` receives the
+ * same treatment from the adapters carve-out. Generated rules are named
+ * `<role>-boundary`, except where an existing stable identifier names the
+ * generated core, standard-adapter, or CLI boundary. The remaining stable
+ * specialized rules have disjoint target sets, so one dependency produces one
+ * actionable diagnostic rather than overlapping reports.
  *
  * The configuration sets `options.tsPreCompilationDeps` to
  * `"specify"` once, alongside the repository `tsconfig.json`. That option
@@ -20,26 +24,27 @@
  * restricted to the `Storage` type; this intentionally coarser approximation
  * is the configuration's stable contract.
  *
- * The generic adapter matcher excludes `src/adapters/http/**`; HTTP has its
- * own runtime-consumer rule permitting only `adapters/http` -> `runtime`.
- * Conversely, runtime's concrete-adapter target matcher excludes HTTP. This
- * leaves neither direction of a runtime/HTTP-adapter cycle inside the generic
- * adapter allowance. Core's external policy permits only `zod`,
- * `node:crypto`, and `node:buffer`, while denying `playwright*` and the
- * normalized builtin families `node:fs`, `node:child_process`, `node:net`,
- * and `node:http` (including bare and subpath spellings such as
- * `node:fs/promises`). AI adapters invoke CLI subprocesses instead of
- * importing an AI SDK, making `node:child_process` the relevant core risk
- * path. `build-tools` has a distinct external allowance of `node:fs`,
- * `node:path`, and `node:url`.
+ * The standard adapter path excludes HTTP, while the HTTP carve-out has its
+ * own runtime-consumer boundary. Runtime permits the standard adapter path
+ * only, and its dedicated HTTP target rule prevents the opposite half of a
+ * cycle. The standard adapter's captured family permits only its matching
+ * port-module file; a shared ports index is not an allowance.
  *
- * The rule identifiers are pinned as `core-is-leaf`,
+ * External allow-lists are also compiled from each role. An approved builtin
+ * must resolve with dependency type `core`; an approved package must resolve
+ * below its approved `node_modules` root with an npm dependency type.
+ * Unresolved dependencies, including fake builtin-looking subpaths, and every
+ * other resolved external dependency are forbidden. This relies on
+ * dependency-cruiser's resolution facts rather than specifier regexes.
+ *
+ * The stable rule identifiers are `core-is-leaf`,
  * `core-external-allowlist`, `usecases-no-concrete-adapters`,
  * `cli-must-go-through-runtime`, `adapters-no-sibling-reachover`,
  * `adapters-http-runtime-only`, `ports-core-types-only`,
  * `usecases-ports-types-only`, `report-core-types-only`, and
- * `config-ports-types-only`. `test/unit/architecture/dependency-cruiser-rules.test.ts`
- * asserts these exact IDs, so renaming one is an intentional contract change.
+ * `config-ports-types-only`. Fixture tests assert these alongside generated
+ * boundary names, so changing either convention is an intentional contract
+ * change.
  */
 
 /**
@@ -49,11 +54,7 @@
  */
 import { fileURLToPath } from 'node:url';
 import { relative } from 'node:path';
-import {
-  CORE_EXTERNAL_ALLOW,
-  CORE_EXTERNAL_DENY_PATTERNS,
-  LAYERS,
-} from './tools/architecture-policy.mjs';
+import { LAYERS } from './tools/architecture-policy.mjs';
 
 const CONFIG_DIRECTORY = fileURLToPath(new URL('./', import.meta.url));
 const TSCONFIG_FILE = relative(
@@ -65,36 +66,46 @@ function escapedPattern(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function externalSpecifierPattern(specifier) {
-  if (specifier.endsWith('*')) {
-    const packagePrefix = escapedPattern(specifier.slice(0, -1));
-    const packageRoot = `(?:${packagePrefix}|node_modules/${packagePrefix})[^/]*`;
-    return `(?:${packageRoot}|${packageRoot}/.+)`;
-  }
-
-  if (specifier.startsWith('node:')) {
-    const builtinRoot = `(?:node:)?${escapedPattern(specifier.slice('node:'.length))}`;
-    return `(?:${builtinRoot}|${builtinRoot}/.+)`;
-  }
-
+function resolvedNpmPackagePathPattern(specifier) {
   const packageName = escapedPattern(specifier);
   const packageRoot = packageName;
-  return `(?:${packageRoot}|${packageRoot}/.+)`;
-}
-
-function anyExternalSpecifier(values) {
-  return values.map(externalSpecifierPattern).join('|');
-}
-
-/**
- * Matches resolved npm targets at a package-path boundary. Dependency-cruiser
- * checks those paths after resolution, while unresolved package targets keep
- * the bare specifier matched by externalSpecifierPattern.
- */
-function resolvedNpmPackagePathPattern(specifier) {
-  const packageName = escapedPattern(specifier.endsWith('*') ? specifier.slice(0, -1) : specifier);
-  const packageRoot = specifier.endsWith('*') ? `${packageName}[^/]*` : packageName;
   return `(?:^|/)node_modules/${packageRoot}(?:/|$)`;
+}
+
+function resolvedBuiltinPathPattern(specifiers) {
+  const roots = specifiers
+    .filter((specifier) => specifier.startsWith('node:'))
+    .map((specifier) => `${escapedPattern(specifier.slice('node:'.length))}(?:|/[^/]*)`);
+
+  return roots.length === 0 ? '^$' : `^(?:${roots.join('|')})$`;
+}
+
+function allowedTargetPatterns(layer) {
+  return layer.mayImport.map((target) => {
+    if (target.sameFamily) {
+      return '^src/adapters/$1(?:/|$)';
+    }
+
+    if (target.matchingFamily) {
+      return '^src/ports/$1\\.ts$';
+    }
+
+    return LAYERS[target.layer].path;
+  });
+}
+
+function internalBoundaryRule(name, layer, additionalAllowedPaths = []) {
+  const permittedTargets = [...allowedTargetPatterns(layer), ...additionalAllowedPaths];
+
+  return {
+    name,
+    severity: 'error',
+    from: { path: layer.path },
+    to: {
+      path: '^src/',
+      ...(permittedTargets.length === 0 ? {} : { pathNot: permittedTargets }),
+    },
+  };
 }
 
 function typesOnlyEdge(name, from, to) {
@@ -106,16 +117,93 @@ function typesOnlyEdge(name, from, to) {
   };
 }
 
-const coreExternalAllowPattern = anyExternalSpecifier(CORE_EXTERNAL_ALLOW);
-const coreExternalAllowPackagePaths = CORE_EXTERNAL_ALLOW
-  .filter((specifier) => !specifier.startsWith('node:'))
-  .map(resolvedNpmPackagePathPattern);
 const standardAdapter = LAYERS.adapters;
 const httpAdapter = standardAdapter.carveOut;
+const NPM_DEPENDENCY_TYPES = [
+  'npm',
+  'npm-bundled',
+  'npm-dev',
+  'npm-no-pkg',
+  'npm-optional',
+  'npm-peer',
+  'npm-unknown',
+];
+const TYPE_ONLY_RULE_NAMES = Object.freeze({
+  'config:ports': 'config-ports-types-only',
+  'ports:core': 'ports-core-types-only',
+  'report:core': 'report-core-types-only',
+  'usecases:ports': 'usecases-ports-types-only',
+});
 
-if (CORE_EXTERNAL_DENY_PATTERNS.some((pattern) => CORE_EXTERNAL_ALLOW.includes(pattern))) {
-  throw new Error('Core external allow and deny policies must not overlap.');
+function externalAllowRules(role, layer) {
+  const allowed = layer.externalAllow ?? [];
+  const allowedNpmPackagePaths = allowed
+    .filter((specifier) => !specifier.startsWith('node:'))
+    .map(resolvedNpmPackagePathPattern);
+  const name = `${role}-external-allowlist`;
+  const from = { path: layer.path };
+
+  return [
+    {
+      name,
+      severity: 'error',
+      from,
+      to: { couldNotResolve: true },
+    },
+    {
+      name,
+      severity: 'error',
+      from,
+      to: {
+        couldNotResolve: false,
+        dependencyTypes: ['core'],
+        pathNot: resolvedBuiltinPathPattern(allowed),
+      },
+    },
+    {
+      name,
+      severity: 'error',
+      from,
+      to: {
+        couldNotResolve: false,
+        dependencyTypes: NPM_DEPENDENCY_TYPES,
+        pathNot: allowedNpmPackagePaths.length === 0 ? '^$' : allowedNpmPackagePaths,
+      },
+    },
+    {
+      name,
+      severity: 'error',
+      from,
+      to: {
+        couldNotResolve: false,
+        dependencyTypesNot: ['core', ...NPM_DEPENDENCY_TYPES],
+        pathNot: '^src/',
+      },
+    },
+  ];
 }
+
+const roleBoundaryNames = Object.freeze({
+  adapters: 'adapters-no-sibling-reachover',
+  cli: 'cli-must-go-through-runtime',
+  core: 'core-is-leaf',
+});
+const specializedBoundaryTargetPaths = Object.freeze({
+  runtime: [httpAdapter.path],
+  usecases: [standardAdapter.path],
+});
+const declaredRoles = [
+  ...Object.entries(LAYERS),
+  ['adapters-http', httpAdapter],
+];
+const internalBoundaryRules = declaredRoles.map(([role, layer]) => internalBoundaryRule(
+  roleBoundaryNames[role] ?? `${role}-boundary`,
+  layer,
+  specializedBoundaryTargetPaths[role] ?? [],
+));
+const typesOnlyRules = Object.entries(LAYERS).flatMap(([role, layer]) => layer.mayImport
+  .filter((target) => target.typesOnly)
+  .map((target) => typesOnlyEdge(TYPE_ONLY_RULE_NAMES[`${role}:${target.layer}`], layer, LAYERS[target.layer])));
 
 /**
  * The dependency-cruiser configuration consumed by the CLI and fixture tests.
@@ -124,20 +212,7 @@ if (CORE_EXTERNAL_DENY_PATTERNS.some((pattern) => CORE_EXTERNAL_ALLOW.includes(p
  */
 export default {
   forbidden: [
-    {
-      name: 'core-is-leaf',
-      severity: 'error',
-      from: { path: LAYERS.core.path },
-      to: { path: '^src/', pathNot: LAYERS.core.path },
-    },
-    {
-      name: 'core-external-allowlist',
-      severity: 'error',
-      from: { path: LAYERS.core.path },
-      to: {
-        pathNot: ['^src/', `^(?:${coreExternalAllowPattern})$`, ...coreExternalAllowPackagePaths],
-      },
-    },
+    ...internalBoundaryRules,
     {
       name: 'usecases-no-concrete-adapters',
       severity: 'error',
@@ -145,35 +220,14 @@ export default {
       to: { path: standardAdapter.path },
     },
     {
-      name: 'cli-must-go-through-runtime',
-      severity: 'error',
-      from: { path: [LAYERS.cli.path, httpAdapter.path] },
-      to: { path: '^src/', pathNot: LAYERS.runtime.path },
-    },
-    {
-      name: 'adapters-no-sibling-reachover',
-      severity: 'error',
-      from: { path: standardAdapter.path, pathNot: httpAdapter.path },
-      to: {
-        path: '^src/',
-        pathNot: [
-          LAYERS.core.path,
-          '^src/adapters/$1(?:/|$)',
-          '^src/ports/$1\\.ts$',
-          '^src/ports/index\\.ts$',
-        ],
-      },
-    },
-    {
       name: 'adapters-http-runtime-only',
       severity: 'error',
       from: { path: LAYERS.runtime.path },
       to: { path: httpAdapter.path },
     },
-    typesOnlyEdge('ports-core-types-only', LAYERS.ports, LAYERS.core),
-    typesOnlyEdge('usecases-ports-types-only', LAYERS.usecases, LAYERS.ports),
-    typesOnlyEdge('report-core-types-only', LAYERS.report, LAYERS.core),
-    typesOnlyEdge('config-ports-types-only', LAYERS.config, LAYERS.ports),
+    ...typesOnlyRules,
+    ...externalAllowRules('core', LAYERS.core),
+    ...externalAllowRules('build-tools', LAYERS['build-tools']),
   ],
   options: {
     tsPreCompilationDeps: 'specify',

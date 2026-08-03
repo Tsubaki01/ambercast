@@ -26,7 +26,7 @@ async function findTypeScriptFiles(directory: string): Promise<string[]> {
 }
 
 describe('architecture guardrails', () => {
-  test('scans the current source tree without finding digest call sites', async () => {
+  test('scans the current source tree without finding digest call-site violations', async () => {
     const sourceFiles = await findTypeScriptFiles(SOURCE_ROOT);
     const program = ts.createProgram({
       rootNames: sourceFiles,
@@ -44,7 +44,9 @@ describe('architecture guardrails', () => {
     expect(sourceFiles.length).toBeGreaterThan(0);
     expect(program.getSyntacticDiagnostics()).toEqual([]);
     expect(program.getSemanticDiagnostics()).toEqual([]);
-    expect(scanComputeInputsDigestCalls(program, DIGEST_MODULE_FILE)).toEqual([]);
+    const callSites = scanComputeInputsDigestCalls(program, DIGEST_MODULE_FILE);
+
+    expect(callSites.filter((site) => site.violation !== undefined)).toEqual([]);
   });
 
   test('resolves the core subpath alias to the relative digest module', () => {

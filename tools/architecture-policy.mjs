@@ -9,8 +9,9 @@
  * is never bundled. It covers the eight product layers plus the `public-entry`,
  * `build-tools`, and `global-types` non-product roles. Together, the eleven
  * roles fully classify `src/**`, including the exact `src/global.d.ts`
- * declaration-file path. A role matcher may match zero files; the fixture
- * suite validates every rule against a representative path.
+ * declaration-file path. A role matcher may match zero files; fixture tests
+ * validate representative edges, while the ESLint suite verifies each current
+ * source file maps to one policy role and none is unknown.
  */
 
 /**
@@ -24,17 +25,18 @@
  *
  * - `core` is rooted at `src/core` and may import only `core` internally.
  * - `ports` is rooted at `src/ports` and may import `ports` plus `core` only
- *   through a type-only edge.
+ *   through a type-only edge. Its port-module file descriptor captures the
+ *   basename as `family`, allowing an adapter family to target only its own
+ *   interface file.
  * - `adapters` has mutually exclusive standard and HTTP matchers. The
  *   standard matcher is rooted at `src/adapters/<family>` and explicitly
  *   excludes the `http` family; it may import `core`, its own adapter family,
  *   and its implemented port module. By convention, that module has the same
  *   base file name as the adapter family: `adapters/storage/**` may import
- *   `ports/storage.ts` and a shared ports index, but not `ports/ai.ts` or a
- *   different family's port module. The specialized `src/adapters/http`
- *   matcher may import `runtime` only. The standard adapter policy enforces
- *   the matching-port convention through the captured adapter family, and
- *   fixture tests exercise it with synthetic family names.
+ *   `ports/storage.ts`, but not `ports/ai.ts` or a different family's port
+ *   module. The specialized `src/adapters/http` matcher may import `runtime`
+ *   only. The standard adapter policy compares the captured adapter and port
+ *   families, and fixture tests exercise that convention with synthetic names.
  * - `usecases` is rooted at `src/usecases` and may import `core`, `usecases`,
  *   and `report`, plus `ports` through a type-only edge.
  * - `report` is rooted at `src/report` and may import `report` plus `core`
@@ -47,19 +49,22 @@
  *   `usecases`, `config`, `runtime`, and concrete `adapters/**` other than
  *   `adapters/http`; it is the composition point for those concrete adapters.
  * - `cli` is rooted at `src/cli` and may import `runtime` only.
- * - `public-entry` is the exact file `src/index.ts`; it has no default
- *   product-layer target. A public API target, when needed, is an explicit
- *   allowance rather than a catch-all inherited permission.
+ * - `public-entry` is the exact file `src/index.ts`, classified by a file
+ *   category rather than a folder element. It has no default product-layer
+ *   target; a public API target, when needed, is an explicit allowance rather
+ *   than a catch-all inherited permission.
  * - `build-tools` is rooted at `src/build-tools`; it may import `core` and
  *   has the separate external allowance of `node:fs`, `node:path`, and
  *   `node:url`, rather than inheriting core's external permission.
- * - `global-types` is the exact file `src/global.d.ts`. Its ambient
- *   `declare const` declarations have no import permissions because a global
- *   declaration file cannot contain runtime imports.
+ * - `global-types` is the exact file `src/global.d.ts`, also classified by a
+ *   file category. Its ambient `declare const` declarations have no import
+ *   permissions because a global declaration file cannot contain runtime
+ *   imports.
  *
- * Excluding HTTP from the standard adapter matcher keeps those two matchers
- * non-overlapping and prevents either direction of a `runtime`/HTTP-adapter
- * cycle from being treated as a generic adapter permission.
+ * The standard adapter path excludes HTTP, keeping it non-overlapping with
+ * the specialized HTTP role and preventing either direction of a
+ * `runtime`/HTTP-adapter cycle from being treated as a generic adapter
+ * permission.
  *
  * Cross-layer aliases mirror legal import targets only. There is no `#cli/*`
  * alias because no role may use CLI as a cross-layer target.
@@ -70,16 +75,22 @@ export const LAYERS = Object.freeze({
     path: '^src/core(?:/|$)',
     element: { type: 'core', pattern: 'src/core', partialMatch: false },
     mayImport: [{ layer: 'core' }],
+    externalAllow: ['zod', 'node:crypto', 'node:buffer'],
   },
   ports: {
     root: 'src/ports',
     path: '^src/ports(?:/|$)',
     element: { type: 'ports', pattern: 'src/ports', partialMatch: false },
+    portModule: {
+      category: 'ports-module',
+      pattern: 'src/ports/(*).ts',
+      capture: ['family'],
+    },
     mayImport: [{ layer: 'ports' }, { layer: 'core', typesOnly: true }],
   },
   adapters: {
     root: 'src/adapters',
-    path: '^src/adapters/([^/]+)(?:/|$)',
+    path: '^src/adapters/(?!http(?:/|$))([^/]+)(?:/|$)',
     element: {
       type: 'adapters',
       pattern: 'src/adapters/*',
@@ -148,7 +159,7 @@ export const LAYERS = Object.freeze({
   'public-entry': {
     root: 'src/index.ts',
     path: '^src/index\\.ts$',
-    element: { type: 'public-entry', pattern: 'src/index.ts' },
+    file: { category: 'public-entry', pattern: 'src/index.ts' },
     mayImport: [],
   },
   'build-tools': {
@@ -161,49 +172,19 @@ export const LAYERS = Object.freeze({
   'global-types': {
     root: 'src/global.d.ts',
     path: '^src/global\\.d\\.ts$',
-    element: { type: 'global-types', pattern: 'src/global.d.ts' },
+    file: { category: 'global-types', pattern: 'src/global.d.ts' },
     mayImport: [],
   },
 });
 
 /**
- * Names the only external module roots core may import: `zod`, `node:crypto`,
- * and `node:buffer`. All other external dependencies are rejected for core;
- * this policy is independent of the internal permissions in {@link LAYERS}.
- *
- * External comparison is by normalized package or builtin identity. For Node
- * builtins the dependency-cruiser projection treats `node:fs`, `fs`,
- * `node:fs/promises`, and `fs/promises` as the `fs` builtin family, so a
- * spelling or subpath cannot bypass the configured external policy. The allow
- * and deny collections are disjoint, and core's default-deny rule rejects
- * every external specifier outside the allow-list. The distinct `build-tools`
- * role may additionally use `node:fs`, `node:path`,
- * and `node:url`; that allowance does not apply to core.
+ * Each role's `externalAllow` is its complete external-dependency contract.
+ * Dependency-cruiser accepts an approved Node builtin only when resolution
+ * marks it as `core`, and an approved package only when resolution lands below
+ * that package's `node_modules` root. Every unresolved or unapproved external
+ * dependency is rejected, so a builtin-looking but nonexistent subpath cannot
+ * obtain permission from its spelling alone.
  */
-export const CORE_EXTERNAL_ALLOW = Object.freeze([
-  'zod',
-  'node:crypto',
-  'node:buffer',
-]);
-
-/**
- * Names the external module families core must reject: `playwright*`,
- * `node:fs`, `node:child_process`, `node:net`, and `node:http`. Each package
- * pattern applies to its package root and subpaths; the builtin normalization described by
- * {@link CORE_EXTERNAL_ALLOW} also makes, for example, `node:fs/promises`
- * and `fs/promises` match the `node:fs` denial. These are configured
- * specifier checks, not a claim about arbitrary computed dynamic imports. AI
- * adapters invoke CLI subprocesses rather than importing an AI SDK, so the
- * `node:child_process` denial covers the relevant core risk path.
- */
-export const CORE_EXTERNAL_DENY_PATTERNS = Object.freeze([
-  'playwright*',
-  'node:fs',
-  'node:child_process',
-  'node:net',
-  'node:http',
-]);
-
 /**
  * Describes the five direct syntax forms rejected by ESLint: `Date.now()`, a
  * zero-argument `new Date()`, `Math.random()`, `crypto.randomUUID()`, and any
@@ -211,11 +192,11 @@ export const CORE_EXTERNAL_DENY_PATTERNS = Object.freeze([
  * is outside this rule. The selectors are intentionally syntax-only, so they
  * also report a shadowed identifier with one of those spellings.
  *
- * The restrictions apply to architecture/determinism lint targets under
- * `src/**` and `test/**`; the direct-form restriction is exempt for
- * `src/adapters/system/**`. General TypeScript linting remains repository
- * wide. This documents the direct forms the rule checks, rather than claiming
- * to detect every source of nondeterminism.
+ * The restrictions apply only to production files under `src/**`; the
+ * direct-form restriction is exempt for `src/adapters/system/**`. General
+ * TypeScript linting remains repository wide. This documents the direct forms
+ * the rule checks, rather than claiming to detect every source of
+ * nondeterminism.
  */
 export const NONDETERMINISTIC_GLOBALS = Object.freeze({
   exemptPath: 'src/adapters/system/**',

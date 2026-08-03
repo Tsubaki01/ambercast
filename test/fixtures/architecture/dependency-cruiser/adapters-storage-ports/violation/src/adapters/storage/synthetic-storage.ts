@@ -1,4 +1,4 @@
-import { syntheticAiValue } from '../ai/synthetic-ai.js';
+import { syntheticAiPortName } from '../../ports/ai.js';
 
 /** Synthetic dependency-cruiser fixture; not a product module. */
-export const syntheticStorageValue = syntheticAiValue;
+export const syntheticStorageValue = syntheticAiPortName;

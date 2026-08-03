@@ -15,7 +15,7 @@ interface EdgeCase {
   readonly id: string;
   readonly expectedRuleId: string;
   readonly source: string;
-  readonly target: string;
+  readonly target: string | RegExp;
   readonly compliantSource: string;
   readonly compliantTarget: string;
 }
@@ -24,6 +24,10 @@ function expectedCompliantDependency(target: string) {
   return target.startsWith('src/')
     ? { resolved: target }
     : { module: target };
+}
+
+function expectedViolationTarget(target: string | RegExp) {
+  return typeof target === 'string' ? target : expect.stringMatching(target);
 }
 
 const edgeCases: readonly EdgeCase[] = [
@@ -66,6 +70,22 @@ const edgeCases: readonly EdgeCase[] = [
     target: 'left-pad',
     compliantSource: 'src/core/synthetic-core.ts',
     compliantTarget: 'zod',
+  },
+  {
+    id: 'core-external-resolved-default-deny',
+    expectedRuleId: 'core-external-allowlist',
+    source: 'src/core/synthetic-core.ts',
+    target: /node_modules\/ajv\//,
+    compliantSource: 'src/core/synthetic-core.ts',
+    compliantTarget: 'zod',
+  },
+  {
+    id: 'core-external-fake-builtin',
+    expectedRuleId: 'core-external-allowlist',
+    source: 'src/core/synthetic-core.ts',
+    target: 'crypto/fake',
+    compliantSource: 'src/core/synthetic-core.ts',
+    compliantTarget: 'crypto',
   },
   {
     id: 'usecases-adapters-value',
@@ -151,9 +171,49 @@ const edgeCases: readonly EdgeCase[] = [
     id: 'adapters-storage-ports',
     expectedRuleId: 'adapters-no-sibling-reachover',
     source: 'src/adapters/storage/synthetic-storage.ts',
-    target: 'src/adapters/ai/synthetic-ai.ts',
+    target: 'src/ports/ai.ts',
     compliantSource: 'src/adapters/storage/synthetic-storage.ts',
     compliantTarget: 'src/ports/storage.ts',
+  },
+  {
+    id: 'ports-runtime',
+    expectedRuleId: 'ports-boundary',
+    source: 'src/ports/synthetic-port.ts',
+    target: 'src/runtime/synthetic-runtime.ts',
+    compliantSource: 'src/ports/synthetic-port.ts',
+    compliantTarget: 'src/ports/synthetic-sibling.ts',
+  },
+  {
+    id: 'usecases-config',
+    expectedRuleId: 'usecases-boundary',
+    source: 'src/usecases/synthetic-usecase.ts',
+    target: 'src/config/synthetic-config.ts',
+    compliantSource: 'src/usecases/synthetic-usecase.ts',
+    compliantTarget: 'src/report/synthetic-report.ts',
+  },
+  {
+    id: 'report-adapters',
+    expectedRuleId: 'report-boundary',
+    source: 'src/report/synthetic-report.ts',
+    target: 'src/adapters/storage/synthetic-storage.ts',
+    compliantSource: 'src/report/synthetic-report.ts',
+    compliantTarget: 'src/report/synthetic-sibling.ts',
+  },
+  {
+    id: 'build-tools-runtime',
+    expectedRuleId: 'build-tools-boundary',
+    source: 'src/build-tools/synthetic-build-tool.ts',
+    target: 'src/runtime/synthetic-runtime.ts',
+    compliantSource: 'src/build-tools/synthetic-build-tool.ts',
+    compliantTarget: 'src/core/synthetic-core.ts',
+  },
+  {
+    id: 'build-tools-external',
+    expectedRuleId: 'build-tools-external-allowlist',
+    source: 'src/build-tools/synthetic-build-tool.ts',
+    target: 'crypto',
+    compliantSource: 'src/build-tools/synthetic-build-tool.ts',
+    compliantTarget: 'fs/promises',
   },
 ];
 
@@ -165,6 +225,7 @@ async function cruiseFixture(root: string, entry = 'src'): Promise<ICruiseResult
   const report = await cruise([entry], {
     ...dependencyCruiserConfig.options,
     baseDir: root,
+    enhancedResolveOptions: { modules: [resolve('node_modules')] },
     ruleSet: { forbidden: dependencyCruiserConfig.forbidden },
     tsPreCompilationDeps: 'specify',
     tsConfig: { fileName: 'tsconfig.json' },
@@ -187,6 +248,23 @@ async function cruiseFixture(root: string, entry = 'src'): Promise<ICruiseResult
 }
 
 describe('dependency-cruiser architecture rules', () => {
+  test('generates one internal boundary for every policy role', () => {
+    expect(dependencyCruiserConfig.forbidden.map((rule: { readonly name: string }) => rule.name)).toEqual(expect.arrayContaining([
+      'core-is-leaf',
+      'ports-boundary',
+      'adapters-no-sibling-reachover',
+      'adapters-http-boundary',
+      'usecases-boundary',
+      'report-boundary',
+      'config-boundary',
+      'runtime-boundary',
+      'cli-must-go-through-runtime',
+      'public-entry-boundary',
+      'build-tools-boundary',
+      'global-types-boundary',
+    ]));
+  });
+
   test('configures pre-compilation dependency data for types-only rules', () => {
     expect(dependencyCruiserConfig.options).toMatchObject({
       tsPreCompilationDeps: 'specify',
@@ -207,7 +285,7 @@ describe('dependency-cruiser architecture rules', () => {
       expect.objectContaining({
         from: source,
         rule: expect.objectContaining({ name: expectedRuleId }),
-        to: target,
+        to: expectedViolationTarget(target),
       }),
     ]);
   });
@@ -226,6 +304,37 @@ describe('dependency-cruiser architecture rules', () => {
       ]),
       source: compliantSource,
     }));
+  });
+
+  test('uses resolution facts for core external decisions', async () => {
+    const allowed = await cruiseFixture(fixturePath('core-external-default-deny', 'compliant'));
+    const rejected = await cruiseFixture(fixturePath('core-external-resolved-default-deny', 'violation'));
+    const fakeBuiltin = await cruiseFixture(fixturePath('core-external-fake-builtin', 'violation'));
+
+    const allowedDependency = allowed.modules
+      .find(({ source }) => source === 'src/core/synthetic-core.ts')
+      ?.dependencies.find(({ module }) => module === 'zod');
+    const rejectedDependency = rejected.modules
+      .find(({ source }) => source === 'src/core/synthetic-core.ts')
+      ?.dependencies.find(({ module }) => module === 'ajv');
+    const fakeBuiltinDependency = fakeBuiltin.modules
+      .find(({ source }) => source === 'src/core/synthetic-core.ts')
+      ?.dependencies.find(({ module }) => module === 'crypto/fake');
+
+    expect(allowedDependency).toMatchObject({
+      couldNotResolve: false,
+      dependencyTypes: expect.arrayContaining(['npm']),
+      resolved: expect.stringContaining('node_modules/zod/'),
+    });
+    expect(rejectedDependency).toMatchObject({
+      couldNotResolve: false,
+      dependencyTypes: expect.arrayContaining(['npm-dev']),
+      resolved: expect.stringContaining('node_modules/ajv/'),
+    });
+    expect(fakeBuiltinDependency).toMatchObject({
+      couldNotResolve: true,
+      dependencyTypes: ['unknown'],
+    });
   });
 
   test('cruises a declared but file-less ports layer without violations or environment issues', async () => {

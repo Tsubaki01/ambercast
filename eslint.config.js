@@ -15,7 +15,11 @@
  * translates the shared eleven-role layer policy for
  * prompt editor feedback. Dependency-cruiser evaluates the configured
  * statically resolvable graph edges in CI; the two tools share policy data
- * rather than maintaining separate manually authored layer tables.
+ * rather than maintaining separate manually authored layer tables. Exact-file
+ * roles and captured port modules use file descriptors, while
+ * `boundaries/no-unknown-files` rejects an unclassified production file under
+ * `src/**`; boundary dependency feedback also applies to test fixtures when
+ * they are exercised explicitly.
  *
  * `no-restricted-syntax` rejects these direct syntax forms outside
  * `src/adapters/system/**`: `Date.now()`, zero-argument `new Date()`,
@@ -59,33 +63,59 @@ function elementSelector(layer, options = {}) {
   return { element: { type: layer.element.type, ...options } };
 }
 
+function roleSelector(layer, options = {}) {
+  if (layer.file !== undefined) {
+    return { file: { categories: layer.file.category, ...options } };
+  }
+
+  return elementSelector(layer, options);
+}
+
 function importPolicy(target) {
   const targetLayer = LAYERS[target.layer];
   const captured = target.matchingFamily || target.sameFamily
     ? { family: '{{from.family}}' }
     : undefined;
 
+  if (target.matchingFamily) {
+    return {
+      to: {
+        element: { type: targetLayer.element.type },
+        file: {
+          categories: targetLayer.portModule.category,
+          captured,
+        },
+      },
+      ...(target.typesOnly ? { dependency: { kind: 'type' } } : {}),
+    };
+  }
+
   return {
-    to: elementSelector(targetLayer, captured === undefined ? {} : { captured }),
+    to: roleSelector(targetLayer, captured === undefined ? {} : { captured }),
     ...(target.typesOnly ? { dependency: { kind: 'type' } } : {}),
   };
 }
 
 function layerPolicy(layer) {
   return {
-    from: elementSelector(layer),
+    from: roleSelector(layer),
     allow: layer.mayImport.map(importPolicy),
   };
 }
 
 const boundaryElements = [
   ...Object.values(LAYERS)
-    .filter((layer) => layer !== STANDARD_ADAPTER)
+    .filter((layer) => layer !== STANDARD_ADAPTER && layer.element !== undefined)
     .map((layer) => layer.element),
   HTTP_ADAPTER.element,
   STANDARD_ADAPTER.element,
   STANDARD_ADAPTER.fallbackElement,
 ];
+
+const boundaryFiles = Object.values(LAYERS).flatMap((layer) => [
+  layer.file,
+  layer.portModule,
+].filter((descriptor) => descriptor !== undefined));
 
 const boundaryPolicies = [
   ...Object.values(LAYERS)
@@ -138,12 +168,20 @@ export default [
     settings: {
       'boundaries/elements': boundaryElements,
       'boundaries/elements-single-match': true,
+      'boundaries/files': boundaryFiles,
+      'boundaries/files-single-match': true,
     },
     rules: {
       'boundaries/element-types': ['error', {
         default: 'disallow',
         policies: boundaryPolicies,
       }],
+    },
+  },
+  {
+    files: ARCHITECTURE_FILES,
+    rules: {
+      'boundaries/no-unknown-files': 'error',
     },
   },
   {
