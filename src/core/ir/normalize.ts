@@ -29,5 +29,5 @@ export type NormalizedTestMd = string & { readonly __brand: 'NormalizedTestMd' }
  * CRLF and lone CR line endings to LF, with every other byte preserved.
  */
 export function normalizeTestMd(raw: string): NormalizedTestMd {
-  throw new Error('not implemented');
+  return raw.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n') as NormalizedTestMd;
 }

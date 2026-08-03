@@ -9,12 +9,19 @@
  * Hashing uses the canonical JSON bytes shared with artifact
  * serialization, so construction order never changes a provenance value.
  */
+import { createHash } from 'node:crypto';
+import { toCanonicalDigestBytes } from './canonical-json.js';
 import type { NormalizedTestMd } from './normalize.js';
 import type {
   GroundingDocument,
+  JsonValueT,
   PlanDocument,
   TargetDefinition,
 } from './schema.js';
+
+function sha256Hex(value: JsonValueT): string {
+  return createHash('sha256').update(toCanonicalDigestBytes(value)).digest('hex');
+}
 
 /**
  * Contains every declared compiler input that participates in `inputsDigest`.
@@ -75,7 +82,14 @@ export interface DigestInputs {
  * @returns The lowercase hexadecimal digest embedded in a compiled plan.
  */
 export function computeInputsDigest(inputs: DigestInputs): string {
-  throw new Error('not implemented');
+  const preimage = {
+    normalizedTestMd: inputs.normalizedTestMd,
+    schemaVersion: inputs.schemaVersion,
+    compilerPromptTemplateFingerprint: inputs.compilerPromptTemplateFingerprint,
+    targetDefinitions: inputs.targetDefinitions,
+  };
+
+  return sha256Hex(preimage as JsonValueT);
 }
 
 /**
@@ -90,7 +104,9 @@ export function computeInputsDigest(inputs: DigestInputs): string {
  * @returns The lowercase hexadecimal digest recorded by grounding artifacts.
  */
 export function computePlanDigest(plan: PlanDocument): string {
-  throw new Error('not implemented');
+  const { compilerMeta: _compilerMeta, ...canonicalPlan } = plan;
+
+  return sha256Hex(canonicalPlan as JsonValueT);
 }
 
 /**
@@ -108,5 +124,5 @@ export function isPlanDigestCurrent(
   grounding: GroundingDocument,
   planDigest: string,
 ): boolean {
-  throw new Error('not implemented');
+  return grounding.planDigest === planDigest;
 }
