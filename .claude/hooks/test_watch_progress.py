@@ -231,8 +231,34 @@ class EnvFloatTest(unittest.TestCase):
     def test_max_runtime_is_clamped_under_the_hook_timeout(self):
         # A max runtime above the hook timeout would let the runner kill
         # the process before its re-arm wake ever fires.
-        self.assertEqual(watch_progress.clamp_max_runtime(50000.0), 21000.0)
+        self.assertEqual(
+            watch_progress.clamp_max_runtime(
+                watch_progress.MAX_RUNTIME_CEILING_SEC + 1
+            ),
+            watch_progress.MAX_RUNTIME_CEILING_SEC,
+        )
         self.assertEqual(watch_progress.clamp_max_runtime(600.0), 600.0)
+
+    def test_ceiling_keeps_a_margin_under_the_configured_hook_timeout(self):
+        # Drift guard: if someone changes the Stop-hook timeout in
+        # settings.json or the ceiling constant, the re-arm wake must
+        # still fire before the runner kills the process.
+        settings = json.loads(
+            (HOOKS_DIR.parent / "settings.json").read_text(encoding="utf-8")
+        )
+        entries = [
+            hook
+            for group in settings["hooks"]["Stop"]
+            for hook in group["hooks"]
+            if "watch_progress.py" in hook.get("command", "")
+        ]
+        self.assertEqual(len(entries), 1)
+        self.assertTrue(entries[0].get("async"))
+        self.assertTrue(entries[0].get("asyncRewake"))
+        self.assertGreaterEqual(
+            entries[0]["timeout"] - watch_progress.MAX_RUNTIME_CEILING_SEC,
+            300,
+        )
 
 
 class EndToEndTest(unittest.TestCase):
@@ -318,23 +344,27 @@ class EndToEndTest(unittest.TestCase):
                     "AMBERCAST_WATCHDOG_MAX_RUNTIME_SEC": "20",
                 }),
             )
-            first.stdin.write('{"hook_event_name":"Stop"}')
-            first.stdin.close()
-            deadline = time.time() + 5
-            lock = Path(watch_progress.lock_path(proj, "7"))
-            while not lock.exists() and time.time() < deadline:
-                time.sleep(0.05)
-            self.assertTrue(lock.exists(), "watchdog never locked")
-            subprocess.run(
-                ["git", "-C", proj, "symbolic-ref", "HEAD",
-                 "refs/heads/main"],
-                check=True, capture_output=True,
-            )
-            self.assertEqual(first.wait(timeout=10), 0)
-            err = first.stderr.read()
-            self.assertEqual(err.strip(), "")
-            first.stdout.close()
-            first.stderr.close()
+            try:
+                first.stdin.write('{"hook_event_name":"Stop"}')
+                first.stdin.close()
+                deadline = time.time() + 5
+                lock = Path(watch_progress.lock_path(proj, "7"))
+                while not lock.exists() and time.time() < deadline:
+                    time.sleep(0.05)
+                self.assertTrue(lock.exists(), "watchdog never locked")
+                subprocess.run(
+                    ["git", "-C", proj, "symbolic-ref", "HEAD",
+                     "refs/heads/main"],
+                    check=True, capture_output=True,
+                )
+                self.assertEqual(first.wait(timeout=10), 0)
+                err = first.stderr.read()
+                self.assertEqual(err.strip(), "")
+            finally:
+                first.terminate()
+                first.wait(timeout=10)
+                first.stdout.close()
+                first.stderr.close()
 
     def test_second_instance_yields_to_a_live_lock(self):
         with self._git_repo("issues/7") as proj:
