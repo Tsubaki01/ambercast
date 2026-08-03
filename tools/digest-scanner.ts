@@ -14,7 +14,8 @@ export interface DigestCallSite {
 }
 
 /**
- * Locates calls resolved by TypeScript to `computeInputsDigest` in one program.
+ * Locates calls resolved by TypeScript to `computeInputsDigest` in a program's
+ * non-declaration source files.
  *
  * This deliberate test-support seam complements the syntax-only ESLint rule:
  * it compares declaration identity so renamed imports and namespace calls
@@ -108,6 +109,10 @@ export function scanComputeInputsDigestCalls(
   }
 
   for (const sourceFile of program.getSourceFiles()) {
+    if (sourceFile.isDeclarationFile) {
+      continue;
+    }
+
     visit(sourceFile, sourceFile);
   }
 
