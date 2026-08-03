@@ -28,6 +28,8 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./schema/plan.json": "./dist/schema/plan.schema.json",
+    "./schema/grounding.json": "./dist/schema/grounding.schema.json",
     "./package.json": "./package.json"
   },
   "files": [
@@ -38,15 +40,19 @@
     "node": ">=22.14"
   },
   "scripts": {
-    "build": "tsdown",
+    "build": "tsdown && node dist/schema-gen.js",
     "typecheck": "tsc --noEmit",
     "pretest": "npm run build",
     "test": "vitest run"
   },
   "devDependencies": {
     "@types/node": "^26.1.2",
+    "ajv": "^8.20.0",
     "tsdown": "^0.21.10",
     "typescript": "^6.0.3",
     "vitest": "^4.1.10"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
   }
 }

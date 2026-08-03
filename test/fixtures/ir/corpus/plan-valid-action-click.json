@@ -1,0 +1,12 @@
+{
+  "document": "plan",
+  "expected": "valid",
+  "value": {
+    "schemaVersion": 1,
+    "source": { "inputsDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    "targets": { "app": { "baseUrl": "https://example.test", "browser": "chromium" } },
+    "steps": [
+      { "id": "click-submit", "kind": "action", "action": "click", "target": { "strategy": "accessibility", "role": "button", "name": "Submit" } }
+    ]
+  }
+}

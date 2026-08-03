@@ -1,0 +1,10 @@
+{
+  "document": "plan",
+  "expected": "invalid",
+  "value": {
+    "schemaVersion": 1,
+    "source": { "inputsDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    "targets": {},
+    "steps": [{ "id": "navigate-home", "kind": "action", "action": "navigate", "url": 42 }]
+  }
+}

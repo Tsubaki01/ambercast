@@ -1,0 +1,12 @@
+{
+  "document": "plan",
+  "expected": "valid",
+  "value": {
+    "schemaVersion": 1,
+    "source": { "inputsDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    "targets": { "app": { "baseUrl": "https://example.test", "browser": "chromium" } },
+    "steps": [
+      { "id": "one-alert", "kind": "assert", "check": "element-count", "target": { "strategy": "accessibility", "role": "alert", "name": "Status" }, "count": 1 }
+    ]
+  }
+}

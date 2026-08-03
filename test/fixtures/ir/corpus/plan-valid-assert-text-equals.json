@@ -1,0 +1,12 @@
+{
+  "document": "plan",
+  "expected": "valid",
+  "value": {
+    "schemaVersion": 1,
+    "source": { "inputsDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    "targets": { "app": { "baseUrl": "https://example.test", "browser": "chromium" } },
+    "steps": [
+      { "id": "heading-text", "kind": "assert", "check": "text-equals", "target": { "strategy": "accessibility", "role": "heading", "name": "Welcome" }, "text": "Welcome" }
+    ]
+  }
+}

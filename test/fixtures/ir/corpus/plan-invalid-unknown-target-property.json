@@ -1,0 +1,10 @@
+{
+  "document": "plan",
+  "expected": "invalid",
+  "value": {
+    "schemaVersion": 1,
+    "source": { "inputsDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    "targets": { "app": { "baseUrl": "https://example.test", "browser": "chromium", "unexpected": true } },
+    "steps": []
+  }
+}

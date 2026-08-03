@@ -1,0 +1,10 @@
+{
+  "document": "plan",
+  "expected": "invalid",
+  "value": {
+    "schemaVersion": 1,
+    "source": { "inputsDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    "targets": {},
+    "steps": [{ "id": "find-submit", "kind": "action", "action": "click", "target": { "role": "button", "name": "Submit" } }]
+  }
+}

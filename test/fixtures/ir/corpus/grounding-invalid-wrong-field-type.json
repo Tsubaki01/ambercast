@@ -1,0 +1,13 @@
+{
+  "document": "grounding",
+  "expected": "invalid",
+  "value": {
+    "schemaVersion": 1,
+    "planDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "entries": {
+      "step": {
+        "fingerprint": { "algorithm": "a11y-neighborhood-v1", "hash": 42 }
+      }
+    }
+  }
+}
