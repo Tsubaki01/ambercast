@@ -18,9 +18,18 @@ export type ErrorExitCode = Exclude<ExitCode, 0>;
  * Associates every {@link ErrorKind} with its process exit status.
  *
  * @remarks
- * The eventual implementation will replace these uniform placeholder values
- * with the contract's real per-kind assignments while retaining the complete
- * mapping invariant.
+ * The contract assigns `assertion-failed` to exit code `1`, which identifies
+ * a test assertion failure. It assigns `config-invalid`, `secret-unresolved`,
+ * `target-unresolved`, and `secrets-literal-rejected` to exit code `2` because
+ * each is a usage error that a caller can correct in its inputs or setup.
+ *
+ * It assigns `browser-launch-failed`, `ai-executor-unavailable`,
+ * `fs-io-error`, and `unexpected-crash` to exit code `3`, grouping failures
+ * caused by the execution environment. It assigns `missing-plan`, `stale-ir`,
+ * and `integrity-violation` to exit code `4`, because each means the plan or
+ * grounding artifact is untrustworthy. Finally, `no-tests-found` maps to exit
+ * code `5` so a zero-match invocation remains distinguishable from an
+ * assertion failure or an invalid invocation.
  */
 export const ERROR_EXIT_CODES = {
   'assertion-failed': 1,
