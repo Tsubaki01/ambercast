@@ -29,6 +29,7 @@ interface PolicyLayer {
   readonly path: string;
   readonly carveOut?: { readonly path: string };
   readonly fallbackPath?: string;
+  readonly fallbackElement?: { readonly type: string };
 }
 
 function restrictedSyntaxMessages(code: string, filename: string) {
@@ -106,7 +107,13 @@ function policyRolesForSourcePath(sourcePath: string): string[] {
     }
 
     if (layer.fallbackPath !== undefined && new RegExp(layer.fallbackPath).test(sourcePath)) {
-      return ['adapters-root-file'];
+      const fallbackRole = layer.fallbackElement?.type;
+
+      if (fallbackRole === undefined) {
+        throw new Error(`Policy role ${role} declares fallbackPath without fallbackElement.type.`);
+      }
+
+      return [fallbackRole];
     }
 
     return layer.carveOut !== undefined && new RegExp(layer.carveOut.path).test(sourcePath)

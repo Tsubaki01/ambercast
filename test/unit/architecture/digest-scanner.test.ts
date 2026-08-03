@@ -108,6 +108,18 @@ describe('scanComputeInputsDigestCalls()', () => {
     );
   });
 
+  test('records a clean literal wrapped in an angle-bracket type assertion as compliant', async () => {
+    await withSyntheticProgram(
+      [
+        "import { computeInputsDigest, type DigestInputs } from '../core/ir/digest.js';",
+        'computeInputsDigest(<DigestInputs>{ schemaVersion: 1 });',
+      ].join('\n'),
+      (program, digestModuleFileName, callerFileName) => {
+        expectOneSaneCallSite(program, digestModuleFileName, callerFileName, undefined);
+      },
+    );
+  });
+
   test('records a clean literal wrapped in a satisfies-expression as compliant', async () => {
     await withSyntheticProgram(
       [
