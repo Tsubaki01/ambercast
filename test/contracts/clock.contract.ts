@@ -15,6 +15,8 @@ export function registerClockContract(harness: ClockContractHarness): void {
         const first = clock.monotonicMs();
         const second = clock.monotonicMs();
 
+        expect(Number.isFinite(first)).toBe(true);
+        expect(Number.isFinite(second)).toBe(true);
         expect(second).toBeGreaterThanOrEqual(first);
       } finally {
         await harness.dispose?.();
@@ -25,7 +27,10 @@ export function registerClockContract(harness: ClockContractHarness): void {
       try {
         const clock = await harness.createClock();
 
-        expect(clock.now()).toBeInstanceOf(Date);
+        const now = clock.now();
+
+        expect(now).toBeInstanceOf(Date);
+        expect(Number.isFinite(now.getTime())).toBe(true);
       } finally {
         await harness.dispose?.();
       }

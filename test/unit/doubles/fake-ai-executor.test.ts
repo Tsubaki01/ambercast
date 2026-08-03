@@ -25,6 +25,16 @@ describe('createFakeAiExecutor', () => {
     await expect(executor.execute(request('unknown-step'))).rejects.toThrow(/unscripted|unhandled/i);
   });
 
+  it('rejects a request whose context is not a canned-response key string', async () => {
+    const executor = createFakeAiExecutor({ cannedResponses: new Map([['step-one', FIRST_RESULT]]) });
+
+    await expect(executor.execute({
+      prompt: 'respond',
+      responseSchema: RESPONSE_SCHEMA,
+      context: { step: 'one' },
+    })).rejects.toThrow('Unscripted AI execute request: context must be a string canned-response key');
+  });
+
   it('supports an execute handler and passes it the original request', async () => {
     let received: AiExecuteRequest | undefined;
     const executor = createFakeAiExecutor({

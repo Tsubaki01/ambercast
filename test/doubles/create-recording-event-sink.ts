@@ -3,9 +3,9 @@ import type { EventSink, RunEvent } from '../../src/ports/system.js';
 /**
  * Couples an event sink to a read-only inspection view for assertions.
  *
- * `emitted()` returns a fresh array so test code cannot alter the sink's
- * internal delivery history while still observing exact event order and
- * duplicates.
+ * `emitted()` returns fresh event objects in a fresh array so test code cannot
+ * alter the sink's internal delivery history while still observing exact event
+ * order and duplicates.
  */
 export interface RecordingEventSink {
   readonly sink: EventSink;
@@ -27,11 +27,11 @@ export function createRecordingEventSink(): RecordingEventSink {
   return {
     sink: {
       emit(event: RunEvent): void {
-        events.push(event);
+        events.push({ ...event });
       },
     },
     emitted(): readonly RunEvent[] {
-      return events.slice();
+      return events.map((event) => ({ ...event }));
     },
   };
 }

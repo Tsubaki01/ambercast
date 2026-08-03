@@ -67,6 +67,14 @@ describe('createInMemoryStorage', () => {
     await expect(storage.listFiles('records')).resolves.toEqual(['alpha.txt', 'zeta.txt']);
   });
 
+  it('lists root-level files', async () => {
+    const storage = createInMemoryStorage();
+
+    await storage.writeText('root.txt', 'root');
+
+    await expect(storage.listFiles('')).resolves.toEqual(['root.txt']);
+  });
+
   it('treats an empty or missing directory as an empty listing', async () => {
     const storage = createInMemoryStorage();
     await storage.ensureDir('empty');
@@ -81,6 +89,18 @@ describe('createInMemoryStorage', () => {
 
     await expect(storage.exists('directory')).resolves.toBe(false);
     await expect(storage.exists('missing.txt')).resolves.toBe(false);
+  });
+
+  it('rejects writes, directory creation, and reads that conflict with an existing entry', async () => {
+    const storage = createInMemoryStorage();
+    await storage.ensureDir('records');
+    await storage.writeText('notes.txt', 'note');
+
+    await expect(storage.writeText('records', 'text')).rejects.toThrow(Error);
+    await expect(storage.writeBinary('records', new Uint8Array([1]))).rejects.toThrow(Error);
+    await expect(storage.ensureDir('notes.txt')).rejects.toThrow(Error);
+    await expect(storage.readText('records')).rejects.toThrow(Error);
+    await expect(storage.readBinary('records')).rejects.toThrow(Error);
   });
 
   it('rejects missing reads while allowing the same paths to be read after writing', async () => {

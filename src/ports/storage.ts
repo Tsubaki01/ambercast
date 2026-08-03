@@ -33,6 +33,7 @@ export interface StorageAdapter {
    *
    * @param path - Opaque path of the file to write.
    * @param content - Text to encode as UTF-8.
+   * @throws An `Error` if `path` names an existing directory.
    * @throws If the backend cannot create parents or write the file.
    */
   writeText(path: string, content: string): Promise<void>;
@@ -54,6 +55,7 @@ export interface StorageAdapter {
    *
    * @param path - Opaque path of the file to write.
    * @param content - Bytes to persist.
+   * @throws An `Error` if `path` names an existing directory.
    * @throws If the backend cannot create parents or write the file.
    */
   writeBinary(path: string, content: Uint8Array): Promise<void>;
@@ -70,7 +72,8 @@ export interface StorageAdapter {
   /**
    * Lists regular files directly inside a directory.
    *
-   * @param dir - Opaque directory path to inspect.
+   * @param dir - Opaque directory path to inspect; use `''` for the root
+   * directory.
    * @returns Lexicographically ascending bare file names. Subdirectories are
    * excluded, listing is not recursive, and both missing and empty directories
    * resolve to an empty array.
@@ -81,7 +84,8 @@ export interface StorageAdapter {
   /**
    * Creates a directory for later use when it does not already exist.
    *
-   * @param dir - Opaque directory path to create.
+   * @param dir - Opaque directory path to create; use `''` for the root
+   * directory.
    * @returns Resolves without effect when the directory already exists.
    * @throws If the backend cannot create the directory.
    */

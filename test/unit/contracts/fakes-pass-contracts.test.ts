@@ -40,7 +40,13 @@ registerBrowserDriverContract({
 
 registerAiExecutorContract({
   createExecutor: (scripted) => createFakeAiExecutor({
-    execute: () => scripted.execute,
+    execute: () => {
+      if (scripted.executeError !== undefined) {
+        throw scripted.executeError;
+      }
+
+      return scripted.execute;
+    },
     executeAgentic: (request) => typeof scripted.executeAgentic === 'function'
       ? scripted.executeAgentic(request)
       : scripted.executeAgentic,

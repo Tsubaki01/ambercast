@@ -31,6 +31,19 @@ describe('createRecordingEventSink', () => {
     expect(recording.emitted()).toEqual([START, START]);
   });
 
+  it('returns defensive copies of the recorded event array and objects', () => {
+    const recording = createRecordingEventSink();
+    const emitted: RunEvent = { type: 'step-start', stepId: 'open-page' };
+    recording.sink.emit(emitted);
+
+    (emitted as { stepId: string }).stepId = 'mutated-source';
+    const snapshot = recording.emitted() as RunEvent[];
+    (snapshot[0] as { stepId: string }).stepId = 'mutated-snapshot';
+    snapshot.push(AI_CALL);
+
+    expect(recording.emitted()).toEqual([START]);
+  });
+
   it('keeps recordings isolated between instances', () => {
     const first = createRecordingEventSink();
     const second = createRecordingEventSink();

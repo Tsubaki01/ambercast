@@ -39,7 +39,14 @@ export function registerStorageContract(harness: StorageContractHarness): void {
       await withStorage(harness, async (storage) => {
         const bytes = new Uint8Array([0, 1, 255]);
         await storage.writeBinary('artifacts/screenshot.png', bytes);
-        await expect(storage.readBinary('artifacts/screenshot.png')).resolves.toEqual(bytes);
+        await expect(storage.readBinary('artifacts/screenshot.png')).resolves.toEqual(new Uint8Array([0, 1, 255]));
+
+        bytes[0] = 42;
+        await expect(storage.readBinary('artifacts/screenshot.png')).resolves.toEqual(new Uint8Array([0, 1, 255]));
+
+        const read = await storage.readBinary('artifacts/screenshot.png');
+        read[1] = 42;
+        await expect(storage.readBinary('artifacts/screenshot.png')).resolves.toEqual(new Uint8Array([0, 1, 255]));
       });
     });
 

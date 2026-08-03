@@ -9,9 +9,9 @@ const utf8Decoder = new TextDecoder();
  * The storage port leaves normalization to its caller, so this helper uses
  * only the final separator needed to model direct-child directory behavior.
  */
-function parentPath(path: string): string | undefined {
+function parentPath(path: string): string {
   const separator = path.lastIndexOf('/');
-  return separator < 0 ? undefined : path.slice(0, separator);
+  return separator < 0 ? '' : path.slice(0, separator);
 }
 
 function fileName(path: string): string {
@@ -33,7 +33,7 @@ function ensureParentDirectories(
   const parents: string[] = [];
   let parent = parentPath(path);
 
-  while (parent !== undefined && parent !== '') {
+  while (parent !== '') {
     parents.push(parent);
     parent = parentPath(parent);
   }

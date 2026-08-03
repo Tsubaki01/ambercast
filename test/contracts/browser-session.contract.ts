@@ -50,10 +50,17 @@ async function withSession(
   setup: BrowserSessionContractSetup,
   assertion: (session: BrowserSession) => Promise<void>,
 ): Promise<void> {
+  let session: BrowserSession | undefined;
+
   try {
-    await assertion(await harness.createSession(setup));
+    session = await harness.createSession(setup);
+    await assertion(session);
   } finally {
-    await harness.dispose?.();
+    try {
+      await session?.close();
+    } finally {
+      await harness.dispose?.();
+    }
   }
 }
 
@@ -119,7 +126,6 @@ export function registerBrowserSessionContract(harness: BrowserSessionContractHa
         expect(await session.screenshot()).toBeInstanceOf(Uint8Array);
         expect(isJsonValue(await session.accessibilitySnapshot())).toBe(true);
 
-        await expect(session.close()).resolves.toBeUndefined();
       });
     });
   });

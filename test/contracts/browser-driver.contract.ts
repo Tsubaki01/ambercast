@@ -19,9 +19,11 @@ export function registerBrowserDriverContract(harness: BrowserDriverContractHarn
     });
 
     it('launches a working browser session', async () => {
+      let session: Awaited<ReturnType<BrowserDriver['launch']>> | undefined;
+
       try {
         const driver = await harness.createDriver();
-        const session = await driver.launch(TARGET);
+        session = await driver.launch(TARGET);
 
         expect(session).toMatchObject({
           perform: expect.any(Function),
@@ -29,9 +31,12 @@ export function registerBrowserDriverContract(harness: BrowserDriverContractHarn
           resolveGrounded: expect.any(Function),
           close: expect.any(Function),
         });
-        await session.close();
       } finally {
-        await harness.dispose?.();
+        try {
+          await session?.close();
+        } finally {
+          await harness.dispose?.();
+        }
       }
     });
   });

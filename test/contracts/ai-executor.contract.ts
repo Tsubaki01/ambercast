@@ -16,6 +16,8 @@ export type AiExecutorContractAgenticScript = AiAgenticResult | (
 export interface AiExecutorContractScript {
   readonly execute: AiExecuteResult<unknown>;
   readonly executeAgentic: AiExecutorContractAgenticScript;
+  /** When present, the implementation must reject `execute` with this error. */
+  readonly executeError?: Error;
 }
 
 export interface AiExecutorContractHarness {
@@ -40,13 +42,13 @@ interface RecordingController {
   readonly controller: AiActionController;
   readonly performed: PerformableAction[];
   readonly evaluated: AssertCheck[];
-  readonly snapshots: [][];
+  readonly snapshotCalls: { count: number };
 }
 
 function createRecordingController(harness: AiExecutorContractHarness): RecordingController {
   const performed: PerformableAction[] = [];
   const evaluated: AssertCheck[] = [];
-  const snapshots: [][] = [];
+  const snapshotCalls = { count: 0 };
 
   return {
     controller: harness.createActionController({
@@ -57,14 +59,14 @@ function createRecordingController(harness: AiExecutorContractHarness): Recordin
         evaluated.push(check);
         return { passed: true };
       },
-      snapshotForResolution: async (...argumentsReceived: []) => {
-        snapshots.push(argumentsReceived);
+      snapshotForResolution: async () => {
+        snapshotCalls.count += 1;
         return EMPTY_SNAPSHOT;
       },
     }),
     performed,
     evaluated,
-    snapshots,
+    snapshotCalls,
   };
 }
 
@@ -84,6 +86,24 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
         expect(result.data).toEqual(EXECUTE_RESULT.data);
         expect(result.raw).toEqual(EXECUTE_RESULT.raw);
         expect(result.usage).toEqual(EXECUTE_RESULT.usage);
+      } finally {
+        await harness.dispose?.();
+      }
+    });
+
+    it('rejects execute with the scripted error', async () => {
+      try {
+        const executeError = new Error('The scripted execute request failed.');
+        const executor = await harness.createExecutor({
+          execute: EXECUTE_RESULT,
+          executeAgentic: AGENTIC_RESULT,
+          executeError,
+        });
+
+        await expect(executor.execute<unknown>({
+          prompt: 'Return a JSON status.',
+          responseSchema: RESPONSE_SCHEMA,
+        })).rejects.toBe(executeError);
       } finally {
         await harness.dispose?.();
       }
@@ -110,7 +130,7 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
 
         expect(recording.performed).toEqual([ACTION_A]);
         expect(recording.evaluated).toEqual([CHECK]);
-        expect(recording.snapshots).toEqual([[]]);
+        expect(recording.snapshotCalls.count).toBe(1);
         expect(result.trace).toEqual(recording.performed);
         expect(result.outcome).toBe('success');
       } finally {
