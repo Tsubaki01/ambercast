@@ -254,6 +254,17 @@ describe('valid nested schema fixtures', () => {
   it('parses a StepResult without optional diagnostic fields', () => {
     expectAccepted(StepResult, MINIMAL_STEP_RESULT);
   });
+
+  it('accepts JSON ambiguity objects and rejects non-JSON ambiguity values', () => {
+    expectAccepted(GenerateResult, {
+      ...GENERATE_RESULT,
+      ambiguities: [{ stepId: 'submit-login', candidates: ['Submit', 'Log in'] }],
+    });
+    expectRejected(GenerateResult, {
+      ...GENERATE_RESULT,
+      ambiguities: [{ stepId: 'submit-login', resolve: () => 'Submit' }],
+    });
+  });
 });
 
 describe('nested strict object boundaries', () => {

@@ -1,6 +1,6 @@
 import { ERROR_EXIT_CODES } from './exit-codes.js';
 
-/**
+/*
  * Declares the shared vocabulary and base class for failures that Ambercast can
  * classify before choosing its process outcome. Keeping classification on an
  * abstract error preserves a consistent boundary between domain failures and
