@@ -28,7 +28,7 @@ export const ERROR_EXIT_CODES = {
   'config-invalid': 2,
   'secret-unresolved': 2,
   'target-unresolved': 2,
-  'secrets-literal-rejected': 2,
+  'secret-literal-rejected': 2,
   'missing-plan': 4,
   'stale-ir': 4,
   'integrity-violation': 4,

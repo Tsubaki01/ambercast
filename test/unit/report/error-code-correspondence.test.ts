@@ -20,7 +20,7 @@ const ERROR_CODE_CORRESPONDENCE = [
   { errorKind: 'config-invalid', reportCode: 'CONFIG_INVALID', exitCode: 2, reportKind: 'usage' },
   { errorKind: 'secret-unresolved', reportCode: 'SECRET_UNRESOLVED', exitCode: 2, reportKind: 'usage' },
   { errorKind: 'target-unresolved', reportCode: 'TARGET_UNRESOLVED', exitCode: 2, reportKind: 'usage' },
-  { errorKind: 'secrets-literal-rejected', reportCode: 'SECRET_LITERAL_REJECTED', exitCode: 2, reportKind: 'usage' },
+  { errorKind: 'secret-literal-rejected', reportCode: 'SECRET_LITERAL_REJECTED', exitCode: 2, reportKind: 'usage' },
   { errorKind: 'missing-plan', reportCode: 'MISSING_PLAN', exitCode: 4, reportKind: 'usage' },
   { errorKind: 'stale-ir', reportCode: 'STALE_PLAN', exitCode: 4, reportKind: 'usage' },
   { errorKind: 'integrity-violation', reportCode: 'INTEGRITY_VIOLATION', exitCode: 4, reportKind: 'usage' },
@@ -34,7 +34,7 @@ const REPORTABLE_ERROR_KINDS = [
   'config-invalid',
   'secret-unresolved',
   'target-unresolved',
-  'secrets-literal-rejected',
+  'secret-literal-rejected',
   'missing-plan',
   'stale-ir',
   'integrity-violation',
@@ -46,10 +46,6 @@ const REPORTABLE_ERROR_KINDS = [
 
 function expectAccepted(schema: SchemaUnderTest, value: unknown): void {
   expect(schema.safeParse(value).success).toBe(true);
-}
-
-function reportErrorCodeOptions(): readonly string[] {
-  return (ReportErrorCode as unknown as { options?: readonly string[] }).options ?? [];
 }
 
 describe('ErrorKind and ReportErrorCode correspondence', () => {
@@ -68,9 +64,9 @@ describe('ErrorKind and ReportErrorCode correspondence', () => {
     const mappedCodes = ERROR_CODE_CORRESPONDENCE.map(({ reportCode }) => reportCode);
     const mappedKinds = ERROR_CODE_CORRESPONDENCE.map(({ errorKind }) => errorKind);
 
-    expect(new Set(mappedCodes)).toHaveLength(ERROR_CODE_CORRESPONDENCE.length);
-    expect(new Set(mappedCodes)).toStrictEqual(new Set(reportErrorCodeOptions()));
-    expect(new Set(mappedKinds)).toHaveLength(11);
+    expect(new Set(mappedCodes).size).toBe(ERROR_CODE_CORRESPONDENCE.length);
+    expect(new Set(mappedCodes)).toStrictEqual(new Set(ReportErrorCode.options));
+    expect(new Set(mappedKinds).size).toBe(REPORTABLE_ERROR_KINDS.length);
     expect(new Set(mappedKinds)).toStrictEqual(new Set(REPORTABLE_ERROR_KINDS));
   });
 

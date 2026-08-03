@@ -1,4 +1,4 @@
-import { ERROR_EXIT_CODES } from './exit-codes.js';
+import { ERROR_EXIT_CODES, type ErrorExitCode } from './exit-codes.js';
 
 /*
  * Declares the shared vocabulary and base class for failures that Ambercast can
@@ -27,7 +27,7 @@ export type ErrorKind =
   | 'config-invalid'
   | 'secret-unresolved'
   | 'target-unresolved'
-  | 'secrets-literal-rejected'
+  | 'secret-literal-rejected'
   | 'missing-plan'
   | 'stale-ir'
   | 'integrity-violation'
@@ -58,7 +58,7 @@ export abstract class AmbercastError extends Error {
    * The getter resolves the classification through the central error-to-exit-
    * code table, so every concrete error follows one authoritative mapping.
    */
-  get exitCode(): ExitCode {
+  get exitCode(): ErrorExitCode {
     return ERROR_EXIT_CODES[this.kind];
   }
 

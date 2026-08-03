@@ -7,7 +7,7 @@ const ALL_ERROR_KINDS = [
   'config-invalid',
   'secret-unresolved',
   'target-unresolved',
-  'secrets-literal-rejected',
+  'secret-literal-rejected',
   'missing-plan',
   'stale-ir',
   'integrity-violation',
@@ -33,7 +33,7 @@ function exitCodeFor(kind: ErrorKind): ErrorExitCode {
     case 'config-invalid':
     case 'secret-unresolved':
     case 'target-unresolved':
-    case 'secrets-literal-rejected':
+    case 'secret-literal-rejected':
       return 2;
     case 'browser-launch-failed':
     case 'ai-executor-unavailable':
