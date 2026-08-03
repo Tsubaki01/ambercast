@@ -4,7 +4,7 @@
  *
  * Both representations share one value-walking core so recursive UTF-16
  * member ordering and scalar formatting cannot drift between reviewable
- * artifacts and their hash preimages. The eventual implementation guarantees
+ * artifacts and their hash preimages. This module guarantees
  * that numbers with magnitude at least 1e21, or with nonzero magnitude less
  * than 1e-6, use exponential form; every other finite number uses fixed
  * decimal form, matching native `Number.prototype.toString()` exactly.

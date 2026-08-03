@@ -45,7 +45,7 @@ function asJsonValue(plan: PlanDocument): JsonValueT {
 }
 
 describe('canonical JSON serialization', () => {
-  it('serializes a simple object identically in compact and artifact forms', () => {
+  it('represents a simple object correctly in compact and artifact forms', () => {
     const value: JsonValueT = { z: [true, null, 'x'], a: 1 };
 
     expect(digestText(value)).toBe('{"a":1,"z":[true,null,"x"]}');

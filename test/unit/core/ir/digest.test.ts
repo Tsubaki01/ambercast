@@ -171,32 +171,23 @@ describe('isPlanDigestCurrent', () => {
     expect(isPlanDigestCurrent(groundingWithB, DIGEST_A)).toBe(false);
   });
 
-  it('keeps grounding current across a compilerMeta-only change but stale after a canonical plan change', () => {
+  it('tracks grounding provenance through real plan digest calculations', () => {
     const originalPlan = createPlan();
+    const originalPlanDigest = computePlanDigest(originalPlan);
+    const groundingCachedForOriginalPlan = createGrounding(originalPlanDigest);
     const planAfterCanonicalFieldChange = createPlan({
       navigateUrl: 'https://example.test/dashboard',
     });
     const planAfterCompilerMetaOnlyChange = createPlan({
       compilerMeta: { model: 'compiler-v2' },
     });
-    const planDigestX = 'c'.repeat(64);
-    const planDigestY = 'd'.repeat(64);
-    const groundingCachedForPlanX = createGrounding(planDigestX);
-    const groundingCachedForPlanY = createGrounding(planDigestY);
+    const canonicalChangePlanDigest = computePlanDigest(planAfterCanonicalFieldChange);
+    const compilerMetaOnlyChangePlanDigest = computePlanDigest(planAfterCompilerMetaOnlyChange);
 
-    expect(planAfterCanonicalFieldChange.steps).not.toEqual(originalPlan.steps);
-    const { compilerMeta, ...canonicalPlanAfterCompilerMetaOnlyChange } = planAfterCompilerMetaOnlyChange;
-    expect(compilerMeta).toEqual({ model: 'compiler-v2' });
-    expect(canonicalPlanAfterCompilerMetaOnlyChange).toEqual(originalPlan);
-    expect(isPlanDigestCurrent(groundingCachedForPlanX, planDigestX)).toBe(true);
-    expect(isPlanDigestCurrent(groundingCachedForPlanX, planDigestY)).toBe(false);
-    expect(isPlanDigestCurrent(groundingCachedForPlanY, planDigestY)).toBe(true);
-
-    // computePlanDigest's compilerMeta exclusion is tested separately above.
-    // This test verifies current/stale comparison once that calculation has
-    // supplied the unchanged digest for a compilerMeta-only plan change.
-    const planDigestAfterCompilerMetaOnlyChange = planDigestX;
-
-    expect(isPlanDigestCurrent(groundingCachedForPlanX, planDigestAfterCompilerMetaOnlyChange)).toBe(true);
+    expect(isPlanDigestCurrent(groundingCachedForOriginalPlan, originalPlanDigest)).toBe(true);
+    expect(canonicalChangePlanDigest).not.toBe(originalPlanDigest);
+    expect(isPlanDigestCurrent(groundingCachedForOriginalPlan, canonicalChangePlanDigest)).toBe(false);
+    expect(compilerMetaOnlyChangePlanDigest).toBe(originalPlanDigest);
+    expect(isPlanDigestCurrent(groundingCachedForOriginalPlan, compilerMetaOnlyChangePlanDigest)).toBe(true);
   });
 });
