@@ -22,16 +22,7 @@ function expectBothFormsToRejectWithValueSpecificErrors(value: unknown): void {
   ];
 
   for (const serialize of serializers) {
-    let thrown: unknown;
-
-    try {
-      serialize();
-    } catch (error) {
-      thrown = error;
-    }
-
-    expect(thrown).toBeInstanceOf(Error);
-    expect((thrown as Error).message).not.toBe('not implemented');
+    expect(serialize).toThrow(TypeError);
   }
 }
 
@@ -83,6 +74,10 @@ describe('canonical JSON serialization', () => {
     ['symbol', Symbol('value')],
   ])('rejects a %s value anywhere in the value tree', (_description, value) => {
     expectBothFormsToRejectWithValueSpecificErrors({ nested: [value] });
+  });
+
+  it('rejects a Date value anywhere in the value tree', () => {
+    expectBothFormsToRejectWithValueSpecificErrors({ nested: [new Date()] });
   });
 
   it.each([

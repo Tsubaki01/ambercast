@@ -24,7 +24,8 @@
  * whitespace. `toCanonicalArtifactText` produces a distinct, deliberately
  * separate form with two-space pretty-printing; it retains identical key
  * ordering and scalar formatting so only presentation differs for readable
- * diffs.
+ * diffs. Objects must be plain objects (including null-prototype records),
+ * so specialized object behavior cannot be discarded as an empty JSON object.
  */
 import { Buffer } from 'node:buffer';
 import type { JsonValueT } from './schema.js';
@@ -108,10 +109,19 @@ function renderCanonicalValue(value: unknown, form: CanonicalForm, depth = 0): s
     case 'function':
     case 'symbol':
       throw new TypeError(`Cannot canonicalize a ${typeof value} value.`);
-    case 'object':
-      return Array.isArray(value)
-        ? renderCanonicalArray(value, form, depth)
-        : renderCanonicalObject(value, form, depth);
+    case 'object': {
+      if (Array.isArray(value)) {
+        return renderCanonicalArray(value, form, depth);
+      }
+
+      const prototype = Object.getPrototypeOf(value);
+
+      if (prototype !== Object.prototype && prototype !== null) {
+        throw new TypeError('Cannot canonicalize a non-plain object value.');
+      }
+
+      return renderCanonicalObject(value, form, depth);
+    }
     default:
       throw new TypeError('Cannot canonicalize an unsupported value.');
   }
