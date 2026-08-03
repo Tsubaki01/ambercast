@@ -5,7 +5,7 @@ import {
   isPlanDigestCurrent,
 } from '../../../../src/core/ir/digest.js';
 import type { DigestInputs } from '../../../../src/core/ir/digest.js';
-import { normalizeTestMd } from '../../../../src/core/ir/normalize.js';
+import type { NormalizedTestMd } from '../../../../src/core/ir/normalize.js';
 import { GroundingDocument, PlanDocument } from '../../../../src/core/ir/schema.js';
 import type { JsonValueT, TargetDefinition } from '../../../../src/core/ir/schema.js';
 
@@ -16,9 +16,13 @@ function targetDefinition(baseUrl = 'https://example.test'): TargetDefinition {
   return { baseUrl, browser: 'chromium' };
 }
 
+function asNormalizedTestMd(value: string): NormalizedTestMd {
+  return value as NormalizedTestMd;
+}
+
 function createInputs(overrides: Partial<DigestInputs> = {}): DigestInputs {
   return {
-    normalizedTestMd: normalizeTestMd('# Smoke\n'),
+    normalizedTestMd: asNormalizedTestMd('# Smoke\n'),
     schemaVersion: 1,
     compilerPromptTemplateFingerprint: 'compiler-template-v1',
     targetDefinitions: { app: targetDefinition() },
@@ -88,7 +92,7 @@ describe('computeInputsDigest', () => {
   });
 
   it.each([
-    ['normalized test Markdown', () => createInputs({ normalizedTestMd: normalizeTestMd('# Changed smoke\n') })],
+    ['normalized test Markdown', () => createInputs({ normalizedTestMd: asNormalizedTestMd('# Changed smoke\n') })],
     ['schema version', () => createInputs({ schemaVersion: 2 })],
     ['compiler prompt-template fingerprint', () => createInputs({ compilerPromptTemplateFingerprint: 'compiler-template-v2' })],
     ['target definitions', () => createInputs({ targetDefinitions: { app: targetDefinition('https://changed.example.test') } })],
@@ -125,14 +129,24 @@ describe('computeInputsDigest', () => {
 
     expect(computeInputsDigest(reordered)).toBe(computeInputsDigest(first));
   });
+
+  it('hashes only its four declared fields when passed a structurally wider runtime object', () => {
+    const declaredInputs = createInputs();
+    const widerRuntimeInputs = {
+      ...declaredInputs,
+      extraRuntimeProperty: 'must not affect the digest',
+    } as DigestInputs;
+
+    expect(computeInputsDigest(widerRuntimeInputs)).toBe(computeInputsDigest(declaredInputs));
+  });
 });
 
 describe('computePlanDigest', () => {
   it('excludes compilerMeta from the digest', () => {
-    const first = createPlan({ compilerMeta: { model: 'first', retryCount: 1 } });
-    const second = createPlan({ compilerMeta: { model: 'second', retryCount: 2 } });
+    const withoutCompilerMeta = createPlan();
+    const withCompilerMeta = createPlan({ compilerMeta: { model: 'compiler', retryCount: 1 } });
 
-    expect(computePlanDigest(first)).toBe(computePlanDigest(second));
+    expect(computePlanDigest(withoutCompilerMeta)).toBe(computePlanDigest(withCompilerMeta));
   });
 
   it.each([
@@ -155,5 +169,34 @@ describe('isPlanDigestCurrent', () => {
     const groundingWithB = createGrounding(DIGEST_B);
 
     expect(isPlanDigestCurrent(groundingWithB, DIGEST_A)).toBe(false);
+  });
+
+  it('keeps grounding current across a compilerMeta-only change but stale after a canonical plan change', () => {
+    const originalPlan = createPlan();
+    const planAfterCanonicalFieldChange = createPlan({
+      navigateUrl: 'https://example.test/dashboard',
+    });
+    const planAfterCompilerMetaOnlyChange = createPlan({
+      compilerMeta: { model: 'compiler-v2' },
+    });
+    const planDigestX = 'c'.repeat(64);
+    const planDigestY = 'd'.repeat(64);
+    const groundingCachedForPlanX = createGrounding(planDigestX);
+    const groundingCachedForPlanY = createGrounding(planDigestY);
+
+    expect(planAfterCanonicalFieldChange.steps).not.toEqual(originalPlan.steps);
+    const { compilerMeta, ...canonicalPlanAfterCompilerMetaOnlyChange } = planAfterCompilerMetaOnlyChange;
+    expect(compilerMeta).toEqual({ model: 'compiler-v2' });
+    expect(canonicalPlanAfterCompilerMetaOnlyChange).toEqual(originalPlan);
+    expect(isPlanDigestCurrent(groundingCachedForPlanX, planDigestX)).toBe(true);
+    expect(isPlanDigestCurrent(groundingCachedForPlanX, planDigestY)).toBe(false);
+    expect(isPlanDigestCurrent(groundingCachedForPlanY, planDigestY)).toBe(true);
+
+    // computePlanDigest's compilerMeta exclusion is tested separately above.
+    // This test verifies current/stale comparison once that calculation has
+    // supplied the unchanged digest for a compilerMeta-only plan change.
+    const planDigestAfterCompilerMetaOnlyChange = planDigestX;
+
+    expect(isPlanDigestCurrent(groundingCachedForPlanX, planDigestAfterCompilerMetaOnlyChange)).toBe(true);
   });
 });

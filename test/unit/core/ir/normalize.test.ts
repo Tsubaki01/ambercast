@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { normalizeTestMd } from '../../../../src/core/ir/normalize.js';
+import type { NormalizedTestMd } from '../../../../src/core/ir/normalize.js';
 
 describe('normalizeTestMd', () => {
-  it('leaves already-LF Markdown unchanged and returns a runtime string', () => {
+  it('leaves already-LF Markdown unchanged and returns a branded runtime string', () => {
     const raw = '# Sign in\n\nOpen the dashboard.\n';
-    const normalized = normalizeTestMd(raw);
+    const branded: NormalizedTestMd = normalizeTestMd(raw);
+    const normalized = branded;
 
     expect(normalized).toBe(raw);
     expect(typeof normalized).toBe('string');

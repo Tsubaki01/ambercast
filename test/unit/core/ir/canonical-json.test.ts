@@ -15,9 +15,24 @@ function digestText(value: JsonValueT): string {
   return Buffer.from(toCanonicalDigestBytes(value)).toString('utf8');
 }
 
-function expectBothFormsToReject(value: unknown): void {
-  expect(() => toCanonicalDigestBytes(value as JsonValueT)).toThrow();
-  expect(() => toCanonicalArtifactText(value as JsonValueT)).toThrow();
+function expectBothFormsToRejectWithValueSpecificErrors(value: unknown): void {
+  const serializers = [
+    () => toCanonicalDigestBytes(value as JsonValueT),
+    () => toCanonicalArtifactText(value as JsonValueT),
+  ];
+
+  for (const serialize of serializers) {
+    let thrown: unknown;
+
+    try {
+      serialize();
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).not.toBe('not implemented');
+  }
 }
 
 function expectBothFormsToThrowRangeError(value: unknown): void {
@@ -67,7 +82,7 @@ describe('canonical JSON serialization', () => {
     ['function', () => undefined],
     ['symbol', Symbol('value')],
   ])('rejects a %s value anywhere in the value tree', (_description, value) => {
-    expectBothFormsToReject({ nested: [value] });
+    expectBothFormsToRejectWithValueSpecificErrors({ nested: [value] });
   });
 
   it.each([
@@ -102,13 +117,18 @@ describe('canonical JSON serialization', () => {
     expect(JSON.parse(artifactText)).toEqual(value);
   });
 
-  it('uses RFC 8785 UTF-16 code-unit ordering for the emoji and Hebrew key vector', () => {
+  it('uses RFC 8785 UTF-16 code-unit ordering for its full seven-key vector', () => {
     const value: JsonValueT = {
+      '€': 'Euro Sign',
+      '\r': 'Carriage Return',
       'דּ': 'Hebrew Letter Dalet With Dagesh',
+      '1': 'One',
       '😀': 'Emoji: Grinning Face',
+      '\u0080': 'Control',
+      'ö': 'Latin Small Letter O With Diaeresis',
     };
 
-    expect(digestText(value)).toBe('{"😀":"Emoji: Grinning Face","דּ":"Hebrew Letter Dalet With Dagesh"}');
+    expect(digestText(value)).toBe('{"\\r":"Carriage Return","1":"One","\u0080":"Control","ö":"Latin Small Letter O With Diaeresis","€":"Euro Sign","😀":"Emoji: Grinning Face","דּ":"Hebrew Letter Dalet With Dagesh"}');
   });
 
   it('ignores source object key insertion order in both canonical forms', () => {
