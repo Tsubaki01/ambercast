@@ -18,7 +18,8 @@ interface NamedCorpusFixture extends CorpusFixture {
   name: string;
 }
 
-const corpusDirectory = fileURLToPath(new URL('../../../fixtures/ir/corpus/', import.meta.url));
+const corpusDirectoryUrl = new URL('../../../fixtures/ir/corpus/', import.meta.url);
+const corpusDirectory = fileURLToPath(corpusDirectoryUrl);
 
 function isCorpusFixture(value: unknown): value is CorpusFixture {
   if (typeof value !== 'object' || value === null) {
@@ -36,7 +37,7 @@ function loadCorpus(): NamedCorpusFixture[] {
     .filter((fileName) => fileName.endsWith('.json'))
     .sort()
     .map((fileName) => {
-      const parsed: unknown = JSON.parse(readFileSync(new URL(fileName, `${new URL('../../../fixtures/ir/corpus/', import.meta.url).href}`), 'utf8'));
+      const parsed: unknown = JSON.parse(readFileSync(new URL(fileName, corpusDirectoryUrl), 'utf8'));
 
       if (!isCorpusFixture(parsed)) {
         throw new TypeError(`Invalid IR corpus fixture: ${fileName}`);
@@ -47,6 +48,11 @@ function loadCorpus(): NamedCorpusFixture[] {
 }
 
 const corpus = loadCorpus();
+const ajv = new Ajv2020({ strict: true });
+const validators = {
+  plan: ajv.compile(getPlanJsonSchema()),
+  grounding: ajv.compile(getGroundingJsonSchema()),
+};
 
 describe('IR JSON Schema corpus equivalence', () => {
   it('contains valid and invalid fixtures for plan and grounding documents', () => {
@@ -63,8 +69,7 @@ describe('IR JSON Schema corpus equivalence', () => {
     const expected = fixture.expected === 'valid';
     const zodSchema = fixture.document === 'plan' ? PlanDocument : GroundingDocument;
     const zodVerdict = zodSchema.safeParse(fixture.value).success;
-    const jsonSchema = fixture.document === 'plan' ? getPlanJsonSchema() : getGroundingJsonSchema();
-    const ajvVerdict = new Ajv2020({ strict: true }).compile(jsonSchema)(fixture.value);
+    const ajvVerdict = validators[fixture.document](fixture.value);
 
     expect.soft(zodVerdict).toBe(expected);
     expect.soft(ajvVerdict).toBe(expected);
