@@ -30,6 +30,20 @@ const ERROR_CODE_CORRESPONDENCE = [
   { errorKind: 'unexpected-crash', reportCode: 'UNEXPECTED_CRASH', exitCode: 3, reportKind: 'environment' },
 ] as const satisfies readonly ErrorCodeCorrespondence[];
 
+const REPORTABLE_ERROR_KINDS = [
+  'config-invalid',
+  'secret-unresolved',
+  'target-unresolved',
+  'secrets-literal-rejected',
+  'missing-plan',
+  'stale-ir',
+  'integrity-violation',
+  'browser-launch-failed',
+  'ai-executor-unavailable',
+  'fs-io-error',
+  'unexpected-crash',
+] as const satisfies readonly ErrorKind[];
+
 function expectAccepted(schema: SchemaUnderTest, value: unknown): void {
   expect(schema.safeParse(value).success).toBe(true);
 }
@@ -50,11 +64,14 @@ describe('ErrorKind and ReportErrorCode correspondence', () => {
     expect(mappedKinds).not.toContain('no-tests-found');
   });
 
-  it('covers every ReportErrorCode enum member exactly once', () => {
+  it('covers every ReportErrorCode and reportable ErrorKind exactly once', () => {
     const mappedCodes = ERROR_CODE_CORRESPONDENCE.map(({ reportCode }) => reportCode);
+    const mappedKinds = ERROR_CODE_CORRESPONDENCE.map(({ errorKind }) => errorKind);
 
     expect(new Set(mappedCodes)).toHaveLength(ERROR_CODE_CORRESPONDENCE.length);
     expect(new Set(mappedCodes)).toStrictEqual(new Set(reportErrorCodeOptions()));
+    expect(new Set(mappedKinds)).toHaveLength(11);
+    expect(new Set(mappedKinds)).toStrictEqual(new Set(REPORTABLE_ERROR_KINDS));
   });
 
   it.each(ERROR_CODE_CORRESPONDENCE)('accepts $reportCode through both ReportError scopes', ({ reportCode, reportKind }) => {

@@ -33,6 +33,11 @@ const STEP_RESULT = {
   screenshot: 'screenshots/assert-welcome.png',
   observed: OBSERVED,
 };
+const MINIMAL_STEP_RESULT = {
+  id: 'capture-home',
+  type: 'capture',
+  status: 'passed',
+};
 const RUN_RESULT = {
   id: 'login-succeeds',
   file: 'tests/login.test.md',
@@ -210,6 +215,10 @@ for (const variant of COMMAND_VARIANTS) {
       expectRejected(ReportEnvelope, { ...fixture, [field]: wrongValue });
     });
 
+    it('rejects a non-literal schemaVersion string', () => {
+      expectRejected(ReportEnvelope, { ...fixture, schemaVersion: '1.0.0' });
+    });
+
     it.each(variant.requiredResultFields)('rejects a missing or wrong-typed result %s field', (field, wrongValue) => {
       expectRejected(ReportEnvelope, reportEnvelope(variant.command, [without(variant.result, field)]));
       expectRejected(ReportEnvelope, reportEnvelope(variant.command, [{ ...variant.result, [field]: wrongValue }]));
@@ -230,12 +239,20 @@ describe('valid nested schema fixtures', () => {
     expectAccepted(Summary, SUMMARY);
   });
 
+  it('does not require total to equal the sum of the outcome counts', () => {
+    expectAccepted(Summary, { total: 9, passed: 1, failed: 0, errored: 0, skipped: 0 });
+  });
+
   it.each(COMMAND_VARIANTS)('parses a valid $command result item', ({ resultSchema, result }) => {
     expectAccepted(resultSchema, result);
   });
 
   it('parses a valid StepResult fixture', () => {
     expectAccepted(StepResult, STEP_RESULT);
+  });
+
+  it('parses a StepResult without optional diagnostic fields', () => {
+    expectAccepted(StepResult, MINIMAL_STEP_RESULT);
   });
 });
 
@@ -254,10 +271,6 @@ describe('nested strict object boundaries', () => {
 
   it('rejects an unknown Observed property', () => {
     expectRejected(Observed, { ...OBSERVED, unexpected: true });
-  });
-
-  it('rejects an unknown ReportError property', () => {
-    expectRejected(ReportError, { ...CASE_USAGE_ERROR, unexpected: true });
   });
 
   it('rejects an unknown review concern property', () => {
@@ -386,20 +399,33 @@ describe('ReportError', () => {
     expectAccepted(ReportError, error);
   });
 
-  it('rejects a code from the wrong kind vocabulary', () => {
-    expectRejected(ReportError, { scope: 'run', kind: 'usage', code: 'BROWSER_LAUNCH_FAILED', message: 'Wrong kind.' });
+  it('parses a valid optional hint', () => {
+    expectAccepted(ReportError, CASE_USAGE_ERROR);
   });
 
-  it('rejects a mismatched kind and code', () => {
-    expectRejected(ReportError, { scope: 'run', kind: 'environment', code: 'CONFIG_INVALID', message: 'Mismatched pair.' });
+  it.each(REPORT_ERROR_BRANCHES)('rejects an unknown property in the $scope/$kind branch', (error) => {
+    expectRejected(ReportError, { ...error, unexpected: true });
   });
 
-  it('rejects a case error without caseId', () => {
-    expectRejected(ReportError, { scope: 'case', kind: 'usage', code: 'CONFIG_INVALID', message: 'Missing case id.' });
+  it.each(REPORT_ERROR_BRANCHES)('rejects a code from the wrong kind vocabulary in the $scope/$kind branch', (error) => {
+    const code = error.kind === 'usage' ? 'BROWSER_LAUNCH_FAILED' : 'CONFIG_INVALID';
+
+    expectRejected(ReportError, { ...error, code });
   });
 
-  it('rejects a run error carrying caseId', () => {
-    expectRejected(ReportError, { scope: 'run', kind: 'usage', code: 'CONFIG_INVALID', message: 'Unexpected case id.', caseId: 'login-succeeds' });
+  it.each(REPORT_ERROR_BRANCHES)('rejects a kind that does not match the code in the $scope/$kind branch', (error) => {
+    const kind = error.kind === 'usage' ? 'environment' : 'usage';
+
+    expectRejected(ReportError, { ...error, kind });
+  });
+
+  it.each(REPORT_ERROR_BRANCHES)('enforces the caseId rule in the $scope/$kind branch', (error) => {
+    if (error.scope === 'case') {
+      expectRejected(ReportError, without(error, 'caseId'));
+      return;
+    }
+
+    expectRejected(ReportError, { ...error, caseId: 'login-succeeds' });
   });
 
   it.each([
@@ -415,6 +441,10 @@ describe('ReportError', () => {
 
   it('rejects a present but wrong-typed optional hint', () => {
     expectRejected(ReportError, { ...CASE_USAGE_ERROR, hint: 1 });
+  });
+
+  it('rejects an unrecognized error code', () => {
+    expectRejected(ReportError, { ...CASE_USAGE_ERROR, code: 'UNKNOWN_CODE' });
   });
 
   it('rejects unknown scope and kind enum values', () => {
@@ -470,5 +500,15 @@ describe('zero-match reports', () => {
       summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 },
       errors: [],
     }));
+  });
+});
+
+describe('ReportEnvelope command/result and error correlation', () => {
+  it('rejects a result item that is valid only for another command', () => {
+    expectRejected(ReportEnvelope, reportEnvelope('run', [HEAL_RESULT]));
+  });
+
+  it('accepts a non-empty errors array containing a valid ReportError', () => {
+    expectAccepted(ReportEnvelope, reportEnvelope('run', [RUN_RESULT], { errors: [CASE_USAGE_ERROR] }));
   });
 });

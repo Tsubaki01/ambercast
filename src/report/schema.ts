@@ -35,8 +35,8 @@ export type ReportErrorCode = z.infer<typeof ReportErrorCode>;
  * The schema is a flat four-branch `z.union`: `run` × `usage`, `run` ×
  * `environment`, `case` × `usage`, and `case` × `environment`. Every branch
  * has a fixed `scope` and `kind`, a required `message`, and an optional
- * `hint`. A case branch also requires `caseId`; a run branch must not contain
- * `caseId`.
+ * `hint`. A case branch also requires a `caseId` containing at least one
+ * non-whitespace character; a run branch must not contain `caseId`.
  *
  * Each branch scopes `code` to a `z.enum` containing only the
  * {@link ReportErrorCode} values valid for that branch's kind: the seven usage
@@ -71,10 +71,11 @@ export type Summary = z.infer<typeof Summary>;
  * Zod schema for the result of an executed test step.
  *
  * Its shape is `{ id, type, status, kind?, expected?, actual?, screenshot?,
- * observed? }`. `id` is a non-empty string and `type` is one of `action`,
- * `assert`, `capture`, or `ai`. The optional diagnostic `kind` is either
- * `assertion` or `environment`; `expected`, `actual`, `screenshot`, and
- * `observed` are also optional.
+ * observed? }`. `id` is a non-empty string containing at least one
+ * non-whitespace character, and `type` is one of `action`, `assert`,
+ * `capture`, or `ai`. The optional diagnostic `kind` is either `assertion` or
+ * `environment`; `expected`, `actual`, `screenshot`, and `observed` are also
+ * optional.
  *
  * This schema's `type` and diagnostic `kind` are independent axes. They are
  * also unrelated to the IR's `kind` discriminant: the report and IR are
@@ -111,8 +112,9 @@ export type Observed = z.infer<typeof Observed>;
  * Its shape is `{ id, file, planFile, status, durationMs, steps,
  * explanation }`, where `status` is `passed`, `failed`, `error`, or `skipped`;
  * `durationMs` is a non-negative integer; `steps` is an array of
- * {@link StepResult}; and `explanation` is a string. The remaining fields
- * identify the test case and its source and plan files.
+ * {@link StepResult}; and `explanation` is a string. Its `id` and `file` are
+ * non-empty strings that each contain at least one non-whitespace character;
+ * the remaining fields identify the test case and its source and plan files.
  */
 export const RunResult = z.never();
 
@@ -128,8 +130,10 @@ export type RunResult = z.infer<typeof RunResult>;
  * durationMs, steps, explanation }`. Its `status` is `healed`,
  * `partially-healed`, `unresolved`, or `no-changes-needed`; `durationMs` is a
  * non-negative integer; `steps` is an array of {@link StepResult}; and
- * `explanation` is a string. The healing-specific status vocabulary lets
- * consumers distinguish a repair outcome from an ordinary execution outcome.
+ * `explanation` is a string. Its `id` and `file` are non-empty strings that
+ * each contain at least one non-whitespace character. The healing-specific
+ * status vocabulary lets consumers distinguish a repair outcome from an
+ * ordinary execution outcome.
  */
 export const HealResult = z.never();
 
@@ -143,9 +147,10 @@ export type HealResult = z.infer<typeof HealResult>;
  *
  * Its shape is `{ id, file, planFile, status, dryRun, ambiguities }`, where
  * `status` is `generated`, `skipped-fresh`, or `failed`; `dryRun` is a
- * boolean; and `ambiguities` is an array. This variant gives plan generation
- * its own result vocabulary instead of overloading execution-oriented step
- * results.
+ * boolean; and `ambiguities` is an array. Its `id` and `file` are non-empty
+ * strings that each contain at least one non-whitespace character. This
+ * variant gives plan generation its own result vocabulary instead of
+ * overloading execution-oriented step results.
  */
 export const GenerateResult = z.never();
 
@@ -159,9 +164,10 @@ export type GenerateResult = z.infer<typeof GenerateResult>;
  *
  * Its shape is `{ id, file, planFile, status, reason }`, where `status` is
  * `fresh`, `stale`, `orphaned-plan`, `orphaned-grounding`, or `missing-plan`;
- * and `reason` is a string. A dedicated variant keeps validation outcomes
- * machine-readable without implying that every command operates on executable
- * steps.
+ * and `reason` is a string. Its `id` and `file` are non-empty strings that
+ * each contain at least one non-whitespace character. A dedicated variant
+ * keeps validation outcomes machine-readable without implying that every
+ * command operates on executable steps.
  */
 export const CheckResult = z.never();
 
@@ -175,9 +181,10 @@ export type CheckResult = z.infer<typeof CheckResult>;
  *
  * Its shape is `{ id, file, planFile, status, concerns }`, where `status` is
  * `sufficient` or `insufficient`, and `concerns` is an array of objects with
- * `stepId`, `concern`, and `suggestion`. Fixing this shape keeps the single
- * report-schema source of truth complete and avoids a second schema-design
- * pass when the command is wired to the CLI.
+ * `stepId`, `concern`, and `suggestion`. Its `id` and `file` are non-empty
+ * strings that each contain at least one non-whitespace character. Fixing this
+ * shape keeps the single report-schema source of truth complete and avoids a
+ * second schema-design pass when the command is wired to the CLI.
  */
 export const ReviewResult = z.never();
 

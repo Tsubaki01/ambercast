@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { ERROR_EXIT_CODES } from '../../../../src/core/errors/exit-codes.js';
+import { ERROR_EXIT_CODES, type ErrorExitCode } from '../../../../src/core/errors/exit-codes.js';
 import { AmbercastError, type ErrorKind } from '../../../../src/core/errors/types.js';
+
+const EXIT_CODE_GROUP_REPRESENTATIVES = [
+  ['assertion-failed', 1],
+  ['config-invalid', 2],
+  ['browser-launch-failed', 3],
+  ['stale-ir', 4],
+  ['no-tests-found', 5],
+] as const satisfies readonly (readonly [ErrorKind, ErrorExitCode])[];
 
 class TestAmbercastError extends AmbercastError {
   constructor(
@@ -15,10 +23,28 @@ class TestAmbercastError extends AmbercastError {
 
 describe('AmbercastError', () => {
   it('dispatches its exit code through ERROR_EXIT_CODES', () => {
-    for (const kind of ['assertion-failed', 'stale-ir', 'no-tests-found'] as const) {
+    for (const [kind, expectedExitCode] of EXIT_CODE_GROUP_REPRESENTATIVES) {
       const error = new TestAmbercastError(kind, 'The operation failed.');
 
       expect(error.exitCode).toBe(ERROR_EXIT_CODES[kind]);
+      expect(error.exitCode).toBe(expectedExitCode);
+    }
+  });
+
+  it('keeps the exit-code table in ErrorExitCode non-success value space', () => {
+    const errorExitCodes: readonly ErrorExitCode[] = Object.values(ERROR_EXIT_CODES);
+
+    for (const exitCode of errorExitCodes) {
+      expect([1, 2, 3, 4, 5]).toContain(exitCode);
+      expect(exitCode).not.toBe(0);
+    }
+  });
+
+  it('never exposes a success exit code from an AmbercastError instance', () => {
+    for (const kind of Object.keys(ERROR_EXIT_CODES) as ErrorKind[]) {
+      const error = new TestAmbercastError(kind, 'The operation failed.');
+
+      expect(error.exitCode).not.toBe(0);
     }
   });
 
