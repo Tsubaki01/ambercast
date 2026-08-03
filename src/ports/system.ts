@@ -1,50 +1,51 @@
 /**
  * Declares ambient-runtime dependencies that application logic receives
- * explicitly. Isolating these effects keeps deterministic IR work free of
- * direct process, clock, and entropy access.
+ * explicitly.
  */
 import type { StepId } from '#core/ir/schema.js';
 
 /**
- * Supplies wall-clock and monotonic time without coupling callers to a host
- * clock.
+ * Supplies wall-clock instants and elapsed-time readings.
  *
- * Time is a port because deterministic IR digest work must not call a clock
- * directly; the application can instead select a real or fixed source at its
- * composition boundary.
+ * @remarks
+ * Receiving time through a port keeps deterministic IR work free of direct
+ * host-clock access and lets composition select a real or fixed source.
  */
 export interface Clock {
   /**
-   * Gets the current wall-clock instant.
+   * Returns the current wall-clock instant.
    *
-   * @returns A date representing the supplied current instant.
+   * @returns A `Date` representing the supplied current instant.
    */
   now(): Date;
 
   /**
-   * Gets an elapsed-time reading suitable for duration comparisons.
+   * Returns a non-decreasing millisecond reading for duration comparisons.
    *
-   * @returns A non-negative monotonically advancing millisecond value.
+   * This value is not a wall-clock timestamp.
+   *
+   * @returns A monotonic elapsed-time value in milliseconds.
    */
   monotonicMs(): number;
 }
 
 /**
- * Supplies entropy without coupling callers to a process-global generator.
+ * Supplies UUIDs and fractional random values.
  *
- * Randomness is a port for the same reason as time: core IR digest logic must
- * remain deterministic and never obtain random values directly.
+ * @remarks
+ * Receiving randomness through a port keeps deterministic IR work free of a
+ * process-global generator and lets tests provide fixed values.
  */
 export interface RandomSource {
   /**
-   * Generates an RFC 4122-compatible unique identifier.
+   * Generates an RFC 4122-compatible UUID.
    *
-   * @returns A newly supplied UUID string.
+   * @returns A UUID string for a new caller-owned identifier.
    */
   uuid(): string;
 
   /**
-   * Generates a fractional value in the unit interval.
+   * Generates a fractional random value in the unit interval.
    *
    * @returns A value greater than or equal to zero and less than one.
    */
@@ -54,37 +55,39 @@ export interface RandomSource {
 /**
  * Resolves a named secret only at the boundary that needs its value.
  *
- * Keeping a missing secret distinct from an empty string lets callers decide
- * whether absence is an error without revealing a value in an IR artifact.
+ * @remarks
+ * Returning absence separately from an empty string lets callers apply their
+ * own missing-secret policy without placing a secret value in an IR artifact.
  */
 export interface SecretsProvider {
   /**
    * Looks up a secret reference.
    *
    * @param ref - The name or reference understood by this provider.
-   * @returns The secret value, or `undefined` when it is unavailable.
+   * @returns The secret value, or `undefined` when no value is available.
    */
   resolve(ref: string): string | undefined;
 }
 
 /**
- * Provides stable facts about the current execution environment.
+ * Provides stable facts about the execution environment for policy decisions.
  */
 export interface EnvironmentInfo {
   /**
-   * Reports whether the current execution runs under continuous integration.
+   * Determines whether continuous-integration policy should apply.
    *
-   * @returns `true` when CI-specific policy should apply.
+   * @returns `true` when the current execution is running in CI.
    */
   isCI(): boolean;
 }
 
 /**
- * A minimal lifecycle event emitted while executing a run.
+ * A lifecycle event emitted while a run is executing.
  *
- * The variants carry only the step identity and, for results, the resolution
- * path. This keeps the event boundary useful before consumers need richer
- * payloads while preserving additive evolution through a discriminator.
+ * @remarks
+ * The variants intentionally carry only step identity and, for results, the
+ * resolution path. The discriminated union can gain richer payloads later
+ * without making an early reporting boundary needlessly broad.
  */
 export type RunEvent =
   | { readonly type: 'step-start'; readonly stepId: StepId }
@@ -97,13 +100,21 @@ export type RunEvent =
 
 /**
  * Receives run lifecycle events without coupling execution to a reporting
- * transport such as a terminal or notification channel.
+ * transport.
  */
 export interface EventSink {
   /**
-   * Publishes one well-formed run event.
+   * Delivers one well-formed lifecycle event to this sink.
    *
-   * @param event - The lifecycle event to report.
+   * Events are delivered in emission order. Repeated or identical events are
+   * retained as separate deliveries, and this method never throws for a
+   * well-formed {@link RunEvent}.
+   *
+   * @param event - The event to deliver.
+   *
+   * @remarks
+   * A sink that might fail must swallow the failure or queue work internally;
+   * reporting must not interrupt the run loop that emits these events.
    */
   emit(event: RunEvent): void;
 }

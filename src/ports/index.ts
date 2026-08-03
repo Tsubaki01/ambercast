@@ -1,7 +1,5 @@
 /**
  * Groups the application-facing port dependencies used at composition time.
- * The aggregate describes ownership and selection without allowing adapters to
- * treat the shared index as an import shortcut.
  */
 import type { AiExecutor } from './ai.js';
 import type { BrowserDriver, BrowserEngine } from './browser.js';
@@ -15,62 +13,49 @@ import type {
 } from './system.js';
 
 /**
- * Selects the browser driver capable of launching a requested engine.
+ * Resolves the browser driver selected by a target engine.
  *
- * Browser drivers are deferred through a resolver to avoid circular
- * initialization between target selection and adapter composition. The other
- * ports have one already-selected instance and therefore remain direct
- * dependencies.
+ * @param engine - Engine requested by the run's target definition.
+ * @returns The driver that can launch that engine.
+ * @throws If composition cannot provide a compatible driver.
  *
- * @param engine - The target browser engine to support.
- * @returns The driver for that engine.
+ * @remarks
+ * Browser selection occurs only after the target is known. A resolver keeps
+ * that deferred selection explicit, while the other ports are already chosen
+ * direct dependencies.
  */
 export type BrowserDriverResolver = (engine: BrowserEngine) => BrowserDriver;
 
 /**
- * The readonly dependency set supplied to application orchestration.
+ * The immutable port dependencies supplied to application orchestration.
  *
- * Readonly properties prevent a consumer from silently replacing shared
- * infrastructure after composition, keeping dependency wiring explicit.
+ * @remarks
+ * Readonly properties make dependency replacement an explicit composition
+ * change instead of an invisible mutation by a consumer. This shared index is
+ * for runtime composition, not an adapter import shortcut.
  */
 export interface Ports {
-  /**
-   * Selects a browser driver after the run identifies its target engine.
-   */
+  /** Resolves the driver compatible with the target's selected browser engine. */
   readonly browserDriver: BrowserDriverResolver;
 
-  /**
-   * Performs structured and browser-directed AI work.
-   */
+  /** Performs the application's structured and browser-directed AI calls. */
   readonly aiExecutor: AiExecutor;
 
-  /**
-   * Persists text, binary artifacts, and directories.
-   */
+  /** Stores compiled artifacts, run data, and binary diagnostic evidence. */
   readonly storage: StorageAdapter;
 
-  /**
-   * Supplies wall-clock and monotonic time.
-   */
+  /** Provides wall-clock instants and monotonic duration measurements. */
   readonly clock: Clock;
 
-  /**
-   * Supplies UUIDs and fractional random values.
-   */
+  /** Supplies UUIDs and unit-interval values where orchestration needs entropy. */
   readonly random: RandomSource;
 
-  /**
-   * Resolves secret references at their use boundary.
-   */
+  /** Resolves secret references at the point their values are needed. */
   readonly secrets: SecretsProvider;
 
-  /**
-   * Reports stable execution-environment facts.
-   */
+  /** Supplies execution-environment facts that influence runtime policy. */
   readonly environment: EnvironmentInfo;
 
-  /**
-   * Receives run lifecycle events.
-   */
+  /** Receives ordered lifecycle reporting without affecting run execution. */
   readonly events: EventSink;
 }

@@ -12,35 +12,36 @@ import type {
 } from '#core/ir/schema.js';
 
 /**
- * A browser engine supported by the IR target definition.
+ * A browser engine that a target can select for a run.
  *
+ * @remarks
  * Deriving this union from the target contract keeps target validation and
  * driver selection aligned as browser support grows.
  */
 export type BrowserEngine = TargetDefinition['browser'];
 
 /**
- * A portable snapshot captured from a browser session.
- *
- * The accessibility tree remains a serializable {@link JsonValueT}, rather
- * than `unknown`, so consumers can inspect it without an unsafe cast while
- * preserving the value class that can be recorded or transported. Screenshots
- * use `Uint8Array` to avoid imposing a Node-specific binary type.
+ * Paired browser evidence captured at the same point in a session.
  */
 export type PageSnapshot = {
+  /** A serializable accessibility-tree representation for inspection. */
   readonly accessibilityTree: JsonValueT;
+
+  /** Raw screenshot bytes that callers can persist or attach to diagnostics. */
   readonly screenshot: Uint8Array;
 };
 
 /**
- * An action whose values are ready for direct browser execution.
+ * A browser action whose values are ready for direct execution.
  *
- * This intentionally mirrors the trace action vocabulary instead of reusing
- * its unresolved IR shape. The caller that owns run state and secret lookup
- * resolves interpolation and secret references immediately before calling
- * {@link BrowserSession.perform}, so this port never receives either. The
- * separate secret-fill variant remains visible to drivers and tracers as a
- * do-not-log signal after materialization.
+ * `fill-secret` identifies materialized secret data that drivers and tracers
+ * must not log.
+ *
+ * @remarks
+ * This deliberately mirrors, rather than reuses, the unresolved IR action
+ * shape. The caller that owns run state and secret lookup resolves
+ * interpolation and secret references immediately before calling
+ * {@link BrowserSession.perform}, so this port never receives either.
  */
 export type PerformableAction =
   | { readonly type: 'click'; readonly target: ElementRef }
@@ -50,12 +51,13 @@ export type PerformableAction =
   | { readonly type: 'fill-secret'; readonly target: ElementRef; readonly value: string };
 
 /**
- * An assertion whose expected text has been materialized for the current run.
+ * An assertion check with expected values materialized for the current run.
  *
- * As with {@link PerformableAction}, this is a local mirror rather than an IR
- * assertion: the caller resolves interpolated text before evaluating it. Its
- * branches retain targets only where the assertion semantics require an
- * element, avoiding an invented target for page-wide text and URL checks.
+ * @remarks
+ * This is a port-local mirror rather than an IR assertion because the caller
+ * resolves interpolated text before evaluating it. Its branches contain a
+ * target only where the assertion semantics need an element, so callers do
+ * not invent one for page-wide text or URL checks.
  */
 export type AssertCheck =
   | { readonly check: 'text-visible'; readonly text: string }
@@ -65,44 +67,69 @@ export type AssertCheck =
   | { readonly check: 'element-count'; readonly target: ElementRef; readonly count: number };
 
 /**
- * The diagnosable result of evaluating an assertion.
+ * The result of evaluating an assertion check.
  *
- * A failed assertion always carries an explanation, while a passing assertion
- * may include non-failure detail without being forced to do so.
+ * A passing result may include supplemental detail; every failing result
+ * includes a message suitable for diagnosis.
+ *
+ * @remarks
+ * The discriminated shape prevents consumers from accidentally treating an
+ * absent failure explanation as a successful assertion.
  */
 export type AssertOutcome =
   | { readonly passed: true; readonly message?: string }
   | { readonly passed: false; readonly message: string };
 
 /**
- * The browser read strategy to use when capturing an element.
+ * The content to read from an element during capture.
  *
- * Choosing a strategy is run-usecase policy because the IR capture step does
- * not prescribe one. Requiring it from the caller makes that choice explicit
- * and prevents this boundary from silently selecting a default.
+ * @remarks
+ * The IR capture step does not prescribe this choice. Requiring the caller to
+ * choose it keeps future run-usecase policy explicit instead of letting this
+ * boundary silently select a default.
  */
 export type CaptureMode = 'text' | 'value';
 
 /**
- * A live, launched browser session.
- *
- * Its action and assertion operations accept one structured argument because
- * each relevant branch already contains its target; a second target argument
- * would allow two conflicting descriptions of the same element.
+ * The result of checking whether recorded grounding still identifies an
+ * element on the current page.
+ */
+export type GroundedResolution =
+  | {
+      /** The recorded reference remains valid for the current page. */
+      readonly kind: 'hit';
+      /** The live element reference confirmed by the check. */
+      readonly ref: ElementRef;
+    }
+  | {
+      /** The recorded grounding cannot be used for the current page. */
+      readonly kind: 'miss';
+      /** Why the recorded reference could not be resolved safely. */
+      readonly reason: 'fingerprint-mismatch' | 'element-not-found';
+    };
+
+/**
+ * A live browser session owned by the caller until {@link close} resolves.
  */
 export interface BrowserSession {
   /**
    * Executes a fully materialized action.
    *
    * @param action - The action with resolved run and secret values.
+   * @returns Resolves after the action completes.
+   * @throws If the browser cannot complete the action.
    */
   perform(action: PerformableAction): Promise<void>;
 
   /**
    * Evaluates a fully materialized assertion.
    *
-   * @param check - The assertion with any interpolated expected text resolved.
+   * A failed assertion is returned as an {@link AssertOutcome}; browser or
+   * evaluation errors reject instead.
+   *
+   * @param check - The assertion with interpolated expected text resolved.
    * @returns A passing or diagnosable failing outcome.
+   * @throws If the assertion cannot be evaluated.
    */
   evaluateAssert(check: AssertCheck): Promise<AssertOutcome>;
 
@@ -110,41 +137,44 @@ export interface BrowserSession {
    * Reads an element using the caller-selected capture strategy.
    *
    * @param target - The element to read.
-   * @param mode - The explicit text or value strategy to apply.
-   * @returns The captured string, including an allowed empty value.
+   * @param mode - Whether to read visible text or the element value.
+   * @returns The captured string, which may be empty.
+   * @throws If the element cannot be read.
    */
   captureValue(target: ElementRef, mode: CaptureMode): Promise<string>;
 
   /**
-   * Verifies that recorded grounding still identifies a current element.
+   * Checks whether recorded grounding still identifies a current element.
    *
-   * This is a Midscene-style hard gate rather than a Stagehand-style soft
-   * wait: a mismatch must surface as a miss so stale grounding cannot be
-   * mistaken for a match and cause a test to pass against the wrong element.
+   * Nonexistence is checked first and always produces
+   * `element-not-found`, regardless of the supplied fingerprint. A
+   * `fingerprint-mismatch` is returned only when the element exists but its
+   * current fingerprint differs from `fp`.
    *
    * @param ref - The recorded element reference to resolve.
    * @param fp - The recorded fingerprint to verify against the live page.
-   * @returns A hit with the live reference or a reasoned miss.
+   * @returns A confirmed reference or the reason it cannot be used.
+   * @throws If the current page cannot be inspected.
+   *
+   * @remarks
+   * This is a hard gate: a mismatch must remain a miss so stale grounding
+   * cannot be mistaken for a match and direct a test to the wrong element.
    */
-  resolveGrounded(
-    ref: ElementRef,
-    fp: Fingerprint,
-  ): Promise<
-    | { kind: 'hit'; ref: ElementRef }
-    | { kind: 'miss'; reason: 'fingerprint-mismatch' | 'element-not-found' }
-  >;
+  resolveGrounded(ref: ElementRef, fp: Fingerprint): Promise<GroundedResolution>;
 
   /**
-   * Captures the paired evidence used to resolve browser interactions.
+   * Captures the accessibility tree and screenshot used for resolution.
    *
-   * @returns The current serializable accessibility tree and screenshot.
+   * @returns Evidence captured from the current page.
+   * @throws If either representation cannot be captured.
    */
   snapshotForResolution(): Promise<PageSnapshot>;
 
   /**
-   * Captures the current page image without prescribing persistence.
+   * Captures the current page image without prescribing where it is stored.
    *
-   * @returns Screenshot bytes suitable for the caller's storage policy.
+   * @returns Screenshot bytes for the caller's storage policy.
+   * @throws If the screenshot cannot be captured.
    */
   screenshot(): Promise<Uint8Array>;
 
@@ -152,33 +182,36 @@ export interface BrowserSession {
    * Captures the current serializable accessibility representation.
    *
    * @returns The tree evidence used by resolution and diagnostics.
+   * @throws If the accessibility representation cannot be captured.
    */
   accessibilitySnapshot(): Promise<JsonValueT>;
 
   /**
-   * Releases resources held by the browser session.
+   * Releases resources held by the session.
+   *
+   * @throws If the underlying browser resources cannot be released.
    */
   close(): Promise<void>;
 }
 
 /**
- * Launches sessions for one supported browser engine.
+ * Launches browser sessions for one supported engine.
  *
- * Driver selection happens outside the port, allowing a single run to choose
- * the adapter matching its IR target without exposing adapter construction to
+ * @remarks
+ * Driver selection happens outside this port. That lets a run select the
+ * adapter matching its IR target without exposing adapter construction to
  * browser-session consumers.
  */
 export interface BrowserDriver {
-  /**
-   * The engine this driver can launch.
-   */
+  /** Identifies the engine this driver is selected to launch. */
   readonly engine: BrowserEngine;
 
   /**
-   * Starts a session for a validated target.
+   * Starts a session for a target that selects this driver's engine.
    *
    * @param target - The target that supplies the base URL and browser engine.
-   * @returns A session owned by the caller, which must later close it.
+   * @returns A session the caller must later close.
+   * @throws If the target cannot be launched.
    */
   launch(target: TargetDefinition): Promise<BrowserSession>;
 }

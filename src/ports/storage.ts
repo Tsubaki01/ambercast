@@ -1,61 +1,89 @@
 /**
  * Declares the persistence boundary for text, binary artifacts, and directory
- * preparation. Adapters provide the filesystem-specific mechanics while this
- * contract keeps callers independent of a particular storage backend.
+ * preparation.
  */
+
 /**
- * Storage operations required by ambercast artifacts and run data.
+ * Storage operations for ambercast artifacts and run data.
  *
- * Text is always UTF-8 so callers cannot accidentally make artifact encoding
- * a backend-specific choice. Path normalization, listing depth and order, and
- * overwrite behavior are shared behavioral contracts rather than assumptions
- * each implementation may make independently.
+ * Text operations always use UTF-8. Paths and directory names are opaque
+ * strings: this port does not resolve `.` or `..`, or canonicalize separators,
+ * so callers must supply paths already valid for their chosen layout.
+ *
+ * @remarks
+ * Path construction belongs to the layout resolver. Keeping this boundary as
+ * a thin I/O primitive avoids creating a second, potentially divergent set of
+ * path-normalization rules in every storage adapter.
  */
 export interface StorageAdapter {
   /**
-   * Reads a UTF-8 text file.
+   * Reads a UTF-8 regular file.
    *
-   * @param path - The storage path to read.
-   * @returns The file contents.
+   * @param path - Opaque path of the file to read.
+   * @returns The decoded text content.
+   * @throws An `Error` if `path` is missing or names a directory.
    */
   readText(path: string): Promise<string>;
 
   /**
-   * Writes UTF-8 text to a storage path.
+   * Writes UTF-8 text to a file.
    *
-   * @param path - The storage path to write.
-   * @param content - The text to persist.
+   * Missing parent directories are created automatically. Existing content at
+   * `path` is replaced without an exclusive-create mode.
+   *
+   * @param path - Opaque path of the file to write.
+   * @param content - Text to encode as UTF-8.
+   * @throws If the backend cannot create parents or write the file.
    */
   writeText(path: string, content: string): Promise<void>;
 
   /**
-   * Writes binary data without converting it through a text encoding.
+   * Reads a regular file as its original bytes.
    *
-   * @param path - The storage path to write.
-   * @param content - The bytes to persist.
+   * @param path - Opaque path of the file to read.
+   * @returns The file bytes without text decoding.
+   * @throws An `Error` if `path` is missing or names a directory.
+   */
+  readBinary(path: string): Promise<Uint8Array>;
+
+  /**
+   * Writes binary data to a file without text encoding.
+   *
+   * Missing parent directories are created automatically. Existing content at
+   * `path` is silently replaced.
+   *
+   * @param path - Opaque path of the file to write.
+   * @param content - Bytes to persist.
+   * @throws If the backend cannot create parents or write the file.
    */
   writeBinary(path: string, content: Uint8Array): Promise<void>;
 
   /**
-   * Determines whether a path currently exists.
+   * Checks whether a path names a regular file.
    *
-   * @param path - The storage path to inspect.
-   * @returns Whether the path exists.
+   * @param path - Opaque path to inspect.
+   * @returns `true` only for an existing regular file. Missing paths and
+   * directories both resolve to `false`; this method never rejects.
    */
   exists(path: string): Promise<boolean>;
 
   /**
-   * Lists files held by a directory according to the shared storage contract.
+   * Lists regular files directly inside a directory.
    *
-   * @param dir - The directory to list.
-   * @returns The paths selected by the adapter's contract-defined listing.
+   * @param dir - Opaque directory path to inspect.
+   * @returns Lexicographically ascending bare file names. Subdirectories are
+   * excluded, listing is not recursive, and both missing and empty directories
+   * resolve to an empty array.
+   * @throws If an existing directory cannot be listed.
    */
   listFiles(dir: string): Promise<readonly string[]>;
 
   /**
-   * Ensures a directory is available for later writes.
+   * Creates a directory for later use when it does not already exist.
    *
-   * @param dir - The directory to create or retain.
+   * @param dir - Opaque directory path to create.
+   * @returns Resolves without effect when the directory already exists.
+   * @throws If the backend cannot create the directory.
    */
   ensureDir(dir: string): Promise<void>;
 }

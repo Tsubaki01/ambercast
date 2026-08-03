@@ -1,90 +1,75 @@
 /**
  * Declares the AI boundary for structured compilation calls and browser-led
- * agentic work. The two interaction modes have deliberately different
- * contracts so adapters cannot blur a deterministic response request with
- * iterative browser control.
+ * agentic work.
  */
 import type { JsonValueT } from '#core/ir/schema.js';
 
 import type { BrowserSession, PerformableAction } from './browser.js';
 
 /**
- * An opaque response schema supplied to an AI adapter.
+ * An object-form response schema passed to an AI adapter for validation.
  *
- * The port transports this data but does not interpret JSON Schema itself, so
- * a small record is sufficient and avoids coupling the port to zod's schema
- * implementation types.
+ * @remarks
+ * The port transports a schema but never interprets it. A small local record
+ * therefore avoids coupling port consumers to a particular validation
+ * library's implementation types.
  */
 export type JsonSchema = Record<string, unknown>;
 
 /**
- * Token use reported by an AI provider when available.
+ * Optional provider-reported token accounting for one AI call.
+ *
+ * Omitted fields mean the provider did not supply that measurement.
  */
 export interface AiUsage {
-  /**
-   * Tokens accepted as input by the provider.
-   */
+  /** Tokens the provider counted for the submitted prompt and context. */
   readonly inputTokens?: number;
 
-  /**
-   * Tokens emitted as output by the provider.
-   */
+  /** Tokens the provider counted for the generated response. */
   readonly outputTokens?: number;
 }
 
 /**
- * The input to one schema-constrained AI response request.
+ * Inputs for one structured AI response request.
  */
 export interface AiExecuteRequest {
-  /**
-   * The complete instruction sent to the provider.
-   */
+  /** Complete instructions sent to the provider. */
   readonly prompt: string;
 
-  /**
-   * The schema the adapter uses to validate the response.
-   */
+  /** Response shape that the adapter validates before returning data. */
   readonly responseSchema: JsonSchema;
 
-  /**
-   * Optional serializable context retained with the request.
-   */
+  /** Serializable caller context sent with the request when needed. */
   readonly context?: JsonValueT;
 
-  /**
-   * Cancellation signal forwarded to the provider when it supports one.
-   */
+  /** Cancellation signal forwarded to a provider that supports cancellation. */
   readonly signal?: AbortSignal;
 }
 
 /**
- * A validated result from one schema-constrained AI response request.
+ * A validated structured AI response with its unparsed provider output.
  *
- * @typeParam T - The validated response value.
+ * @typeParam T - The expected shape of the validated response data.
  */
 export interface AiExecuteResult<T> {
-  /**
-   * The response after adapter validation.
-   */
+  /** Data after the adapter validates it against the supplied response schema. */
   readonly data: T;
 
-  /**
-   * The unparsed provider response retained for diagnostics.
-   */
+  /** Original provider output retained for diagnostics. */
   readonly raw: string;
 
-  /**
-   * Provider-reported token use, when the provider supplies it.
-   */
+  /** Provider accounting, when the provider supplies it. */
   readonly usage?: AiUsage;
 }
 
 /**
- * The browser operations an agentic AI call may direct.
+ * Browser operations available to an agentic AI call.
  *
- * This compile-time projection excludes the rest of `BrowserSession`, keeping
- * an AI adapter from depending on another port's raw object or unrelated
- * lifecycle and capture capabilities.
+ * @remarks
+ * This compile-time projection limits the controller contract to the browser
+ * operations agentic execution needs. It does not remove other methods from a
+ * runtime object; creating a runtime projection, if required, belongs to the
+ * composition layer.
  */
 export type AiActionController = Pick<
   BrowserSession,
@@ -92,86 +77,84 @@ export type AiActionController = Pick<
 >;
 
 /**
- * The input to an AI-directed browser interaction.
+ * Inputs for an AI-directed browser interaction.
  */
 export interface AiAgenticRequest {
-  /**
-   * The instruction that guides the browser-directed interaction.
-   */
+  /** Instructions that guide the browser-directed interaction. */
   readonly instructionPrompt: string;
 
-  /**
-   * The narrowly scoped browser control surface available to the AI adapter.
-   */
+  /** Browser operations the adapter may direct while handling this request. */
   readonly controller: AiActionController;
 
-  /**
-   * Prior materialized actions that provide optional interaction context.
-   */
+  /** Materialized actions from earlier interaction, when they aid context. */
   readonly priorTrace?: readonly PerformableAction[];
 
-  /**
-   * Cancellation signal forwarded to the provider when it supports one.
-   */
+  /** Cancellation signal forwarded to a provider that supports cancellation. */
   readonly signal?: AbortSignal;
 }
 
 /**
- * The outcome and trace produced by an AI-directed browser interaction.
+ * The outcome of an AI-directed browser interaction and its performed trace.
  */
 export interface AiAgenticResult {
   /**
-   * The materialized actions performed or proposed during the interaction.
+   * Actions the controller actually performed during this call, in order.
+   *
+   * On a `failure` outcome this remains the true partial record through the
+   * failure point; it never contains proposed, predicted, or hypothetical
+   * completion actions.
    */
   readonly trace: readonly PerformableAction[];
 
-  /**
-   * Whether the agentic interaction reached its requested outcome.
-   */
+  /** Whether the interaction completed its requested outcome. */
   readonly outcome: 'success' | 'failure';
 
-  /**
-   * Provider-reported token use, when the provider supplies it.
-   */
+  /** Provider accounting, when the provider supplies it. */
   readonly usage?: AiUsage;
 }
 
 /**
- * An AI implementation capable of structured and browser-directed work.
+ * An AI implementation for structured responses and browser-directed work.
  *
- * `execute` and `executeAgentic` stay separate because their control models
- * differ fundamentally: one returns a schema-validated response, while the
- * other receives a browser controller and produces an interaction trace. A
- * single generic method would hide that boundary and make incompatible call
- * contracts easier to conflate.
+ * @remarks
+ * Structured execution returns a schema-validated value, whereas agentic
+ * execution controls a browser and produces a performed trace. Keeping them
+ * as separate methods makes their incompatible call contracts explicit.
  */
 export interface AiExecutor {
-  /**
-   * The supported command-line provider implementation.
-   */
+  /** Identifies the command-line provider integration behind this executor. */
   readonly name: 'claude-code-cli' | 'codex-cli';
 
   /**
    * Obtains and validates one structured response.
    *
-   * @typeParam T - The caller-asserted expected response type.
-   * @param request - The prompt, response schema, and optional context.
-   * @returns The validated result and optional provider usage.
+   * @typeParam T - The caller's expected response type.
+   * @param request - Instructions, response schema, and optional context.
+   * @returns The validated data, raw output, and any provider accounting.
+   * @throws If the provider is unavailable, the request is cancelled, or a
+   * response cannot be obtained or validated.
    */
   execute<T>(request: AiExecuteRequest): Promise<AiExecuteResult<T>>;
 
   /**
    * Performs an AI-directed interaction through the supplied controller.
    *
-   * @param request - The instruction, controller, and optional prior trace.
-   * @returns The resulting action trace and success state.
+   * A completed call may return `outcome: 'failure'` with its partial,
+   * actually performed trace; transport, cancellation, and execution errors
+   * reject instead.
+   *
+   * @param request - Instructions, browser controller, and optional trace.
+   * @returns The interaction outcome and actions actually performed.
+   * @throws If the request cannot be performed.
    */
   executeAgentic(request: AiAgenticRequest): Promise<AiAgenticResult>;
 
   /**
-   * Reports whether this implementation can currently accept requests.
+   * Checks whether this executor can currently accept requests.
    *
-   * @returns `true` when the executor is available for use.
+   * @returns `true` when callers may issue requests and `false` when it is
+   * unavailable.
+   * @throws If availability cannot be determined.
    */
   isAvailable(): Promise<boolean>;
 }
