@@ -1,8 +1,10 @@
+import { ERROR_EXIT_CODES } from './exit-codes.js';
+
 /**
  * Declares the shared vocabulary and base class for failures that Ambercast can
  * classify before choosing its process outcome. Keeping classification on an
  * abstract error preserves a consistent boundary between domain failures and
- * the use cases that eventually create their concrete variants.
+ * the use cases that create their concrete variants.
  */
 
 /**
@@ -53,12 +55,11 @@ export abstract class AmbercastError extends Error {
    * Gets the non-success process status associated with this error.
    *
    * @remarks
-   * The eventual getter will resolve the classification through the central
-   * error-to-exit-code table, so every concrete error follows one authoritative
-   * mapping.
+   * The getter resolves the classification through the central error-to-exit-
+   * code table, so every concrete error follows one authoritative mapping.
    */
   get exitCode(): ExitCode {
-    throw new Error('not implemented');
+    return ERROR_EXIT_CODES[this.kind];
   }
 
   /**
