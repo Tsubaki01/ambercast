@@ -12,6 +12,7 @@ export interface EventSinkContractHarness {
 const START_EVENT: RunEvent = { type: 'step-start', stepId: 'open-page' };
 const RESULT_EVENT: RunEvent = { type: 'step-result', stepId: 'open-page', via: 'grounding' };
 const AI_RESOLVED_EVENT: RunEvent = { type: 'step-result', stepId: 'resolve-form', via: 'ai-resolve' };
+const TRACE_REPLAYED_EVENT: RunEvent = { type: 'step-result', stepId: 'replay-trace', via: 'trace-replay' };
 const AI_CALL_EVENT: RunEvent = { type: 'ai-call', stepId: 'resolve-form' };
 
 export function registerEventSinkContract(harness: EventSinkContractHarness): void {
@@ -47,7 +48,16 @@ export function registerEventSinkContract(harness: EventSinkContractHarness): vo
         expect(() => recording.sink.emit(START_EVENT)).not.toThrow();
         expect(() => recording.sink.emit(RESULT_EVENT)).not.toThrow();
         expect(() => recording.sink.emit(AI_RESOLVED_EVENT)).not.toThrow();
+        expect(() => recording.sink.emit(TRACE_REPLAYED_EVENT)).not.toThrow();
         expect(() => recording.sink.emit(AI_CALL_EVENT)).not.toThrow();
+
+        expect(recording.emitted()).toEqual([
+          START_EVENT,
+          RESULT_EVENT,
+          AI_RESOLVED_EVENT,
+          TRACE_REPLAYED_EVENT,
+          AI_CALL_EVENT,
+        ]);
       } finally {
         await harness.dispose?.();
       }
