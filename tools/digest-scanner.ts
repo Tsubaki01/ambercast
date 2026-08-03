@@ -20,8 +20,9 @@ export interface DigestCallSite {
  * it compares declaration identity so renamed imports and namespace calls
  * cannot bypass the digest-input containment contract. The
  * scanner returns every resolved call, with a violation only when its argument
- * is not one spread-free inline object literal. Derived nondeterminism inside a
- * scalar remains outside the scope of this structural check.
+ * is not one spread-free inline object literal after removing transparent
+ * TypeScript wrappers. Derived nondeterminism inside a scalar remains outside
+ * the scope of this structural check.
  */
 export function scanComputeInputsDigestCalls(
   program: ts.Program,
@@ -62,12 +63,35 @@ export function scanComputeInputsDigestCalls(
     return resolvedSymbol.declarations?.includes(targetDeclaration) ?? false;
   }
 
+  /**
+   * Removes syntax-only expression wrappers before enforcing the digest input
+   * contract. Parentheses and TypeScript assertions do not change the runtime
+   * object passed to the function, so treating them as a different input shape
+   * would reject valid calls; inspecting the final expression also ensures a
+   * spread nested inside any number of wrappers remains visible.
+   */
+  function unwrapDigestArgument(expression: ts.Expression): ts.Expression {
+    let unwrapped = expression;
+
+    while (
+      ts.isParenthesizedExpression(unwrapped)
+      || ts.isAsExpression(unwrapped)
+      || ts.isSatisfiesExpression(unwrapped)
+      || ts.isTypeAssertionExpression(unwrapped)
+    ) {
+      unwrapped = unwrapped.expression;
+    }
+
+    return unwrapped;
+  }
+
   function visit(sourceFile: ts.SourceFile, node: ts.Node): void {
     if (ts.isCallExpression(node) && resolvesToDigestDeclaration(node.expression)) {
       const argument = node.arguments.length === 1 ? node.arguments[0] : undefined;
-      const violation = argument === undefined || !ts.isObjectLiteralExpression(argument)
+      const unwrappedArgument = argument === undefined ? undefined : unwrapDigestArgument(argument);
+      const violation = unwrappedArgument === undefined || !ts.isObjectLiteralExpression(unwrappedArgument)
         ? 'argument-must-be-inline-object-literal'
-        : argument.properties.some(ts.isSpreadAssignment)
+        : unwrappedArgument.properties.some(ts.isSpreadAssignment)
           ? 'argument-must-not-contain-spread'
           : undefined;
       const position = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));

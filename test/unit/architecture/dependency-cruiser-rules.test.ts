@@ -253,6 +253,7 @@ describe('dependency-cruiser architecture rules', () => {
       'core-is-leaf',
       'ports-boundary',
       'adapters-no-sibling-reachover',
+      'adapters-root-files-no-imports',
       'adapters-http-boundary',
       'usecases-boundary',
       'report-boundary',
@@ -263,6 +264,24 @@ describe('dependency-cruiser architecture rules', () => {
       'build-tools-boundary',
       'global-types-boundary',
     ]));
+  });
+
+  test('forbids every import from a flat adapters-root file', async () => {
+    const result = await cruiseFixture(fixturePath('adapters-root-file', 'violation'));
+
+    expect(result.summary.violations).toEqual([
+      expect.objectContaining({
+        from: 'src/adapters/synthetic-adapter.ts',
+        rule: expect.objectContaining({ name: 'adapters-root-files-no-imports' }),
+        to: 'src/core/synthetic-core.ts',
+      }),
+    ]);
+  });
+
+  test('permits a flat adapters-root file only when it has no imports', async () => {
+    const result = await cruiseFixture(fixturePath('adapters-root-file', 'compliant'));
+
+    expect(result.summary.violations).toEqual([]);
   });
 
   test('configures pre-compilation dependency data for types-only rules', () => {

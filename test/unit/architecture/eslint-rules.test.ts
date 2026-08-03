@@ -28,6 +28,7 @@ interface BoundariesFixtureCase {
 interface PolicyLayer {
   readonly path: string;
   readonly carveOut?: { readonly path: string };
+  readonly fallbackPath?: string;
 }
 
 function restrictedSyntaxMessages(code: string, filename: string) {
@@ -104,6 +105,10 @@ function policyRolesForSourcePath(sourcePath: string): string[] {
       return [role];
     }
 
+    if (layer.fallbackPath !== undefined && new RegExp(layer.fallbackPath).test(sourcePath)) {
+      return ['adapters-root-file'];
+    }
+
     return layer.carveOut !== undefined && new RegExp(layer.carveOut.path).test(sourcePath)
       ? ['adapters-http']
       : [];
@@ -145,7 +150,7 @@ const boundariesFixtureCases: readonly BoundariesFixtureCase[] = [
   {
     id: 'core-boundary',
     source: 'src/core/synthetic-core.ts',
-    expectedMessage: 'There is no policy allowing dependencies from elements of type "core" to elements of type "adapters"',
+    expectedMessage: 'There is no policy allowing dependencies from elements of type "core" to elements of type "adapters-root-file"',
   },
   {
     id: 'usecases-ports',
@@ -171,6 +176,11 @@ const boundariesFixtureCases: readonly BoundariesFixtureCase[] = [
     id: 'adapters-storage-ports',
     source: 'src/adapters/storage/synthetic-storage.ts',
     expectedMessage: 'There is no policy allowing dependencies from elements of type "adapters" and captured values: family="storage" to file of category "ports-module" and captured values: family="ai" belonging to elements of type "ports"',
+  },
+  {
+    id: 'adapters-root-file',
+    source: 'src/adapters/synthetic-adapter.ts',
+    expectedMessage: 'There is no policy allowing dependencies from elements of type "adapters-root-file" to elements of type "core"',
   },
 ];
 
@@ -305,6 +315,7 @@ describe('ESLint architecture and determinism rules', () => {
 
     expect(policyRolesForSourcePath('src/index.ts')).toEqual(['public-entry']);
     expect(policyRolesForSourcePath('src/global.d.ts')).toEqual(['global-types']);
+    expect(policyRolesForSourcePath('src/adapters/synthetic-adapter.ts')).toEqual(['adapters-root-file']);
   });
 
   test('reports no unknown-file diagnostic for every current source file', async () => {

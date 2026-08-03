@@ -28,7 +28,10 @@
  * own runtime-consumer boundary. Runtime permits the standard adapter path
  * only, and its dedicated HTTP target rule prevents the opposite half of a
  * cycle. The standard adapter's captured family permits only its matching
- * port-module file; a shared ports index is not an allowance.
+ * port-module file; a shared ports index is not an allowance. A flat file at
+ * the adapters root cannot represent a family and is therefore subject to a
+ * separate no-import rule; this conservative fallback prevents a filename
+ * from being used as a fictitious family capture.
  *
  * External allow-lists are also compiled from each role. An approved builtin
  * must resolve with dependency type `core`; an approved package must resolve
@@ -108,6 +111,15 @@ function internalBoundaryRule(name, layer, additionalAllowedPaths = []) {
   };
 }
 
+function noImportsRule(name, path) {
+  return {
+    name,
+    severity: 'error',
+    from: { path },
+    to: {},
+  };
+}
+
 function typesOnlyEdge(name, from, to) {
   return {
     name,
@@ -119,6 +131,7 @@ function typesOnlyEdge(name, from, to) {
 
 const standardAdapter = LAYERS.adapters;
 const httpAdapter = standardAdapter.carveOut;
+const standardAdapterOrRootFilePath = `(?:${standardAdapter.path}|${standardAdapter.fallbackPath})`;
 const NPM_DEPENDENCY_TYPES = [
   'npm',
   'npm-bundled',
@@ -190,7 +203,7 @@ const roleBoundaryNames = Object.freeze({
 });
 const specializedBoundaryTargetPaths = Object.freeze({
   runtime: [httpAdapter.path],
-  usecases: [standardAdapter.path],
+  usecases: [standardAdapterOrRootFilePath],
 });
 const declaredRoles = [
   ...Object.entries(LAYERS),
@@ -201,9 +214,20 @@ const internalBoundaryRules = declaredRoles.map(([role, layer]) => internalBound
   layer,
   specializedBoundaryTargetPaths[role] ?? [],
 ));
+const adaptersRootFileRule = noImportsRule(
+  'adapters-root-files-no-imports',
+  standardAdapter.fallbackPath,
+);
 const typesOnlyRules = Object.entries(LAYERS).flatMap(([role, layer]) => layer.mayImport
   .filter((target) => target.typesOnly)
-  .map((target) => typesOnlyEdge(TYPE_ONLY_RULE_NAMES[`${role}:${target.layer}`], layer, LAYERS[target.layer])));
+  .map((target) => typesOnlyEdge(
+    TYPE_ONLY_RULE_NAMES[`${role}:${target.layer}`] ?? `${role}-${target.layer}-types-only`,
+    layer,
+    LAYERS[target.layer],
+  )));
+const externalAllowlistRules = Object.entries(LAYERS)
+  .filter(([, layer]) => layer.externalAllow !== undefined)
+  .flatMap(([role, layer]) => externalAllowRules(role, layer));
 
 /**
  * The dependency-cruiser configuration consumed by the CLI and fixture tests.
@@ -213,11 +237,12 @@ const typesOnlyRules = Object.entries(LAYERS).flatMap(([role, layer]) => layer.m
 export default {
   forbidden: [
     ...internalBoundaryRules,
+    adaptersRootFileRule,
     {
       name: 'usecases-no-concrete-adapters',
       severity: 'error',
       from: { path: LAYERS.usecases.path },
-      to: { path: standardAdapter.path },
+      to: { path: standardAdapterOrRootFilePath },
     },
     {
       name: 'adapters-http-runtime-only',
@@ -226,8 +251,7 @@ export default {
       to: { path: httpAdapter.path },
     },
     ...typesOnlyRules,
-    ...externalAllowRules('core', LAYERS.core),
-    ...externalAllowRules('build-tools', LAYERS['build-tools']),
+    ...externalAllowlistRules,
   ],
   options: {
     tsPreCompilationDeps: 'specify',

@@ -29,12 +29,15 @@
  *   basename as `family`, allowing an adapter family to target only its own
  *   interface file.
  * - `adapters` has mutually exclusive standard and HTTP matchers. The
- *   standard matcher is rooted at `src/adapters/<family>` and explicitly
+ *   standard matcher is rooted at `src/adapters/<family>/` and explicitly
  *   excludes the `http` family; it may import `core`, its own adapter family,
  *   and its implemented port module. By convention, that module has the same
  *   base file name as the adapter family: `adapters/storage/**` may import
  *   `ports/storage.ts`, but not `ports/ai.ts` or a different family's port
- *   module. The specialized `src/adapters/http` matcher may import `runtime`
+ *   module. A flat module directly below `src/adapters/` is instead an
+ *   `adapters-root-file` fallback with no import permissions: it is malformed
+ *   for the family convention, so the safest contract prevents its filename
+ *   from becoming a fictitious family. The specialized `src/adapters/http` matcher may import `runtime`
  *   only. The standard adapter policy compares the captured adapter and port
  *   families, and fixture tests exercise that convention with synthetic names.
  * - `usecases` is rooted at `src/usecases` and may import `core`, `usecases`,
@@ -90,14 +93,15 @@ export const LAYERS = Object.freeze({
   },
   adapters: {
     root: 'src/adapters',
-    path: '^src/adapters/(?!http(?:/|$))([^/]+)(?:/|$)',
+    path: '^src/adapters/(?!http(?:/|$))([^/]+)/',
     element: {
       type: 'adapters',
       pattern: 'src/adapters/*',
       capture: ['family'],
       partialMatch: false,
     },
-    fallbackElement: { type: 'adapters', pattern: 'src/adapters', partialMatch: false },
+    fallbackPath: '^src/adapters/[^/]+$',
+    fallbackElement: { type: 'adapters-root-file', pattern: 'src/adapters', partialMatch: false },
     mayImport: [
       { layer: 'core' },
       { layer: 'ports', matchingFamily: true },

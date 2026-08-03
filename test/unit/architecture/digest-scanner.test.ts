@@ -96,6 +96,60 @@ describe('scanComputeInputsDigestCalls()', () => {
     );
   });
 
+  test('records a clean literal wrapped in an as-expression as compliant', async () => {
+    await withSyntheticProgram(
+      [
+        "import { computeInputsDigest, type DigestInputs } from '../core/ir/digest.js';",
+        'computeInputsDigest(({ schemaVersion: 1 }) as DigestInputs);',
+      ].join('\n'),
+      (program, digestModuleFileName, callerFileName) => {
+        expectOneSaneCallSite(program, digestModuleFileName, callerFileName, undefined);
+      },
+    );
+  });
+
+  test('records a clean literal wrapped in a satisfies-expression as compliant', async () => {
+    await withSyntheticProgram(
+      [
+        "import { computeInputsDigest, type DigestInputs } from '../core/ir/digest.js';",
+        'computeInputsDigest(({ schemaVersion: 1 }) satisfies DigestInputs);',
+      ].join('\n'),
+      (program, digestModuleFileName, callerFileName) => {
+        expectOneSaneCallSite(program, digestModuleFileName, callerFileName, undefined);
+      },
+    );
+  });
+
+  test('records a clean literal wrapped in redundant parentheses as compliant', async () => {
+    await withSyntheticProgram(
+      [
+        "import { computeInputsDigest } from '../core/ir/digest.js';",
+        'computeInputsDigest((({ schemaVersion: 1 })));',
+      ].join('\n'),
+      (program, digestModuleFileName, callerFileName) => {
+        expectOneSaneCallSite(program, digestModuleFileName, callerFileName, undefined);
+      },
+    );
+  });
+
+  test('rejects a spread hidden inside a type wrapper', async () => {
+    await withSyntheticProgram(
+      [
+        "import { computeInputsDigest, type DigestInputs } from '../core/ir/digest.js';",
+        'const wider = { schemaVersion: 1 };',
+        'computeInputsDigest(({ ...wider }) as DigestInputs);',
+      ].join('\n'),
+      (program, digestModuleFileName, callerFileName) => {
+        expectOneSaneCallSite(
+          program,
+          digestModuleFileName,
+          callerFileName,
+          'argument-must-not-contain-spread',
+        );
+      },
+    );
+  });
+
   test('rejects a direct call with a bare identifier', async () => {
     await withSyntheticProgram(
       [

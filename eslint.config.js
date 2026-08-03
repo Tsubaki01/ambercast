@@ -59,8 +59,8 @@ const BOUNDARY_FILES = ['src/**/*.ts', 'test/**/*.ts'];
 const STANDARD_ADAPTER = LAYERS.adapters;
 const HTTP_ADAPTER = STANDARD_ADAPTER.carveOut;
 
-function elementSelector(layer, options = {}) {
-  return { element: { type: layer.element.type, ...options } };
+function elementSelector(element, options = {}) {
+  return { element: { type: element.type, ...options } };
 }
 
 function roleSelector(layer, options = {}) {
@@ -68,7 +68,7 @@ function roleSelector(layer, options = {}) {
     return { file: { categories: layer.file.category, ...options } };
   }
 
-  return elementSelector(layer, options);
+  return elementSelector(layer.element, options);
 }
 
 function importPolicy(target) {
@@ -122,8 +122,14 @@ const boundaryPolicies = [
     .filter((layer) => layer !== STANDARD_ADAPTER)
     .map(layerPolicy),
   {
-    from: elementSelector(HTTP_ADAPTER),
+    from: elementSelector(HTTP_ADAPTER.element),
     allow: HTTP_ADAPTER.mayImport.map(importPolicy),
+  },
+  // A root-level adapter file has no family capture, so it must not inherit
+  // the standard adapter's cross-layer permissions.
+  {
+    from: elementSelector(STANDARD_ADAPTER.fallbackElement),
+    allow: [],
   },
   layerPolicy(STANDARD_ADAPTER),
 ];
