@@ -14,5 +14,7 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['test/**/*.test.ts'],
+    // TypeScript compiler and dependency-cruiser tests can contend for CPU on CI runners.
+    testTimeout: 30_000,
   },
 });
