@@ -126,11 +126,6 @@ export const Summary = z.strictObject({
  */
 export type Summary = z.infer<typeof Summary>;
 
-const ObservedSchema = z.strictObject({
-  note: z.literal(OBSERVED_NOTE),
-  accessibilitySnapshot: z.string(),
-}).describe(OBSERVED_NOTE);
-
 /**
  * Zod schema for the accessibility evidence attached to an observed
  * diagnostic.
@@ -139,7 +134,10 @@ const ObservedSchema = z.strictObject({
  * The fixed disclaimer is part of the prompt-injection isolation contract, so
  * a missing or altered value is rejected rather than silently accepted.
  */
-export const Observed = ObservedSchema;
+export const Observed = z.strictObject({
+  note: z.literal(OBSERVED_NOTE),
+  accessibilitySnapshot: z.string(),
+}).describe(OBSERVED_NOTE);
 
 /**
  * Accessibility evidence retained with an observed step diagnostic.
@@ -165,7 +163,7 @@ export const StepResult = z.strictObject({
   expected: z.string().optional(),
   actual: z.string().optional(),
   screenshot: z.string().optional(),
-  observed: ObservedSchema.optional(),
+  observed: Observed.optional(),
 });
 
 /**

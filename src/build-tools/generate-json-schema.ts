@@ -45,6 +45,6 @@ if (import.meta.url === url.pathToFileURL(process.argv[1] ?? '').href) {
   mkdirSync(outDir, { recursive: true });
   writeJsonSchemaFiles({
     outDir,
-    writeFile: (path, content) => writeFileSync(path, content),
+    writeFile: writeFileSync,
   });
 }
