@@ -45,4 +45,18 @@ describe('createProcessEnvironmentInfo()', () => {
       restoreEnvironmentVariable('CI', previousCi);
     }
   });
+
+  it('reads CI from the live process environment after construction', () => {
+    const previousCi = process.env.CI;
+
+    try {
+      delete process.env.CI;
+      const environment = createProcessEnvironmentInfo();
+      process.env.CI = 'true';
+
+      expect(environment.isCI()).toBe(true);
+    } finally {
+      restoreEnvironmentVariable('CI', previousCi);
+    }
+  });
 });

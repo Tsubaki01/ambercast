@@ -20,8 +20,7 @@ describe('readConfigEnvironment()', () => {
 
       const snapshot = readConfigEnvironment();
 
-      expect(snapshot.configPathOverride).toBeUndefined();
-      expect(snapshot.aiProviderRaw).toBeUndefined();
+      expect(snapshot).toStrictEqual({});
     } finally {
       restoreEnvironmentVariable('AMBERCAST_CONFIG', previousConfig);
       restoreEnvironmentVariable('AMBERCAST_AI_PROVIDER', previousProvider);
@@ -39,6 +38,39 @@ describe('readConfigEnvironment()', () => {
       expect(readConfigEnvironment()).toEqual({
         aiProviderRaw: 'codex',
         configPathOverride: 'configs/ambercast.local.json',
+      });
+    } finally {
+      restoreEnvironmentVariable('AMBERCAST_CONFIG', previousConfig);
+      restoreEnvironmentVariable('AMBERCAST_AI_PROVIDER', previousProvider);
+    }
+  });
+
+  it('captures an unsupported AI provider verbatim without validation', () => {
+    const previousConfig = process.env.AMBERCAST_CONFIG;
+    const previousProvider = process.env.AMBERCAST_AI_PROVIDER;
+
+    try {
+      delete process.env.AMBERCAST_CONFIG;
+      process.env.AMBERCAST_AI_PROVIDER = 'not-a-real-provider';
+
+      expect(readConfigEnvironment()).toStrictEqual({ aiProviderRaw: 'not-a-real-provider' });
+    } finally {
+      restoreEnvironmentVariable('AMBERCAST_CONFIG', previousConfig);
+      restoreEnvironmentVariable('AMBERCAST_AI_PROVIDER', previousProvider);
+    }
+  });
+
+  it('captures whitespace-only configuration variables verbatim', () => {
+    const previousConfig = process.env.AMBERCAST_CONFIG;
+    const previousProvider = process.env.AMBERCAST_AI_PROVIDER;
+
+    try {
+      process.env.AMBERCAST_CONFIG = '   ';
+      process.env.AMBERCAST_AI_PROVIDER = '   ';
+
+      expect(readConfigEnvironment()).toStrictEqual({
+        aiProviderRaw: '   ',
+        configPathOverride: '   ',
       });
     } finally {
       restoreEnvironmentVariable('AMBERCAST_CONFIG', previousConfig);
