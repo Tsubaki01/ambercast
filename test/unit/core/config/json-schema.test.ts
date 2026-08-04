@@ -34,6 +34,7 @@ describe('config JSON Schema document', () => {
     ['the highest valid viewer port', { $schema: CONFIG_SCHEMA_URL, viewer: { port: 65_535 } }, true],
     ['a viewer port below the range', { $schema: CONFIG_SCHEMA_URL, viewer: { port: 0 } }, false],
     ['a viewer port above the range', { $schema: CONFIG_SCHEMA_URL, viewer: { port: 65_536 } }, false],
+    ['a non-integer viewer port', { $schema: CONFIG_SCHEMA_URL, viewer: { port: 1.5 } }, false],
   ] as const)('matches RawConfig for %s', (_name, document, expected) => {
     const validator = new Ajv2020({ strict: true }).compile(getConfigJsonSchema());
     const zodVerdict = RawConfig.safeParse(document).success;

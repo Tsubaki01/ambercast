@@ -6,10 +6,10 @@
  * locations. This module uses one fixed test-file format and derives its
  * compiled companions from that format.
  *
- * The constructor probes forward and inverse transforms with a synthetic path.
- * That confirms only that `testDir` is a usable absolute,
- * non-empty, dot-segment-free containment boundary; fixed suffix transforms
- * cannot make the probe establish any `testMatch` or `testIgnore` semantics.
+ * Construction validates both configured roots and probes the forward and
+ * inverse transforms with a synthetic path. The probe confirms that `testDir`
+ * is a usable containment boundary; fixed suffix transforms cannot establish
+ * any `testMatch` or `testIgnore` semantics.
  */
 
 import type { LayoutConfig } from '#core/config/schema.js';
@@ -121,15 +121,18 @@ export interface LayoutResolver {
  * @param config - The normalized absolute paths that bound the layout.
  * @returns A resolver that maps known test files and recognized companions.
  * @throws {import('../errors/config-invalid-error.js').ConfigInvalidError}
- *   When `testDir` cannot support the forward-to-inverse self-check. The
- *   thrown error identifies `testDir` diagnostically.
+ *   When `testDir` or `runsDir` is not a normalized absolute path, or when
+ *   `testDir` cannot support the forward-to-inverse self-check. The thrown
+ *   error identifies both configured paths diagnostically and retains the
+ *   underlying path error as its cause.
  * @remarks
  * The construction probe maps one synthetic in-tree test path to each
- * companion and back. It catches an empty, relative, or dot-segmented
- * `testDir`, but says nothing about discovery globs because this resolver does
- * not evaluate `testMatch` or `testIgnore`. A discovered test must have a
- * non-empty name component before `.test.md`; an anonymous `.test.md` file
- * has no valid companion or run-directory mapping.
+ * companion and back. Construction rejects empty, relative, or dot-segmented
+ * configured paths rather than leaving either root to fail when a resolver
+ * method is first used. It says nothing about discovery globs because this
+ * resolver does not evaluate `testMatch` or `testIgnore`. A discovered test
+ * must have a non-empty name component before `.test.md`; an anonymous
+ * `.test.md` file has no valid companion or run-directory mapping.
  */
 export function createLayoutResolver(config: LayoutConfig): LayoutResolver {
   function discoveredTestPathRelativeToTestDir(testPath: string): string {
@@ -197,6 +200,10 @@ export function createLayoutResolver(config: LayoutConfig): LayoutResolver {
       throw new RangeError('testDir must be absolute.');
     }
 
+    if (!isAbsolutePath(config.runsDir)) {
+      throw new RangeError('runsDir must be absolute.');
+    }
+
     const probeTestPath = joinPath(config.testDir, `__ambercast_layout_selfcheck__${TEST_SUFFIX}`);
     const planRoundTrip = resolver.testPathForPlan(resolver.planPathFor(probeTestPath));
     const groundingRoundTrip = resolver.testPathForGrounding(resolver.groundingPathFor(probeTestPath));
@@ -204,8 +211,12 @@ export function createLayoutResolver(config: LayoutConfig): LayoutResolver {
     if (planRoundTrip !== probeTestPath || groundingRoundTrip !== probeTestPath) {
       throw new RangeError('testDir cannot support layout round trips.');
     }
-  } catch {
-    throw new ConfigInvalidError('Layout configuration has an invalid testDir.', { testDir: config.testDir });
+  } catch (error) {
+    throw new ConfigInvalidError(
+      'Layout configuration has an invalid testDir or runsDir.',
+      { testDir: config.testDir, runsDir: config.runsDir },
+      { cause: error },
+    );
   }
 
   return resolver;

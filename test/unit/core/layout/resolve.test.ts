@@ -18,14 +18,16 @@ describe('createLayoutResolver', () => {
   });
 
   it.each([
-    ['', '/workspace/.runs'],
-    ['tests/ambercast', '/workspace/.runs'],
-    ['.', '/workspace/.runs'],
-    ['/workspace/tests/../tests/ambercast', '/workspace/.runs'],
-    ['/workspace/tests/./ambercast', '/workspace/.runs'],
-    ['/workspace/tests//ambercast', '/workspace/.runs'],
-    ['/workspace/tests/ambercast/', '/workspace/.runs'],
-  ] as const)('rejects malformed testDir %j during construction', (testDir, runsDir) => {
+    ['testDir', '', '', '/workspace/.runs'],
+    ['testDir', 'tests/ambercast', 'tests/ambercast', '/workspace/.runs'],
+    ['testDir', '.', '.', '/workspace/.runs'],
+    ['testDir', '/workspace/tests/../tests/ambercast', '/workspace/tests/../tests/ambercast', '/workspace/.runs'],
+    ['testDir', '/workspace/tests/./ambercast', '/workspace/tests/./ambercast', '/workspace/.runs'],
+    ['testDir', '/workspace/tests//ambercast', '/workspace/tests//ambercast', '/workspace/.runs'],
+    ['testDir', '/workspace/tests/ambercast/', '/workspace/tests/ambercast/', '/workspace/.runs'],
+    ['runsDir', 'workspace/.runs', '/workspace/tests/ambercast', 'workspace/.runs'],
+    ['runsDir', '/workspace/.runs/', '/workspace/tests/ambercast', '/workspace/.runs/'],
+  ] as const)('rejects malformed %s %j during construction', (invalidField, invalidValue, testDir, runsDir) => {
     let thrown: unknown;
 
     try {
@@ -37,8 +39,9 @@ describe('createLayoutResolver', () => {
     expect(thrown).toBeInstanceOf(ConfigInvalidError);
 
     if (thrown instanceof ConfigInvalidError) {
-      expect(thrown.message).toContain('testDir');
-      expect(thrown.details?.testDir).toBe(testDir);
+      expect(thrown.message).toContain(invalidField);
+      expect(thrown.details?.[invalidField]).toBe(invalidValue);
+      expect(thrown.cause).toBeInstanceOf(RangeError);
     }
   });
 });
