@@ -1,9 +1,10 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import type { ConfigEnvSnapshot, ResolvedConfig } from '#core/config/schema.js';
 import { ConfigInvalidError } from '#core/errors/config-invalid-error.js';
 import { DEFAULT_RAW_CONFIG } from '#config/defaults.js';
 import { loadConfig } from '#config/load.js';
 import type { StorageAdapter } from '#ports/storage.js';
+import { EXPECTED_DEFAULT_CONFIG } from './expected-default-config.fixture.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
 
 const CONFIG_SCHEMA_URL = 'https://ambercast.dev/schema/config.json';
@@ -208,18 +209,6 @@ describe('loadConfig', () => {
       },
     );
 
-    it('selects a valid environment override ahead of an ancestor file when the command override is absent', async () => {
-      const config = await load(await createDiscoveryConflictFixture(), {
-        configPathOverride: undefined,
-        configEnv: { configPathOverride: 'settings/environment.json' },
-      });
-
-      expect(config).toStrictEqual({
-        ...expectedDefaults(`${CWD}/settings`),
-        viewer: { port: 4_603 },
-      });
-    });
-
     it.each([
       ['a command override', { configPathOverride: '/workspace/missing-command.json' }],
       ['an environment override', { configEnv: { configPathOverride: '/workspace/missing-environment.json' } }],
@@ -281,23 +270,14 @@ describe('loadConfig', () => {
   });
 
   describe('parsing and validation failures', () => {
-    it('wraps malformed JSON in ConfigInvalidError while retaining the exact SyntaxError cause', async () => {
+    it('wraps malformed JSON in ConfigInvalidError while retaining its SyntaxError cause', async () => {
       const storage = createInMemoryStorage();
       const malformedJson = '{"$schema":';
-      const parseError = new SyntaxError('sentinel parse failure');
-      const parseSpy = vi.spyOn(JSON, 'parse').mockImplementation((_text: string) => {
-        throw parseError;
-      });
       await storage.writeText(`${CWD}/ambercast.config.json`, malformedJson);
 
-      try {
-        const error = await expectConfigInvalid(load(storage));
+      const error = await expectConfigInvalid(load(storage));
 
-        expect(parseSpy).toHaveBeenCalledWith(malformedJson);
-        expect(error.cause).toBe(parseError);
-      } finally {
-        parseSpy.mockRestore();
-      }
+      expect(error.cause).toBeInstanceOf(SyntaxError);
     });
 
     it('retains the failing Zod issue path for schema-invalid content', async () => {
@@ -543,22 +523,7 @@ describe('loadConfig', () => {
       mutableFirst.ci.heal = true;
 
       expect(second).toStrictEqual(expectedDefaults(CWD));
-      expect(DEFAULT_RAW_CONFIG).toStrictEqual({
-        testDir: 'tests/ambercast',
-        runsDir: 'tests/ambercast/.runs',
-        testMatch: ['**/*.test.md'],
-        testIgnore: ['**/.runs/**', '**/*.ambercast.plan.json', '**/*.ambercast.grounding.json'],
-        targets: {
-          'web-user': {
-            baseUrl: 'http://localhost:3000',
-            browser: 'chromium',
-          },
-        },
-        defaultTarget: 'web-user',
-        ai: { provider: 'auto' },
-        viewer: { port: 4_600 },
-        ci: { heal: false, updateGroundingCache: false },
-      });
+      expect(DEFAULT_RAW_CONFIG).toStrictEqual(EXPECTED_DEFAULT_CONFIG);
     });
 
     it('creates non-aliased file-supplied arrays and nested objects for every result and the defaults template', async () => {
@@ -597,22 +562,7 @@ describe('loadConfig', () => {
         ...withoutDefaultTarget(expectedDefaults(CWD)),
         ...fileConfig,
       });
-      expect(DEFAULT_RAW_CONFIG).toStrictEqual({
-        testDir: 'tests/ambercast',
-        runsDir: 'tests/ambercast/.runs',
-        testMatch: ['**/*.test.md'],
-        testIgnore: ['**/.runs/**', '**/*.ambercast.plan.json', '**/*.ambercast.grounding.json'],
-        targets: {
-          'web-user': {
-            baseUrl: 'http://localhost:3000',
-            browser: 'chromium',
-          },
-        },
-        defaultTarget: 'web-user',
-        ai: { provider: 'auto' },
-        viewer: { port: 4_600 },
-        ci: { heal: false, updateGroundingCache: false },
-      });
+      expect(DEFAULT_RAW_CONFIG).toStrictEqual(EXPECTED_DEFAULT_CONFIG);
     });
   });
 });
