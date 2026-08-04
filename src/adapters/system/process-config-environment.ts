@@ -16,7 +16,7 @@ import type { ConfigEnvSnapshot } from '#core/config/schema.js';
  * `configPathOverride` field and `process.env.AMBERCAST_AI_PROVIDER` to its
  * `aiProviderRaw` field.
  *
- * @returns A snapshot that will omit absent or empty environment values.
+ * @returns A snapshot that omits absent or empty environment values.
  *
  * @remarks
  * This is deliberately a plain real-adapter function rather than a port.
@@ -25,12 +25,18 @@ import type { ConfigEnvSnapshot } from '#core/config/schema.js';
  * port would duplicate the injection seam that already exists at the
  * `loadConfig()` boundary.
  *
- * The eventual capture will preserve every nonempty value verbatim and treat
+ * The capture preserves every nonempty value verbatim and treats
  * an empty string as absent, preventing an empty variable from becoming an
- * explicit empty override. `aiProviderRaw` will remain an unvalidated string:
+ * explicit empty override. `aiProviderRaw` remains an unvalidated string:
  * `loadConfig()` owns provider vocabulary validation, so this boundary must
  * not duplicate configuration-domain policy.
  */
 export function readConfigEnvironment(): ConfigEnvSnapshot {
-  throw new Error('not implemented');
+  const configPathOverride = process.env.AMBERCAST_CONFIG;
+  const aiProviderRaw = process.env.AMBERCAST_AI_PROVIDER;
+
+  return {
+    ...(configPathOverride === undefined || configPathOverride === '' ? {} : { configPathOverride }),
+    ...(aiProviderRaw === undefined || aiProviderRaw === '' ? {} : { aiProviderRaw }),
+  };
 }

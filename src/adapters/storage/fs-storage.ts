@@ -2,85 +2,86 @@
  * Adapts ambercast's storage port to the host filesystem at the real I/O
  * boundary.
  *
- * The eventual adapter owns Node-specific paths and filesystem behavior so
- * core and use cases stay deterministic and can receive storage fakes. Unlike
+ * This adapter owns Node-specific paths and filesystem behavior so core and
+ * use cases stay deterministic and can receive storage fakes. Unlike
  * core, adapters have no dependency-cruiser external-module allowlist, so this
  * boundary may import `node:fs/promises` and `node:path` when it implements
  * the port.
  */
 
+import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import type { StorageAdapter } from '#ports/storage.js';
+
+async function ensureParentDirectory(path: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+}
 
 /**
  * Creates storage backed by the host filesystem.
  *
- * @returns A storage adapter that will implement the `StorageAdapter` file
+ * @returns A storage adapter that implements the `StorageAdapter` file
  * contract against Node's filesystem.
  *
  * @remarks
- * Text operations will use UTF-8, while binary operations will pass bytes
- * through without text encoding. Both write forms will prepare missing parent
+ * Text operations use UTF-8, while binary operations pass bytes
+ * through without text encoding. Both write forms prepare missing parent
  * directories before writing, preserving the port's convenience contract
  * without forcing callers to sequence directory creation themselves.
  *
- * The eventual existence probe will return `false` for every inspection
+ * The existence probe returns `false` for every inspection
  * failure, including missing paths, directories, and operating-system errors,
- * so callers can use it safely during discovery. Direct-file listings will be
+ * so callers can use it safely during discovery. Direct-file listings are
  * non-recursive, contain only lexicographically sorted bare regular-file
  * names, and yield `[]` for empty or missing directories. Directory creation
- * will be idempotent, including the port's empty-string root directory.
+ * is idempotent, including the port's empty-string root directory.
  */
 export function createFsStorage(): StorageAdapter {
   return {
-    /**
-     * The eventual read will decode a regular file as UTF-8 and let ordinary
-     * read failures distinguish missing files from successful empty content.
-     */
-    async readText(_path: string): Promise<string> {
-      throw new Error('not implemented');
+    async readText(path: string): Promise<string> {
+      return readFile(path, 'utf8');
     },
-    /**
-     * The eventual write will create any missing parent directories before
-     * replacing the target's UTF-8 content.
-     */
-    async writeText(_path: string, _content: string): Promise<void> {
-      throw new Error('not implemented');
+    async writeText(path: string, content: string): Promise<void> {
+      await ensureParentDirectory(path);
+      await writeFile(path, content, 'utf8');
     },
-    /**
-     * The eventual read will return a regular file's original bytes without a
-     * decoding step that could alter binary artifacts.
-     */
-    async readBinary(_path: string): Promise<Uint8Array> {
-      throw new Error('not implemented');
+    async readBinary(path: string): Promise<Uint8Array> {
+      return new Uint8Array(await readFile(path));
     },
-    /**
-     * The eventual write will create missing parents and persist bytes without
-     * applying a text encoding.
-     */
-    async writeBinary(_path: string, _content: Uint8Array): Promise<void> {
-      throw new Error('not implemented');
+    async writeBinary(path: string, content: Uint8Array): Promise<void> {
+      await ensureParentDirectory(path);
+      await writeFile(path, content);
     },
-    /**
-     * The eventual probe will translate every host inspection failure into
-     * `false`, preserving this port's never-reject discovery contract.
-     */
-    async exists(_path: string): Promise<boolean> {
-      throw new Error('not implemented');
+    async exists(path: string): Promise<boolean> {
+      try {
+        return (await stat(path)).isFile();
+      } catch {
+        return false;
+      }
     },
-    /**
-     * The eventual listing will inspect direct entries only, retain regular
-     * files, and sort their bare names while treating a missing directory as
-     * an empty result rather than a discovery failure.
-     */
-    async listFiles(_dir: string): Promise<readonly string[]> {
-      throw new Error('not implemented');
+    async listFiles(dir: string): Promise<readonly string[]> {
+      try {
+        const entries = await readdir(dir || '.', { withFileTypes: true });
+        return entries
+          .filter((entry) => entry.isFile())
+          .map((entry) => entry.name)
+          .sort();
+      } catch (error: unknown) {
+        if (isMissingPathError(error)) {
+          return [];
+        }
+
+        throw error;
+      }
     },
-    /**
-     * The eventual directory preparation will tolerate an existing directory
-     * and the root representation so callers need no existence preflight.
-     */
-    async ensureDir(_dir: string): Promise<void> {
-      throw new Error('not implemented');
+    async ensureDir(dir: string): Promise<void> {
+      if (dir !== '') {
+        await mkdir(dir, { recursive: true });
+      }
     },
   };
+}
+
+function isMissingPathError(error: unknown): error is NodeJS.ErrnoException {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT';
 }
