@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { ConfigEnvSnapshot, ResolvedConfig } from '#core/config/schema.js';
 import { ConfigInvalidError } from '#core/errors/config-invalid-error.js';
 import { DEFAULT_RAW_CONFIG } from '#config/defaults.js';
@@ -23,9 +23,11 @@ interface LoadOptions {
 }
 
 function expectedDefaults(configRoot: string): ResolvedConfig {
+  const rootPrefix = configRoot === '/' ? '' : configRoot;
+
   return {
-    testDir: `${configRoot}/tests/ambercast`,
-    runsDir: `${configRoot}/tests/ambercast/.runs`,
+    testDir: `${rootPrefix}/tests/ambercast`,
+    runsDir: `${rootPrefix}/tests/ambercast/.runs`,
     testMatch: ['**/*.test.md'],
     testIgnore: ['**/.runs/**', '**/*.ambercast.plan.json', '**/*.ambercast.grounding.json'],
     targets: {
@@ -99,6 +101,36 @@ async function expectConfigInvalid(operation: Promise<unknown>): Promise<ConfigI
   expect(thrown.kind).toBe('config-invalid');
   expect(thrown.exitCode).toBe(2);
   return thrown;
+}
+
+function expectNestedGroupsToBeIndependent(first: ResolvedConfig, second: ResolvedConfig): void {
+  expect(first.testMatch).not.toBe(second.testMatch);
+  expect(first.testMatch).not.toBe(DEFAULT_RAW_CONFIG.testMatch);
+  expect(second.testMatch).not.toBe(DEFAULT_RAW_CONFIG.testMatch);
+
+  expect(first.testIgnore).not.toBe(second.testIgnore);
+  expect(first.testIgnore).not.toBe(DEFAULT_RAW_CONFIG.testIgnore);
+  expect(second.testIgnore).not.toBe(DEFAULT_RAW_CONFIG.testIgnore);
+
+  expect(first.targets).not.toBe(second.targets);
+  expect(first.targets).not.toBe(DEFAULT_RAW_CONFIG.targets);
+  expect(second.targets).not.toBe(DEFAULT_RAW_CONFIG.targets);
+
+  for (const targetName of Object.keys(first.targets)) {
+    expect(first.targets[targetName]).not.toBe(second.targets[targetName]);
+  }
+
+  expect(first.ai).not.toBe(second.ai);
+  expect(first.ai).not.toBe(DEFAULT_RAW_CONFIG.ai);
+  expect(second.ai).not.toBe(DEFAULT_RAW_CONFIG.ai);
+
+  expect(first.viewer).not.toBe(second.viewer);
+  expect(first.viewer).not.toBe(DEFAULT_RAW_CONFIG.viewer);
+  expect(second.viewer).not.toBe(DEFAULT_RAW_CONFIG.viewer);
+
+  expect(first.ci).not.toBe(second.ci);
+  expect(first.ci).not.toBe(DEFAULT_RAW_CONFIG.ci);
+  expect(second.ci).not.toBe(DEFAULT_RAW_CONFIG.ci);
 }
 
 async function createDiscoveryConflictFixture(): Promise<StorageAdapter> {
@@ -176,6 +208,18 @@ describe('loadConfig', () => {
       },
     );
 
+    it('selects a valid environment override ahead of an ancestor file when the command override is absent', async () => {
+      const config = await load(await createDiscoveryConflictFixture(), {
+        configPathOverride: undefined,
+        configEnv: { configPathOverride: 'settings/environment.json' },
+      });
+
+      expect(config).toStrictEqual({
+        ...expectedDefaults(`${CWD}/settings`),
+        viewer: { port: 4_603 },
+      });
+    });
+
     it.each([
       ['a command override', { configPathOverride: '/workspace/missing-command.json' }],
       ['an environment override', { configEnv: { configPathOverride: '/workspace/missing-environment.json' } }],
@@ -206,24 +250,54 @@ describe('loadConfig', () => {
       expect(config).toStrictEqual(expectedDefaults(''));
     });
 
+    it('checks the root candidate before falling back to defaults', async () => {
+      const storage = createInMemoryStorage();
+      await writeConfig(storage, '/ambercast.config.json', { viewer: { port: 4_608 } });
+
+      const config = await load(storage);
+
+      expect(config).toStrictEqual({
+        ...expectedDefaults('/'),
+        viewer: { port: 4_608 },
+      });
+    });
+
     it.each([
       ['a command override with a dot segment', { configPathOverride: './ambercast.config.json' }],
       ['a command override with a repeated separator', { configPathOverride: 'settings//ambercast.config.json' }],
       ['an environment override with a dot segment', { configEnv: { configPathOverride: './ambercast.config.json' } }],
       ['an environment override with a repeated separator', { configEnv: { configPathOverride: 'settings//ambercast.config.json' } }],
+      ['a command override with an absolute dot segment', { configPathOverride: '/workspace/./ambercast.config.json' }],
+      ['a command override with an absolute dot-dot segment', { configPathOverride: '/workspace/../ambercast.config.json' }],
+      ['a command override with an absolute repeated separator', { configPathOverride: '/workspace//ambercast.config.json' }],
+      ['a command override with an absolute trailing separator', { configPathOverride: '/workspace/ambercast.config.json/' }],
+      ['an environment override with an absolute dot segment', { configEnv: { configPathOverride: '/workspace/./ambercast.config.json' } }],
+      ['an environment override with an absolute dot-dot segment', { configEnv: { configPathOverride: '/workspace/../ambercast.config.json' } }],
+      ['an environment override with an absolute repeated separator', { configEnv: { configPathOverride: '/workspace//ambercast.config.json' } }],
+      ['an environment override with an absolute trailing separator', { configEnv: { configPathOverride: '/workspace/ambercast.config.json/' } }],
     ] as const)('classifies %s as invalid configuration rather than leaking RangeError', async (_description, options) => {
       await expectConfigInvalid(load(createInMemoryStorage(), options));
     });
   });
 
   describe('parsing and validation failures', () => {
-    it('wraps malformed JSON in ConfigInvalidError while retaining the SyntaxError cause', async () => {
+    it('wraps malformed JSON in ConfigInvalidError while retaining the exact SyntaxError cause', async () => {
       const storage = createInMemoryStorage();
-      await storage.writeText(`${CWD}/ambercast.config.json`, '{"$schema":');
+      const malformedJson = '{"$schema":';
+      const parseError = new SyntaxError('sentinel parse failure');
+      const parseSpy = vi.spyOn(JSON, 'parse').mockImplementation((_text: string) => {
+        throw parseError;
+      });
+      await storage.writeText(`${CWD}/ambercast.config.json`, malformedJson);
 
-      const error = await expectConfigInvalid(load(storage));
+      try {
+        const error = await expectConfigInvalid(load(storage));
 
-      expect(error.cause).toBeInstanceOf(SyntaxError);
+        expect(parseSpy).toHaveBeenCalledWith(malformedJson);
+        expect(error.cause).toBe(parseError);
+      } finally {
+        parseSpy.mockRestore();
+      }
     });
 
     it('retains the failing Zod issue path for schema-invalid content', async () => {
@@ -232,8 +306,21 @@ describe('loadConfig', () => {
 
       const error = await expectConfigInvalid(load(storage));
 
-      expect(error.message).toContain('viewer.port');
       expect(error.details).toBeDefined();
+      expect(containsIssuePath(error.details, ['viewer', 'port'])).toBe(true);
+    });
+
+    it('retains every failing Zod issue path for schema-invalid content with multiple violations', async () => {
+      const storage = createInMemoryStorage();
+      await writeConfig(storage, `${CWD}/ambercast.config.json`, {
+        ai: { provider: 'unsupported' },
+        viewer: { port: 0 },
+      });
+
+      const error = await expectConfigInvalid(load(storage));
+
+      expect(error.details).toBeDefined();
+      expect(containsIssuePath(error.details, ['ai', 'provider'])).toBe(true);
       expect(containsIssuePath(error.details, ['viewer', 'port'])).toBe(true);
     });
 
@@ -250,11 +337,43 @@ describe('loadConfig', () => {
     it.each([
       ['testDir', { testDir: './checks' }],
       ['runsDir', { runsDir: 'artifacts//runs' }],
+      ['testDir with an absolute dot segment', { testDir: '/workspace/./checks' }],
+      ['testDir with an absolute dot-dot segment', { testDir: '/workspace/../checks' }],
+      ['testDir with an absolute repeated separator', { testDir: '/workspace//checks' }],
+      ['testDir with an absolute trailing separator', { testDir: '/workspace/checks/' }],
+      ['runsDir with an absolute dot segment', { runsDir: '/workspace/./artifacts' }],
+      ['runsDir with an absolute dot-dot segment', { runsDir: '/workspace/../artifacts' }],
+      ['runsDir with an absolute repeated separator', { runsDir: '/workspace//artifacts' }],
+      ['runsDir with an absolute trailing separator', { runsDir: '/workspace/artifacts/' }],
     ] as const)('rejects a resolved %s with non-normalized POSIX path syntax', async (_field, rawConfig) => {
       const storage = createInMemoryStorage();
       await writeConfig(storage, `${CWD}/ambercast.config.json`, rawConfig);
 
       await expectConfigInvalid(load(storage));
+    });
+
+    it('surfaces a selected-file storage read error without reclassifying it', async () => {
+      const selectedPath = `${CWD}/ambercast.config.json`;
+      const sentinelError = new Error('sentinel storage read failure');
+      const storage: StorageAdapter = {
+        async readText(): Promise<string> {
+          throw sentinelError;
+        },
+        async writeText(): Promise<void> {},
+        async readBinary(): Promise<Uint8Array> {
+          return new Uint8Array();
+        },
+        async writeBinary(): Promise<void> {},
+        async exists(path: string): Promise<boolean> {
+          return path === selectedPath;
+        },
+        async listFiles(): Promise<readonly string[]> {
+          return [];
+        },
+        async ensureDir(): Promise<void> {},
+      };
+
+      await expect(load(storage)).rejects.toBe(sentinelError);
     });
   });
 
@@ -270,6 +389,20 @@ describe('loadConfig', () => {
       expect(config).toStrictEqual({
         ...withoutDefaultTarget(expectedDefaults(CWD)),
         targets: { app: APP_TARGET, admin: ADMIN_TARGET },
+      });
+    });
+
+    it('clears the built-in default target even when an atomic replacement still declares web-user', async () => {
+      const storage = createInMemoryStorage();
+      await writeConfig(storage, `${CWD}/ambercast.config.json`, {
+        targets: { 'web-user': APP_TARGET },
+      });
+
+      const config = await load(storage);
+
+      expect(config).toStrictEqual({
+        ...withoutDefaultTarget(expectedDefaults(CWD)),
+        targets: { 'web-user': APP_TARGET },
       });
     });
 
@@ -289,8 +422,16 @@ describe('loadConfig', () => {
       });
     });
 
+    it('allows the built-in default target when the file does not replace targets', async () => {
+      const storage = createInMemoryStorage();
+      await writeConfig(storage, `${CWD}/ambercast.config.json`, { defaultTarget: 'web-user' });
+
+      await expect(load(storage)).resolves.toStrictEqual(expectedDefaults(CWD));
+    });
+
     it.each([
       ['a defaultTarget that names no replacement target', { targets: { app: APP_TARGET }, defaultTarget: 'missing' }],
+      ['a defaultTarget that names no built-in target', { defaultTarget: 'missing' }],
       ['an empty targets replacement', { targets: {} }],
     ] as const)('rejects %s', async (_description, rawConfig) => {
       const storage = createInMemoryStorage();
@@ -354,6 +495,18 @@ describe('loadConfig', () => {
         '/shared/checks',
         '/shared/artifacts',
       ],
+      [
+        'empty relative directories exactly at the selected config file directory',
+        { testDir: '', runsDir: '' },
+        '/workspace/project',
+        '/workspace/project',
+      ],
+      [
+        'the root directory unchanged instead of falling back to a default directory',
+        { testDir: '/', runsDir: '/' },
+        '/',
+        '/',
+      ],
     ] as const)('resolves %s', async (_description, rawConfig, testDir, runsDir) => {
       const storage = createInMemoryStorage();
       await writeConfig(storage, ANCESTOR_CONFIG_PATH, rawConfig);
@@ -367,21 +520,83 @@ describe('loadConfig', () => {
       });
     });
 
-    it('creates non-aliased arrays and nested objects for every result and the defaults template', async () => {
+    it('creates non-aliased defaulted arrays and nested objects for every result and the defaults template', async () => {
       const storage = createInMemoryStorage();
       const first = await load(storage);
       const second = await load(storage);
       const mutableFirst = first as unknown as {
         testMatch: string[];
+        testIgnore: string[];
         targets: Record<string, { baseUrl: string; browser: 'chromium' }>;
         ai: { provider: 'claude' | 'codex' | 'auto' };
+        viewer: { port: number };
+        ci: { heal: boolean; updateGroundingCache: boolean };
       };
 
+      expectNestedGroupsToBeIndependent(first, second);
+
       mutableFirst.testMatch.push('mutated/**/*.test.md');
+      mutableFirst.testIgnore.push('mutated-ignore');
       mutableFirst.targets['web-user']!.baseUrl = 'http://mutated.test';
       mutableFirst.ai.provider = 'claude';
+      mutableFirst.viewer.port = 9_999;
+      mutableFirst.ci.heal = true;
 
       expect(second).toStrictEqual(expectedDefaults(CWD));
+      expect(DEFAULT_RAW_CONFIG).toStrictEqual({
+        testDir: 'tests/ambercast',
+        runsDir: 'tests/ambercast/.runs',
+        testMatch: ['**/*.test.md'],
+        testIgnore: ['**/.runs/**', '**/*.ambercast.plan.json', '**/*.ambercast.grounding.json'],
+        targets: {
+          'web-user': {
+            baseUrl: 'http://localhost:3000',
+            browser: 'chromium',
+          },
+        },
+        defaultTarget: 'web-user',
+        ai: { provider: 'auto' },
+        viewer: { port: 4_600 },
+        ci: { heal: false, updateGroundingCache: false },
+      });
+    });
+
+    it('creates non-aliased file-supplied arrays and nested objects for every result and the defaults template', async () => {
+      const storage = createInMemoryStorage();
+      const fileConfig = {
+        testMatch: ['file/**/*.test.md'],
+        testIgnore: ['file-ignore'],
+        targets: { app: APP_TARGET },
+        ai: { provider: 'codex' },
+        viewer: { port: 4_321 },
+        ci: { heal: true, updateGroundingCache: true },
+      } as const;
+      await writeConfig(storage, `${CWD}/ambercast.config.json`, fileConfig);
+
+      const first = await load(storage);
+      const second = await load(storage);
+      const mutableFirst = first as unknown as {
+        testMatch: string[];
+        testIgnore: string[];
+        targets: Record<string, { baseUrl: string; browser: 'chromium' }>;
+        ai: { provider: 'claude' | 'codex' | 'auto' };
+        viewer: { port: number };
+        ci: { heal: boolean; updateGroundingCache: boolean };
+      };
+
+      expectNestedGroupsToBeIndependent(first, second);
+
+      mutableFirst.testMatch.push('mutated/**/*.test.md');
+      mutableFirst.testIgnore.push('mutated-ignore');
+      mutableFirst.targets.app!.baseUrl = 'http://mutated.test';
+      mutableFirst.ai.provider = 'claude';
+      mutableFirst.viewer.port = 9_999;
+      mutableFirst.ci.heal = false;
+
+      expect(second).toStrictEqual({
+        ...expectedDefaults(CWD),
+        ...fileConfig,
+      });
       expect(DEFAULT_RAW_CONFIG).toStrictEqual({
         testDir: 'tests/ambercast',
         runsDir: 'tests/ambercast/.runs',
