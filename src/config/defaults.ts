@@ -6,7 +6,7 @@
  * repair.
  *
  * `testDir` and `runsDir` intentionally remain relative here even though the
- * eventual ResolvedConfig contract carries absolute paths. The distinction is
+ * ResolvedConfig contract carries absolute paths. The distinction is
  * an invariant of the loader, not of TypeScript's string type: loadConfig
  * alone anchors these opaque path strings to the selected config file or its
  * caller's directory, just as StorageAdapter leaves path interpretation to
@@ -20,7 +20,7 @@ import type { ResolvedConfig } from '#core/config/schema.js';
  * do not provide a configuration file.
  *
  * @remarks
- * The eventual loader will create fresh resolved values from this template,
+ * The loader creates fresh resolved values from this template,
  * so consumers cannot make one load influence another by mutating a default
  * array, target, or policy group. Its two path fields are purposefully
  * project-relative at this boundary and become absolute only during loading.

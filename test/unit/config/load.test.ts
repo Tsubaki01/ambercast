@@ -594,7 +594,7 @@ describe('loadConfig', () => {
       mutableFirst.ci.heal = false;
 
       expect(second).toStrictEqual({
-        ...expectedDefaults(CWD),
+        ...withoutDefaultTarget(expectedDefaults(CWD)),
         ...fileConfig,
       });
       expect(DEFAULT_RAW_CONFIG).toStrictEqual({
