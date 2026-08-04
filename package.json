@@ -30,6 +30,7 @@
     },
     "./schema/plan.json": "./dist/schema/plan.schema.json",
     "./schema/grounding.json": "./dist/schema/grounding.schema.json",
+    "./schema/config.json": "./dist/schema/config.schema.json",
     "./package.json": "./package.json"
   },
   "files": [

@@ -12,6 +12,7 @@ const REQUIRED_FILES = [
   'bin/ambercast.js',
   'dist/schema/plan.schema.json',
   'dist/schema/grounding.schema.json',
+  'dist/schema/config.schema.json',
 ];
 const EXECUTABLE_FILES = ['bin/ambercast.js'];
 
