@@ -84,9 +84,11 @@ export interface LoadConfigOptions {
  *   path is malformed or contains a dot segment. A JSON parse failure retains
  *   its original `SyntaxError` as this error's `cause`, while RawConfig schema
  *   validation retains the failing Zod issue path or paths in this error's
- *   diagnostic details so callers can identify the invalid key. The loader
- *   also rejects raw own `__proto__` and `constructor` keys because Zod
- *   strict-object validation does not report them as unrecognized keys.
+ *   diagnostic details so callers can identify the invalid key. The loader will
+ *   reject a raw own `constructor` key through `RawConfig`'s own strict-object
+ *   validation, while a raw own `__proto__` key will be rejected earlier by a
+ *   dedicated pre-check because Zod silently drops it instead of reporting it as
+ *   an unrecognized key.
  * @throws {Error} When the injected storage cannot read a selected file.
  * @remarks
  * The discovery sequence is command override, environment override, nearest
@@ -255,11 +257,12 @@ function parseConfigDocument(text: string, configPath: string): unknown {
 }
 
 /**
- * Rejects raw keys that strict-object parsing does not report as unknown.
+ * The pre-check will reject a raw own `__proto__` key that strict-object parsing
+ * does not report as unknown.
  *
- * JSON parsing creates these names as ordinary own properties, but Zod drops
- * them while parsing a strict object. Rejecting them before schema validation
- * ensures an untrusted name cannot silently cross the merge boundary.
+ * Zod silently drops this key while parsing a strict object, so the pre-check
+ * prevents an untrusted name from crossing the merge boundary. A raw own
+ * `constructor` key will be left to `RawConfig`'s own strict-object validation.
  */
 function rejectUnsafeRawKeys(document: unknown, configPath: string): void {
   if (document === null || typeof document !== 'object') {
