@@ -84,9 +84,9 @@ export interface LoadConfigOptions {
  *   path is malformed or contains a dot segment. A JSON parse failure retains
  *   its original `SyntaxError` as this error's `cause`, while RawConfig schema
  *   validation retains the failing Zod issue path or paths in this error's
- *   diagnostic details so callers can identify the invalid key. The loader will
- *   reject a raw own `constructor` key through `RawConfig`'s own strict-object
- *   validation, while a raw own `__proto__` key will be rejected earlier by a
+ *   diagnostic details so callers can identify the invalid key. The loader
+ *   rejects a raw own `constructor` key through `RawConfig`'s own strict-object
+ *   validation, while a raw own `__proto__` key is rejected earlier by a
  *   dedicated pre-check because Zod silently drops it instead of reporting it as
  *   an unrecognized key.
  * @throws {Error} When the injected storage cannot read a selected file.
@@ -257,19 +257,19 @@ function parseConfigDocument(text: string, configPath: string): unknown {
 }
 
 /**
- * The pre-check will reject a raw own `__proto__` key that strict-object parsing
+ * The pre-check rejects a raw own `__proto__` key that strict-object parsing
  * does not report as unknown.
  *
  * Zod silently drops this key while parsing a strict object, so the pre-check
  * prevents an untrusted name from crossing the merge boundary. A raw own
- * `constructor` key will be left to `RawConfig`'s own strict-object validation.
+ * `constructor` key is left to `RawConfig`'s own strict-object validation.
  */
 function rejectUnsafeRawKeys(document: unknown, configPath: string): void {
   if (document === null || typeof document !== 'object') {
     return;
   }
 
-  for (const key of ['__proto__', 'constructor'] as const) {
+  for (const key of ['__proto__'] as const) {
     if (Object.prototype.hasOwnProperty.call(document, key)) {
       throw new ConfigInvalidError(
         `Configuration file must not declare an own ${key} key.`,
