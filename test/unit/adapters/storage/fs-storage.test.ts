@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -29,6 +29,14 @@ function isSymbolicLinkPermissionError(error: unknown): error is { readonly code
   }
 
   return error.code === 'EACCES' || error.code === 'EPERM';
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (error === null || typeof error !== 'object' || !('code' in error)) {
+    return undefined;
+  }
+
+  return typeof error.code === 'string' ? error.code : undefined;
 }
 
 registerStorageContract({
@@ -118,6 +126,62 @@ describe('createFsStorage()', () => {
       await writeFile('not-a-directory', 'file component', 'utf8');
 
       await expect(storage.exists('not-a-directory/child.txt')).resolves.toBe(false);
+    });
+  });
+
+  it('rethrows ENOTDIR when listing below a regular file', async () => {
+    await withIsolatedStorage(async (storage) => {
+      await writeFile('not-a-directory', 'file component', 'utf8');
+
+      let thrown: unknown;
+      try {
+        await storage.listFiles(join('not-a-directory', 'child.txt'));
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(Error);
+      expect(errorCode(thrown)).toBe('ENOTDIR');
+    });
+  });
+
+  it('rethrows non-missing directory-listing errors when permissions are enforced', async (context) => {
+    await withIsolatedStorage(async (storage) => {
+      const restrictedDirectory = 'restricted-directory';
+      await mkdir(restrictedDirectory);
+
+      try {
+        await chmod(restrictedDirectory, 0o000);
+
+        let directListingError: unknown;
+        try {
+          await readdir(restrictedDirectory);
+        } catch (error) {
+          directListingError = error;
+        }
+
+        if (directListingError === undefined) {
+          context.skip('Directory permissions are not enforced; cannot exercise listing error propagation.');
+          return;
+        }
+
+        if (errorCode(directListingError) === 'EACCES') {
+          let thrown: unknown;
+          try {
+            await storage.listFiles(restrictedDirectory);
+          } catch (error) {
+            thrown = error;
+          }
+
+          expect(thrown).toBeInstanceOf(Error);
+          expect(errorCode(thrown)).toBe('EACCES');
+          return;
+        }
+
+        await expect(storage.listFiles(restrictedDirectory)).rejects.toBeInstanceOf(Error);
+      } finally {
+        await chmod(restrictedDirectory, 0o700);
+      }
     });
   });
 });

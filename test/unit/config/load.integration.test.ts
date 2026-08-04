@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -65,7 +65,7 @@ describe('loadConfig() with FsStorage', () => {
     });
   });
 
-  it('surfaces a real selected-file read error without translating it to ConfigInvalidError', async () => {
+  it('surfaces a real selected-file read error without translating it to ConfigInvalidError', async (context) => {
     await withIsolatedConfigDirectory(async (root) => {
       const configPath = join(root, 'ambercast.config.json');
       const storage = createFsStorage();
@@ -73,6 +73,19 @@ describe('loadConfig() with FsStorage', () => {
 
       try {
         await chmod(configPath, 0o000);
+
+        let directReadError: unknown;
+        try {
+          await readFile(configPath, 'utf8');
+        } catch (error) {
+          directReadError = error;
+        }
+
+        if (directReadError === undefined) {
+          context.skip('File permissions are not enforced; cannot exercise the selected-file read error.');
+          return;
+        }
+
         await expect(storage.exists(configPath)).resolves.toBe(true);
 
         let thrown: unknown;
