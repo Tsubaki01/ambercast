@@ -168,7 +168,8 @@ export function isAbsolutePath(path: string): boolean {
  * relativeWithin('/tests', '/tests-archive/case') // undefined
  * ```
  * @remarks
- * The containment check compares path segments, not raw prefixes.
+ * The descendant check uses a raw-prefix match anchored on a full trailing
+ * `/` separator, which makes the string comparison segment-boundary-safe.
  * That prevents a sibling such as `tests/ambercast-evil` from being mistaken
  * for a descendant of `tests/ambercast`.
  */

@@ -3,8 +3,8 @@
  * as tests. Test discovery and `testMatch`/`testIgnore` glob evaluation
  * remain outside this module: a test-discovery use case determines which
  * files are tests, then asks this resolver for their deterministic companion
- * locations. This module recognizes only the fixed terminal companion suffixes
- * `.test.md`, `.ambercast.plan.json`, and `.ambercast.grounding.json`.
+ * locations. This module uses one fixed test-file format and derives its
+ * compiled companions from that format.
  *
  * The constructor probes forward and inverse transforms with a synthetic path.
  * That confirms only that `testDir` is a usable absolute,
@@ -29,16 +29,19 @@ const GROUNDING_SUFFIX = '.ambercast.grounding.json';
  * discovered tests, so invalid input is a caller error reported as a plain
  * `RangeError`. Inverse methods instead support orphan detection, where an
  * unrecognized file is an expected negative answer and therefore yields
- * `undefined` rather than requiring exception handling.
+ * `undefined` rather than requiring exception handling. A discovered test
+ * must have a non-empty name component before `.test.md`; an anonymous
+ * `.test.md` file has no valid companion or run-directory mapping.
  */
 export interface LayoutResolver {
   /**
    * Derives the plan artifact path for a discovered test file.
    *
-   * @param testPath - A discovered test path inside the configured test tree.
+   * @param testPath - A discovered test path inside the configured test tree
+   *   with a non-empty name component before `.test.md`.
    * @returns The matching plan artifact path.
    * @throws {RangeError} When the path is outside the test tree or does not
-   *   end with the exact test suffix.
+   *   end with the exact test suffix or has no name component before it.
    * @remarks
    * The mapping replaces only the terminal test suffix. It does not extract a
    * generic filename stem, because names such as
@@ -48,10 +51,11 @@ export interface LayoutResolver {
   /**
    * Derives the grounding-cache artifact path for a discovered test file.
    *
-   * @param testPath - A discovered test path inside the configured test tree.
+   * @param testPath - A discovered test path inside the configured test tree
+   *   with a non-empty name component before `.test.md`.
    * @returns The matching grounding-cache artifact path.
    * @throws {RangeError} When the path is outside the test tree or does not
-   *   end with the exact test suffix.
+   *   end with the exact test suffix or has no name component before it.
    * @remarks
    * Like {@link planPathFor}, the mapping changes an exact terminal suffix
    * rather than applying stem extraction that would mishandle dotted
@@ -61,21 +65,20 @@ export interface LayoutResolver {
   /**
    * Locates the dedicated run-artifact directory for a discovered test file.
    *
-   * @param testPath - A discovered test path inside the configured test tree.
+   * @param testPath - A discovered test path inside the configured test tree
+   *   with a non-empty name component before `.test.md`.
    * @returns The per-test directory under the configured runs directory.
    * @throws {RangeError} When the path is outside the test tree or does not
-   *   end with the exact test suffix.
+   *   end with the exact test suffix or has no name component before it.
    * @remarks
-   * The result is the test path's relative directory within `testDir`, joined
-   * under `runsDir`, then joined with the test's base name after removing only
-   * its terminal `.test.md` suffix. Equivalently, for relative test path `p`,
-   * it returns `joinPath(runsDir, joinPath(dirnamePath(p),
-   * basenamePath(p).slice(0, -TEST_SUFFIX.length)))`. For example, a test at
+   * The test's relative directory within `testDir` is joined under `runsDir`,
+   * followed by the test's name without its terminal `.test.md` suffix. For
+   * example, a test at
    * `/project/tests/ui/login.test.md` with `testDir` `/project/tests` and
    * `runsDir` `/project/.runs` maps to `/project/.runs/ui/login`.
    *
-   * A per-test directory prevents screenshots, traces, and other artifacts
-   * from distinct tests colliding in the bare shared runs directory.
+   * A per-test directory keeps screenshots, traces, and other artifacts from
+   * distinct tests from colliding in the shared runs directory.
    */
   runsDirFor(testPath: string): string;
   /**
@@ -83,14 +86,15 @@ export interface LayoutResolver {
    *
    * @param planPath - The discovered path that may be a plan artifact.
    * @returns Its source test path, or `undefined` when it is not a recognized
-   *   in-tree plan companion.
+   *   in-tree plan companion or has no name component before its suffix.
    * @remarks
    * Recognition requires an exact terminal `.ambercast.plan.json` suffix and
    * containment within `testDir`. On success, the resolver removes that
    * terminal suffix and appends `.test.md`; it never replaces a suffix-like
    * substring elsewhere in the name. It returns `undefined` when the path has
    * the wrong suffix, is a grounding companion rather than a plan companion,
-   * or lies outside `testDir`.
+   * lies outside `testDir`, or would recover the invalid anonymous
+   * `.test.md` path.
    */
   testPathForPlan(planPath: string): string | undefined;
   /**
@@ -98,14 +102,15 @@ export interface LayoutResolver {
    *
    * @param groundingPath - The discovered path that may be a grounding cache.
    * @returns Its source test path, or `undefined` when it is not a recognized
-   *   in-tree grounding companion.
+   *   in-tree grounding companion or has no name component before its suffix.
    * @remarks
    * Recognition requires an exact terminal `.ambercast.grounding.json` suffix
    * and containment within `testDir`. On success, the resolver removes that
    * terminal suffix and appends `.test.md`; it never replaces a suffix-like
    * substring elsewhere in the name. It returns `undefined` when the path has
    * the wrong suffix, is a plan companion rather than a grounding companion,
-   * or lies outside `testDir`.
+   * lies outside `testDir`, or would recover the invalid anonymous
+   * `.test.md` path.
    */
   testPathForGrounding(groundingPath: string): string | undefined;
 }
@@ -122,7 +127,9 @@ export interface LayoutResolver {
  * The construction probe maps one synthetic in-tree test path to each
  * companion and back. It catches an empty, relative, or dot-segmented
  * `testDir`, but says nothing about discovery globs because this resolver does
- * not evaluate `testMatch` or `testIgnore`.
+ * not evaluate `testMatch` or `testIgnore`. A discovered test must have a
+ * non-empty name component before `.test.md`; an anonymous `.test.md` file
+ * has no valid companion or run-directory mapping.
  */
 export function createLayoutResolver(config: LayoutConfig): LayoutResolver {
   function discoveredTestPathRelativeToTestDir(testPath: string): string {
@@ -130,6 +137,10 @@ export function createLayoutResolver(config: LayoutConfig): LayoutResolver {
 
     if (relativeTestPath === undefined || !testPath.endsWith(TEST_SUFFIX)) {
       throw new RangeError('Expected a discovered test path within testDir ending in .test.md.');
+    }
+
+    if (basenamePath(testPath) === TEST_SUFFIX) {
+      throw new RangeError('Expected a discovered test path with a name before .test.md.');
     }
 
     return relativeTestPath;
@@ -150,6 +161,10 @@ export function createLayoutResolver(config: LayoutConfig): LayoutResolver {
     }
 
     const companionName = basenamePath(companionPath);
+    if (companionName === companionSuffix) {
+      return undefined;
+    }
+
     return joinPath(dirnamePath(companionPath), `${companionName.slice(0, -companionSuffix.length)}${TEST_SUFFIX}`);
   }
 

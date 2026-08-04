@@ -37,10 +37,8 @@ describe('createLayoutResolver', () => {
     expect(thrown).toBeInstanceOf(ConfigInvalidError);
 
     if (thrown instanceof ConfigInvalidError) {
-      const diagnostic = `${thrown.message} ${JSON.stringify(thrown.details ?? {})}`;
-
-      expect(diagnostic).toContain('testDir');
-      expect(diagnostic).toContain(testDir);
+      expect(thrown.message).toContain('testDir');
+      expect(thrown.details?.testDir).toBe(testDir);
     }
   });
 });
@@ -77,10 +75,16 @@ describe('LayoutResolver companion derivation', () => {
     expect(resolver.runsDirFor(testPath)).toBe(runsDir);
   });
 
-  it('maps a legal empty-stem test into the enclosing root runs directory', () => {
-    const rootRunsResolver = createLayoutResolver({ ...CONFIG, runsDir: '/' });
+  it.each(['planPathFor', 'groundingPathFor', 'runsDirFor'] as const)('%s rejects an anonymous empty-stem test path', (method) => {
+    expect(() => resolver[method]('/workspace/tests/ambercast/.test.md')).toThrow(RangeError);
+  });
 
-    expect(rootRunsResolver.runsDirFor('/workspace/tests/ambercast/.test.md')).toBe('/');
+  it('prevents the previously colliding named and anonymous test paths from sharing a runs directory', () => {
+    const namedTestPath = '/workspace/tests/ambercast/ui.test.md';
+    const anonymousTestPath = '/workspace/tests/ambercast/ui/.test.md';
+
+    expect(resolver.runsDirFor(namedTestPath)).toBe('/workspace/.runs/ui');
+    expect(() => resolver.runsDirFor(anonymousTestPath)).toThrow(RangeError);
   });
 
   it.each([
@@ -138,6 +142,8 @@ describe('LayoutResolver companion derivation', () => {
     ['testPathForGrounding', 'a repeated-separator grounding companion', '/workspace/tests/ambercast/ui//login.ambercast.grounding.json'],
     ['testPathForPlan', 'a dot-segmented plan companion', '/workspace/tests/ambercast/./login.ambercast.plan.json'],
     ['testPathForGrounding', 'a dot-segmented grounding companion', '/workspace/tests/ambercast/./login.ambercast.grounding.json'],
+    ['testPathForPlan', 'an anonymous plan companion', '/workspace/tests/ambercast/.ambercast.plan.json'],
+    ['testPathForGrounding', 'an anonymous grounding companion', '/workspace/tests/ambercast/.ambercast.grounding.json'],
   ] as const)('%s returns undefined without throwing for %s', (method, _name, path) => {
     let result: string | undefined;
 
