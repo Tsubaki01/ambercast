@@ -1,0 +1,9 @@
+{
+  "document": "grounding",
+  "expected": "valid",
+  "value": {
+    "schemaVersion": 1,
+    "planDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "entries": {}
+  }
+}

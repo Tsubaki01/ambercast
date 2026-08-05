@@ -509,6 +509,10 @@ describe('PlanDocument', () => {
 });
 
 describe('GroundingDocument', () => {
+  // Fresh generation creates an empty grounding artifact alongside its plan; an
+  // empty entries record and a trace-omitted entry are valid cold-grounding states
+  // that deserve direct positive coverage rather than relying on digest.test.ts's
+  // createGrounding() helper merely not throwing.
   it('accepts a grounding entry with a fingerprint and populated trace', () => {
     expectAccepted(GroundingDocument, {
       schemaVersion: 1,
@@ -517,6 +521,26 @@ describe('GroundingDocument', () => {
         'login-flow': {
           fingerprint: { algorithm: 'a11y-neighborhood-v1', hash: DIGEST_A },
           trace: traceVariants.map(([, , value]) => value),
+        },
+      },
+    });
+  });
+
+  it('accepts an empty entries record for a freshly generated cold-grounding artifact', () => {
+    expectAccepted(GroundingDocument, {
+      schemaVersion: 1,
+      planDigest: DIGEST_B,
+      entries: {},
+    });
+  });
+
+  it('accepts a grounding entry with its trace omitted', () => {
+    expectAccepted(GroundingDocument, {
+      schemaVersion: 1,
+      planDigest: DIGEST_B,
+      entries: {
+        'login-flow': {
+          fingerprint: { algorithm: 'a11y-neighborhood-v1', hash: DIGEST_A },
         },
       },
     });
