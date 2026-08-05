@@ -2,7 +2,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Linter, type Linter as LinterTypes } from 'eslint';
 import tseslint from 'typescript-eslint';
-import { describe, expect, test } from 'vitest';
+import { describe, expect, it, test } from 'vitest';
 // @ts-expect-error -- the docs-first flat config intentionally has no .d.ts file.
 import eslintConfig from '../../../eslint.config.js';
 // @ts-expect-error -- the shared ESM policy intentionally has no .d.ts file.
@@ -18,6 +18,8 @@ const DEPENDENCY_CRUISER_FIXTURE_ROOT = new URL(
 );
 const ESLINT_FIXTURE_ROOT = new URL('../../fixtures/architecture/eslint/', import.meta.url);
 const SOURCE_ROOT = new URL('../../../src/', import.meta.url);
+const CORE_RESOLVER_REGRESSION_FILE = new URL('core/paths.ts', SOURCE_ROOT).pathname;
+const CONFIG_RESOLVER_REGRESSION_FILE = new URL('config/defaults.ts', SOURCE_ROOT).pathname;
 
 interface BoundariesFixtureCase {
   readonly id: string;
@@ -45,7 +47,12 @@ function restrictedSyntaxMessages(code: string, filename: string) {
  * fixtures deliberately use NodeNext's emitted-JavaScript import suffixes.
  * Projecting only those suffixes to their adjacent source files lets this
  * in-memory rule test inspect the same source-to-target fixture edges without
- * changing the fixture corpus or requiring a second resolver package.
+ * changing the fixture corpus. That deliberate projection keeps these fixture
+ * checks focused on POLICY-CONVERSION correctness: whether the layer policy
+ * translates to correct `boundaries/element-types` rules independently of
+ * resolver behavior. The resolver's actual `.js`-to-`.ts` and `#`-alias
+ * resolution is covered separately by the three real-source-path regression
+ * tests later in this file.
  */
 function projectNodeNextFixtureImportsToTypeScript(code: string): string {
   return code.replaceAll(/(from\s+['"][^'"]+)\.js(['"])/g, '$1.ts$2');
@@ -142,6 +149,16 @@ async function boundariesMessagesForFixture(
     fileName,
     messages: messages.filter(({ ruleId }) => ruleId === BOUNDARIES_ELEMENT_TYPES_RULE),
   };
+}
+
+function boundariesMessagesForRealSourceText(code: string, filename: string) {
+  const messages = new Linter({ configType: 'flat' }).verify(code, flatEslintConfig, filename);
+
+  expect(messages.filter(({ fatal, message }) => (
+    fatal || /\b(?:resolver|resolve)\b/i.test(message)
+  ))).toEqual([]);
+
+  return messages.filter(({ ruleId }) => ruleId === BOUNDARIES_ELEMENT_TYPES_RULE);
 }
 
 const nondeterministicGlobalCases = [
@@ -308,6 +325,31 @@ describe('ESLint architecture and determinism rules', () => {
       expect(result.messages).toEqual([]);
     },
   );
+
+  it('reports a relative .js-suffixed core-to-adapters boundary violation at a real source path', () => {
+    expect(boundariesMessagesForRealSourceText(
+      "import '../adapters/system/system-clock.js';",
+      CORE_RESOLVER_REGRESSION_FILE,
+    )).toEqual([
+      expect.objectContaining({ ruleId: BOUNDARIES_ELEMENT_TYPES_RULE }),
+    ]);
+  });
+
+  it('reports a # alias .js-suffixed core-to-adapters boundary violation at a real source path', () => {
+    expect(boundariesMessagesForRealSourceText(
+      "import '#adapters/system/system-clock.js';",
+      CORE_RESOLVER_REGRESSION_FILE,
+    )).toEqual([
+      expect.objectContaining({ ruleId: BOUNDARIES_ELEMENT_TYPES_RULE }),
+    ]);
+  });
+
+  it('permits an allowed # alias .js-suffixed config-to-core boundary edge at a real source path', () => {
+    expect(boundariesMessagesForRealSourceText(
+      "import '#core/config/schema.js';",
+      CONFIG_RESOLVER_REGRESSION_FILE,
+    )).toEqual([]);
+  });
 
   test('classifies every current source file into exactly one policy role', async () => {
     const sourceFiles = await findTypeScriptFiles(SOURCE_ROOT.pathname);
