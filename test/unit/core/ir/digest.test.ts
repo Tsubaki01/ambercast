@@ -96,6 +96,26 @@ describe('computeInputsDigest', () => {
   // Object.values(FIELD_MUTATIONS) and Vitest's `$displayName` object interpolation will replace this positional array so case titles remain readable prose.
   // FieldMutation will have exactly two readonly members: `displayName: string` and `mutate: (inputs: DigestInputs) => DigestInputs`, so mutate will receive an input rather than use a zero-argument callback.
   // Each mutator will receive the baseline DigestInputs and return a new object that changes only its own keyed field.
+  interface FieldMutation {
+    readonly displayName: string;
+    readonly mutate: (inputs: DigestInputs) => DigestInputs;
+  }
+
+  const FIELD_MUTATIONS: { [K in keyof DigestInputs]-?: FieldMutation } = {
+    normalizedTestMd: {
+      displayName: 'normalized test Markdown',
+      mutate: (inputs) => ({ ...inputs, normalizedTestMd: asNormalizedTestMd('# Changed smoke\n') }),
+    },
+    schemaVersion: {
+      displayName: 'schema version',
+      mutate: (inputs) => ({ ...inputs, schemaVersion: inputs.schemaVersion + 1 }),
+    },
+    compilerPromptTemplateFingerprint: {
+      displayName: 'compiler prompt-template fingerprint',
+      mutate: (inputs) => ({ ...inputs, compilerPromptTemplateFingerprint: 'compiler-template-v2' }),
+    },
+  };
+
   it.each([
     ['normalized test Markdown', () => createInputs({ normalizedTestMd: asNormalizedTestMd('# Changed smoke\n') })],
     ['schema version', () => createInputs({ schemaVersion: 2 })],
