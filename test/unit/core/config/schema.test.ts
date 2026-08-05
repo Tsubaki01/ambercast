@@ -91,10 +91,11 @@ describe('RawConfig', () => {
     expectRejected(RawConfig, value);
   });
 
-  it('reuses TargetDefinition by accepting only Chromium targets', () => {
+  it('reuses TargetDefinition by accepting only Chromium targets without embedded secret references', () => {
     expectAccepted(RawConfig, { $schema: CONFIG_SCHEMA_URL, targets: { app: TARGET } });
     expectRejected(RawConfig, { $schema: CONFIG_SCHEMA_URL, targets: { app: { ...TARGET, browser: 'firefox' } } });
     expectRejected(RawConfig, { $schema: CONFIG_SCHEMA_URL, targets: { app: { ...TARGET, browser: 'webkit' } } });
+    expectRejected(RawConfig, { $schema: CONFIG_SCHEMA_URL, targets: { app: { ...TARGET, baseUrl: 'https://example.com/{{secrets.TOKEN}}' } } });
   });
 
   it.each(['claude', 'codex', 'auto'] as const)('accepts %s as an AI provider', (provider) => {
