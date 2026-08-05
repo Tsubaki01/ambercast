@@ -91,6 +91,11 @@ describe('computeInputsDigest', () => {
     expect(computeInputsDigest(createInputs())).toBe('47d93e230bb0e2139401d889e67462843cd1bf1d0590ebe3a982661d2887c26a');
   });
 
+  // The eventual FIELD_MUTATIONS map will be typed `{ [K in keyof DigestInputs]-?: FieldMutation }` so TypeScript will reject incomplete maps whenever DigestInputs gains, loses, or renames a field: missing keys produce TS2741 and extra keys produce TS2353.
+  // The `-?` will be required because a plain homomorphic mapped type preserves optionality, which would silently exempt a future optional field from the completeness check.
+  // Object.values(FIELD_MUTATIONS) and Vitest's `$displayName` object interpolation will replace this positional array so case titles remain readable prose.
+  // FieldMutation will have exactly two readonly members: `displayName: string` and `mutate: (inputs: DigestInputs) => DigestInputs`, so mutate will receive an input rather than use a zero-argument callback.
+  // Each mutator will receive the baseline DigestInputs and return a new object that changes only its own keyed field.
   it.each([
     ['normalized test Markdown', () => createInputs({ normalizedTestMd: asNormalizedTestMd('# Changed smoke\n') })],
     ['schema version', () => createInputs({ schemaVersion: 2 })],
