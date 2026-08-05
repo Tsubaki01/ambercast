@@ -280,6 +280,10 @@ describe('loadConfig', () => {
       expect(error.cause).toBeInstanceOf(SyntaxError);
     });
 
+    // A `null` top-level document is the only non-object case whose observable
+    // behavior depends on `rejectUnsafeRawKeys` returning early:
+    // `Object.prototype.hasOwnProperty.call` throws for `null` but not boxed
+    // primitives or arrays, so it alone merits dedicated coverage.
     it('retains the failing Zod issue path for schema-invalid content', async () => {
       const storage = createInMemoryStorage();
       await writeConfig(storage, `${CWD}/ambercast.config.json`, { viewer: { port: 0 } });
