@@ -91,11 +91,8 @@ describe('computeInputsDigest', () => {
     expect(computeInputsDigest(createInputs())).toBe('47d93e230bb0e2139401d889e67462843cd1bf1d0590ebe3a982661d2887c26a');
   });
 
-  // The eventual FIELD_MUTATIONS map will be typed `{ [K in keyof DigestInputs]-?: FieldMutation }` so TypeScript will reject incomplete maps whenever DigestInputs gains, loses, or renames a field: missing keys produce TS2741 and extra keys produce TS2353.
-  // The `-?` will be required because a plain homomorphic mapped type preserves optionality, which would silently exempt a future optional field from the completeness check.
-  // Object.values(FIELD_MUTATIONS) and Vitest's `$displayName` object interpolation will replace this positional array so case titles remain readable prose.
-  // FieldMutation will have exactly two readonly members: `displayName: string` and `mutate: (inputs: DigestInputs) => DigestInputs`, so mutate will receive an input rather than use a zero-argument callback.
-  // Each mutator will receive the baseline DigestInputs and return a new object that changes only its own keyed field.
+  // The `-?` modifier prevents a future optional DigestInputs field from silently evading this completeness check.
+  // Each mutator receives the baseline and returns a new object that changes only the field it covers.
   interface FieldMutation {
     readonly displayName: string;
     readonly mutate: (inputs: DigestInputs) => DigestInputs;
@@ -114,17 +111,19 @@ describe('computeInputsDigest', () => {
       displayName: 'compiler prompt-template fingerprint',
       mutate: (inputs) => ({ ...inputs, compilerPromptTemplateFingerprint: 'compiler-template-v2' }),
     },
+    targetDefinitions: {
+      displayName: 'target definitions',
+      mutate: (inputs) => ({
+        ...inputs,
+        targetDefinitions: { app: targetDefinition('https://changed.example.test') },
+      }),
+    },
   };
 
-  it.each([
-    ['normalized test Markdown', () => createInputs({ normalizedTestMd: asNormalizedTestMd('# Changed smoke\n') })],
-    ['schema version', () => createInputs({ schemaVersion: 2 })],
-    ['compiler prompt-template fingerprint', () => createInputs({ compilerPromptTemplateFingerprint: 'compiler-template-v2' })],
-    ['target definitions', () => createInputs({ targetDefinitions: { app: targetDefinition('https://changed.example.test') } })],
-  ])('changes when only the %s changes', (_field, change) => {
-    const baseline = computeInputsDigest(createInputs());
+  it.each(Object.values(FIELD_MUTATIONS))('changes when only the $displayName changes', ({ mutate }) => {
+    const baseline = createInputs();
 
-    expect(computeInputsDigest(change())).not.toBe(baseline);
+    expect(computeInputsDigest(mutate(baseline))).not.toBe(computeInputsDigest(baseline));
   });
 
   it('is unchanged across fresh deep-equal input objects', () => {
