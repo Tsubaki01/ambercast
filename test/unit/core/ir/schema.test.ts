@@ -138,11 +138,12 @@ describe('TargetDefinition', () => {
     expectAccepted(TargetDefinition, { baseUrl: 'https://example.test/path?query=value#section', browser: 'chromium' });
   });
 
-  it('rejects malformed or non-HTTP URLs, unsupported browsers, wrong field types, and unknown properties', () => {
+  it('rejects malformed or non-HTTP URLs, embedded secret references, unsupported browsers, wrong field types, and unknown properties', () => {
     expectRejected(TargetDefinition, { baseUrl: 'ftp://example.test', browser: 'chromium' });
     for (const hostlessUrl of ['https://?', 'https:///path', 'http://', 'http://#fragment']) {
       expectRejected(TargetDefinition, { baseUrl: hostlessUrl, browser: 'chromium' });
     }
+    expectRejected(TargetDefinition, { baseUrl: 'https://example.com/{{secrets.TOKEN}}', browser: 'chromium' });
     expectRejected(TargetDefinition, { baseUrl: 'https://example.test', browser: 'firefox' });
     expectRejected(TargetDefinition, { baseUrl: 42, browser: 'chromium' });
     expectRejected(TargetDefinition, { ...TARGET_DEFINITION, unexpected: true });
@@ -340,10 +341,14 @@ describe('AssertStep', () => {
     expectRejected(ElementCountCheck, { id: 'fractional-alerts', kind: 'assert', check: 'element-count', target: TARGET, count: 1.5 });
   });
 
-  it('accepts unicode text and rejects secret interpolation in assertion text', () => {
+  it('accepts unicode and multi-line text while rejecting contiguous secret interpolation in assertion text', () => {
     expectAccepted(TextVisibleCheck, { id: 'japanese-visible', kind: 'assert', check: 'text-visible', text: 'ようこそ、世界' });
     expectAccepted(TextVisibleCheck, { id: 'run-visible', kind: 'assert', check: 'text-visible', text: 'Hello {{run.username}}' });
     expectRejected(TextVisibleCheck, { id: 'secret-visible', kind: 'assert', check: 'text-visible', text: 'Hello {{secrets.app.password}}' });
+    expectAccepted(TextVisibleCheck, { id: 'multiline-visible', kind: 'assert', check: 'text-visible', text: 'Line one\nLine two' });
+    expectRejected(TextVisibleCheck, { id: 'multiline-secret-first', kind: 'assert', check: 'text-visible', text: '{{secrets.TOKEN}}\ntext' });
+    expectRejected(TextVisibleCheck, { id: 'multiline-secret-later', kind: 'assert', check: 'text-visible', text: 'text\n{{secrets.TOKEN}}' });
+    expectAccepted(TextVisibleCheck, { id: 'multiline-split-marker', kind: 'assert', check: 'text-visible', text: 'text\n{{secrets\n.TOKEN}}' });
   });
 });
 

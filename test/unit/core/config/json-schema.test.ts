@@ -28,6 +28,7 @@ describe('config JSON Schema document', () => {
     ['an unknown top-level key', { $schema: CONFIG_SCHEMA_URL, unexpected: true }, false],
     ['a Chromium target', { $schema: CONFIG_SCHEMA_URL, targets: { app: TARGET } }, true],
     ['a bad target entry', { $schema: CONFIG_SCHEMA_URL, targets: { app: { ...TARGET, browser: 'firefox' } } }, false],
+    ['a target URL embedding a secret reference', { $schema: CONFIG_SCHEMA_URL, targets: { app: { ...TARGET, baseUrl: 'https://example.com/{{secrets.TOKEN}}' } } }, false],
     ['a supported AI provider', { $schema: CONFIG_SCHEMA_URL, ai: { provider: 'codex' } }, true],
     ['an invalid AI provider', { $schema: CONFIG_SCHEMA_URL, ai: { provider: 'openai' } }, false],
     ['the lowest valid viewer port', { $schema: CONFIG_SCHEMA_URL, viewer: { port: 1 } }, true],

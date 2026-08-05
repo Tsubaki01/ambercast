@@ -1,0 +1,12 @@
+{
+  "document": "plan",
+  "expected": "valid",
+  "value": {
+    "schemaVersion": 1,
+    "source": { "inputsDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    "targets": {},
+    "steps": [
+      { "id": "multiline-visible", "kind": "assert", "check": "text-visible", "text": "Line one\nLine two" }
+    ]
+  }
+}

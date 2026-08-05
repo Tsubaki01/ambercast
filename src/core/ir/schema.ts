@@ -21,7 +21,8 @@ import { z } from 'zod';
 // A dotted-path resolver must use own-property-safe access (Object.hasOwn or Map), never plain-object bracket access.
 const SECRET_REF_PATTERN = /^\{\{secrets\.[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*\}\}$/;
 const HEX_SHA256_PATTERN = /^[0-9a-f]{64}$/;
-const INTERPOLATABLE_TEXT_PATTERN = /^(?!.*\{\{secrets\.).*$/s;
+// This flag-independent pattern keeps zod's runtime validator and the generated public JSON Schema aligned: JSON Schema's `pattern` keyword carries no flags, and `z.toJSONSchema()` emits only a regex's source. It rejects a contiguous `{{secrets.` marker at the start of a multi-line string, immediately after an embedded newline, or anywhere later, while accepting a near-miss with a newline inside the marker such as `{{secrets\n.TOKEN}}` because the marker text is not contiguous.
+const NO_SECRETS_LITERAL_PATTERN = /^(?![\s\S]*\{\{secrets\.)[\s\S]*$/;
 const HTTP_URL_PATTERN = /^https?:\/\/[^\s/?#]\S*$/;
 const STEP_ID_PATTERN = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
 const RUN_VARIABLE_NAME_PATTERN = /^[a-z][a-zA-Z0-9]*$/;
@@ -66,7 +67,7 @@ export type HexSha256 = z.infer<typeof HexSha256>;
  * {@link SecretRef} prevents values surfaced in traces, assertions, or
  * compiler instructions from embedding secret tokens.
  */
-export const InterpolatableText = z.string().regex(INTERPOLATABLE_TEXT_PATTERN);
+export const InterpolatableText = z.string().regex(NO_SECRETS_LITERAL_PATTERN);
 
 /**
  * The static output type of {@link InterpolatableText}; it represents text
@@ -75,15 +76,26 @@ export const InterpolatableText = z.string().regex(INTERPOLATABLE_TEXT_PATTERN);
 export type InterpolatableText = z.infer<typeof InterpolatableText>;
 
 /**
- * Validates the browser target named by a plan's `targets` record.
+ * Validates the browser target shared by a plan's `targets` record and
+ * `RawConfig.targets`.
  *
  * A portable regex, rather than `z.url()`, preserves the HTTP(S) restriction
  * in generated JSON Schema without requiring AJV format support. Keeping the
  * browser explicit makes schema evolution visible rather than hiding it in a
  * runtime constant.
+ *
+ * @remarks
+ * A separate `.regex()` composes the HTTP(S) restriction with a
+ * secrets-literal check, rather than combining patterns or using `.refine()`.
+ * Separate regex constraints remain visible in generated JSON Schema, while a
+ * refinement would violate this module's invariant against
+ * JSON-Schema-invisible constraints. A `baseUrl` rejects those references
+ * because target URLs are human-authored configuration rather than
+ * interpolation inputs, preventing unresolved references from entering
+ * committed IR or runtime requests.
  */
 export const TargetDefinition = z.strictObject({
-  baseUrl: z.string().regex(HTTP_URL_PATTERN),
+  baseUrl: z.string().regex(HTTP_URL_PATTERN).regex(NO_SECRETS_LITERAL_PATTERN),
   browser: z.literal('chromium'),
 });
 
