@@ -11,14 +11,13 @@
  *
  * The selected preset is `tseslint.configs.recommended`, not
  * `recommendedTypeChecked`: type-aware linting is outside this policy and
- * can slow linting across the repository. Boundary checks will nevertheless
- * require a TypeScript-aware resolver: `boundaries/element-types` must map
+ * can slow linting across the repository. Boundary checks nevertheless
+ * require a TypeScript-aware resolver: `boundaries/element-types` maps
  * the repository's NodeNext `.js`-suffixed specifiers back to `.ts` paths
- * without running type checks. That resolver will be
- * `eslint-import-resolver-typescript`, wired through
- * `settings['import/resolver']` and resolving with its own
+ * without running type checks. `eslint-import-resolver-typescript` is
+ * configured through `settings['import/resolver']` and resolves with its own
  * `unrs-resolver`/`get-tsconfig` machinery rather than TypeScript compiler
- * APIs, closing the gap with dependency-cruiser's `.dependency-cruiser.mjs`
+ * APIs. This closes the gap with dependency-cruiser's `.dependency-cruiser.mjs`
  * `tsConfig`-based resolution, which already follows these paths while
  * ESLint's default resolver cannot. eslint-plugin-boundaries
  * translates the shared eleven-role layer policy for
@@ -181,6 +180,9 @@ export default [
     files: BOUNDARY_FILES,
     plugins: { boundaries },
     settings: {
+      'import/resolver': {
+        typescript: { project: './tsconfig.json' },
+      },
       'boundaries/elements': boundaryElements,
       'boundaries/elements-single-match': true,
       'boundaries/files': boundaryFiles,

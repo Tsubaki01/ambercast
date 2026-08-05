@@ -47,7 +47,12 @@ function restrictedSyntaxMessages(code: string, filename: string) {
  * fixtures deliberately use NodeNext's emitted-JavaScript import suffixes.
  * Projecting only those suffixes to their adjacent source files lets this
  * in-memory rule test inspect the same source-to-target fixture edges without
- * changing the fixture corpus or requiring a second resolver package.
+ * changing the fixture corpus. That deliberate projection keeps these fixture
+ * checks focused on POLICY-CONVERSION correctness: whether the layer policy
+ * translates to correct `boundaries/element-types` rules independently of
+ * resolver behavior. The resolver's actual `.js`-to-`.ts` and `#`-alias
+ * resolution is covered separately by the three real-source-path regression
+ * tests later in this file.
  */
 function projectNodeNextFixtureImportsToTypeScript(code: string): string {
   return code.replaceAll(/(from\s+['"][^'"]+)\.js(['"])/g, '$1.ts$2');
