@@ -15,6 +15,12 @@ interface Fixture {
   readonly receptacle: string;
 }
 
+interface RunScriptOptions {
+  readonly cwd?: string;
+  readonly environment?: NodeJS.ProcessEnv;
+  readonly skipSetup?: boolean;
+}
+
 let fixture: Fixture | undefined;
 
 function getFixture(): Fixture {
@@ -33,25 +39,33 @@ function runGit(cwd: string, args: readonly string[]): string {
   });
 }
 
-function runScript(script: string, args: readonly string[], environment: NodeJS.ProcessEnv = {}): string {
+function runScript(
+  script: string,
+  args: readonly string[],
+  { cwd = getFixture().repository, environment = {}, skipSetup = true }: RunScriptOptions = {},
+): string {
+  const commandEnvironment = { ...process.env, ...environment };
+
+  if (skipSetup) {
+    commandEnvironment.AMBERCAST_WT_SKIP_SETUP = '1';
+  } else {
+    delete commandEnvironment.AMBERCAST_WT_SKIP_SETUP;
+  }
+
   return execFileSync(process.execPath, [script, ...args], {
-    cwd: getFixture().repository,
+    cwd,
     encoding: 'utf8',
-    env: {
-      ...process.env,
-      AMBERCAST_WT_SKIP_SETUP: '1',
-      ...environment,
-    },
+    env: commandEnvironment,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 }
 
-function runAdd(args: readonly string[], environment: NodeJS.ProcessEnv = {}): string {
-  return runScript(ADD_SCRIPT, args, environment);
+function runAdd(args: readonly string[], options: RunScriptOptions = {}): string {
+  return runScript(ADD_SCRIPT, args, options);
 }
 
-function runRemove(args: readonly string[]): string {
-  return runScript(REMOVE_SCRIPT, args);
+function runRemove(args: readonly string[], options: RunScriptOptions = {}): string {
+  return runScript(REMOVE_SCRIPT, args, options);
 }
 
 function expectScriptFailure(command: () => unknown): string {
@@ -195,14 +209,39 @@ describe('worktree-add.mjs', () => {
     },
   );
 
+  it('accepts --no-setup before the issue number and skips setup without the environment override', () => {
+    runAdd(['--no-setup', '107'], { skipSetup: false });
+    const path = worktreePath('107');
+
+    expect(existsSync(path)).toBe(true);
+    expect(existsSync(join(path, 'node_modules'))).toBe(false);
+  });
+
+  it('rejects an unknown flag without creating a worktree', async () => {
+    const error = expectScriptFailure(() => runAdd(['108', '--unexpected']));
+
+    expect(error).toContain('Usage:');
+    expect(await readdir(getFixture().receptacle)).toEqual([]);
+  });
+
   it('uses the absolute AMBERCAST_WORKTREE_ROOT override when provided', async () => {
     const override = join(getFixture().root, 'alternate-worktrees');
     await mkdir(override, { recursive: true });
 
-    runAdd(['107'], { AMBERCAST_WORKTREE_ROOT: override });
+    runAdd(['107'], { environment: { AMBERCAST_WORKTREE_ROOT: override } });
 
     expect(existsSync(join(override, 'issues-107'))).toBe(true);
     expect(existsSync(worktreePath('107'))).toBe(false);
+  });
+
+  it('rejects a relative AMBERCAST_WORKTREE_ROOT override without creating a worktree', async () => {
+    const error = expectScriptFailure(() => runAdd(['109'], {
+      environment: { AMBERCAST_WORKTREE_ROOT: 'relative-worktrees' },
+    }));
+
+    expect(error).toMatch(/absolute path/i);
+    expect(await readdir(getFixture().receptacle)).toEqual([]);
+    expect(branchExists('issues/109')).toBe(false);
   });
 });
 
@@ -276,16 +315,26 @@ describe('worktree-remove.mjs', () => {
     expect(branchExists('issues/207')).toBe(true);
   });
 
-  it('force-deletes an unmerged branch when --force and --with-branch are supplied', async () => {
+  it('refuses to remove the worktree containing the running command', () => {
     const path = createWorktree('208');
+
+    const error = expectScriptFailure(() => runRemove(['208', '--with-branch'], { cwd: path }));
+
+    expect(error).toMatch(/run from the main checkout/i);
+    expect(existsSync(path)).toBe(true);
+    expect(branchExists('issues/208')).toBe(true);
+  });
+
+  it('force-deletes an unmerged branch when --force and --with-branch are supplied', async () => {
+    const path = createWorktree('209');
     await writeFile(join(path, 'change.txt'), 'unmerged\n');
     runGit(path, ['add', 'change.txt']);
     runGit(path, ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'unmerged']);
 
-    runRemove(['208', '--force', '--with-branch']);
+    runRemove(['209', '--force', '--with-branch']);
 
     expect(existsSync(path)).toBe(false);
-    expect(branchExists('issues/208')).toBe(false);
+    expect(branchExists('issues/209')).toBe(false);
   });
 
   it('rejects an unknown issue number', () => {
@@ -295,7 +344,7 @@ describe('worktree-remove.mjs', () => {
   });
 
   it('copies missing logs and todos back without overwriting main-checkout files', async () => {
-    const path = createWorktree('209');
+    const path = createWorktree('210');
     const mainLogs = join(getFixture().repository, '.claude', 'logs');
     const mainTodos = join(getFixture().repository, '.claude', 'todos');
 
@@ -312,12 +361,13 @@ describe('worktree-remove.mjs', () => {
       writeFile(join(mainLogs, 'already-in-main.md'), 'main copy\n'),
     ]);
 
-    const output = runRemove(['209', '--force']);
+    const output = runRemove(['210', '--force']);
 
     await expect(readFile(join(mainLogs, 'only-in-worktree.md'), 'utf8')).resolves.toBe('preserve this log\n');
     await expect(readFile(join(mainLogs, 'already-in-main.md'), 'utf8')).resolves.toBe('main copy\n');
     await expect(readFile(join(mainTodos, 'nested', 'only-in-worktree.md'), 'utf8')).resolves.toBe('preserve this todo\n');
     expect(output).toMatch(/skipped.*already-in-main/i);
+    expect(output).toContain('Copied todo file: nested/only-in-worktree.md');
   });
 
   it('refuses to remove the main worktree when given its path', () => {

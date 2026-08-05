@@ -5,61 +5,10 @@
 import { execFileSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { relative, resolve } from 'node:path';
+import { fail, getErrorMessage, parseWorktreeList, runGit } from './lib/worktree.mjs';
 
 const USAGE = 'Usage: node scripts/worktree-remove.mjs <issue-number|worktree-path> [--force] [--with-branch]';
 const ISSUE_NUMBER = /^[1-9]\d*$/;
-
-function fail(message) {
-  console.error(`worktree-remove: ${message}`);
-  process.exitCode = 1;
-}
-
-function getErrorMessage(error) {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function runGit(args, options = {}) {
-  return execFileSync('git', args, {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    ...options,
-  });
-}
-
-function parseWorktreeList() {
-  const output = runGit(['worktree', 'list', '--porcelain']);
-  const worktrees = [];
-  let worktree;
-
-  for (const line of output.split('\n')) {
-    if (line === '') {
-      if (worktree !== undefined) {
-        worktrees.push(worktree);
-        worktree = undefined;
-      }
-      continue;
-    }
-
-    if (line.startsWith('worktree ')) {
-      worktree = { path: line.slice('worktree '.length) };
-      continue;
-    }
-
-    if (worktree !== undefined && line.startsWith('branch refs/heads/')) {
-      worktree.branch = line.slice('branch refs/heads/'.length);
-    }
-  }
-
-  if (worktree !== undefined) {
-    worktrees.push(worktree);
-  }
-
-  if (worktrees.length === 0) {
-    throw new Error('Git did not report a main worktree.');
-  }
-
-  return worktrees;
-}
 
 function parseArguments(args) {
   const [target, ...flags] = args;
@@ -113,7 +62,7 @@ function selectWorktree(target, worktrees) {
 
 // Only ordinary files are copied. Ignoring symlinks prevents a worktree from
 // turning record preservation into an unexpected read outside its own tree.
-function copyMissingFiles(sourceDirectory, destinationDirectory, category) {
+function copyMissingFiles(sourceDirectory, destinationDirectory, category, categoryRoot = sourceDirectory) {
   if (!existsSync(sourceDirectory)) {
     return;
   }
@@ -123,7 +72,7 @@ function copyMissingFiles(sourceDirectory, destinationDirectory, category) {
     const destinationPath = resolve(destinationDirectory, entry.name);
 
     if (entry.isDirectory()) {
-      copyMissingFiles(sourcePath, destinationPath, category);
+      copyMissingFiles(sourcePath, destinationPath, category, categoryRoot);
       continue;
     }
 
@@ -131,7 +80,7 @@ function copyMissingFiles(sourceDirectory, destinationDirectory, category) {
       continue;
     }
 
-    const recordName = relative(sourceDirectory, sourcePath);
+    const recordName = relative(categoryRoot, sourcePath);
     if (existsSync(destinationPath)) {
       console.log(`Skipped existing ${category} file: ${recordName}`);
       continue;
@@ -160,6 +109,10 @@ function isDirty(worktreePath) {
   return runGit(['-C', worktreePath, 'status', '--porcelain']).trim() !== '';
 }
 
+function resolveCurrentWorktree() {
+  return runGit(['rev-parse', '--show-toplevel']).trim();
+}
+
 function removeWorktree(worktreePath, force) {
   const args = ['worktree', 'remove'];
   if (force) {
@@ -176,7 +129,7 @@ function removeBranch(branch, force) {
 function main() {
   const parsed = parseArguments(process.argv.slice(2));
   if (parsed === undefined) {
-    fail(USAGE);
+    fail('worktree-remove', USAGE);
     return;
   }
 
@@ -188,17 +141,22 @@ function main() {
 
   const targetWorktree = selectWorktree(parsed.target, worktrees);
   if (resolve(targetWorktree.path) === resolve(mainWorktree.path)) {
-    fail(`Refusing to remove the main worktree: ${mainWorktree.path}`);
+    fail('worktree-remove', `Refusing to remove the main worktree: ${mainWorktree.path}`);
+    return;
+  }
+
+  if (resolve(targetWorktree.path) === resolve(resolveCurrentWorktree())) {
+    fail('worktree-remove', `Refusing to remove the worktree containing this command. Run from the main checkout: ${mainWorktree.path}`);
     return;
   }
 
   if (parsed.withBranch && targetWorktree.branch === undefined) {
-    fail(`Worktree ${targetWorktree.path} has no local branch to delete.`);
+    fail('worktree-remove', `Worktree ${targetWorktree.path} has no local branch to delete.`);
     return;
   }
 
   if (!parsed.force && isDirty(targetWorktree.path)) {
-    fail(`Worktree is dirty: ${targetWorktree.path}. Re-run with --force to remove it.`);
+    fail('worktree-remove', `Worktree is dirty: ${targetWorktree.path}. Re-run with --force to remove it.`);
     return;
   }
 
@@ -215,5 +173,5 @@ function main() {
 try {
   main();
 } catch (error) {
-  fail(getErrorMessage(error));
+  fail('worktree-remove', getErrorMessage(error));
 }

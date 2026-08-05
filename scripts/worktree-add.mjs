@@ -4,27 +4,11 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
+import { fail, getErrorMessage, parseWorktreeList, runGit } from './lib/worktree.mjs';
 
 const USAGE = 'Usage: node scripts/worktree-add.mjs <issue-number> [slug] [--no-setup]';
 const ISSUE_NUMBER = /^[1-9]\d*$/;
 const SLUG = /^[a-z0-9][a-z0-9-]*$/;
-
-function fail(message) {
-  console.error(`worktree-add: ${message}`);
-  process.exitCode = 1;
-}
-
-function getErrorMessage(error) {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function runGit(args, options = {}) {
-  return execFileSync('git', args, {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    ...options,
-  });
-}
 
 function gitSucceeds(args) {
   try {
@@ -33,41 +17,6 @@ function gitSucceeds(args) {
   } catch {
     return false;
   }
-}
-
-function parseWorktreeList() {
-  const output = runGit(['worktree', 'list', '--porcelain']);
-  const worktrees = [];
-  let worktree;
-
-  for (const line of output.split('\n')) {
-    if (line === '') {
-      if (worktree !== undefined) {
-        worktrees.push(worktree);
-        worktree = undefined;
-      }
-      continue;
-    }
-
-    if (line.startsWith('worktree ')) {
-      worktree = { path: line.slice('worktree '.length) };
-      continue;
-    }
-
-    if (worktree !== undefined && line.startsWith('branch refs/heads/')) {
-      worktree.branch = line.slice('branch refs/heads/'.length);
-    }
-  }
-
-  if (worktree !== undefined) {
-    worktrees.push(worktree);
-  }
-
-  if (worktrees.length === 0) {
-    throw new Error('Git did not report a main worktree.');
-  }
-
-  return worktrees;
 }
 
 // Git lists the primary checkout first. Resolving its top-level directory
@@ -97,19 +46,27 @@ function resolveReceptacle(mainWorktree) {
 }
 
 function parseArguments(args) {
-  const argumentsWithoutSetup = [...args];
-  const noSetupIndex = argumentsWithoutSetup.indexOf('--no-setup');
+  const positionals = [];
+  let noSetup = false;
 
-  if (noSetupIndex !== -1 && noSetupIndex !== argumentsWithoutSetup.length - 1) {
-    return undefined;
+  for (const argument of args) {
+    if (argument === '--no-setup') {
+      if (noSetup) {
+        return undefined;
+      }
+
+      noSetup = true;
+      continue;
+    }
+
+    if (argument.startsWith('--')) {
+      return undefined;
+    }
+
+    positionals.push(argument);
   }
 
-  const noSetup = noSetupIndex !== -1;
-  if (noSetup) {
-    argumentsWithoutSetup.pop();
-  }
-
-  const [issue, slug, ...extra] = argumentsWithoutSetup;
+  const [issue, slug, ...extra] = positionals;
   if (
     extra.length > 0
     || issue === undefined
@@ -139,7 +96,7 @@ function runSetup(target) {
 function main() {
   const parsed = parseArguments(process.argv.slice(2));
   if (parsed === undefined) {
-    fail(USAGE);
+    fail('worktree-add', USAGE);
     return;
   }
 
@@ -151,14 +108,14 @@ function main() {
   const target = resolve(receptacle, directoryName);
 
   if (existsSync(target)) {
-    fail(`Target directory already exists: ${target}`);
+    fail('worktree-add', `Target directory already exists: ${target}`);
     return;
   }
 
   const branchExists = gitSucceeds(['show-ref', '--verify', '--quiet', `refs/heads/${branch}`]);
   const checkedOut = worktrees.find((worktree) => worktree.branch === branch);
   if (checkedOut !== undefined) {
-    fail(`Branch ${branch} is already checked out at ${checkedOut.path}.`);
+    fail('worktree-add', `Branch ${branch} is already checked out at ${checkedOut.path}.`);
     return;
   }
 
@@ -175,7 +132,7 @@ function main() {
   try {
     runSetup(target);
   } catch (error) {
-    fail(`Setup failed after creating ${target}: ${getErrorMessage(error)}`);
+    fail('worktree-add', `Setup failed after creating ${target}: ${getErrorMessage(error)}`);
     console.error(`The worktree was kept. Re-run setup manually with: cd ${target} && npm ci && npm run build`);
     return;
   }
@@ -188,5 +145,5 @@ function main() {
 try {
   main();
 } catch (error) {
-  fail(getErrorMessage(error));
+  fail('worktree-add', getErrorMessage(error));
 }
