@@ -526,6 +526,26 @@ describe('GroundingDocument', () => {
     });
   });
 
+  it('accepts an empty entries record for a freshly generated cold-grounding artifact', () => {
+    expectAccepted(GroundingDocument, {
+      schemaVersion: 1,
+      planDigest: DIGEST_B,
+      entries: {},
+    });
+  });
+
+  it('accepts a grounding entry with its trace omitted', () => {
+    expectAccepted(GroundingDocument, {
+      schemaVersion: 1,
+      planDigest: DIGEST_B,
+      entries: {
+        'login-flow': {
+          fingerprint: { algorithm: 'a11y-neighborhood-v1', hash: DIGEST_A },
+        },
+      },
+    });
+  });
+
   it('rejects wrong document fields, invalid entry keys, and unknown properties', () => {
     expectRejected(GroundingDocument, { schemaVersion: 1, planDigest: 'b'.repeat(63), entries: {} });
     expectRejected(GroundingDocument, { schemaVersion: 1, planDigest: DIGEST_B, entries: { '1': { fingerprint: { algorithm: 'a11y-neighborhood-v1', hash: DIGEST_A } } } });
