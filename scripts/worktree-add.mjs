@@ -3,7 +3,7 @@
 // checkout location. Git remains the authority for branch and worktree state.
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync } from 'node:fs';
-import { isAbsolute, resolve } from 'node:path';
+import { basename, isAbsolute, resolve } from 'node:path';
 import { fail, getErrorMessage, parseWorktreeList, runGit } from './lib/worktree.mjs';
 
 const USAGE = 'Usage: node scripts/worktree-add.mjs <issue-number> [slug] [--no-setup]';
@@ -39,10 +39,10 @@ function resolveReceptacle(mainWorktree) {
       throw new Error('AMBERCAST_WORKTREE_ROOT must be an absolute path.');
     }
 
-    return resolve(override);
+    return resolve(override, basename(mainWorktree));
   }
 
-  return resolve(mainWorktree, '..', '..', '.worktrees');
+  return resolve(mainWorktree, '..', '..', '.worktrees', basename(mainWorktree));
 }
 
 function parseArguments(args) {

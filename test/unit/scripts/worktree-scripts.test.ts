@@ -11,7 +11,9 @@ const REMOVE_SCRIPT = fileURLToPath(new URL('../../../scripts/worktree-remove.mj
 
 interface Fixture {
   readonly root: string;
+  readonly repositoryName: string;
   readonly repository: string;
+  readonly receptacleRoot: string;
   readonly receptacle: string;
 }
 
@@ -109,22 +111,28 @@ function createWorktree(issue: string, slug?: string): string {
   return worktreePath(issue, slug);
 }
 
-beforeEach(async () => {
-  const createdRoot = await mkdtemp(join(tmpdir(), 'ambercast-worktree-scripts-'));
-  const root = await realpath(createdRoot);
-  const repository = join(root, 'product', 'workspace', 'repo');
-  const receptacle = join(root, 'product', '.worktrees');
-
-  await Promise.all([
-    mkdir(repository, { recursive: true }),
-    mkdir(receptacle, { recursive: true }),
-  ]);
+async function initializeRepository(repository: string): Promise<void> {
+  await mkdir(repository, { recursive: true });
   runGit(repository, ['init', '-b', 'main']);
   await writeFile(join(repository, 'README.md'), '# fixture\n');
   runGit(repository, ['add', 'README.md']);
   runGit(repository, ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'fixture']);
+}
 
-  fixture = { root, repository, receptacle };
+beforeEach(async () => {
+  const createdRoot = await mkdtemp(join(tmpdir(), 'ambercast-worktree-scripts-'));
+  const root = await realpath(createdRoot);
+  const repositoryName = 'repo';
+  const repository = join(root, 'product', 'workspace', repositoryName);
+  const receptacleRoot = join(root, 'product', '.worktrees');
+  const receptacle = join(receptacleRoot, repositoryName);
+
+  await Promise.all([
+    initializeRepository(repository),
+    mkdir(receptacleRoot, { recursive: true }),
+  ]);
+
+  fixture = { root, repositoryName, repository, receptacleRoot, receptacle };
 });
 
 afterEach(async () => {
@@ -149,6 +157,25 @@ describe('worktree-add.mjs', () => {
     expect(output).toContain(path);
     expect(output).toContain('issues/101');
     expect(output).toContain(`cd ${path}`);
+  });
+
+  it('namespaces the default receptacle by the main repository directory basename', () => {
+    runAdd(['110']);
+    const path = join(getFixture().root, 'product', '.worktrees', 'repo', 'issues-110');
+
+    expect(existsSync(path)).toBe(true);
+  });
+
+  it('keeps same-number worktrees from differently named repositories separate', async () => {
+    const secondRepositoryName = 'website';
+    const secondRepository = join(getFixture().root, 'product', 'workspace', secondRepositoryName);
+    await initializeRepository(secondRepository);
+
+    runAdd(['110']);
+    runAdd(['110'], { cwd: secondRepository });
+
+    expect(existsSync(join(getFixture().receptacleRoot, 'repo', 'issues-110'))).toBe(true);
+    expect(existsSync(join(getFixture().receptacleRoot, secondRepositoryName, 'issues-110'))).toBe(true);
   });
 
   it('creates a slugged issue branch and directory', () => {
@@ -195,7 +222,7 @@ describe('worktree-add.mjs', () => {
       const error = expectScriptFailure(() => runAdd([issue]));
 
       expect(error).toContain('Usage:');
-      expect(await readdir(getFixture().receptacle)).toEqual([]);
+      expect(await readdir(getFixture().receptacleRoot)).toEqual([]);
     },
   );
 
@@ -205,7 +232,7 @@ describe('worktree-add.mjs', () => {
       const error = expectScriptFailure(() => runAdd(['106', slug]));
 
       expect(error).toContain('Usage:');
-      expect(await readdir(getFixture().receptacle)).toEqual([]);
+      expect(await readdir(getFixture().receptacleRoot)).toEqual([]);
     },
   );
 
@@ -221,7 +248,7 @@ describe('worktree-add.mjs', () => {
     const error = expectScriptFailure(() => runAdd(['108', '--unexpected']));
 
     expect(error).toContain('Usage:');
-    expect(await readdir(getFixture().receptacle)).toEqual([]);
+    expect(await readdir(getFixture().receptacleRoot)).toEqual([]);
   });
 
   it('uses the absolute AMBERCAST_WORKTREE_ROOT override when provided', async () => {
@@ -230,8 +257,19 @@ describe('worktree-add.mjs', () => {
 
     runAdd(['107'], { environment: { AMBERCAST_WORKTREE_ROOT: override } });
 
-    expect(existsSync(join(override, 'issues-107'))).toBe(true);
+    expect(existsSync(join(override, 'repo', 'issues-107'))).toBe(true);
+    expect(existsSync(join(override, 'issues-107'))).toBe(false);
     expect(existsSync(worktreePath('107'))).toBe(false);
+  });
+
+  it('uses repository directory names verbatim as namespace segments', async () => {
+    const repositoryName = 'ambercast.web';
+    const repository = join(getFixture().root, 'product', 'workspace', repositoryName);
+    await initializeRepository(repository);
+
+    runAdd(['111'], { cwd: repository });
+
+    expect(existsSync(join(getFixture().receptacleRoot, repositoryName, 'issues-111'))).toBe(true);
   });
 
   it('rejects a relative AMBERCAST_WORKTREE_ROOT override without creating a worktree', async () => {
@@ -240,7 +278,7 @@ describe('worktree-add.mjs', () => {
     }));
 
     expect(error).toMatch(/absolute path/i);
-    expect(await readdir(getFixture().receptacle)).toEqual([]);
+    expect(await readdir(getFixture().receptacleRoot)).toEqual([]);
     expect(branchExists('issues/109')).toBe(false);
   });
 });
@@ -253,6 +291,15 @@ describe('worktree-remove.mjs', () => {
     expect(existsSync(path)).toBe(false);
     expect(branchExists('issues/201')).toBe(true);
     expect(output).toMatch(/removed/i);
+  });
+
+  it('removes a namespaced worktree selected by its bare issue number', () => {
+    const path = createWorktree('211');
+
+    expect(path).toBe(join(getFixture().receptacleRoot, 'repo', 'issues-211'));
+    runRemove(['211']);
+
+    expect(existsSync(path)).toBe(false);
   });
 
   it('matches a lone slugged worktree from its bare issue number', () => {
