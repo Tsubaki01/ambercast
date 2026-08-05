@@ -46,6 +46,15 @@ Enforcement is layered: GitHub branch protection (PRs only, conversations resolv
 
 **Stacked pull requests** (GitHub native, public preview): when an issue splits into independently reviewable layers, plan a stack at step 3 and use layer branches `issues/<N>-<slug>` (e.g. `issues/12-schema` → `issues/12-serializer`). Manage stacks exclusively with `gh stack` following the official skill in `.agents/skills/gh-stack/SKILL.md` (non-interactive rules: always `--json`, `submit --auto`, positional branch names; `gh pr merge` does not work on stacks — use `gh stack merge --yes`). One issue per stack; unrelated work gets its own issue and branch.
 
+## Parallel work with git worktrees (default)
+
+Implementation tasks run in a **linked worktree per issue** by default; working directly in the main checkout requires a stated reason (e.g. a trivial few-line fix). The main checkout (`<product-root>/workspace/ambercast`) stays on `main` — integration, acceptance, and releases only — and is never switched to an issue branch (a branch cannot be checked out in two worktrees at once).
+
+- Layout: worktrees live at `<product-root>/.worktrees/issues-<N>[-<slug>]` on branch `issues/<N>[-<slug>]`. When an issue is worked as a stacked PR, each layer branch gets its own worktree only if the layers are worked in parallel.
+- Create: `node scripts/worktree-add.mjs <N> [slug]` — creates the branch from local `main` (or attaches an existing one), then runs `npm ci` and `npm run build` in the new worktree. `--no-setup` (or `AMBERCAST_WT_SKIP_SETUP=1`) skips setup. Receptacle override: `AMBERCAST_WORKTREE_ROOT`.
+- Remove (after merge): `node scripts/worktree-remove.mjs <N> [--with-branch] [--force]` — copies this worktree's `.claude/logs/` and `.claude/todos/` files back to the main checkout first (per-issue state is gitignored, so it is worktree-local and would die with the directory), refuses dirty trees without `--force`, and refuses to remove the main checkout. Never delete a worktree directory by hand; if one was deleted, run `git worktree prune`.
+- Concurrency: at most ~5 worktrees at a time; one agent, one scope per worktree; before merging, review `git diff main..issues/<N>`; merge one branch at a time and remove its worktree immediately.
+
 ## Commands
 
 - `npm run build` — compile `src/` to `dist/` via `tsdown`
