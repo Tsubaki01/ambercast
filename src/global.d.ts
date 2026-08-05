@@ -1,5 +1,5 @@
-// __VERSION__ is a compile-time constant injected by tsdown.config.js's
-// `define` (and mirrored by vitest.config.ts for tests) — see
-// .claude/impl/issue-10-plan.md ("Decisions") for why the CLI banner reads
-// its version this way instead of reading package.json at runtime.
+// `tsdown.config.js` injects __VERSION__ into the built artifact, and
+// `vitest.config.ts` mirrors that injection while tests load unbundled source.
+// This avoids a runtime package.json read whose relative path resolves
+// differently in those two execution contexts.
 declare const __VERSION__: string;
