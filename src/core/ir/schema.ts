@@ -21,6 +21,7 @@ import { z } from 'zod';
 // A dotted-path resolver must use own-property-safe access (Object.hasOwn or Map), never plain-object bracket access.
 const SECRET_REF_PATTERN = /^\{\{secrets\.[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*\}\}$/;
 const HEX_SHA256_PATTERN = /^[0-9a-f]{64}$/;
+// The eventual pattern is `/^(?![\s\S]*\{\{secrets\.)[\s\S]*$/`, with no flag. JSON Schema's `pattern` keyword carries no flags, and `z.toJSONSchema()` emits only a regex's source, so the current `s`-flag-dependent pattern silently diverges between zod's runtime validator and the generated public JSON Schema: a multi-line secret-free value parses under zod but is wrongly rejected by the Ajv-compiled schema. It will reject a contiguous `{{secrets.` marker at the start of a multi-line string, immediately after an embedded newline, or anywhere later, while accepting a near-miss with a newline inside the marker such as `{{secrets\n.TOKEN}}` because the marker text is not contiguous.
 const INTERPOLATABLE_TEXT_PATTERN = /^(?!.*\{\{secrets\.).*$/s;
 const HTTP_URL_PATTERN = /^https?:\/\/[^\s/?#]\S*$/;
 const STEP_ID_PATTERN = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
@@ -75,12 +76,24 @@ export const InterpolatableText = z.string().regex(INTERPOLATABLE_TEXT_PATTERN);
 export type InterpolatableText = z.infer<typeof InterpolatableText>;
 
 /**
- * Validates the browser target named by a plan's `targets` record.
+ * Validates the browser target shared by a plan's `targets` record and
+ * `RawConfig.targets`.
  *
  * A portable regex, rather than `z.url()`, preserves the HTTP(S) restriction
  * in generated JSON Schema without requiring AJV format support. Keeping the
  * browser explicit makes schema evolution visible rather than hiding it in a
  * runtime constant.
+ *
+ * @remarks
+ * The eventual implementation will compose the HTTP(S) check with a second
+ * `.regex()` that rejects embedded `{{secrets.` references, rather than
+ * combining patterns or using `.refine()`. Separate regex constraints remain
+ * visible in generated JSON Schema, while a refinement would violate this
+ * module's invariant against JSON-Schema-invisible constraints. A `baseUrl`
+ * will reject those references because it is human-authored configuration,
+ * not a `{{...}}` interpolation target for any current use case; this closes
+ * a validation gap that could otherwise leave a secret literal unresolved in
+ * committed IR or a runtime request.
  */
 export const TargetDefinition = z.strictObject({
   baseUrl: z.string().regex(HTTP_URL_PATTERN),
