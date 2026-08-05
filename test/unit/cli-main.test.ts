@@ -4,17 +4,12 @@ import { describe, expect, it } from 'vitest';
 import { main } from '../../src/cli/main.js';
 
 /**
- * Unit-level coverage for the CLI banner. Calls main() directly with an
- * injected in-memory writable stream so this test never spawns a process
- * and never depends on the built dist/ output — see
- * .claude/impl/issue-10-plan.md "Test strategy" for why this, not the
- * e2e test, is the genuine TDD red step for this issue (the assertion
- * fails against the step-6 scaffold's empty-bodied main() until step 11
- * implements it).
+ * Calls main() with an in-memory writable stream for process-free,
+ * dist/-independent unit coverage of the banner.
  *
- * A real node:stream Writable (not a hand-rolled object cast to
- * NodeJS.WritableStream) so the test exercises the same interface
- * main()'s default `process.stdout` actually implements.
+ * This is a real node:stream Writable rather than a cast fake object so the
+ * test exercises the same interface that main()'s default process.stdout
+ * implements.
  */
 class MemoryWritable extends Writable {
   chunks: string[] = [];
@@ -29,11 +24,9 @@ class MemoryWritable extends Writable {
   }
 }
 
-// Read the version from package.json directly, the same source
-// tsdown.config.js/vitest.config.ts read it from to build __VERSION__ —
-// this is the boundary case the plan calls out: the banner must track
-// package.json's actual version rather than a value hardcoded in the test
-// or the implementation.
+// Read the version from package.json rather than hardcoding it so the banner
+// tracks the published version, the same source tsdown.config.js and
+// vitest.config.ts use to supply __VERSION__.
 const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
 
 const EXPECTED_BANNER = [

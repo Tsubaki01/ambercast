@@ -1,11 +1,9 @@
 #!/usr/bin/env node
-// Thin, published entry point. Kept as a separate file (rather than pointing
-// package.json's "bin" field straight at dist/cli.js) so npm pack always
-// ships a stable, human-readable executable path — see
-// .claude/impl/issue-10-plan.md ("Decisions") for why this reading of the
-// design doc was chosen. Explicitly imports and calls main(): relying on an
-// import.meta.url entry-point guard inside the bundled module doesn't work
-// here, since process.argv[1] identifies this shim, not dist/cli.js.
+// This published shim provides a stable, human-readable executable path
+// instead of exposing dist/cli.js directly through package.json's "bin" field.
+// It explicitly imports and calls main() because an import.meta.url entry-point
+// guard in the bundled module cannot distinguish this shim from dist/cli.js:
+// process.argv[1] identifies this file, not the module performing the check.
 import { main } from '../dist/cli.js';
 
 main();
