@@ -21,8 +21,8 @@ import { z } from 'zod';
 // A dotted-path resolver must use own-property-safe access (Object.hasOwn or Map), never plain-object bracket access.
 const SECRET_REF_PATTERN = /^\{\{secrets\.[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*\}\}$/;
 const HEX_SHA256_PATTERN = /^[0-9a-f]{64}$/;
-// The eventual pattern is `/^(?![\s\S]*\{\{secrets\.)[\s\S]*$/`, with no flag. JSON Schema's `pattern` keyword carries no flags, and `z.toJSONSchema()` emits only a regex's source, so the current `s`-flag-dependent pattern silently diverges between zod's runtime validator and the generated public JSON Schema: a multi-line secret-free value parses under zod but is wrongly rejected by the Ajv-compiled schema. It will reject a contiguous `{{secrets.` marker at the start of a multi-line string, immediately after an embedded newline, or anywhere later, while accepting a near-miss with a newline inside the marker such as `{{secrets\n.TOKEN}}` because the marker text is not contiguous.
-const INTERPOLATABLE_TEXT_PATTERN = /^(?!.*\{\{secrets\.).*$/s;
+// This flag-independent pattern keeps zod's runtime validator and the generated public JSON Schema aligned: JSON Schema's `pattern` keyword carries no flags, and `z.toJSONSchema()` emits only a regex's source. It rejects a contiguous `{{secrets.` marker at the start of a multi-line string, immediately after an embedded newline, or anywhere later, while accepting a near-miss with a newline inside the marker such as `{{secrets\n.TOKEN}}` because the marker text is not contiguous.
+const NO_SECRETS_LITERAL_PATTERN = /^(?![\s\S]*\{\{secrets\.)[\s\S]*$/;
 const HTTP_URL_PATTERN = /^https?:\/\/[^\s/?#]\S*$/;
 const STEP_ID_PATTERN = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
 const RUN_VARIABLE_NAME_PATTERN = /^[a-z][a-zA-Z0-9]*$/;
@@ -67,7 +67,7 @@ export type HexSha256 = z.infer<typeof HexSha256>;
  * {@link SecretRef} prevents values surfaced in traces, assertions, or
  * compiler instructions from embedding secret tokens.
  */
-export const InterpolatableText = z.string().regex(INTERPOLATABLE_TEXT_PATTERN);
+export const InterpolatableText = z.string().regex(NO_SECRETS_LITERAL_PATTERN);
 
 /**
  * The static output type of {@link InterpolatableText}; it represents text
@@ -85,18 +85,17 @@ export type InterpolatableText = z.infer<typeof InterpolatableText>;
  * runtime constant.
  *
  * @remarks
- * The eventual implementation will compose the HTTP(S) check with a second
- * `.regex()` that rejects embedded `{{secrets.` references, rather than
- * combining patterns or using `.refine()`. Separate regex constraints remain
- * visible in generated JSON Schema, while a refinement would violate this
- * module's invariant against JSON-Schema-invisible constraints. A `baseUrl`
- * will reject those references because it is human-authored configuration,
- * not a `{{...}}` interpolation target for any current use case; this closes
- * a validation gap that could otherwise leave a secret literal unresolved in
- * committed IR or a runtime request.
+ * A separate `.regex()` composes the HTTP(S) restriction with a
+ * secrets-literal check, rather than combining patterns or using `.refine()`.
+ * Separate regex constraints remain visible in generated JSON Schema, while a
+ * refinement would violate this module's invariant against
+ * JSON-Schema-invisible constraints. A `baseUrl` rejects those references
+ * because target URLs are human-authored configuration rather than
+ * interpolation inputs, preventing unresolved references from entering
+ * committed IR or runtime requests.
  */
 export const TargetDefinition = z.strictObject({
-  baseUrl: z.string().regex(HTTP_URL_PATTERN),
+  baseUrl: z.string().regex(HTTP_URL_PATTERN).regex(NO_SECRETS_LITERAL_PATTERN),
   browser: z.literal('chromium'),
 });
 
