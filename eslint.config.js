@@ -11,7 +11,16 @@
  *
  * The selected preset is `tseslint.configs.recommended`, not
  * `recommendedTypeChecked`: type-aware linting is outside this policy and
- * can slow linting across the repository. eslint-plugin-boundaries
+ * can slow linting across the repository. Boundary checks will nevertheless
+ * require a TypeScript-aware resolver: `boundaries/element-types` must map
+ * the repository's NodeNext `.js`-suffixed specifiers back to `.ts` paths
+ * without running type checks. That resolver will be
+ * `eslint-import-resolver-typescript`, wired through
+ * `settings['import/resolver']` and resolving with its own
+ * `unrs-resolver`/`get-tsconfig` machinery rather than TypeScript compiler
+ * APIs, closing the gap with dependency-cruiser's `.dependency-cruiser.mjs`
+ * `tsConfig`-based resolution, which already follows these paths while
+ * ESLint's default resolver cannot. eslint-plugin-boundaries
  * translates the shared eleven-role layer policy for
  * prompt editor feedback. Dependency-cruiser evaluates the configured
  * statically resolvable graph edges in CI; the two tools share policy data
