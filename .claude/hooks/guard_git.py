@@ -33,10 +33,12 @@ def resolve_target_dir(data: dict) -> str:
 # Subcommand detection: hyphen guards keep branch names like
 # issues/6-fix-commit-msg from being mistaken for a `commit` subcommand.
 def has_git_sub(text, names):
+    """Detect a Git subcommand without matching hyphenated branch-name text."""
     return bool(re.search(rf"\bgit\b[^|;&]*?(?<!-)\b(?:{names})\b(?!-)", text))
 
 
 def evaluate(command: str, data: dict) -> tuple[int, str] | None:
+    """Return a branch-policy block for a commit or push command, if needed."""
     if not re.search(r"\bgit\b", command):
         return None
 
@@ -57,10 +59,13 @@ def evaluate(command: str, data: dict) -> tuple[int, str] | None:
         )
 
     proj = resolve_target_dir(data)
-    res = subprocess.run(
-        ["git", "-C", proj, "rev-parse", "--abbrev-ref", "HEAD"],
-        capture_output=True, text=True,
-    )
+    try:
+        res = subprocess.run(
+            ["git", "-C", proj, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
     if res.returncode != 0:
         return None
     branch = res.stdout.strip()
@@ -84,9 +89,12 @@ def evaluate(command: str, data: dict) -> tuple[int, str] | None:
 
 
 def main() -> int:
+    """Apply branch enforcement to hook input and emit a block message if needed."""
     try:
         data = json.load(sys.stdin)
     except Exception:
+        return 0
+    if not isinstance(data, dict):
         return 0
 
     command = (data.get("tool_input") or {}).get("command", "")

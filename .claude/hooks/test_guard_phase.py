@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Tests for guard_phase.py's worktree ownership and edit gates."""
+import io
 import os
 import subprocess
 import sys
@@ -74,6 +75,18 @@ class LinkedWorktreeTest(unittest.TestCase):
             guard_phase.resolve_owning_worktree(str(path), str(self.main)),
             str(self.main),
         )
+
+    def test_worktree_resolution_timeout_uses_anchor(self):
+        path = self.worktree / "src" / "example.ts"
+        with patch(
+            "guard_phase.subprocess.run",
+            side_effect=subprocess.TimeoutExpired("git", 5),
+        ) as run:
+            self.assertEqual(
+                guard_phase.resolve_owning_worktree(str(path), str(self.main)),
+                str(self.main),
+            )
+        self.assertEqual(run.call_args.kwargs["timeout"], 5)
 
     def test_symlink_alias_into_worktree_resolves_real_worktree_root(self):
         worktree_src = self.worktree / "src"
@@ -159,8 +172,49 @@ class ExistingGateBehaviorTest(unittest.TestCase):
         (rebase / "head-name").write_text("refs/heads/issues/73\n", encoding="utf-8")
         self.assertIsNone(self.evaluate("src/example.ts"))
 
+    def test_empty_rebase_gitdir_skips_head_name_lookup(self):
+        write_state(self.proj, "73", "step05_plan_revised=done\n")
+        path = self.proj / "src" / "example.ts"
+        runs = [
+            subprocess.CompletedProcess([], 0, str(self.proj)),
+            subprocess.CompletedProcess([], 0, ".git"),
+            subprocess.CompletedProcess([], 1, ""),
+            subprocess.CompletedProcess([], 1, ""),
+        ]
+        with patch("guard_phase.subprocess.run", side_effect=runs) as run, patch(
+            "builtins.open", wraps=open
+        ) as file_open:
+            blocked = guard_phase.evaluate(str(path), {})
+
+        self.assertIsNotNone(blocked)
+        self.assertIn("detached HEAD outside a rebase", blocked[1])
+        self.assertFalse(
+            any(
+                call.args and str(call.args[0]).endswith("head-name")
+                for call in file_open.call_args_list
+            )
+        )
+        for call in run.call_args_list:
+            self.assertEqual(call.kwargs["timeout"], 5)
+
     def test_files_outside_source_and_tests_are_not_blocked(self):
         self.assertIsNone(self.evaluate("README.md"))
+
+    def test_git_timeout_allows_source_edit(self):
+        write_state(self.proj, "73", "step05_plan_revised=done\n")
+        with patch(
+            "guard_phase.subprocess.run",
+            side_effect=subprocess.TimeoutExpired("git", 5),
+        ) as run:
+            self.assertIsNone(self.evaluate("src/example.ts"))
+        for call in run.call_args_list:
+            self.assertEqual(call.kwargs["timeout"], 5)
+
+
+class MainTest(unittest.TestCase):
+    def test_non_object_stdin_fails_open(self):
+        with patch("guard_phase.sys.stdin", io.StringIO("[]")):
+            self.assertEqual(guard_phase.main(), 0)
 
 
 if __name__ == "__main__":

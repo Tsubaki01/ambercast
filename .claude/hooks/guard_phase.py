@@ -35,14 +35,16 @@ def resolve_owning_worktree(path: str, anchor_proj: str) -> str:
             ["git", "-C", directory, "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
+            timeout=5,
         )
-    except OSError:
+    except (OSError, subprocess.SubprocessError):
         return anchor_proj
     root = result.stdout.strip()
     return root if result.returncode == 0 and root else anchor_proj
 
 
 def evaluate(path: str, data: dict) -> tuple[int, str] | None:
+    """Return an edit-gate block after resolving the path's owning worktree."""
     anchor_proj = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     proj = resolve_owning_worktree(path, anchor_proj)
     try:
@@ -62,16 +64,23 @@ def evaluate(path: str, data: dict) -> tuple[int, str] | None:
     if not (in_src or in_tests):
         return None
 
-    if subprocess.run(
-        ["git", "-C", proj, "rev-parse", "--git-dir"],
-        capture_output=True, text=True,
-    ).returncode != 0:
+    try:
+        git_dir_check = subprocess.run(
+            ["git", "-C", proj, "rev-parse", "--git-dir"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if git_dir_check.returncode != 0:
         return None
 
-    res = subprocess.run(
-        ["git", "-C", proj, "symbolic-ref", "--short", "HEAD"],
-        capture_output=True, text=True,
-    )
+    try:
+        res = subprocess.run(
+            ["git", "-C", proj, "symbolic-ref", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
     if res.returncode == 0:
         branch = res.stdout.strip()
     else:
@@ -79,18 +88,23 @@ def evaluate(path: str, data: dict) -> tuple[int, str] | None:
         # a stack layer — recover the branch being rebased; otherwise block.
         # Resolve the git dir through git itself: in linked worktrees .git is a
         # file and rebase metadata lives in the worktree-specific git dir.
-        gitdir = subprocess.run(
-            ["git", "-C", proj, "rev-parse", "--absolute-git-dir"],
-            capture_output=True, text=True,
-        ).stdout.strip()
+        try:
+            gitdir_res = subprocess.run(
+                ["git", "-C", proj, "rev-parse", "--absolute-git-dir"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        gitdir = gitdir_res.stdout.strip() if gitdir_res.returncode == 0 else ""
         branch = ""
-        for d in ("rebase-merge", "rebase-apply"):
-            try:
-                with open(os.path.join(gitdir, d, "head-name"), encoding="utf-8") as f:
-                    branch = f.read().strip().removeprefix("refs/heads/")
-                break
-            except OSError:
-                continue
+        if gitdir:
+            for d in ("rebase-merge", "rebase-apply"):
+                try:
+                    with open(os.path.join(gitdir, d, "head-name"), encoding="utf-8") as f:
+                        branch = f.read().strip().removeprefix("refs/heads/")
+                    break
+                except OSError:
+                    continue
         if not branch:
             return (
                 2,
@@ -119,6 +133,7 @@ def evaluate(path: str, data: dict) -> tuple[int, str] | None:
         )
 
     def done(key: str) -> bool:
+        """Return whether the issue state records the gate as complete."""
         return bool(re.search(rf"^{key}=done\s*$", state, re.M))
 
     if not done("step05_plan_revised"):
@@ -139,9 +154,12 @@ def evaluate(path: str, data: dict) -> tuple[int, str] | None:
 
 
 def main() -> int:
+    """Apply source/test edit gates to hook input and print any block reason."""
     try:
         data = json.load(sys.stdin)
     except Exception:
+        return 0
+    if not isinstance(data, dict):
         return 0
 
     ti = data.get("tool_input") or {}

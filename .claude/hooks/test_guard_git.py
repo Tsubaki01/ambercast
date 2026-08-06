@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Tests for guard_git.py's command-target and branch resolution."""
+import io
 import os
 import subprocess
 import sys
@@ -115,6 +116,20 @@ class EvaluateTest(unittest.TestCase):
         result = self.evaluate("git commit -m message", invalid)
         self.assertIsNotNone(result)
         self.assertIn("does not match issues/<N>", result[1])
+
+    def test_git_timeout_fails_open(self):
+        with patch(
+            "guard_git.subprocess.run",
+            side_effect=subprocess.TimeoutExpired("git", 5),
+        ) as run:
+            self.assertIsNone(self.evaluate("git commit -m message"))
+        self.assertEqual(run.call_args.kwargs["timeout"], 5)
+
+
+class MainTest(unittest.TestCase):
+    def test_non_object_stdin_fails_open(self):
+        with patch("guard_git.sys.stdin", io.StringIO("[]")):
+            self.assertEqual(guard_git.main(), 0)
 
 
 if __name__ == "__main__":
