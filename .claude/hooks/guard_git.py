@@ -97,7 +97,15 @@ def main() -> int:
     if not isinstance(data, dict):
         return 0
 
-    command = (data.get("tool_input") or {}).get("command", "")
+    tool_input = data.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return 0
+    command = tool_input.get("command", "")
+    if not isinstance(command, str):
+        return 0
+    if "cwd" in data and not isinstance(data["cwd"], str):
+        return 0
+
     result = evaluate(command, data)
     if result is None:
         return 0

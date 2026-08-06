@@ -131,6 +131,28 @@ class MainTest(unittest.TestCase):
         with patch("guard_git.sys.stdin", io.StringIO("[]")):
             self.assertEqual(guard_git.main(), 0)
 
+    def test_non_object_tool_input_fails_open(self):
+        with patch("guard_git.sys.stdin", io.StringIO('{"tool_input": []}')), patch(
+            "guard_git.evaluate"
+        ) as evaluate:
+            self.assertEqual(guard_git.main(), 0)
+        evaluate.assert_not_called()
+
+    def test_non_string_command_fails_open(self):
+        with patch(
+            "guard_git.sys.stdin", io.StringIO('{"tool_input": {"command": []}}')
+        ), patch("guard_git.evaluate") as evaluate:
+            self.assertEqual(guard_git.main(), 0)
+        evaluate.assert_not_called()
+
+    def test_non_string_cwd_fails_open(self):
+        with patch(
+            "guard_git.sys.stdin",
+            io.StringIO('{"tool_input": {"command": "git commit"}, "cwd": []}'),
+        ), patch("guard_git.evaluate") as evaluate:
+            self.assertEqual(guard_git.main(), 0)
+        evaluate.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -216,6 +216,27 @@ class MainTest(unittest.TestCase):
         with patch("guard_phase.sys.stdin", io.StringIO("[]")):
             self.assertEqual(guard_phase.main(), 0)
 
+    def test_non_object_tool_input_fails_open(self):
+        with patch("guard_phase.sys.stdin", io.StringIO('{"tool_input": []}')), patch(
+            "guard_phase.evaluate"
+        ) as evaluate:
+            self.assertEqual(guard_phase.main(), 0)
+        evaluate.assert_not_called()
+
+    def test_non_string_path_fails_open(self):
+        with patch(
+            "guard_phase.sys.stdin", io.StringIO('{"tool_input": {"file_path": []}}')
+        ), patch("guard_phase.evaluate") as evaluate:
+            self.assertEqual(guard_phase.main(), 0)
+        evaluate.assert_not_called()
+
+    def test_empty_path_fails_open(self):
+        with patch(
+            "guard_phase.sys.stdin", io.StringIO('{"tool_input": {}}')
+        ), patch("guard_phase.evaluate") as evaluate:
+            self.assertEqual(guard_phase.main(), 0)
+        evaluate.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

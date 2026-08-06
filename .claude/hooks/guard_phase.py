@@ -162,8 +162,13 @@ def main() -> int:
     if not isinstance(data, dict):
         return 0
 
-    ti = data.get("tool_input") or {}
-    path = ti.get("file_path") or ti.get("notebook_path") or ""
+    tool_input = data.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return 0
+    path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
+    if not isinstance(path, str) or not path:
+        return 0
+
     result = evaluate(path, data)
     if result is None:
         return 0
