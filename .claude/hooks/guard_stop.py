@@ -359,10 +359,13 @@ def main():
         if has_live_background(data.get("background_tasks")):
             return 0
         proj = (
-            os.environ.get("CLAUDE_PROJECT_DIR")
-            or data.get("cwd")
+            data.get("cwd")
+            or os.environ.get("CLAUDE_PROJECT_DIR")
             or os.getcwd()
         )
+        worktree_root = _git_stdout(proj, ["rev-parse", "--show-toplevel"])
+        if worktree_root:
+            proj = worktree_root.decode(errors="replace").strip() or proj
         branch = current_branch(proj)
         if not branch:
             return 0

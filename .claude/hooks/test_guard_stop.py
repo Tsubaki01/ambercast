@@ -4,6 +4,7 @@
 Run from the repository root:
     python3 -m unittest discover -s .claude/hooks -p "test_*.py" -v
 """
+import io
 import json
 import os
 import subprocess
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HOOKS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(HOOKS_DIR))
@@ -555,6 +557,72 @@ class EndToEndTest(unittest.TestCase):
             self.assertEqual(res.returncode, 0)
             payload = json.loads(res.stdout)
             self.assertEqual(payload["decision"], "block")
+
+    def test_input_cwd_wins_over_project_dir(self):
+        with self._git_repo("main") as main:
+            main_path = Path(main)
+            subprocess.run(
+                [
+                    "git", "-C", main, "-c", "user.email=test@example.com",
+                    "-c", "user.name=Test", "commit", "-q", "--allow-empty",
+                    "-m", "initial",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            with tempfile.TemporaryDirectory() as root:
+                worktree = Path(root) / "issues-7"
+                subprocess.run(
+                    [
+                        "git", "-C", main, "worktree", "add", "-q", "-b",
+                        "issues/7", str(worktree),
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                write_state(worktree, "7", "step01_issue=done\n")
+                stdin = json.dumps({"hook_event_name": "Stop", "cwd": str(worktree)})
+                with patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(main_path)}), patch(
+                    "guard_stop.sys.stdin", new=io.StringIO(stdin)
+                ), patch("guard_stop.sys.stdout", new=io.StringIO()) as stdout:
+                    self.assertEqual(guard_stop.main(), 0)
+                    payload = json.loads(stdout.getvalue())
+                self.assertEqual(payload["decision"], "block")
+                self.assertIn("issue 7", payload["reason"])
+
+    def test_input_cwd_subdirectory_uses_worktree_state_file(self):
+        with self._git_repo("main") as main:
+            main_path = Path(main)
+            subprocess.run(
+                [
+                    "git", "-C", main, "-c", "user.email=test@example.com",
+                    "-c", "user.name=Test", "commit", "-q", "--allow-empty",
+                    "-m", "initial",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            with tempfile.TemporaryDirectory() as root:
+                worktree = Path(root) / "issues-7"
+                subprocess.run(
+                    [
+                        "git", "-C", main, "worktree", "add", "-q", "-b",
+                        "issues/7", str(worktree),
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                cwd = worktree / "src"
+                cwd.mkdir()
+                write_state(worktree, "7", "step01_issue=done\n")
+                stdin = json.dumps({"hook_event_name": "Stop", "cwd": str(cwd)})
+                with patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(main_path)}), patch(
+                    "guard_stop.sys.stdin", new=io.StringIO(stdin)
+                ), patch("guard_stop.sys.stdout", new=io.StringIO()) as stdout:
+                    self.assertEqual(guard_stop.main(), 0)
+                    payload = json.loads(stdout.getvalue())
+                self.assertEqual(payload["decision"], "block")
+                self.assertIn("issue 7", payload["reason"])
 
     def test_non_git_directory_passes_through(self):
         with tempfile.TemporaryDirectory() as proj:
