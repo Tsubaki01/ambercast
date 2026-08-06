@@ -41,7 +41,7 @@ export interface Ports {
   /** Performs the application's structured and browser-directed AI calls. */
   readonly aiExecutor: AiExecutor;
 
-  /** Stores compiled artifacts, run data, and binary diagnostic evidence. */
+  /** Stores generated artifacts, run data, and binary diagnostic evidence. */
   readonly storage: StorageAdapter;
 
   /** Provides wall-clock instants and monotonic duration measurements. */

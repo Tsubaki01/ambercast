@@ -24,7 +24,7 @@ function createInputs(overrides: Partial<DigestInputs> = {}): DigestInputs {
   return {
     normalizedTestMd: asNormalizedTestMd('# Smoke\n'),
     schemaVersion: 1,
-    compilerPromptTemplateFingerprint: 'compiler-template-v1',
+    generatorPromptTemplateFingerprint: 'generator-template-v1',
     targetDefinitions: { app: targetDefinition() },
     ...overrides,
   };
@@ -34,17 +34,17 @@ function createPlan({
   inputsDigest = DIGEST_A,
   targetBaseUrl = 'https://example.test',
   navigateUrl = 'https://example.test/login',
-  compilerMeta,
+  generatorMeta,
 }: {
   inputsDigest?: string;
   targetBaseUrl?: string;
   navigateUrl?: string;
-  compilerMeta?: Record<string, JsonValueT>;
+  generatorMeta?: Record<string, JsonValueT>;
 } = {}): PlanDocument {
   return PlanDocument.parse({
     schemaVersion: 1,
     source: { inputsDigest },
-    ...(compilerMeta === undefined ? {} : { compilerMeta }),
+    ...(generatorMeta === undefined ? {} : { generatorMeta }),
     targets: { app: targetDefinition(targetBaseUrl) },
     steps: [
       {
@@ -85,10 +85,10 @@ describe('computeInputsDigest', () => {
   });
 
   // The expected SHA-256 was calculated without calling the implementation.
-  // Its exact JCS preimage is {"compilerPromptTemplateFingerprint":"compiler-template-v1","normalizedTestMd":"# Smoke\n","schemaVersion":1,"targetDefinitions":{"app":{"baseUrl":"https://example.test","browser":"chromium"}}}.
-  // Command: printf '%s' '{"compilerPromptTemplateFingerprint":"compiler-template-v1","normalizedTestMd":"# Smoke\n","schemaVersion":1,"targetDefinitions":{"app":{"baseUrl":"https://example.test","browser":"chromium"}}}' | shasum -a 256
+  // Its exact JCS preimage is {"generatorPromptTemplateFingerprint":"generator-template-v1","normalizedTestMd":"# Smoke\n","schemaVersion":1,"targetDefinitions":{"app":{"baseUrl":"https://example.test","browser":"chromium"}}}.
+  // Command: printf '%s' '{"generatorPromptTemplateFingerprint":"generator-template-v1","normalizedTestMd":"# Smoke\n","schemaVersion":1,"targetDefinitions":{"app":{"baseUrl":"https://example.test","browser":"chromium"}}}' | shasum -a 256
   it('matches the independently derived SHA-256 oracle for the fixed preimage', () => {
-    expect(computeInputsDigest(createInputs())).toBe('47d93e230bb0e2139401d889e67462843cd1bf1d0590ebe3a982661d2887c26a');
+    expect(computeInputsDigest(createInputs())).toBe('1b1c607e53dbd5c9425f03da186aa2ea5e369c50f0cc592ee46f492f4f111524');
   });
 
   // The `-?` modifier prevents a future optional DigestInputs field from silently evading this completeness check.
@@ -107,9 +107,9 @@ describe('computeInputsDigest', () => {
       displayName: 'schema version',
       mutate: (inputs) => ({ ...inputs, schemaVersion: inputs.schemaVersion + 1 }),
     },
-    compilerPromptTemplateFingerprint: {
-      displayName: 'compiler prompt-template fingerprint',
-      mutate: (inputs) => ({ ...inputs, compilerPromptTemplateFingerprint: 'compiler-template-v2' }),
+    generatorPromptTemplateFingerprint: {
+      displayName: 'generator prompt-template fingerprint',
+      mutate: (inputs) => ({ ...inputs, generatorPromptTemplateFingerprint: 'generator-template-v2' }),
     },
     targetDefinitions: {
       displayName: 'target definitions',
@@ -166,11 +166,11 @@ describe('computeInputsDigest', () => {
 });
 
 describe('computePlanDigest', () => {
-  it('excludes compilerMeta from the digest', () => {
-    const withoutCompilerMeta = createPlan();
-    const withCompilerMeta = createPlan({ compilerMeta: { model: 'compiler', retryCount: 1 } });
+  it('excludes generatorMeta from the digest', () => {
+    const withoutGeneratorMeta = createPlan();
+    const withGeneratorMeta = createPlan({ generatorMeta: { model: 'generator', retryCount: 1 } });
 
-    expect(computePlanDigest(withoutCompilerMeta)).toBe(computePlanDigest(withCompilerMeta));
+    expect(computePlanDigest(withoutGeneratorMeta)).toBe(computePlanDigest(withGeneratorMeta));
   });
 
   it.each([
@@ -202,16 +202,16 @@ describe('isPlanDigestCurrent', () => {
     const planAfterCanonicalFieldChange = createPlan({
       navigateUrl: 'https://example.test/dashboard',
     });
-    const planAfterCompilerMetaOnlyChange = createPlan({
-      compilerMeta: { model: 'compiler-v2' },
+    const planAfterGeneratorMetaOnlyChange = createPlan({
+      generatorMeta: { model: 'generator-v2' },
     });
     const canonicalChangePlanDigest = computePlanDigest(planAfterCanonicalFieldChange);
-    const compilerMetaOnlyChangePlanDigest = computePlanDigest(planAfterCompilerMetaOnlyChange);
+    const generatorMetaOnlyChangePlanDigest = computePlanDigest(planAfterGeneratorMetaOnlyChange);
 
     expect(isPlanDigestCurrent(groundingCachedForOriginalPlan, originalPlanDigest)).toBe(true);
     expect(canonicalChangePlanDigest).not.toBe(originalPlanDigest);
     expect(isPlanDigestCurrent(groundingCachedForOriginalPlan, canonicalChangePlanDigest)).toBe(false);
-    expect(compilerMetaOnlyChangePlanDigest).toBe(originalPlanDigest);
-    expect(isPlanDigestCurrent(groundingCachedForOriginalPlan, compilerMetaOnlyChangePlanDigest)).toBe(true);
+    expect(generatorMetaOnlyChangePlanDigest).toBe(originalPlanDigest);
+    expect(isPlanDigestCurrent(groundingCachedForOriginalPlan, generatorMetaOnlyChangePlanDigest)).toBe(true);
   });
 });

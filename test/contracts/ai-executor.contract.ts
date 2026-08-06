@@ -78,7 +78,7 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
         const request: AiExecuteRequest = {
           prompt: 'Return a JSON status.',
           responseSchema: RESPONSE_SCHEMA,
-          context: { step: 'compile' },
+          context: { step: 'generate' },
         };
 
         const result = await executor.execute<unknown>(request);

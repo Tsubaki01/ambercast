@@ -4,7 +4,7 @@
   "value": {
     "schemaVersion": 1,
     "source": { "inputsDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
-    "compilerMeta": { "model": "test-model", "attempt": 1, "nested": [true, null] },
+    "generatorMeta": { "model": "test-model", "attempt": 1, "nested": [true, null] },
     "targets": { "app": { "baseUrl": "https://example.test", "browser": "chromium" } },
     "steps": [
       { "id": "open-home", "kind": "action", "action": "navigate", "url": "https://example.test" },

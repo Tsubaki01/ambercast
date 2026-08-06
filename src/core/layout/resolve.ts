@@ -4,7 +4,7 @@
  * remain outside this module: a test-discovery use case determines which
  * files are tests, then asks this resolver for their deterministic companion
  * locations. This module uses one fixed test-file format and derives its
- * compiled companions from that format.
+ * generated companions from that format.
  *
  * Construction validates both configured roots and probes the forward and
  * inverse transforms with a synthetic path. The probe confirms that `testDir`

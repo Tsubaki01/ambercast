@@ -2,7 +2,7 @@
  * Defines ambercast's strict, serializable intermediate-representation
  * documents and the smaller values from which they are assembled.
  *
- * This is the trust boundary between the AI compiler, committed plan and
+ * This is the trust boundary between the AI generator, committed plan and
  * grounding artifacts, and deterministic replay. It is deliberately the
  * single runtime source of truth: JSON Schema is derived from these zod
  * schemas, never maintained as a hand-written parallel definition. Strict
@@ -65,7 +65,7 @@ export type HexSha256 = z.infer<typeof HexSha256>;
  * Generic text only enforces secret safety: capture names and dotted run
  * references have distinct contracts. Keeping this separate from
  * {@link SecretRef} prevents values surfaced in traces, assertions, or
- * compiler instructions from embedding secret tokens.
+ * generator instructions from embedding secret tokens.
  */
 export const InterpolatableText = z.string().regex(NO_SECRETS_LITERAL_PATTERN);
 
@@ -468,7 +468,7 @@ export const AiStep = z.strictObject({
 export type AiStep = z.infer<typeof AiStep>;
 
 /**
- * Validates one ordered instruction in a compiled plan.
+ * Validates one ordered instruction in a generated plan.
  *
  * Fully enumerated nested branches let JSON Schema express the same action-
  * and check-specific required fields instead of relying on refinements that
@@ -595,7 +595,7 @@ export type Trace = z.infer<typeof Trace>;
 
 /**
  * Represents every value that can exist in RFC 8259 JSON and therefore in a
- * serializable compiler-metadata record.
+ * serializable generator-metadata record.
  *
  * The recursive definition deliberately excludes `undefined`, bigint,
  * functions, symbols, and other JavaScript-only values before they can reach
@@ -613,7 +613,7 @@ export type JsonValueT =
   | { [key: string]: JsonValueT };
 
 /**
- * Validates {@link JsonValueT} recursively for `compilerMeta` values.
+ * Validates {@link JsonValueT} recursively for `generatorMeta` values.
  *
  * The explicit `z.ZodType<JsonValueT>` annotation breaks TypeScript's
  * self-referential inference cycle. `z.unknown()` would admit values that
@@ -629,18 +629,18 @@ export const JsonValue: z.ZodType<JsonValueT> = z.lazy(() => z.union([
 ]));
 
 /**
- * Validates the complete compiled plan document that is reviewed and
+ * Validates the complete generated plan document that is reviewed and
  * committed beside its source test prompt.
  *
  * Duplicate step IDs are the sole semantic rule outside JSON Schema: projected
  * uniqueness cannot be expressed by `uniqueItems`, which compares complete
  * values. The refinement reports a duplicate at the later step's ID so the
- * compiler can direct a repair to the offending location.
+ * generator can direct a repair to the offending location.
  */
 export const PlanDocument = z.strictObject({
   schemaVersion: z.literal(1),
   source: z.strictObject({ inputsDigest: HexSha256 }),
-  compilerMeta: z.record(z.string(), JsonValue).optional(),
+  generatorMeta: z.record(z.string(), JsonValue).optional(),
   targets: z.record(z.string(), TargetDefinition),
   steps: z.array(Step),
 }).superRefine((plan, ctx) => {
@@ -659,7 +659,7 @@ export const PlanDocument = z.strictObject({
 });
 
 /**
- * The parsed compiled plan used for canonical serialization and digest
+ * The parsed generated plan used for canonical serialization and digest
  * computation. Callers must not hand-edit an IR object to bypass validation.
  */
 export type PlanDocument = z.infer<typeof PlanDocument>;
@@ -682,6 +682,6 @@ export const GroundingDocument = z.strictObject({
 
 /**
  * The parsed grounding cache that records fingerprints and replayable traces
- * for a particular compiled plan.
+ * for a particular generated plan.
  */
 export type GroundingDocument = z.infer<typeof GroundingDocument>;
