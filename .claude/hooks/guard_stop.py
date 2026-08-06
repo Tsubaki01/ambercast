@@ -85,6 +85,7 @@ DELEGATED_TASK_TYPES = {
 
 
 def _normalize_task_type(value):
+    """Normalize task-type spellings before comparing them to the allowlist."""
     return " ".join(
         str(value or "").lower().replace("_", " ").replace("-", " ").split()
     )
@@ -116,19 +117,23 @@ def has_live_background(tasks):
 
 
 def issue_from_branch(branch):
+    """Return the issue number encoded by a valid flow branch, if any."""
     m = BRANCH_RE.fullmatch(branch)
     return m.group(1) if m else None
 
 
 def is_done(state, key):
+    """Return whether a state file marks the named implementation step done."""
     return bool(re.search(rf"^{key}=done\s*$", state, re.M))
 
 
 def is_paused(state):
+    """Return whether a state file explicitly permits the flow to pause."""
     return bool(re.search(r"^paused=true\s*$", state, re.M))
 
 
 def first_incomplete(state):
+    """Return the earliest unfinished flow step and its human-facing description."""
     for key, desc in STEPS:
         if not is_done(state, key):
             return key, desc
@@ -151,10 +156,12 @@ def last_completed(state):
 
 
 def sidecar_path(proj, issue):
+    """Return the per-issue stall-counter path inside this worktree."""
     return os.path.join(proj, ".claude", "impl", f".guard-stop-issue-{issue}.json")
 
 
 def _hash_file(h, path):
+    """Add file content, or an empty marker when the artifact is unavailable."""
     try:
         with open(path, "rb") as f:
             h.update(f.read())
@@ -164,6 +171,7 @@ def _hash_file(h, path):
 
 
 def _hash_dir_listing(h, directory):
+    """Add directory metadata without reading append-mostly artifact content."""
     # Name + size + mtime is enough of a signal for append-mostly artifacts
     # (review verdicts, implementation logs) without hashing their content.
     try:
@@ -180,6 +188,7 @@ def _hash_dir_listing(h, directory):
 
 
 def _git_stdout(proj, args):
+    """Run a bounded Git query and return empty bytes when it cannot complete."""
     # A guard hook must not hang or crash on a broken git: bound every call
     # and treat any failure as "no output" so the hook stays fail-open.
     try:
@@ -193,6 +202,7 @@ def _git_stdout(proj, args):
 
 
 def _hash_git(h, proj):
+    """Add the Git changes that constitute implementation-flow progress."""
     # Tracked-file edits show up in the diff against HEAD; brand-new files
     # show up as untracked paths, hashed with their stat so ongoing edits to
     # them keep counting as progress. Outside a git repo these commands fail
@@ -233,6 +243,7 @@ def progress_hash(proj, issue):
 
 
 def _load_sidecar(side):
+    """Load a valid stall-counter sidecar, treating malformed data as absent."""
     try:
         with open(side, encoding="utf-8") as f:
             prev = json.load(f)
@@ -242,6 +253,7 @@ def _load_sidecar(side):
 
 
 def _persist_sidecar(side, payload):
+    """Atomically store stall state, failing open when durable storage is unavailable."""
     # Atomic replace: never truncate through a symlink, never leave partial
     # JSON for a concurrent reader.
     tmp = None
@@ -263,6 +275,7 @@ def _persist_sidecar(side, payload):
 
 
 def _remove_sidecar(side):
+    """Remove stale stall state without making cleanup failures observable."""
     try:
         os.remove(side)
     except OSError:
@@ -341,12 +354,14 @@ def evaluate(proj, branch, session_id=""):
 
 
 def current_branch(proj):
+    """Return the symbolic branch for a worktree, allowing detached HEAD to pass."""
     out = _git_stdout(proj, ["symbolic-ref", "--short", "HEAD"])
     branch = out.decode(errors="replace").strip()
     return branch or None
 
 
 def main():
+    """Emit a Stop block only while the active issue flow has work remaining."""
     try:
         try:
             data = json.load(sys.stdin)
@@ -359,10 +374,13 @@ def main():
         if has_live_background(data.get("background_tasks")):
             return 0
         proj = (
-            os.environ.get("CLAUDE_PROJECT_DIR")
-            or data.get("cwd")
+            data.get("cwd")
+            or os.environ.get("CLAUDE_PROJECT_DIR")
             or os.getcwd()
         )
+        worktree_root = _git_stdout(proj, ["rev-parse", "--show-toplevel"])
+        if worktree_root:
+            proj = worktree_root.decode(errors="replace").strip() or proj
         branch = current_branch(proj)
         if not branch:
             return 0
