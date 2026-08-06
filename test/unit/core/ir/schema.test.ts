@@ -123,7 +123,7 @@ describe('IR primitive schemas', () => {
     expectRejected(RunVariableName, '{{run.welcomeText}}');
   });
 
-  it('accepts recursively serializable compiler metadata and rejects non-JSON values', () => {
+  it('accepts recursively serializable generator metadata and rejects non-JSON values', () => {
     expectAccepted(JsonValue, { string: 'value', array: [true, null, { number: 1 }] });
     expectRejected(JsonValue, undefined);
     expectRejected(JsonValue, BigInt(1));
@@ -485,11 +485,15 @@ describe('PlanDocument', () => {
     expectAccepted(PlanDocument, plan([], { app: TARGET_DEFINITION }));
   });
 
-  it('accepts JSON-only compiler metadata recursively', () => {
+  it('accepts JSON-only generator metadata recursively', () => {
     expectAccepted(PlanDocument, {
       ...plan([]),
-      compilerMeta: { model: 'compiler', attempt: 1, values: [true, null, { nested: 'value' }] },
+      generatorMeta: { model: 'generator', attempt: 1, values: [true, null, { nested: 'value' }] },
     });
+  });
+
+  it('rejects the retired compilerMeta field as an unrecognized property', () => {
+    expectRejected(PlanDocument, { ...plan([]), compilerMeta: { model: 'generator' } });
   });
 
   it('rejects duplicate step ids through zod-only semantic validation', () => {
@@ -502,7 +506,7 @@ describe('PlanDocument', () => {
   it('rejects wrong document fields and unknown properties at plan and target nesting levels', () => {
     expectRejected(PlanDocument, { ...plan([]), schemaVersion: '1' });
     expectRejected(PlanDocument, { ...plan([]), source: { inputsDigest: 'A'.repeat(64) } });
-    expectRejected(PlanDocument, { ...plan([]), compilerMeta: { unsupported: undefined } });
+    expectRejected(PlanDocument, { ...plan([]), generatorMeta: { unsupported: undefined } });
     expectRejected(PlanDocument, { ...plan([]), unexpected: true });
     expectRejected(PlanDocument, plan([], { app: { ...TARGET_DEFINITION, unexpected: true } }));
   });

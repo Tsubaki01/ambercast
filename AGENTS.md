@@ -6,7 +6,7 @@ Instructions for AI coding agents (Codex, Claude Code, and others) working in th
 
 **ambercast** — prompt-native E2E testing.
 
-Test cases are written as natural-language Markdown prompts; the prompt is the single source of truth. An AI compiler turns each prompt into a deterministic, lockfile-like execution plan (IR). Replays run with **zero AI calls**: fast, free, fully reproducible. When the app's UI drifts, the plan self-repairs; when the *meaning* of a test changes, a human reviews.
+Test cases are written as natural-language Markdown prompts; the prompt is the single source of truth. An AI generator turns each prompt into a deterministic, lockfile-like execution plan (IR). Replays run with **zero AI calls**: fast, free, fully reproducible. When the app's UI drifts, the plan self-repairs; when the *meaning* of a test changes, a human reviews.
 
 ## Status
 
@@ -21,10 +21,10 @@ Pre-implementation. The current package is a 0.0.1 placeholder that reserves the
 
 ## Core design decisions (fixed — do not re-litigate in code)
 
-- The prompt (`<name>.test.md`) is the source of truth. The IR is a compiled artifact, never hand-edited.
+- The prompt (`<name>.test.md`) is the source of truth. The IR is a generated artifact, never hand-edited.
 - IR files: `<name>.ambercast.plan.json` (reviewed, committed) and `<name>.ambercast.grounding.json` (grounding cache, committed by default). Run results go to `.runs/` (gitignored).
 - IR format: plain JSON (RFC 8259). Canonical serialization: JCS-style key ordering with 2-space pretty-printing; parse → re-serialize must be byte-identical.
-- Freshness: the plan embeds an `inputsDigest` (normalized prompt digest + schemaVersion + compiler prompt-template fingerprint + target definitions). Stale plans fail with a message; no silent auto-recompile in CI.
+- Freshness: the plan embeds an `inputsDigest` (normalized prompt digest + schemaVersion + generator prompt-template fingerprint + target definitions). Stale plans fail with a message; no silent auto-regenerate in CI.
 - Repairs regenerate a step subtree via structured output and re-serialize the whole document — never patch raw text.
 - Secrets are referenced (`{{secrets.*}}`), never baked into the IR; the schema rejects literal secrets.
 

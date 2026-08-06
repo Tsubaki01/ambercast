@@ -7,7 +7,7 @@ Thanks for your interest in ambercast!
 The package is a pre-implementation placeholder — the CLI is not functional
 yet, though the TypeScript/ESM build toolchain (`tsdown`, Vitest) is in
 place. Realistic contributions are still limited to docs, configuration, and
-toolchain work until the compiler/runner land.
+toolchain work until the generator/runner land.
 
 ## How to contribute
 

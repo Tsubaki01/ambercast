@@ -32,8 +32,8 @@ const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.ur
 const EXPECTED_BANNER = [
   `ambercast v${pkg.version}`,
   '',
-  'Prompt-native E2E testing: AI compiles your natural-language test',
-  'prompts into a deterministic execution plan, replayed with zero AI calls.',
+  'Prompt-native E2E testing: AI generates a deterministic execution plan',
+  'from your natural-language test prompts, replayed with zero AI calls.',
   '',
   'This package is under active development. The CLI is not functional yet.',
   '',

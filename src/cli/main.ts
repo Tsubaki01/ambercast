@@ -22,8 +22,8 @@ export function main(stdout: NodeJS.WritableStream = process.stdout): void {
   const lines = [
     `ambercast v${__VERSION__}`,
     '',
-    'Prompt-native E2E testing: AI compiles your natural-language test',
-    'prompts into a deterministic execution plan, replayed with zero AI calls.',
+    'Prompt-native E2E testing: AI generates a deterministic execution plan',
+    'from your natural-language test prompts, replayed with zero AI calls.',
     '',
     'This package is under active development. The CLI is not functional yet.',
     '',

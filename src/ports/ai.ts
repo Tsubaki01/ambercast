@@ -1,5 +1,5 @@
 /**
- * Declares the AI boundary for structured compilation calls and browser-led
+ * Declares the AI boundary for structured generation calls and browser-led
  * agentic work.
  */
 import type { JsonValueT } from '#core/ir/schema.js';

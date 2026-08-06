@@ -69,7 +69,7 @@ const CHECK_RESULT = {
   file: 'tests/login.test.md',
   planFile: 'tests/login.ambercast.plan.json',
   status: 'fresh',
-  reason: 'The compiled inputs digest is current.',
+  reason: 'The generated inputs digest is current.',
 };
 const REVIEW_CONCERN = {
   stepId: 'assert-welcome',
