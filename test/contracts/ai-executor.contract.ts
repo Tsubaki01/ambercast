@@ -143,7 +143,7 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
       }
     });
 
-    it('returns only the action performed before an agentic failure', async () => {
+    it('keeps the controller\'s recorded actions limited to those performed before an agentic failure', async () => {
       try {
         const recording = createRecordingController(harness);
         const executor = await harness.createExecutor({

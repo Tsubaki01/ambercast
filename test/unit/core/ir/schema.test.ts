@@ -462,12 +462,15 @@ describe('TraceAction and Trace', () => {
       { type: 'fill-secret', target: TARGET, secretRef: 42 },
       { type: 'fill-secret', target: TARGET, secretRef: 'hunter2' },
       { type: 'fill-secret', target: TARGET },
-      { type: 'fill-secret', target: TARGET, secretRef: '{{secrets.app.password}}', value: 'hunter2' },
     ]],
   ] as const)('rejects wrong or missing values for %s', (_field, schema, invalidValues) => {
     for (const invalidValue of invalidValues) {
       expectRejected(schema, invalidValue);
     }
+  });
+
+  it('rejects unknown properties for TraceFillSecret', () => {
+    expectRejected(TraceFillSecret, { type: 'fill-secret', target: TARGET, secretRef: '{{secrets.app.password}}', value: 'hunter2' });
   });
 
   it.each(['Enter', 'Tab', 'Escape', 'ArrowDown', 'ArrowUp'] as const)('accepts the %s TracePress key enum value', (key) => {
