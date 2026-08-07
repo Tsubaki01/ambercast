@@ -1,0 +1,20 @@
+{
+  "document": "grounding",
+  "expected": "valid",
+  "value": {
+    "schemaVersion": 1,
+    "planDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "entries": {
+      "login-flow": {
+        "kind": "element",
+        "fingerprint": { "algorithm": "a11y-neighborhood-v1", "hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
+      },
+      "submit-review": {
+        "kind": "ai",
+        "trace": [
+          { "type": "click", "target": { "strategy": "accessibility", "role": "button", "name": "Submit" } }
+        ]
+      }
+    }
+  }
+}
