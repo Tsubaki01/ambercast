@@ -1,0 +1,15 @@
+{
+  "document": "grounding",
+  "expected": "invalid",
+  "value": {
+    "schemaVersion": 1,
+    "planDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "entries": {
+      "step": {
+        "kind": "ai",
+        "fingerprint": { "algorithm": "a11y-neighborhood-v1", "hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
+        "trace": [{ "type": "click", "target": { "strategy": "accessibility", "role": "button", "name": "Submit" } }]
+      }
+    }
+  }
+}

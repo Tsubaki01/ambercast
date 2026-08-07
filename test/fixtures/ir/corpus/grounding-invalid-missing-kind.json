@@ -1,11 +1,11 @@
 {
   "document": "grounding",
-  "expected": "valid",
+  "expected": "invalid",
   "value": {
     "schemaVersion": 1,
     "planDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "entries": {
-      "login-flow": {
+      "step": {
         "fingerprint": { "algorithm": "a11y-neighborhood-v1", "hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
       }
     }

@@ -6,8 +6,7 @@
     "planDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "entries": {
       "step": {
-        "kind": "element",
-        "fingerprint": { "algorithm": "a11y-neighborhood-v1", "hash": 42 }
+        "kind": "widget"
       }
     }
   }
