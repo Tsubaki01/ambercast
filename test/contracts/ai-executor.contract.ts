@@ -143,6 +143,31 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
       }
     });
 
+    it('forwards the full prior trace to agentic execution', async () => {
+      try {
+        const recording = createRecordingController(harness);
+        let receivedPriorTrace: readonly TraceAction[] | undefined;
+        const executor = await harness.createExecutor({
+          execute: EXECUTE_RESULT,
+          executeAgentic: (request) => {
+            receivedPriorTrace = request.priorTrace;
+            return AGENTIC_RESULT;
+          },
+        });
+
+        const result = await executor.executeAgentic({
+          instructionPrompt: 'Complete the sign-in.',
+          controller: recording.controller,
+          priorTrace: [ACTION_B, SECRET_FILL_ACTION],
+        });
+
+        expect(receivedPriorTrace).toEqual([ACTION_B, SECRET_FILL_ACTION]);
+        expect(result.outcome).toBe('success');
+      } finally {
+        await harness.dispose?.();
+      }
+    });
+
     it('keeps the controller\'s recorded actions limited to those performed before an agentic failure', async () => {
       try {
         const recording = createRecordingController(harness);

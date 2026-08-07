@@ -10,7 +10,19 @@ import type {
   AiUsage,
   JsonSchema,
 } from '../../../src/ports/ai.js';
-import type { AssertCheck, AssertOutcome, BrowserSession, PageSnapshot } from '../../../src/ports/browser.js';
+import type {
+  AssertCheck,
+  AssertOutcome,
+  BrowserSession,
+  PageSnapshot,
+  PerformableAction,
+} from '../../../src/ports/browser.js';
+
+type PerformableActionController = {
+  perform(action: PerformableAction): Promise<void>;
+  evaluateAssert(check: AssertCheck): Promise<AssertOutcome>;
+  snapshotForResolution(): Promise<PageSnapshot>;
+};
 
 describe('AI port shapes', () => {
   it('defines structured-response request, result, usage, and schema types', () => {
@@ -46,6 +58,7 @@ describe('AI port shapes', () => {
       readonly usage?: AiUsage;
     }>();
     expectTypeOf<BrowserSession>().not.toExtend<AiActionController>();
+    expectTypeOf<PerformableActionController>().not.toExtend<AiActionController>();
     // Structural assignability allows excess properties: this only excludes shapes missing `secretRef`; `secretRef` plus stray `value` is rejected by `TraceFillSecret`'s `z.strictObject` at parse time (schema.test.ts).
     expectTypeOf<{
       type: 'fill-secret';
