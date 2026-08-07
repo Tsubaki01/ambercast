@@ -6,7 +6,7 @@ import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
 const RESPONSE_SCHEMA = { type: 'object' };
 const FIRST_RESULT: AiExecuteResult<unknown> = { data: { answer: 'first' }, raw: '{"answer":"first"}' };
 const SECOND_RESULT: AiExecuteResult<unknown> = { data: { answer: 'second' }, raw: '{"answer":"second"}' };
-const AGENTIC_RESULT: AiAgenticResult = { trace: [], outcome: 'success' };
+const AGENTIC_RESULT: AiAgenticResult = { outcome: 'success' };
 
 function request(context: string): AiExecuteRequest {
   return { prompt: `respond to ${context}`, responseSchema: RESPONSE_SCHEMA, context };

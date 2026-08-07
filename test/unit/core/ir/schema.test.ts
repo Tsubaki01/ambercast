@@ -469,6 +469,10 @@ describe('TraceAction and Trace', () => {
     }
   });
 
+  it('rejects unknown properties for TraceFillSecret', () => {
+    expectRejected(TraceFillSecret, { type: 'fill-secret', target: TARGET, secretRef: '{{secrets.app.password}}', value: 'hunter2' });
+  });
+
   it.each(['Enter', 'Tab', 'Escape', 'ArrowDown', 'ArrowUp'] as const)('accepts the %s TracePress key enum value', (key) => {
     expectAccepted(TracePress, { type: 'press', target: TARGET, key });
   });
@@ -559,6 +563,23 @@ describe('GroundingDocument', () => {
     });
   });
 
+  it('accepts a document with mixed element and AI grounding entries', () => {
+    expectAccepted(GroundingDocument, {
+      schemaVersion: 1,
+      planDigest: DIGEST_B,
+      entries: {
+        'login-flow': {
+          kind: 'element',
+          fingerprint: { algorithm: 'a11y-neighborhood-v1', hash: DIGEST_A },
+        },
+        'submit-review': {
+          kind: 'ai',
+          trace: [{ type: 'click', target: TARGET }],
+        },
+      },
+    });
+  });
+
   it('rejects wrong document fields, invalid entry keys, and unknown properties', () => {
     expectRejected(GroundingDocument, { schemaVersion: 1, planDigest: 'b'.repeat(63), entries: {} });
     expectRejected(GroundingDocument, { schemaVersion: 1, planDigest: DIGEST_B, entries: { '1': { kind: 'element', fingerprint: { algorithm: 'a11y-neighborhood-v1', hash: DIGEST_A } } } });
@@ -616,6 +637,16 @@ describe('GroundingDocument', () => {
           fingerprint: { algorithm: 'a11y-neighborhood-v1', hash: DIGEST_A },
           trace: [{ type: 'click', target: TARGET }],
         },
+      },
+    });
+  });
+
+  it('rejects an element grounding entry without a fingerprint', () => {
+    expectRejected(GroundingDocument, {
+      schemaVersion: 1,
+      planDigest: DIGEST_B,
+      entries: {
+        step: { kind: 'element' },
       },
     });
   });
