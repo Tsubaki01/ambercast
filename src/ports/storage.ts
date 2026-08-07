@@ -14,6 +14,11 @@
  * Path construction belongs to the layout resolver. Keeping this boundary as
  * a thin I/O primitive avoids creating a second, potentially divergent set of
  * path-normalization rules in every storage adapter.
+ *
+ * Names starting with `.ambercast-tmp-` are reserved by the Storage layer for
+ * staging. Implementations that stage writes use this prefix, and callers must
+ * not create paths using it. The prefix may appear in `listFiles` results and,
+ * after abrupt termination of a write, may persist; callers must ignore it.
  */
 export interface StorageAdapter {
   /**
@@ -99,6 +104,9 @@ export interface StorageAdapter {
 
   /**
    * Lists regular files directly inside a directory.
+   *
+   * `.ambercast-tmp-` names may appear in results; callers must ignore them as
+   * described in `StorageAdapter`'s `@remarks`.
    *
    * @param dir - Opaque directory path to inspect; use `''` for the root
    * directory.
