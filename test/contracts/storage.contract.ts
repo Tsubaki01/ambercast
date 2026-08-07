@@ -123,6 +123,14 @@ export function registerStorageContract(harness: StorageContractHarness): void {
       });
     });
 
+    // Successful-write cleanup and failed-write directory/sentinel non-corruption
+    // are postconditions reachable by both atomic staging-and-rename and non-atomic
+    // direct `writeFile` implementations, so they do not by themselves establish
+    // that partial writes are never externally visible. FsStorage's staging-before-
+    // rename mock tests in `test/unit/adapters/storage/fs-storage.test.ts` exercise
+    // the staging-before-rename mechanism that provides that guarantee; no
+    // deterministic, portable test is achievable using only the current
+    // `StorageAdapter` API.
     it.each(storageWriteCases)('leaves no stray temporary file after a successful $name write', async ({ fileName, write }) => {
       await withStorage(harness, async (storage) => {
         await write(storage, `artifacts/${fileName}`);

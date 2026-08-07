@@ -1,5 +1,5 @@
 import * as fsPromises from 'node:fs/promises';
-import { chmod, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -78,6 +78,33 @@ const atomicWriteCases: readonly AtomicWriteCase[] = [
     targetPath: 'atomic-binary.bin',
     async write(storage, path): Promise<void> {
       await storage.writeBinary(path, new Uint8Array([0, 1, 255]));
+    },
+  },
+];
+
+interface SymlinkReplacementWriteCase {
+  readonly name: string;
+  write(storage: ReturnType<typeof createFsStorage>, path: string): Promise<void>;
+  assertContent(storage: ReturnType<typeof createFsStorage>, path: string): Promise<void>;
+}
+
+const symlinkReplacementWriteCases: readonly SymlinkReplacementWriteCase[] = [
+  {
+    name: 'text',
+    async write(storage, path): Promise<void> {
+      await storage.writeText(path, 'symlink replacement text');
+    },
+    async assertContent(storage, path): Promise<void> {
+      await expect(storage.readText(path)).resolves.toBe('symlink replacement text');
+    },
+  },
+  {
+    name: 'binary',
+    async write(storage, path): Promise<void> {
+      await storage.writeBinary(path, new Uint8Array([4, 8, 15, 16, 23, 42]));
+    },
+    async assertContent(storage, path): Promise<void> {
+      await expect(storage.readBinary(path)).resolves.toEqual(new Uint8Array([4, 8, 15, 16, 23, 42]));
     },
   },
 ];
@@ -391,6 +418,40 @@ describe('createFsStorage()', () => {
 
       await expect(storage.exists('dangling-link.txt')).resolves.toBe(false);
       await expect(storage.listFiles('')).resolves.toEqual([]);
+    });
+  });
+
+  it.for(symlinkReplacementWriteCases)('replaces live and dangling file symbolic links when writing $name content', async ({ write, assertContent }, context) => {
+    await withIsolatedStorage(async (storage) => {
+      const liveTargetPath = 'live-target.txt';
+      const liveLinkPath = 'live-link.txt';
+      const danglingTargetPath = 'missing-target.txt';
+      const danglingLinkPath = 'dangling-link.txt';
+
+      await writeFile(liveTargetPath, 'original target content', 'utf8');
+
+      try {
+        await symlink(liveTargetPath, liveLinkPath, 'file');
+        await symlink(danglingTargetPath, danglingLinkPath, 'file');
+      } catch (error) {
+        if (isSymbolicLinkPermissionError(error)) {
+          context.skip(`Symbolic links require unavailable filesystem permission (${error.code}).`);
+        }
+
+        throw error;
+      }
+
+      await write(storage, liveLinkPath);
+
+      expect((await lstat(liveLinkPath)).isSymbolicLink()).toBe(false);
+      await assertContent(storage, liveLinkPath);
+      await expect(storage.readText(liveTargetPath)).resolves.toBe('original target content');
+
+      await write(storage, danglingLinkPath);
+
+      expect((await lstat(danglingLinkPath)).isSymbolicLink()).toBe(false);
+      await assertContent(storage, danglingLinkPath);
+      await expect(lstat(danglingTargetPath)).rejects.toMatchObject({ code: 'ENOENT' });
     });
   });
 
