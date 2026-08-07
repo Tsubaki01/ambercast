@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import type { ElementRef } from '../../../src/core/ir/schema.js';
-import type { AssertCheck, AssertOutcome, PageSnapshot, PerformableAction } from '../../../src/ports/browser.js';
+import type { ElementRef, TraceAction } from '../../../src/core/ir/schema.js';
+import type { AssertCheck, AssertOutcome, PageSnapshot } from '../../../src/ports/browser.js';
 import { createFakeAiActionController } from '../../doubles/fake-ai-action-controller.js';
 
 const REF: ElementRef = { strategy: 'accessibility', role: 'button', name: 'Submit' };
-const ACTION: PerformableAction = { type: 'click', target: REF };
+const ACTION: TraceAction = { type: 'click', target: REF };
 const CHECK: AssertCheck = { check: 'element-visible', target: REF };
 const OUTCOME: AssertOutcome = { passed: true, message: 'Visible' };
 const SNAPSHOT: PageSnapshot = {
@@ -14,7 +14,7 @@ const SNAPSHOT: PageSnapshot = {
 
 describe('createFakeAiActionController', () => {
   it('forwards every operation to its supplied override and returns its result', async () => {
-    const performed: PerformableAction[] = [];
+    const performed: TraceAction[] = [];
     const evaluated: AssertCheck[] = [];
     const snapshotArguments: [][] = [];
     const controller = createFakeAiActionController({
@@ -51,8 +51,8 @@ describe('createFakeAiActionController', () => {
   });
 
   it('keeps overrides from separately created controllers isolated', async () => {
-    const firstActions: PerformableAction[] = [];
-    const secondActions: PerformableAction[] = [];
+    const firstActions: TraceAction[] = [];
+    const secondActions: TraceAction[] = [];
     const first = createFakeAiActionController({
       perform: async (action) => {
         firstActions.push(action);
@@ -63,7 +63,7 @@ describe('createFakeAiActionController', () => {
         secondActions.push(action);
       },
     });
-    const secondAction: PerformableAction = { type: 'navigate', url: 'https://example.test' };
+    const secondAction: TraceAction = { type: 'navigate', url: 'https://example.test' };
 
     await Promise.all([first.perform(ACTION), second.perform(secondAction)]);
 

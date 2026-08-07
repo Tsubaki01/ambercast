@@ -469,6 +469,10 @@ describe('TraceAction and Trace', () => {
     }
   });
 
+  it('rejects unknown properties for TraceFillSecret', () => {
+    expectRejected(TraceFillSecret, { type: 'fill-secret', target: TARGET, secretRef: '{{secrets.app.password}}', value: 'hunter2' });
+  });
+
   it.each(['Enter', 'Tab', 'Escape', 'ArrowDown', 'ArrowUp'] as const)('accepts the %s TracePress key enum value', (key) => {
     expectAccepted(TracePress, { type: 'press', target: TARGET, key });
   });
