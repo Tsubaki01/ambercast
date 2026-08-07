@@ -2,9 +2,9 @@
  * Declares the AI boundary for structured generation calls and browser-led
  * agentic work.
  */
-import type { JsonValueT } from '#core/ir/schema.js';
+import type { JsonValueT, TraceAction } from '#core/ir/schema.js';
 
-import type { BrowserSession, PerformableAction } from './browser.js';
+import type { AssertCheck, AssertOutcome, PageSnapshot } from './browser.js';
 
 /**
  * An object-form response schema passed to an AI adapter for validation.
@@ -66,15 +66,55 @@ export interface AiExecuteResult<T> {
  * Browser operations available to an agentic AI call.
  *
  * @remarks
- * This compile-time projection limits the controller contract to the browser
- * operations agentic execution needs. It does not remove other methods from a
- * runtime object; creating a runtime projection, if required, belongs to the
- * composition layer.
+ * The run-pipeline wrapper materializes each {@link TraceAction} immediately
+ * before passing it to the underlying browser. It resolves `{{run.*}}`
+ * interpolation wherever `InterpolatableText` permits it, including
+ * navigation URLs and fill values, and resolves a `fill-secret` action's
+ * `secretRef` through the secrets port. The browser consequently receives
+ * fully materialized fields, while no resolved secret value crosses back over
+ * this boundary.
+ *
+ * An unknown or unresolvable `secretRef` fails closed: {@link perform}
+ * rejects, and that rejection propagates through agentic execution's
+ * transport/execution-error contract. It is not converted into
+ * `outcome: 'failure'`, which describes a completed interaction that did not
+ * reach its goal.
+ *
+ * The wrapper is the sole recorder of performed actions; adapters do not
+ * report a second trace. A TypeScript type alone does not validate an action
+ * received from an external provider process, so an executor that constructs
+ * actions from that output validates them against the exported
+ * {@link TraceAction} zod schema before calling {@link perform}. This port
+ * contains no runtime logic that can provide that validation itself.
  */
-export type AiActionController = Pick<
-  BrowserSession,
-  'perform' | 'evaluateAssert' | 'snapshotForResolution'
->;
+export interface AiActionController {
+  /**
+   * Materializes and executes one recorded action.
+   *
+   * @param action - An unresolved action that remains safe to record.
+   * @returns Resolves after the action completes.
+   * @throws If the action cannot be materialized or the browser cannot execute
+   * it, including when its secret reference cannot be resolved.
+   */
+  perform(action: TraceAction): Promise<void>;
+
+  /**
+   * Evaluates an assertion with values materialized for the current run.
+   *
+   * @param check - The assertion to evaluate.
+   * @returns A passing or diagnosable failing outcome.
+   * @throws If the assertion cannot be evaluated.
+   */
+  evaluateAssert(check: AssertCheck): Promise<AssertOutcome>;
+
+  /**
+   * Captures the page evidence available for action resolution.
+   *
+   * @returns The current accessibility tree and screenshot.
+   * @throws If either representation cannot be captured.
+   */
+  snapshotForResolution(): Promise<PageSnapshot>;
+}
 
 /**
  * Inputs for an AI-directed browser interaction.
@@ -86,26 +126,33 @@ export interface AiAgenticRequest {
   /** Browser operations the adapter may direct while handling this request. */
   readonly controller: AiActionController;
 
-  /** Materialized actions from earlier interaction, when they aid context. */
-  readonly priorTrace?: readonly PerformableAction[];
+  /**
+   * Recorded actions from an earlier successful interaction, when they aid
+   * context.
+   *
+   * For a `fill-secret` action, its `secretRef` remains an unresolved reference
+   * when carried in the trace. `readonly` protects the array reference
+   * rather than its nested fields; that shallow guarantee matches
+   * {@link TraceAction} and its grounding-storage and replay consumers, so
+   * callers do not mutate supplied or received action elements.
+   */
+  readonly priorTrace?: readonly TraceAction[];
 
   /** Cancellation signal forwarded to a provider that supports cancellation. */
   readonly signal?: AbortSignal;
 }
 
 /**
- * The outcome of an AI-directed browser interaction and its performed trace.
+ * The outcome of a completed AI-directed browser interaction.
+ *
+ * @remarks
+ * The caller supplies the controller and consequently observes every
+ * performed action first-hand. An adapter-reported duplicate trace would
+ * either be trusted, allowing a fabricated action to poison committed replay
+ * data, or be verified against the caller's own record, which adds ceremony
+ * without information.
  */
 export interface AiAgenticResult {
-  /**
-   * Actions the controller actually performed during this call, in order.
-   *
-   * On a `failure` outcome this remains the true partial record through the
-   * failure point; it never contains proposed, predicted, or hypothetical
-   * completion actions.
-   */
-  readonly trace: readonly PerformableAction[];
-
   /** Whether the interaction completed its requested outcome. */
   readonly outcome: 'success' | 'failure';
 
@@ -118,8 +165,8 @@ export interface AiAgenticResult {
  *
  * @remarks
  * Structured execution returns a schema-validated value, whereas agentic
- * execution controls a browser and produces a performed trace. Keeping them
- * as separate methods makes their incompatible call contracts explicit.
+ * execution controls a browser through a caller-provided controller. Keeping
+ * them as separate methods makes their incompatible call contracts explicit.
  */
 export interface AiExecutor {
   /** Identifies the command-line provider integration behind this executor. */
@@ -139,12 +186,14 @@ export interface AiExecutor {
   /**
    * Performs an AI-directed interaction through the supplied controller.
    *
-   * A completed call may return `outcome: 'failure'` with its partial,
-   * actually performed trace; transport, cancellation, and execution errors
-   * reject instead.
+   * A completed call may return `outcome: 'failure'` after partially
+   * performing actions; the controller retains that record. Cancellation,
+   * including an aborted signal, always rejects rather than returning an
+   * outcome. Transport and execution errors also reject.
    *
-   * @param request - Instructions, browser controller, and optional trace.
-   * @returns The interaction outcome and actions actually performed.
+   * @param request - Instructions, browser controller, and optional prior
+   * trace.
+   * @returns The completed interaction outcome.
    * @throws If the request cannot be performed.
    */
   executeAgentic(request: AiAgenticRequest): Promise<AiAgenticResult>;

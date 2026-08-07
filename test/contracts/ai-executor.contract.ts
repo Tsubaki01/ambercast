@@ -7,7 +7,8 @@ import type {
   AiExecuteResult,
   AiExecutor,
 } from '../../src/ports/ai.js';
-import type { AssertCheck, PageSnapshot, PerformableAction } from '../../src/ports/browser.js';
+import type { TraceAction } from '../../src/core/ir/schema.js';
+import type { AssertCheck, PageSnapshot } from '../../src/ports/browser.js';
 
 export type AiExecutorContractAgenticScript = AiAgenticResult | (
   (request: AiAgenticRequest) => AiAgenticResult | Promise<AiAgenticResult>
@@ -32,21 +33,26 @@ const EXECUTE_RESULT: AiExecuteResult<unknown> = {
   raw: '{"ok":true}',
   usage: { inputTokens: 13, outputTokens: 8 },
 };
-const AGENTIC_RESULT: AiAgenticResult = { trace: [], outcome: 'success' };
+const AGENTIC_RESULT: AiAgenticResult = { outcome: 'success' };
 const EMPTY_SNAPSHOT: PageSnapshot = { accessibilityTree: {}, screenshot: new Uint8Array() };
-const ACTION_A: PerformableAction = { type: 'click', target: { strategy: 'accessibility', role: 'button', name: 'Submit' } };
-const ACTION_B: PerformableAction = { type: 'navigate', url: 'https://example.test/second-action' };
+const ACTION_A: TraceAction = { type: 'click', target: { strategy: 'accessibility', role: 'button', name: 'Submit' } };
+const ACTION_B: TraceAction = { type: 'navigate', url: 'https://example.test/second-action' };
 const CHECK: AssertCheck = { check: 'element-visible', target: ACTION_A.target };
+const SECRET_FILL_ACTION: TraceAction = {
+  type: 'fill-secret',
+  target: ACTION_A.target,
+  secretRef: '{{secrets.LOGIN_PASSWORD}}',
+};
 
 interface RecordingController {
   readonly controller: AiActionController;
-  readonly performed: PerformableAction[];
+  readonly performed: TraceAction[];
   readonly evaluated: AssertCheck[];
   readonly snapshotCalls: { count: number };
 }
 
 function createRecordingController(harness: AiExecutorContractHarness): RecordingController {
-  const performed: PerformableAction[] = [];
+  const performed: TraceAction[] = [];
   const evaluated: AssertCheck[] = [];
   const snapshotCalls = { count: 0 };
 
@@ -118,7 +124,7 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
             await request.controller.perform(ACTION_A);
             await request.controller.evaluateAssert(CHECK);
             await request.controller.snapshotForResolution();
-            return { trace: [ACTION_A], outcome: 'success' };
+            return { outcome: 'success' };
           },
         });
 
@@ -131,7 +137,6 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
         expect(recording.performed).toEqual([ACTION_A]);
         expect(recording.evaluated).toEqual([CHECK]);
         expect(recording.snapshotCalls.count).toBe(1);
-        expect(result.trace).toEqual(recording.performed);
         expect(result.outcome).toBe('success');
       } finally {
         await harness.dispose?.();
@@ -145,7 +150,7 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
           execute: EXECUTE_RESULT,
           executeAgentic: async (request) => {
             await request.controller.perform(ACTION_A);
-            return { trace: [ACTION_A], outcome: 'failure' };
+            return { outcome: 'failure' };
           },
         });
 
@@ -156,9 +161,85 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
         });
 
         expect(recording.performed).toEqual([ACTION_A]);
-        expect(result.trace).toEqual(recording.performed);
-        expect(result.trace).not.toContainEqual(ACTION_B);
+        expect(recording.performed).not.toContainEqual(ACTION_B);
         expect(result.outcome).toBe('failure');
+      } finally {
+        await harness.dispose?.();
+      }
+    });
+
+    it('keeps a secret fill reference unresolved at the controller boundary', async () => {
+      try {
+        const recording = createRecordingController(harness);
+        const executor = await harness.createExecutor({
+          execute: EXECUTE_RESULT,
+          executeAgentic: async (request) => {
+            await request.controller.perform(SECRET_FILL_ACTION);
+            return { outcome: 'success' };
+          },
+        });
+
+        const result = await executor.executeAgentic({
+          instructionPrompt: 'Complete the sign-in.',
+          controller: recording.controller,
+        });
+
+        // This proves a valid unresolved fill-secret action crosses unchanged; it does not show this port strips or rejects `value`, a parse-time schema guarantee covered by schema.test.ts.
+        expect(recording.performed).toEqual([SECRET_FILL_ACTION]);
+        expect(result.outcome).toBe('success');
+      } finally {
+        await harness.dispose?.();
+      }
+    });
+
+    it('propagates a controller perform rejection from agentic execution', async () => {
+      try {
+        const controllerError = new Error('The secret reference could not be resolved.');
+        const controller = harness.createActionController({
+          perform: async () => {
+            throw controllerError;
+          },
+        });
+        const executor = await harness.createExecutor({
+          execute: EXECUTE_RESULT,
+          executeAgentic: async (request) => {
+            await request.controller.perform(ACTION_A);
+            return AGENTIC_RESULT;
+          },
+        });
+
+        await expect(executor.executeAgentic({
+          instructionPrompt: 'Complete the sign-in.',
+          controller,
+        })).rejects.toBe(controllerError);
+      } finally {
+        await harness.dispose?.();
+      }
+    });
+
+    // This proves the signal reaches the implementation and its rejection is not converted into an outcome; it does not cover a mid-execution abort, which this logic-free port cannot interrupt.
+    it('rejects an already-aborted agentic request', async () => {
+      try {
+        const recording = createRecordingController(harness);
+        const executor = await harness.createExecutor({
+          execute: EXECUTE_RESULT,
+          executeAgentic: async (request) => {
+            if (request.signal?.aborted) {
+              throw new Error('The scripted agentic request was already aborted.');
+            }
+
+            return AGENTIC_RESULT;
+          },
+        });
+        const abortController = new AbortController();
+        abortController.abort();
+
+        await expect(executor.executeAgentic({
+          instructionPrompt: 'Complete the sign-in.',
+          controller: recording.controller,
+          signal: abortController.signal,
+        })).rejects.toThrow('already aborted');
+        expect(recording.performed).toEqual([]);
       } finally {
         await harness.dispose?.();
       }
