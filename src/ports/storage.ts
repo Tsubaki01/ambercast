@@ -26,15 +26,29 @@ export interface StorageAdapter {
   readText(path: string): Promise<string>;
 
   /**
-   * Writes UTF-8 text to a file.
+   * Writes UTF-8 text to a file with atomic visibility.
    *
-   * Missing parent directories are created automatically. Existing content at
-   * `path` is replaced without an exclusive-create mode.
+   * Missing parent directories are created automatically. While a write is in
+   * progress, readers of `path` receive either its complete previous content
+   * or its complete new content, never a partial write. Existing content is
+   * replaced, and this is the only write mode: callers cannot opt out of
+   * atomicity or request a faster non-atomic alternative.
    *
    * @param path - Opaque path of the file to write.
    * @param content - Text to encode as UTF-8.
    * @throws An `Error` if `path` names an existing directory.
    * @throws If the backend cannot create parents or write the file.
+   *
+   * @remarks
+   * An implementation that creates temporary artifacts attempts to remove
+   * them when its write operation reports a failure. Abrupt process
+   * termination, including a crash, `SIGKILL`, or power loss, can prevent that
+   * cleanup and may leave an implementation-specific artifact behind; this and
+   * `fsync`-based power-loss durability are outside this contract.
+   *
+   * The same-directory, same-volume staging assumption of an implementation
+   * that relies on filesystem rename for atomicity is a caveat for implementers
+   * and deployers, not a runtime-checked invariant.
    */
   writeText(path: string, content: string): Promise<void>;
 
@@ -48,15 +62,29 @@ export interface StorageAdapter {
   readBinary(path: string): Promise<Uint8Array>;
 
   /**
-   * Writes binary data to a file without text encoding.
+   * Writes binary data to a file with atomic visibility.
    *
-   * Missing parent directories are created automatically. Existing content at
-   * `path` is silently replaced.
+   * Missing parent directories are created automatically. While a write is in
+   * progress, readers of `path` receive either its complete previous content
+   * or its complete new content, never a partial write. Existing content is
+   * replaced, and this is the only write mode: callers cannot opt out of
+   * atomicity or request a faster non-atomic alternative.
    *
    * @param path - Opaque path of the file to write.
    * @param content - Bytes to persist.
    * @throws An `Error` if `path` names an existing directory.
    * @throws If the backend cannot create parents or write the file.
+   *
+   * @remarks
+   * An implementation that creates temporary artifacts attempts to remove
+   * them when its write operation reports a failure. Abrupt process
+   * termination, including a crash, `SIGKILL`, or power loss, can prevent that
+   * cleanup and may leave an implementation-specific artifact behind; this and
+   * `fsync`-based power-loss durability are outside this contract.
+   *
+   * The same-directory, same-volume staging assumption of an implementation
+   * that relies on filesystem rename for atomicity is a caveat for implementers
+   * and deployers, not a runtime-checked invariant.
    */
   writeBinary(path: string, content: Uint8Array): Promise<void>;
 

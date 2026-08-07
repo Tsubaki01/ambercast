@@ -67,6 +67,11 @@ function ensureDirectory(
  * Files are stored as bytes so UTF-8 text and binary reads observe the same
  * content. Directory membership is separate from file membership, which keeps
  * the file-only `exists` rule and non-recursive sorted listings explicit.
+ * Writes need no temporary-file mechanism: a single `Map.set` call is a
+ * synchronous, all-or-nothing state transition in JavaScript's single-threaded
+ * execution model, so there is no partial-write window for an interruption to
+ * land in. This fake conforms to the atomic-write contract by construction
+ * rather than replicating the filesystem adapter's mechanism.
  *
  * @returns A scenario-local storage adapter.
  */

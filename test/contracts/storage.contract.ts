@@ -6,6 +6,29 @@ export interface StorageContractHarness {
   dispose?(): void | Promise<void>;
 }
 
+interface StorageWriteCase {
+  readonly name: string;
+  readonly fileName: string;
+  write(storage: StorageAdapter, path: string): Promise<void>;
+}
+
+const storageWriteCases: readonly StorageWriteCase[] = [
+  {
+    name: 'text',
+    fileName: 'completed.txt',
+    async write(storage, path): Promise<void> {
+      await storage.writeText(path, 'complete text');
+    },
+  },
+  {
+    name: 'binary',
+    fileName: 'completed.bin',
+    async write(storage, path): Promise<void> {
+      await storage.writeBinary(path, new Uint8Array([0, 1, 255]));
+    },
+  },
+];
+
 async function withStorage(
   harness: StorageContractHarness,
   assertion: (storage: StorageAdapter) => Promise<void>,
@@ -97,6 +120,31 @@ export function registerStorageContract(harness: StorageContractHarness): void {
         await storage.writeBinary('artifact.bin', replacement);
 
         await expect(storage.readBinary('artifact.bin')).resolves.toEqual(replacement);
+      });
+    });
+
+    it.each(storageWriteCases)('leaves no stray temporary file after a successful $name write', async ({ fileName, write }) => {
+      await withStorage(harness, async (storage) => {
+        await write(storage, `artifacts/${fileName}`);
+
+        await expect(storage.listFiles('artifacts')).resolves.toEqual([fileName]);
+      });
+    });
+
+    it.each(storageWriteCases)('leaves the target directory and its sentinel untouched after a failed $name write', async ({ write }) => {
+      await withStorage(harness, async (storage) => {
+        const targetDirectory = 'artifacts/target-directory';
+        const sentinelPath = `${targetDirectory}/sentinel.txt`;
+        const sentinelContent = 'sentinel content';
+
+        await storage.ensureDir(targetDirectory);
+        await storage.writeText(sentinelPath, sentinelContent);
+
+        await expect(write(storage, targetDirectory)).rejects.toBeInstanceOf(Error);
+
+        await expect(storage.readText(sentinelPath)).resolves.toBe(sentinelContent);
+        await expect(storage.readBinary(sentinelPath)).resolves.toEqual(new TextEncoder().encode(sentinelContent));
+        await expect(storage.listFiles('artifacts')).resolves.toEqual([]);
       });
     });
 
