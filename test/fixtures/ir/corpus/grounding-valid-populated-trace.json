@@ -6,7 +6,7 @@
     "planDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "entries": {
       "login-flow": {
-        "fingerprint": { "algorithm": "a11y-neighborhood-v1", "hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
+        "kind": "ai",
         "trace": [
           { "type": "click", "target": { "strategy": "accessibility", "role": "button", "name": "Start" } },
           { "type": "navigate", "url": "https://example.test/login" },

@@ -1,12 +1,12 @@
 {
   "document": "plan",
-  "expected": "valid",
+  "expected": "invalid",
   "value": {
     "schemaVersion": 1,
     "source": { "inputsDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
     "targets": { "app": { "baseUrl": "https://example.test", "browser": "chromium" } },
     "steps": [
-      { "id": "find-settings", "kind": "ai", "instruction": "Open account settings" }
+      { "id": "find-settings", "kind": "ai", "instruction": "Open account settings", "trace": [{ "type": "click", "target": { "strategy": "accessibility", "role": "link", "name": "Settings" } }] }
     ]
   }
 }

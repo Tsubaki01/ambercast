@@ -149,7 +149,7 @@ export const Fingerprint = z.strictObject({
 });
 
 /**
- * The parsed fingerprint shape associated with a recorded grounding trace.
+ * The parsed fingerprint shape recorded for an `element` grounding entry.
  */
 export type Fingerprint = z.infer<typeof Fingerprint>;
 
@@ -450,16 +450,16 @@ export const CaptureStep = z.strictObject({
 export type CaptureStep = z.infer<typeof CaptureStep>;
 
 /**
- * Validates an AI-directed step and its optional recorded fallback trace.
+ * Validates an AI-directed step as a pure generation artifact.
  *
- * Its optional trace preserves a recorded deterministic fallback while
- * applying the same action and secret-reference rules as executable actions.
+ * Keeping execution results outside the plan preserves digest stability. When
+ * a previously replayed trace exists, it lives solely in
+ * {@link GroundingDocument}.
  */
 export const AiStep = z.strictObject({
   ...StepBase,
   kind: z.literal('ai'),
   instruction: InterpolatableText,
-  trace: z.lazy(() => Trace).optional(),
 });
 
 /**
@@ -581,7 +581,8 @@ export const TraceAction = z.discriminatedUnion('type', [
 export type TraceAction = z.infer<typeof TraceAction>;
 
 /**
- * Validates the ordered recorded actions attached to grounding or an AI step.
+ * Validates the ordered recorded actions held exclusively by an `ai`-kind
+ * grounding entry.
  *
  * An empty trace is structurally valid because usefulness policy belongs
  * outside this trust-boundary schema.
@@ -592,6 +593,57 @@ export const Trace = z.array(TraceAction);
  * The parsed ordered list of {@link TraceAction} values.
  */
 export type Trace = z.infer<typeof Trace>;
+
+/**
+ * Validates grounding recorded for an element-based action, assertion, or
+ * capture step.
+ *
+ * Element grounding retains a stable accessibility-neighborhood fingerprint
+ * without implying that the step has an AI execution trace.
+ */
+export const ElementGroundingEntry = z.strictObject({
+  kind: z.literal('element'),
+  fingerprint: Fingerprint,
+});
+
+/**
+ * The parsed `element` branch of a grounding entry.
+ */
+export type ElementGroundingEntry = z.infer<typeof ElementGroundingEntry>;
+
+/**
+ * Validates grounding recorded for an AI-directed step.
+ *
+ * Requiring a complete trace makes an `ai` entry evidence of a successful
+ * agentic execution; an absent record expresses that no trace has been
+ * recorded yet.
+ */
+export const AiGroundingEntry = z.strictObject({
+  kind: z.literal('ai'),
+  trace: Trace,
+});
+
+/**
+ * The parsed `ai` branch of a grounding entry.
+ */
+export type AiGroundingEntry = z.infer<typeof AiGroundingEntry>;
+
+/**
+ * Validates the distinct grounding records for element-based and AI-directed
+ * steps.
+ *
+ * The discriminator prevents a fingerprint and an AI trace from sharing one
+ * entry, keeping their provenance and replay roles unambiguous.
+ */
+export const GroundingEntry = z.discriminatedUnion('kind', [
+  ElementGroundingEntry,
+  AiGroundingEntry,
+]);
+
+/**
+ * The parsed grounding-entry union narrowed by its `kind` discriminant.
+ */
+export type GroundingEntry = z.infer<typeof GroundingEntry>;
 
 /**
  * Represents every value that can exist in RFC 8259 JSON and therefore in a
@@ -668,20 +720,26 @@ export type PlanDocument = z.infer<typeof PlanDocument>;
  * Validates the committed grounding cache associated with one plan digest.
  *
  * Entry keys associate grounding with descriptive plan steps instead of
- * fragile positions, and the plan digest makes stale grounding detectable by
- * provenance validation.
+ * fragile positions, while the plan digest makes stale grounding detectable
+ * by provenance validation. Grounding is the sole authority for an AI step's
+ * trace: {@link AiStep} has no execution-result field, and only an `ai` entry
+ * records its trace.
+ *
+ * A run-pipeline implementation must leave an entry unchanged after
+ * successfully replaying its existing trace, must write a new `ai` entry —
+ * creating one where none exists or overwriting an existing one — after a
+ * successful `executeAgentic` call, and must leave any existing entry
+ * untouched when `executeAgentic` fails or aborts. This preserves a
+ * previously good trace and prevents a failed or partial execution from
+ * becoming replay data.
  */
 export const GroundingDocument = z.strictObject({
   schemaVersion: z.literal(1),
   planDigest: HexSha256,
-  entries: z.record(StepId, z.strictObject({
-    fingerprint: Fingerprint,
-    trace: Trace.optional(),
-  })),
+  entries: z.record(StepId, GroundingEntry),
 });
 
 /**
- * The parsed grounding cache that records fingerprints and replayable traces
- * for a particular generated plan.
+ * The parsed grounding cache for a particular generated plan.
  */
 export type GroundingDocument = z.infer<typeof GroundingDocument>;
