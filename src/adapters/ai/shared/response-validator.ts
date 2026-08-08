@@ -4,10 +4,14 @@
  */
 
 import { Ajv2020, type ErrorObject } from 'ajv/dist/2020.js';
-import addFormats from 'ajv-formats';
+import addFormatsModule, { type FormatsPlugin } from 'ajv-formats';
 
 import type { TypedJsonSchema } from '#core/ai/typed-json-schema.js';
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
+
+// Node ESM resolves this default export to a callable, while the package's
+// CommonJS metadata makes TypeScript's NodeNext resolver expose its namespace.
+const addFormats = addFormatsModule as unknown as FormatsPlugin;
 
 /**
  * One readable location and explanation for a provider-response violation.
@@ -55,7 +59,7 @@ export function validateAiResponse<T>(raw: string, schema: TypedJsonSchema<T>): 
   }
 
   const ajv = new Ajv2020({ allErrors: true });
-  addFormats.default(ajv);
+  addFormats(ajv);
   const validator = ajv.compile(schema);
   if (validator(value)) {
     return value as T;

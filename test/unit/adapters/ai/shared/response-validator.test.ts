@@ -63,6 +63,7 @@ describe('validateAiResponse', () => {
   it('escapes required property names when rendering JSON Pointer paths', () => {
     const slashKeySchema = typedJsonSchema(z.object({ 'token/key': z.string() }));
 
+    expect(() => validateAiResponse('{}', slashKeySchema)).toThrow(AiResponseInvalidError);
     try {
       validateAiResponse('{}', slashKeySchema);
     } catch (error) {

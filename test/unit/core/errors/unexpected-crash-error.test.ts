@@ -14,10 +14,11 @@ describe('UnexpectedCrashError', () => {
 
   it('retains its message, details, and Error-constructor cause', () => {
     const cause = new Error('unexpected failure');
-    const error = new UnexpectedCrashError('The generate command crashed unexpectedly.', undefined, { cause });
+    const details = { command: 'generate', signal: 'SIGTERM' };
+    const error = new UnexpectedCrashError('The generate command crashed unexpectedly.', details, { cause });
 
     expect(error.message).toBe('The generate command crashed unexpectedly.');
-    expect(error.details).toBeUndefined();
+    expect(error.details).toEqual(details);
     expect(error.cause).toBe(cause);
   });
 

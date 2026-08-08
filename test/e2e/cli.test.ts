@@ -92,6 +92,8 @@ describe('bin/ambercast.js (e2e)', () => {
   });
 
   it('is executable as published', async () => {
-    await expect(access(binPath, constants.X_OK)).resolves.toBeUndefined();
+    if (process.platform !== 'win32') {
+      await expect(access(binPath, constants.X_OK)).resolves.toBeUndefined();
+    }
   });
 });
