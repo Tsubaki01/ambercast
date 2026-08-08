@@ -60,6 +60,8 @@ Implementation tasks run in a **linked worktree per issue** by default; working 
 - `npm run build` — compile `src/` to `dist/` via `tsdown`
 - `npm run typecheck` — `tsc --noEmit`
 - `npm test` — build (via `pretest`) then run the Vitest suite
+- `npm run test:contract:ai` — run opt-in provider smoke tests; requires local
+  `claude`/`codex` CLIs installed and authenticated, and is not run in CI
 - `node bin/ambercast.js` — run the CLI (requires `npm run build` first)
 - `node scripts/verify-pack.mjs` — authoritative, automated check that the
   packed tarball contains `dist/`, `bin/ambercast.js`, and that the bin file

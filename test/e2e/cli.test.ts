@@ -1,68 +1,90 @@
 import { execFile } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import { ReportEnvelope } from '#report/schema.js';
 
 const execFileAsync = promisify(execFile);
-
-/**
- * Characterizes the published bin/ambercast.js → dist/cli.js path as a child
- * process, verifying byte-identical output end to end so a regression in
- * either the shim or the bundle is caught. npm test's pretest builds dist/
- * first, allowing this test to exercise the built path.
- */
 const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
 const binPath = fileURLToPath(new URL('../../bin/ambercast.js', import.meta.url));
+const temporaryDirectories: string[] = [];
 
-const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
+interface CliResult {
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly exitCode: number;
+}
 
-const EXPECTED_STDOUT = [
-  `ambercast v${pkg.version}`,
-  '',
-  'Prompt-native E2E testing: AI generates a deterministic execution plan',
-  'from your natural-language test prompts, replayed with zero AI calls.',
-  '',
-  'This package is under active development. The CLI is not functional yet.',
-  '',
-].join('\n');
+async function runCli(args: readonly string[], cwd = repoRoot): Promise<CliResult> {
+  try {
+    const { stdout, stderr } = await execFileAsync(process.execPath, [binPath, ...args], { cwd, encoding: 'utf8', timeout: 5_000 });
+    return { stdout, stderr, exitCode: 0 };
+  } catch (error) {
+    const failure = error as { code?: number; stdout?: string; stderr?: string };
+    return { stdout: failure.stdout ?? '', stderr: failure.stderr ?? '', exitCode: failure.code ?? 1 };
+  }
+}
+
+async function fixtureProject(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), 'ambercast-cli-'));
+  temporaryDirectories.push(directory);
+  await mkdir(join(directory, 'tests'), { recursive: true });
+  await writeFile(join(directory, 'ambercast.config.json'), JSON.stringify({
+    $schema: 'https://ambercast.dev/schema/config.json', testDir: 'tests', runsDir: 'tests/.runs',
+    targets: { web: { baseUrl: 'https://example.test', browser: 'chromium' } }, defaultTarget: 'web', ai: { provider: 'codex' },
+  }));
+  await writeFile(join(directory, 'tests', 'test.test.md'), '# Fixture test\n');
+  return directory;
+}
+
+afterEach(async () => {
+  await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+});
 
 describe('bin/ambercast.js (e2e)', () => {
-  it('prints the exact placeholder banner and exits 0 with no stderr', async () => {
-    const { stdout, stderr } = await execFileAsync(process.execPath, [binPath], {
-      cwd: repoRoot,
-      encoding: 'utf8',
-      // Below Vitest's default 5s test timeout, so a hung child process
-      // gets killed by execFile's own timeout well before Vitest's — a
-      // trivial banner-printing CLI has no legitimate reason to run long.
-      timeout: 3_000,
-    });
+  it('runs the built dist path, prints no-command usage, and exits 0', async () => {
+    const result = await runCli([]);
 
-    expect(stderr).toBe('');
-    expect(stdout).toBe(EXPECTED_STDOUT);
+    expect(result.stdout).toMatch(/usage/i);
+    expect(result.stderr).toBe('');
+    expect(result.exitCode).toBe(0);
   });
 
-  it('prints the identical banner regardless of argv, per its documented contract', async () => {
-    // src/cli/main.ts documents that every invocation prints the identical
-    // banner regardless of argv, so assert that contract explicitly rather
-    // than leaving it implied by the no-args case above.
-    const { stdout, stderr } = await execFileAsync(process.execPath, [binPath, '--foo', 'bar'], {
-      cwd: repoRoot,
-      encoding: 'utf8',
-      // Below Vitest's default 5s test timeout, so a hung child process
-      // gets killed by execFile's own timeout well before Vitest's — a
-      // trivial banner-printing CLI has no legitimate reason to run long.
-      timeout: 3_000,
-    });
+  it.each([
+    ['--version', /^ambercast v\d+\.\d+\.\d+/, 0],
+    ['--help', /generate/, 0],
+  ] as const)('short-circuits %s through the published bin path', async (argument, output, exitCode) => {
+    const result = await runCli([argument]);
 
-    expect(stderr).toBe('');
-    expect(stdout).toBe(EXPECTED_STDOUT);
+    expect(result.stdout).toMatch(output);
+    expect(result.stderr).toBe('');
+    expect(result.exitCode).toBe(exitCode);
   });
 
-  it('has a #!/usr/bin/env node shebang as its first line', () => {
-    // execFileAsync invokes bin/ambercast.js via `node <path>`, bypassing the
-    // shebang, so a direct text assertion is needed to catch a regression.
-    const firstLine = readFileSync(binPath, 'utf8').split('\n', 1)[0];
+  it('keeps parse failure plain text even when --json is present', async () => {
+    const result = await runCli(['generate', '--json', '--invalid']);
+
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/usage|unknown/i);
+    expect(result.stderr.trim().startsWith('{')).toBe(false);
+    expect(result.exitCode).toBe(2);
+  });
+
+  it('round-trips list mode for a fixture test through the built dist CLI', async () => {
+    const project = await fixtureProject();
+    const result = await runCli(['generate', '--list', '--json'], project);
+
+    expect(result.exitCode).toBe(0);
+    const envelope = JSON.parse(result.stdout);
+    expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
+    expect(envelope.results).toEqual([expect.objectContaining({ file: expect.stringContaining('test.test.md'), status: 'listed' })]);
+  });
+
+  it('has a #!/usr/bin/env node shebang as its first line', async () => {
+    const firstLine = (await readFile(binPath, 'utf8')).split('\n', 1)[0];
     expect(firstLine).toBe('#!/usr/bin/env node');
   });
 });

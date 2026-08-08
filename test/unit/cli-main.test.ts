@@ -1,16 +1,13 @@
-import { readFileSync } from 'node:fs';
 import { Writable } from 'node:stream';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ReportEnvelope } from '#report/schema.js';
+import type { GenerateCommandInput } from '#runtime/generate-command.js';
+
+const runGenerateCommand = vi.hoisted(() => vi.fn());
+vi.mock('#runtime/generate-command.js', () => ({ runGenerateCommand }));
+
 import { main } from '../../src/cli/main.js';
 
-/**
- * Calls main() with an in-memory writable stream for process-free,
- * dist/-independent unit coverage of the banner.
- *
- * This is a real node:stream Writable rather than a cast fake object so the
- * test exercises the same interface that main()'s default process.stdout
- * implements.
- */
 class MemoryWritable extends Writable {
   chunks: string[] = [];
 
@@ -24,44 +21,145 @@ class MemoryWritable extends Writable {
   }
 }
 
-// Read the version from package.json rather than hardcoding it so the banner
-// tracks the published version, the same source tsdown.config.js and
-// vitest.config.ts use to supply __VERSION__.
-const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
+const ENVELOPE = {
+  schemaVersion: '1.0' as const,
+  command: 'generate' as const,
+  startedAt: '2026-08-08T00:00:00Z',
+  durationMs: 0,
+  summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 },
+  errors: [],
+  results: [{ id: 'login', file: 'login.test.md', status: 'listed' as const, dryRun: false }],
+};
 
-const EXPECTED_BANNER = [
-  `ambercast v${pkg.version}`,
-  '',
-  'Prompt-native E2E testing: AI generates a deterministic execution plan',
-  'from your natural-language test prompts, replayed with zero AI calls.',
-  '',
-  'This package is under active development. The CLI is not functional yet.',
-  '',
-].join('\n');
+let exitSpy: ReturnType<typeof vi.spyOn>;
+let cwdSpy: ReturnType<typeof vi.spyOn> | undefined;
+
+afterEach(() => {
+  exitSpy?.mockRestore();
+  cwdSpy?.mockRestore();
+  cwdSpy = undefined;
+  runGenerateCommand.mockReset();
+});
+
+async function run(argv: readonly string[]) {
+  const stdout = new MemoryWritable();
+  const stderr = new MemoryWritable();
+  exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+  await main(argv, stdout, stderr);
+
+  return { stdout: stdout.text, stderr: stderr.text, exitCode: exitSpy.mock.calls[0]?.[0] };
+}
 
 describe('main()', () => {
-  it('writes the exact placeholder banner, in order, to the given stream', () => {
-    const out = new MemoryWritable();
+  it('prints usage and exits 0 when no command is supplied', async () => {
+    const result = await run([]);
 
-    main(out);
-
-    expect(out.text).toBe(EXPECTED_BANNER);
+    expect(result.stdout).toMatch(/usage/i);
+    expect(result.stderr).toBe('');
+    expect(result.exitCode).toBe(0);
   });
 
-  it('defaults to writing to process.stdout when no stream is given', () => {
-    const original = process.stdout.write;
-    const written: string[] = [];
-    process.stdout.write = ((chunk: string) => {
-      written.push(chunk);
-      return true;
-    }) as typeof process.stdout.write;
+  it('short-circuits top-level version and help before command lookup', async () => {
+    const version = await run(['--version']);
+    expect(version.stdout).toMatch(/^ambercast v\d+\.\d+\.\d+/);
+    expect(version.exitCode).toBe(0);
 
-    try {
-      main();
-    } finally {
-      process.stdout.write = original;
-    }
+    const help = await run(['--help']);
+    expect(help.stdout).toMatch(/generate/);
+    expect(help.exitCode).toBe(0);
+    expect(runGenerateCommand).not.toHaveBeenCalled();
+  });
 
-    expect(written.join('')).toBe(EXPECTED_BANNER);
+  it.each([
+    ['unknown command', ['unknown']],
+    ['unknown flag even with JSON requested', ['generate', '--json', '--unknown']],
+    ['missing target value', ['generate', '--target']],
+    ['missing AI provider value', ['generate', '--ai']],
+    ['missing config value', ['generate', '--config']],
+    ['unsupported provider', ['generate', '--ai', 'other']],
+  ] as const)('writes plain usage to stderr and exits 2 for %s', async (_description, argv) => {
+    const result = await run(argv);
+
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/usage|unknown|missing/i);
+    expect(result.stderr.trim().startsWith('{')).toBe(false);
+    expect(result.exitCode).toBe(2);
+    expect(runGenerateCommand).not.toHaveBeenCalled();
+  });
+
+  it('passes parsed list flags and literal paths to runtime then renders its human report', async () => {
+    runGenerateCommand.mockResolvedValue({ exitCode: 0, envelope: ENVELOPE });
+
+    const result = await run(['generate', 'login.test.md', '--list', '--no-color', '--config', 'ambercast.config.json']);
+
+    expect(runGenerateCommand).toHaveBeenCalledWith(expect.objectContaining({
+      files: ['login.test.md'], list: true, dryRun: false, force: false, strict: false,
+      configPathOverride: 'ambercast.config.json',
+    }));
+    expect(result.stdout).toContain('login.test.md');
+    expect(result.stdout).not.toMatch(/\u001B\[/);
+    expect(result.exitCode).toBe(0);
+  });
+
+  it.each([
+    ['target', ['generate', '--target', 'web'], { target: 'web' }],
+    ['Claude provider', ['generate', '--ai', 'claude'], { aiProviderOverride: 'claude' }],
+    ['Codex provider', ['generate', '--ai', 'codex'], { aiProviderOverride: 'codex' }],
+    ['force', ['generate', '--force'], { force: true }],
+    ['allow-empty', ['generate', '--allow-empty'], { allowEmpty: true }],
+  ] as const)('parses the documented generate %s flag', async (_description, argv, expectedInput) => {
+    runGenerateCommand.mockResolvedValue({ exitCode: 0, envelope: ENVELOPE });
+
+    await run(argv);
+
+    expect(runGenerateCommand).toHaveBeenCalledWith(expect.objectContaining(expectedInput));
+  });
+
+  it('short-circuits command-local generate help before calling runtime', async () => {
+    const result = await run(['generate', '--help']);
+
+    expect(result.stdout).toMatch(/generate|usage/i);
+    expect(result.stderr).toBe('');
+    expect(result.exitCode).toBe(0);
+    expect(runGenerateCommand).not.toHaveBeenCalled();
+  });
+
+  it('passes the current working directory to runtime configuration selection', async () => {
+    runGenerateCommand.mockResolvedValue({ exitCode: 0, envelope: ENVELOPE });
+    cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue('/workspace/project');
+
+    await run(['generate']);
+
+    expect(runGenerateCommand).toHaveBeenCalledWith(expect.objectContaining({ cwd: '/workspace/project' }));
+  });
+
+  it('forwards SIGINT through the runtime signal and removes both process listeners after completion', async () => {
+    let receivedSignal: AbortSignal | undefined;
+    const initialSigintListeners = process.listenerCount('SIGINT');
+    const initialSigtermListeners = process.listenerCount('SIGTERM');
+    runGenerateCommand.mockImplementation(async (commandInput: GenerateCommandInput) => {
+      receivedSignal = commandInput.signal;
+      process.emit('SIGINT');
+      return { exitCode: 0, envelope: ENVELOPE };
+    });
+
+    await run(['generate']);
+
+    expect(receivedSignal?.aborted).toBe(true);
+    expect(process.listenerCount('SIGINT')).toBe(initialSigintListeners);
+    expect(process.listenerCount('SIGTERM')).toBe(initialSigtermListeners);
+  });
+
+  it('writes exactly one valid JSON envelope for a parsed dry-run invocation', async () => {
+    const envelope = { ...ENVELOPE, results: [{ ...ENVELOPE.results[0], status: 'would-generate' as const, dryRun: true }] };
+    runGenerateCommand.mockResolvedValue({ exitCode: 1, envelope });
+
+    const result = await run(['generate', '--dry-run', '--strict', '--json']);
+
+    expect(runGenerateCommand).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true, strict: true }));
+    expect(ReportEnvelope.safeParse(JSON.parse(result.stdout)).success).toBe(true);
+    expect(result.stderr).toBe('');
+    expect(result.exitCode).toBe(1);
   });
 });

@@ -26,6 +26,7 @@ const ERROR_CODE_CORRESPONDENCE = [
   { errorKind: 'integrity-violation', reportCode: 'INTEGRITY_VIOLATION', exitCode: 4, reportKind: 'usage' },
   { errorKind: 'browser-launch-failed', reportCode: 'BROWSER_LAUNCH_FAILED', exitCode: 3, reportKind: 'environment' },
   { errorKind: 'ai-executor-unavailable', reportCode: 'AI_EXECUTOR_UNAVAILABLE', exitCode: 3, reportKind: 'environment' },
+  { errorKind: 'ai-response-invalid', reportCode: 'AI_RESPONSE_INVALID', exitCode: 3, reportKind: 'environment' },
   { errorKind: 'fs-io-error', reportCode: 'FS_IO_ERROR', exitCode: 3, reportKind: 'environment' },
   { errorKind: 'unexpected-crash', reportCode: 'UNEXPECTED_CRASH', exitCode: 3, reportKind: 'environment' },
 ] as const satisfies readonly ErrorCodeCorrespondence[];
@@ -40,6 +41,7 @@ const REPORTABLE_ERROR_KINDS = [
   'integrity-violation',
   'browser-launch-failed',
   'ai-executor-unavailable',
+  'ai-response-invalid',
   'fs-io-error',
   'unexpected-crash',
 ] as const satisfies readonly ErrorKind[];

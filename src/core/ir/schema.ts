@@ -717,6 +717,26 @@ export const PlanDocument = z.strictObject({
 export type PlanDocument = z.infer<typeof PlanDocument>;
 
 /**
+ * Validates only the provider-authored portion of a generated plan response.
+ *
+ * Provider output deliberately excludes local provenance, target selection,
+ * and schema versioning. The generation use case adds those deterministic
+ * fields before validating the completed {@link PlanDocument}, preserving the
+ * provider boundary's smaller and more trustworthy responsibility.
+ */
+export const GeneratedPlanResponse = z.strictObject({
+  steps: z.array(Step),
+  generatorMeta: z.record(z.string(), JsonValue).optional(),
+  ambiguities: z.array(JsonValue),
+});
+
+/**
+ * The validated, provider-authored portion from which a complete plan is
+ * assembled locally.
+ */
+export type GeneratedPlanResponse = z.infer<typeof GeneratedPlanResponse>;
+
+/**
  * Validates the committed grounding cache associated with one plan digest.
  *
  * Entry keys associate grounding with descriptive plan steps instead of

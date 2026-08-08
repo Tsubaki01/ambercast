@@ -34,6 +34,7 @@ export const ERROR_EXIT_CODES = {
   'integrity-violation': 4,
   'browser-launch-failed': 3,
   'ai-executor-unavailable': 3,
+  'ai-response-invalid': 3,
   'fs-io-error': 3,
   'unexpected-crash': 3,
   // Zero-match runs are structural report outcomes, but this kind stays mapped

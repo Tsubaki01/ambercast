@@ -1,4 +1,5 @@
 import type { BrowserSession } from '../../../src/ports/browser.js';
+import type { AiExecuteRequest, AiExecuteResult } from '../../../src/ports/ai.js';
 import { registerAiExecutorContract } from '../../contracts/ai-executor.contract.js';
 import { registerBrowserDriverContract } from '../../contracts/browser-driver.contract.js';
 import { registerBrowserSessionContract } from '../../contracts/browser-session.contract.js';
@@ -40,12 +41,14 @@ registerBrowserDriverContract({
 
 registerAiExecutorContract({
   createExecutor: (scripted) => createFakeAiExecutor({
-    execute: () => {
+    execute: <T>(request: AiExecuteRequest<T>) => {
       if (scripted.executeError !== undefined) {
         throw scripted.executeError;
       }
 
-      return scripted.execute;
+      return typeof scripted.execute === 'function'
+        ? scripted.execute(request as AiExecuteRequest<unknown>) as AiExecuteResult<T>
+        : scripted.execute as AiExecuteResult<T>;
     },
     executeAgentic: (request) => typeof scripted.executeAgentic === 'function'
       ? scripted.executeAgentic(request)

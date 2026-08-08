@@ -28,6 +28,8 @@ export const RawConfig = z.strictObject({
   defaultTarget: z.string().optional(),
   ai: z.strictObject({
     provider: z.enum(['claude', 'codex', 'auto']).optional(),
+    // A positive timeout bounds each provider call after configuration resolves.
+    timeoutMs: z.int().positive().optional(),
   }).optional(),
   viewer: z.strictObject({
     port: z.int().min(1).max(65_535).optional(),
@@ -74,7 +76,8 @@ export interface ResolvedConfig extends LayoutConfig {
   readonly testIgnore: readonly string[];
   readonly targets: Readonly<Record<string, Readonly<TargetDefinition>>>;
   readonly defaultTarget?: string;
-  readonly ai: Readonly<{ provider: 'claude' | 'codex' | 'auto' }>;
+  /** AI-provider policy with a positive, resolved per-call timeout. */
+  readonly ai: Readonly<{ provider: 'claude' | 'codex' | 'auto'; timeoutMs: number }>;
   readonly viewer: Readonly<{ port: number }>;
   readonly ci: Readonly<{ heal: boolean; updateGroundingCache: boolean }>;
 }

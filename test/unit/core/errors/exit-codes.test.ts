@@ -13,6 +13,7 @@ const ALL_ERROR_KINDS = [
   'integrity-violation',
   'browser-launch-failed',
   'ai-executor-unavailable',
+  'ai-response-invalid',
   'fs-io-error',
   'unexpected-crash',
   'no-tests-found',
@@ -37,6 +38,7 @@ function exitCodeFor(kind: ErrorKind): ErrorExitCode {
       return 2;
     case 'browser-launch-failed':
     case 'ai-executor-unavailable':
+    case 'ai-response-invalid':
     case 'fs-io-error':
     case 'unexpected-crash':
       return 3;

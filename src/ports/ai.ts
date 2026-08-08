@@ -2,19 +2,10 @@
  * Declares the AI boundary for structured generation calls and browser-led
  * agentic work.
  */
+import type { TypedJsonSchema } from '#core/ai/typed-json-schema.js';
 import type { JsonValueT, TraceAction } from '#core/ir/schema.js';
 
 import type { AssertCheck, AssertOutcome, PageSnapshot } from './browser.js';
-
-/**
- * An object-form response schema passed to an AI adapter for validation.
- *
- * @remarks
- * The port transports a schema but never interprets it. A small local record
- * therefore avoids coupling port consumers to a particular validation
- * library's implementation types.
- */
-export type JsonSchema = Record<string, unknown>;
 
 /**
  * Optional provider-reported token accounting for one AI call.
@@ -31,13 +22,15 @@ export interface AiUsage {
 
 /**
  * Inputs for one structured AI response request.
+ *
+ * @typeParam T - The response shape associated with `responseSchema`.
  */
-export interface AiExecuteRequest {
+export interface AiExecuteRequest<T = unknown> {
   /** Complete instructions sent to the provider. */
   readonly prompt: string;
 
   /** Response shape that the adapter validates before returning data. */
-  readonly responseSchema: JsonSchema;
+  readonly responseSchema: TypedJsonSchema<T>;
 
   /** Serializable caller context sent with the request when needed. */
   readonly context?: JsonValueT;
@@ -181,7 +174,7 @@ export interface AiExecutor {
    * @throws If the provider is unavailable, the request is cancelled, or a
    * response cannot be obtained or validated.
    */
-  execute<T>(request: AiExecuteRequest): Promise<AiExecuteResult<T>>;
+  execute<T>(request: AiExecuteRequest<T>): Promise<AiExecuteResult<T>>;
 
   /**
    * Performs an AI-directed interaction through the supplied controller.
@@ -204,6 +197,10 @@ export interface AiExecutor {
    * @returns `true` when callers may issue requests and `false` when it is
    * unavailable.
    * @throws If availability cannot be determined.
+   * @remarks
+   * The command-line adapters fold every probe failure into `false`. The port
+   * retains its general throwing allowance for an implementation that genuinely
+   * cannot determine availability.
    */
   isAvailable(): Promise<boolean>;
 }

@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { Linter, type Linter as LinterTypes } from 'eslint';
 import tseslint from 'typescript-eslint';
 import { describe, expect, it, test } from 'vitest';
-// @ts-expect-error -- the docs-first flat config intentionally has no .d.ts file.
+// @ts-expect-error -- the flat ESM config has no declaration file.
 import eslintConfig from '../../../eslint.config.js';
 // @ts-expect-error -- the shared ESM policy intentionally has no .d.ts file.
 import { LAYERS } from '../../../tools/architecture-policy.mjs';

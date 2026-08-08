@@ -1,0 +1,232 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { ResolvedConfig } from '#core/config/schema.js';
+import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
+import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
+import { ReportEnvelope, type ReportError } from '#report/schema.js';
+import {
+  runGenerateCommand,
+  type GenerateCommandInput,
+  type GenerateCommandOutput,
+} from '#runtime/generate-command.js';
+
+const mocks = vi.hoisted(() => ({
+  loadConfig: vi.fn(),
+  createAmbercast: vi.fn(),
+  generate: vi.fn(),
+  buildGenerateReport: vi.fn(),
+  claudeFactory: vi.fn(),
+  codexFactory: vi.fn(),
+}));
+
+vi.mock('#config/load.js', () => ({ loadConfig: mocks.loadConfig }));
+vi.mock('#runtime/create-ambercast.js', () => ({ createAmbercast: mocks.createAmbercast }));
+vi.mock('#usecases/generate.js', () => ({ generate: mocks.generate }));
+vi.mock('#usecases/generate-report.js', () => ({ buildGenerateReport: mocks.buildGenerateReport }));
+vi.mock('#adapters/ai/registry.js', () => ({
+  AI_EXECUTOR_FACTORIES: { claude: mocks.claudeFactory, codex: mocks.codexFactory },
+}));
+
+const CONFIG: ResolvedConfig = {
+  testDir: '/workspace/tests',
+  runsDir: '/workspace/tests/.runs',
+  testMatch: ['**/*.test.md'],
+  testIgnore: [],
+  targets: { web: { baseUrl: 'https://example.test', browser: 'chromium' } },
+  defaultTarget: 'web',
+  ai: { provider: 'auto', timeoutMs: 120_000 },
+  viewer: { port: 4600 },
+  ci: { heal: false, updateGroundingCache: false },
+};
+
+function reportOutput(
+  exitCode: GenerateCommandOutput['exitCode'],
+  errors: ReportError[] = [],
+): GenerateCommandOutput {
+  const output: GenerateCommandOutput = {
+    exitCode,
+    envelope: {
+      schemaVersion: '1.0',
+      command: 'generate',
+      startedAt: '2026-08-08T00:00:00Z',
+      durationMs: 1,
+      summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 },
+      errors,
+      results: [],
+    },
+  };
+
+  expect(ReportEnvelope.safeParse(output.envelope).success).toBe(true);
+  return output;
+}
+
+function input(overrides: Partial<GenerateCommandInput> = {}): GenerateCommandInput {
+  return {
+    files: [], strict: false, force: false, dryRun: false, allowEmpty: false, list: false, cwd: '/workspace', ...overrides,
+  };
+}
+
+function executor(provider: 'claude' | 'codex', available: boolean) {
+  return {
+    name: provider === 'claude' ? 'claude-code-cli' as const : 'codex-cli' as const,
+    isAvailable: vi.fn(async () => available),
+  };
+}
+
+function arrangeSuccessfulCommand(
+  configuredProvider: ResolvedConfig['ai']['provider'],
+  selectedProvider: 'claude' | 'codex',
+) {
+  const selected = executor(selectedProvider, true);
+  mocks.loadConfig.mockResolvedValue({ ...CONFIG, ai: { ...CONFIG.ai, provider: configuredProvider } });
+  if (selectedProvider === 'claude') {
+    mocks.claudeFactory.mockReturnValue(selected);
+  } else {
+    mocks.codexFactory.mockReturnValue(selected);
+  }
+  mocks.createAmbercast.mockReturnValue({
+    aiExecutor: selected,
+    clock: { now: () => new Date('2026-08-08T00:00:00Z'), monotonicMs: () => 10 },
+  });
+  mocks.generate.mockResolvedValue({ results: [], noTestsFound: false });
+  const output = reportOutput(0);
+  mocks.buildGenerateReport.mockReturnValue(output);
+  return { selected, output };
+}
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.resetAllMocks();
+});
+
+describe('runGenerateCommand', () => {
+  it('loads config, lets an explicit provider override win, composes, generates, and returns a schema-valid report', async () => {
+    const { selected, output } = arrangeSuccessfulCommand('auto', 'codex');
+
+    await expect(runGenerateCommand(input({ aiProviderOverride: 'codex' }))).resolves.toEqual(output);
+    expect(mocks.loadConfig).toHaveBeenCalledWith(expect.objectContaining({ cwd: '/workspace' }));
+    expect(mocks.createAmbercast).toHaveBeenCalledWith(expect.objectContaining({ aiProvider: 'codex' }));
+    expect(mocks.generate).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ files: [] }));
+    expect(selected.isAvailable).not.toHaveBeenCalled();
+    expect(mocks.claudeFactory).not.toHaveBeenCalled();
+  });
+
+  it('passes captured configuration environment values into config loading', async () => {
+    arrangeSuccessfulCommand('codex', 'codex');
+    vi.stubEnv('AMBERCAST_CONFIG', 'from-environment.json');
+    vi.stubEnv('AMBERCAST_AI_PROVIDER', 'claude');
+
+    await runGenerateCommand(input());
+
+    expect(mocks.loadConfig).toHaveBeenCalledWith(expect.objectContaining({
+      configEnv: {
+        configPathOverride: 'from-environment.json',
+        aiProviderRaw: 'claude',
+      },
+    }));
+  });
+
+  it('anchors a relative literal prompt path to cwd before generation', async () => {
+    arrangeSuccessfulCommand('codex', 'codex');
+
+    await runGenerateCommand(input({ cwd: '/workspace/tests', files: ['login.test.md'] }));
+
+    expect(mocks.generate).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      files: ['/workspace/tests/login.test.md'],
+    }));
+  });
+
+  it.each(['claude', 'codex'] as const)('passes configured %s through without auto probing', async (provider) => {
+    const { selected } = arrangeSuccessfulCommand(provider, provider);
+
+    await runGenerateCommand(input());
+
+    expect(mocks.createAmbercast).toHaveBeenCalledWith(expect.objectContaining({ aiProvider: provider }));
+    expect(selected.isAvailable).not.toHaveBeenCalled();
+    expect(provider === 'claude' ? mocks.codexFactory : mocks.claudeFactory).not.toHaveBeenCalled();
+  });
+
+  it('probes Claude first and never constructs Codex when Claude is available', async () => {
+    const calls: string[] = [];
+    const claude = executor('claude', true);
+    claude.isAvailable.mockImplementation(async () => {
+      calls.push('claude available');
+      return true;
+    });
+    arrangeSuccessfulCommand('auto', 'claude');
+    mocks.claudeFactory.mockImplementation(() => {
+      calls.push('claude factory');
+      return claude;
+    });
+    mocks.createAmbercast.mockReturnValue({ aiExecutor: claude, clock: { now: () => new Date(), monotonicMs: () => 0 } });
+
+    await runGenerateCommand(input());
+
+    expect(calls).toEqual(['claude factory', 'claude available']);
+    expect(mocks.codexFactory).not.toHaveBeenCalled();
+  });
+
+  it('probes Codex only after Claude reports unavailable', async () => {
+    const calls: string[] = [];
+    const claude = executor('claude', false);
+    const codex = executor('codex', true);
+    claude.isAvailable.mockImplementation(async () => {
+      calls.push('claude available');
+      return false;
+    });
+    codex.isAvailable.mockImplementation(async () => {
+      calls.push('codex available');
+      return true;
+    });
+    arrangeSuccessfulCommand('auto', 'codex');
+    mocks.claudeFactory.mockImplementation(() => {
+      calls.push('claude factory');
+      return claude;
+    });
+    mocks.codexFactory.mockImplementation(() => {
+      calls.push('codex factory');
+      return codex;
+    });
+    mocks.createAmbercast.mockReturnValue({ aiExecutor: codex, clock: { now: () => new Date(), monotonicMs: () => 0 } });
+
+    await runGenerateCommand(input());
+
+    expect(calls).toEqual(['claude factory', 'claude available', 'codex factory', 'codex available']);
+  });
+
+  it('returns an exit-3 run-scoped unavailable-provider report when auto probing finds no provider', async () => {
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.claudeFactory.mockReturnValue(executor('claude', false));
+    mocks.codexFactory.mockReturnValue(executor('codex', false));
+    const output = reportOutput(3, [{
+      scope: 'run', kind: 'environment', code: 'AI_EXECUTOR_UNAVAILABLE', message: 'No AI provider is available.',
+    }]);
+    mocks.buildGenerateReport.mockReturnValue(output);
+
+    await expect(runGenerateCommand(input())).resolves.toEqual(output);
+    expect(mocks.buildGenerateReport).toHaveBeenCalledWith(expect.objectContaining({
+      error: expect.any(AiExecutorUnavailableError),
+    }));
+    expect(output.envelope.errors).toEqual([expect.objectContaining({ scope: 'run', code: 'AI_EXECUTOR_UNAVAILABLE' })]);
+  });
+
+  it.each([0, 1, 2, 3, 4, 5] as const)('returns a schema-valid report envelope for exit %i', async (exitCode) => {
+    arrangeSuccessfulCommand('codex', 'codex');
+    const output = reportOutput(exitCode);
+    mocks.buildGenerateReport.mockReturnValue(output);
+
+    await expect(runGenerateCommand(input())).resolves.toEqual(output);
+    expect(ReportEnvelope.safeParse(output.envelope).success).toBe(true);
+  });
+
+  it('passes a classified AI response failure into run-scoped report construction', async () => {
+    const error = new AiResponseInvalidError('invalid AI response');
+    mocks.loadConfig.mockRejectedValue(error);
+    const output = reportOutput(3, [{
+      scope: 'run', kind: 'environment', code: 'AI_RESPONSE_INVALID', message: 'invalid AI response',
+    }]);
+    mocks.buildGenerateReport.mockReturnValue(output);
+
+    await expect(runGenerateCommand(input())).resolves.toEqual(output);
+    expect(mocks.buildGenerateReport).toHaveBeenCalledWith(expect.objectContaining({ error }));
+  });
+});

@@ -27,6 +27,7 @@ const USAGE_REPORT_ERROR_CODES = [
 const ENVIRONMENT_REPORT_ERROR_CODES = [
   'BROWSER_LAUNCH_FAILED',
   'AI_EXECUTOR_UNAVAILABLE',
+  'AI_RESPONSE_INVALID',
   'FS_IO_ERROR',
   'UNEXPECTED_CRASH',
 ] as const;
@@ -177,6 +178,11 @@ const ResultIdentityFields = {
   planFile: z.string(),
 };
 
+const GenerateResultIdentityFields = {
+  ...ResultIdentityFields,
+  planFile: z.string().optional(),
+};
+
 const ExecutedResultFields = {
   durationMs: NonNegativeInteger,
   steps: z.array(StepResult),
@@ -223,15 +229,19 @@ export type HealResult = z.infer<typeof HealResult>;
  * Zod schema for one result produced by the `generate` command.
  *
  * This variant gives plan generation its own result vocabulary instead of
- * overloading execution-oriented step results. Ambiguities are restricted to
- * JSON values so every report remains serializable across CLI and MCP
- * boundaries.
+ * overloading execution-oriented step results. `would-generate` previews a
+ * validated write during dry-run mode, while `listed` reports discovery only.
+ * Listed, skipped-fresh, and failed results omit `ambiguities` because no newly
+ * generated provider response exists; listed and failed results also omit
+ * `planFile`. Generated and previewed results retain both, with an empty
+ * ambiguity list when the provider supplied none. Ambiguities are restricted to
+ * JSON values so every report remains serializable across CLI and MCP boundaries.
  */
 export const GenerateResult = z.strictObject({
-  ...ResultIdentityFields,
-  status: z.enum(['generated', 'skipped-fresh', 'failed']),
+  ...GenerateResultIdentityFields,
+  status: z.enum(['generated', 'skipped-fresh', 'would-generate', 'listed', 'failed']),
   dryRun: z.boolean(),
-  ambiguities: z.array(z.json()),
+  ambiguities: z.array(z.json()).optional(),
 });
 
 /**

@@ -106,6 +106,14 @@ describe('RawConfig', () => {
     expectRejected(RawConfig, { $schema: CONFIG_SCHEMA_URL, ai: { provider } });
   });
 
+  it('accepts an AI timeout of one millisecond at the positive-integer boundary', () => {
+    expectAccepted(RawConfig, { $schema: CONFIG_SCHEMA_URL, ai: { timeoutMs: 1 } });
+  });
+
+  it.each([0, -1, 1.5, '1000'] as const)('rejects an invalid AI timeout value: %j', (timeoutMs) => {
+    expectRejected(RawConfig, { $schema: CONFIG_SCHEMA_URL, ai: { timeoutMs } });
+  });
+
   it.each([1, 65_535])('accepts viewer port %d at the inclusive boundary', (port) => {
     expectAccepted(RawConfig, { $schema: CONFIG_SCHEMA_URL, viewer: { port } });
   });

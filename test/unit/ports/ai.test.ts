@@ -1,5 +1,6 @@
 import { describe, expectTypeOf, it } from 'vitest';
 import type { ElementRef, JsonValueT, TraceAction } from '../../../src/core/ir/schema.js';
+import type { TypedJsonSchema } from '../../../src/core/ai/typed-json-schema.js';
 import type {
   AiActionController,
   AiAgenticRequest,
@@ -8,7 +9,6 @@ import type {
   AiExecuteResult,
   AiExecutor,
   AiUsage,
-  JsonSchema,
 } from '../../../src/ports/ai.js';
 import type {
   AssertCheck,
@@ -24,13 +24,28 @@ type PerformableActionController = {
   snapshotForResolution(): Promise<PageSnapshot>;
 };
 
+/**
+ * Keeps the branded request/schema association in the compiler's test set.
+ *
+ * The deliberate error is type-only: a schema for `{ ok }` must not be
+ * accepted when a caller asks an executor for an unrelated `{ nope }` value.
+ */
+function expectMismatchedSchemaToFail(
+  executor: AiExecutor,
+  schema: TypedJsonSchema<{ readonly ok: boolean }>,
+): void {
+  // @ts-expect-error A schema's required brand must agree with execute<T>.
+  void executor.execute<{ readonly nope: string }>({ prompt: 'Return nope.', responseSchema: schema });
+}
+
+void expectMismatchedSchemaToFail;
+
 describe('AI port shapes', () => {
   it('defines structured-response request, result, usage, and schema types', () => {
-    expectTypeOf<JsonSchema>().toEqualTypeOf<Record<string, unknown>>();
     expectTypeOf<AiUsage>().toEqualTypeOf<{ readonly inputTokens?: number; readonly outputTokens?: number }>();
-    expectTypeOf<AiExecuteRequest>().toEqualTypeOf<{
+    expectTypeOf<AiExecuteRequest<{ readonly ok: boolean }>>().toEqualTypeOf<{
       readonly prompt: string;
-      readonly responseSchema: JsonSchema;
+      readonly responseSchema: TypedJsonSchema<{ readonly ok: boolean }>;
       readonly context?: JsonValueT;
       readonly signal?: AbortSignal;
     }>();
@@ -70,7 +85,7 @@ describe('AI port shapes', () => {
   it('keeps structured and agentic execution as distinct exact signatures', () => {
     expectTypeOf<AiExecutor['name']>().toEqualTypeOf<'claude-code-cli' | 'codex-cli'>();
     expectTypeOf<AiExecutor['execute']>().toEqualTypeOf<
-      <T>(request: AiExecuteRequest) => Promise<AiExecuteResult<T>>
+      <T>(request: AiExecuteRequest<T>) => Promise<AiExecuteResult<T>>
     >();
     expectTypeOf<AiExecutor['executeAgentic']>().toEqualTypeOf<
       (request: AiAgenticRequest) => Promise<AiAgenticResult>

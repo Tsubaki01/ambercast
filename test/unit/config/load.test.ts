@@ -40,6 +40,7 @@ function expectedDefaults(configRoot: string): ResolvedConfig {
     defaultTarget: 'web-user',
     ai: {
       provider: 'auto',
+      timeoutMs: 120_000,
     },
     viewer: {
       port: 4_600,
@@ -436,7 +437,7 @@ describe('loadConfig', () => {
       await writeConfig(storage, `${CWD}/ambercast.config.json`, {
         testMatch: ['specs/**/*.md'],
         testIgnore: [],
-        ai: { provider: 'claude' },
+        ai: { provider: 'claude', timeoutMs: 321 },
         viewer: { port: 4_321 },
         ci: { heal: true },
       });
@@ -447,7 +448,7 @@ describe('loadConfig', () => {
         ...expectedDefaults(CWD),
         testMatch: ['specs/**/*.md'],
         testIgnore: [],
-        ai: { provider: 'claude' },
+        ai: { provider: 'claude', timeoutMs: 321 },
         viewer: { port: 4_321 },
         ci: { heal: true, updateGroundingCache: false },
       });
@@ -463,7 +464,7 @@ describe('loadConfig', () => {
 
       expect(config).toStrictEqual({
         ...expectedDefaults(CWD),
-        ai: { provider },
+        ai: { provider, timeoutMs: 120_000 },
       });
     });
 
@@ -543,7 +544,7 @@ describe('loadConfig', () => {
         testMatch: ['file/**/*.test.md'],
         testIgnore: ['file-ignore'],
         targets: { app: APP_TARGET },
-        ai: { provider: 'codex' },
+        ai: { provider: 'codex', timeoutMs: 120_000 },
         viewer: { port: 4_321 },
         ci: { heal: true, updateGroundingCache: true },
       } as const;
@@ -572,6 +573,7 @@ describe('loadConfig', () => {
       expect(second).toStrictEqual({
         ...withoutDefaultTarget(expectedDefaults(CWD)),
         ...fileConfig,
+        ai: { provider: 'codex', timeoutMs: 120_000 },
       });
       expect(DEFAULT_RAW_CONFIG).toStrictEqual(EXPECTED_DEFAULT_CONFIG);
     });
