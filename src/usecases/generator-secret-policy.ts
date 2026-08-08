@@ -3,7 +3,7 @@
  * reaching a reviewable plan artifact.
  */
 
-import { SecretRef, type JsonValueT, type PlanDocument } from '#core/ir/schema.js';
+import { SecretRef } from '#core/ir/schema.js';
 import { SecretLiteralRejectedError } from '#core/errors/secret-literal-rejected-error.js';
 
 type SecretDetector =
@@ -50,15 +50,17 @@ function detectSecretLiteral(value: string): SecretDetector | undefined {
 }
 
 /**
- * Rejects a generated plan that contains a detected literal secret.
+ * Rejects generated JSON data that contains a detected literal secret.
  *
- * @param plan - The complete schema-valid plan to inspect before persistence.
+ * @param value - Any provider-derived JSON value to inspect before persistence
+ * or report serialization.
  * @throws {import('#core/errors/secret-literal-rejected-error.js').SecretLiteralRejectedError}
  * When a non-exempt string matches the literal-secret heuristics.
  * @remarks
- * The policy visits every string and object key in the schema-valid object
- * graph, including unconstrained `generatorMeta`, using lexical object-key
- * order and array-index order. It rejects the first match from this fixed detector set:
+ * The policy visits every string and object key in the provider-derived JSON
+ * graph, including unconstrained `generatorMeta` and reportable ambiguities,
+ * using lexical object-key order and array-index order. It rejects the first
+ * match from this fixed detector set:
  * `credential-prefix-sk` for strings beginning `sk-`,
  * `credential-prefix-ghp` for strings beginning `ghp_`,
  * `credential-prefix-aws-access-key` for strings beginning `AKIA`, and
@@ -74,29 +76,30 @@ function detectSecretLiteral(value: string): SecretDetector | undefined {
  * object key uses the fixed `[redacted-key]` segment instead of its value.
  * Diagnostics never retain the rejected literal itself.
  */
-export function assertNoLiteralSecrets(plan: PlanDocument): void {
-  const visit = (value: JsonValueT, path: string): void => {
-    if (typeof value === 'string') {
-      if (path === 'source.inputsDigest' || SecretRef.safeParse(value).success) {
+export function assertNoLiteralSecrets(value: unknown): void {
+  const visit = (nextValue: unknown, path: string): void => {
+    if (typeof nextValue === 'string') {
+      if (path === 'source.inputsDigest' || SecretRef.safeParse(nextValue).success) {
         return;
       }
 
-      const detector = detectSecretLiteral(value);
+      const detector = detectSecretLiteral(nextValue);
       if (detector !== undefined) {
         throw new SecretLiteralRejectedError('The generated plan contains a literal secret.', { detector, path });
       }
       return;
     }
 
-    if (Array.isArray(value)) {
-      value.forEach((item, index) => {
+    if (Array.isArray(nextValue)) {
+      nextValue.forEach((item, index) => {
         visit(item, `${path}[${index}]`);
       });
       return;
     }
 
-    if (value !== null && typeof value === 'object') {
-      for (const key of Object.keys(value).sort()) {
+    if (nextValue !== null && typeof nextValue === 'object') {
+      const record = nextValue as Record<string, unknown>;
+      for (const key of Object.keys(record).sort()) {
         const detector = detectSecretLiteral(key);
         const childPath = detector === undefined
           ? (path === '' ? key : `${path}.${key}`)
@@ -106,10 +109,10 @@ export function assertNoLiteralSecrets(plan: PlanDocument): void {
           throw new SecretLiteralRejectedError('The generated plan contains a literal secret.', { detector, path: childPath });
         }
 
-        visit(value[key]!, childPath);
+        visit(record[key], childPath);
       }
     }
   };
 
-  visit(plan as JsonValueT, '');
+  visit(value, '');
 }

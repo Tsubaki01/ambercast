@@ -178,11 +178,6 @@ const ResultIdentityFields = {
   planFile: z.string(),
 };
 
-const GenerateResultIdentityFields = {
-  ...ResultIdentityFields,
-  planFile: z.string().optional(),
-};
-
 const ExecutedResultFields = {
   durationMs: NonNegativeInteger,
   steps: z.array(StepResult),
@@ -237,12 +232,43 @@ export type HealResult = z.infer<typeof HealResult>;
  * ambiguity list when the provider supplied none. Ambiguities are restricted to
  * JSON values so every report remains serializable across CLI and MCP boundaries.
  */
-export const GenerateResult = z.strictObject({
-  ...GenerateResultIdentityFields,
-  status: z.enum(['generated', 'skipped-fresh', 'would-generate', 'listed', 'failed']),
-  dryRun: z.boolean(),
-  ambiguities: z.array(z.json()).optional(),
-});
+export const GenerateResult = z.discriminatedUnion('status', [
+  z.strictObject({
+    id: NonWhitespaceString,
+    file: NonWhitespaceString,
+    planFile: z.string(),
+    status: z.literal('generated'),
+    dryRun: z.literal(false),
+    ambiguities: z.array(z.json()),
+  }),
+  z.strictObject({
+    id: NonWhitespaceString,
+    file: NonWhitespaceString,
+    planFile: z.string(),
+    status: z.literal('would-generate'),
+    dryRun: z.literal(true),
+    ambiguities: z.array(z.json()),
+  }),
+  z.strictObject({
+    id: NonWhitespaceString,
+    file: NonWhitespaceString,
+    planFile: z.string(),
+    status: z.literal('skipped-fresh'),
+    dryRun: z.boolean(),
+  }),
+  z.strictObject({
+    id: NonWhitespaceString,
+    file: NonWhitespaceString,
+    status: z.literal('listed'),
+    dryRun: z.literal(false),
+  }),
+  z.strictObject({
+    id: NonWhitespaceString,
+    file: NonWhitespaceString,
+    status: z.literal('failed'),
+    dryRun: z.boolean(),
+  }),
+]);
 
 /**
  * A result item emitted by a `generate` report.

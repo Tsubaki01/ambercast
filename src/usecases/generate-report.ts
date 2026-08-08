@@ -28,15 +28,40 @@ const REPORT_ERROR_DETAILS = {
   'unexpected-crash': { kind: 'environment', code: 'UNEXPECTED_CRASH' },
 } as const satisfies Partial<Record<ErrorKind, { readonly kind: 'usage' | 'environment'; readonly code: ReportErrorCode }>>;
 
-function reportError(error: AmbercastError, scope: 'run' | 'case', caseId?: string): ReportError {
+function reportError(error: AmbercastError, location: { readonly scope: 'run' }): ReportError;
+function reportError(error: AmbercastError, location: { readonly scope: 'case'; readonly caseId: string }): ReportError;
+function reportError(
+  error: AmbercastError,
+  location: { readonly scope: 'run' } | { readonly scope: 'case'; readonly caseId: string },
+): ReportError {
   const details = REPORT_ERROR_DETAILS[error.kind as keyof typeof REPORT_ERROR_DETAILS];
   if (details === undefined) {
     throw new Error(`Error kind ${error.kind} cannot be serialized as a report error.`);
   }
 
-  return scope === 'run'
-    ? { scope, ...details, message: error.message }
-    : { scope, ...details, caseId: caseId!, message: error.message };
+  return location.scope === 'run'
+    ? { scope: location.scope, ...details, message: error.message }
+    : { scope: location.scope, ...details, caseId: location.caseId, message: error.message };
+}
+
+function reportResult(
+  result: GenerateOutcome['results'][number],
+  dryRun: boolean,
+): GenerateResult {
+  const identity = { id: result.file, file: result.file };
+
+  switch (result.status) {
+    case 'generated':
+      return { ...identity, status: result.status, dryRun: false, planFile: result.planFile!, ambiguities: [...result.ambiguities!] };
+    case 'would-generate':
+      return { ...identity, status: result.status, dryRun: true, planFile: result.planFile!, ambiguities: [...result.ambiguities!] };
+    case 'skipped-fresh':
+      return { ...identity, status: result.status, dryRun, planFile: result.planFile! };
+    case 'listed':
+      return { ...identity, status: result.status, dryRun: false };
+    case 'failed':
+      return { ...identity, status: result.status, dryRun };
+  }
 }
 
 /**
@@ -105,7 +130,8 @@ export interface GenerateReportOutput {
  * Exit selection is deterministic when several conditions coexist: a thrown
  * top-level error wins with its own exit code; then a disallowed zero match
  * (`noTestsFound` without `allowEmpty` or `list`) selects 5; then the first
- * failed result in file order supplies its error's exit code; then strict mode
+ * failed result in file order supplies its error's exit code (or the generic
+ * exit 3 fallback if a malformed outcome omitted that error); then strict mode
  * selects 1 when any generated or previewed result has ambiguities; otherwise
  * the command succeeds with 0. The zero-match envelope is error-free with an
  * all-zero summary. Runtime composes and invokes this helper; the CLI only
@@ -121,24 +147,17 @@ export function buildGenerateReport(input: GenerateReportInput): GenerateReportO
         startedAt: input.startedAt,
         durationMs: input.durationMs,
         summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 },
-        errors: [reportError(input.error, 'run')],
+        errors: [reportError(input.error, { scope: 'run' })],
         results: [],
       },
     };
   }
 
   const outcome = input.outcome!;
-  const results: GenerateResult[] = outcome.results.map((result) => ({
-    id: result.file,
-    file: result.file,
-    status: result.status,
-    dryRun: result.status === 'would-generate',
-    planFile: result.planFile,
-    ambiguities: result.ambiguities,
-  }) as unknown as GenerateResult);
+  const results = outcome.results.map((result) => reportResult(result, input.options.dryRun));
   const errors = outcome.results.flatMap((result) => (
     result.status === 'failed' && result.error !== undefined
-      ? [reportError(result.error, 'case', result.file)]
+      ? [reportError(result.error, { scope: 'case', caseId: result.file })]
       : []
   ));
   const failed = outcome.results.filter((result) => result.status === 'failed');
@@ -146,11 +165,12 @@ export function buildGenerateReport(input: GenerateReportInput): GenerateReportO
 
   const exitCode: ExitCode = outcome.noTestsFound && !input.options.allowEmpty && !input.options.list
     ? 5
-    : failed[0]?.error?.exitCode
-      ?? (input.options.strict && outcome.results.some((result) => (
+    : failed.length > 0
+      ? failed[0]?.error?.exitCode ?? 3
+      : input.options.strict && outcome.results.some((result) => (
         (result.status === 'generated' || result.status === 'would-generate')
         && (result.ambiguities?.length ?? 0) > 0
-      )) ? 1 : 0);
+      )) ? 1 : 0;
 
   return {
     exitCode,

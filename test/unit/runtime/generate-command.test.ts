@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
+import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
 import { ReportEnvelope, type ReportError } from '#report/schema.js';
 import {
   runGenerateCommand,
@@ -16,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   buildGenerateReport: vi.fn(),
   claudeFactory: vi.fn(),
   codexFactory: vi.fn(),
+  createSystemClock: vi.fn(),
 }));
 
 vi.mock('#config/load.js', () => ({ loadConfig: mocks.loadConfig }));
@@ -25,6 +27,7 @@ vi.mock('#usecases/generate-report.js', () => ({ buildGenerateReport: mocks.buil
 vi.mock('#adapters/ai/registry.js', () => ({
   AI_EXECUTOR_FACTORIES: { claude: mocks.claudeFactory, codex: mocks.codexFactory },
 }));
+vi.mock('#adapters/system/system-clock.js', () => ({ createSystemClock: mocks.createSystemClock }));
 
 const CONFIG: ResolvedConfig = {
   testDir: '/workspace/tests',
@@ -98,8 +101,15 @@ afterEach(() => {
   vi.resetAllMocks();
 });
 
+beforeEach(() => {
+  mocks.createSystemClock.mockReturnValue({
+    now: () => new Date('2026-08-08T00:00:00Z'),
+    monotonicMs: () => 10,
+  });
+});
+
 describe('runGenerateCommand', () => {
-  it('loads config, lets an explicit provider override win, composes, generates, and returns a schema-valid report', async () => {
+  it('loads config, lets an explicit provider override win, composes, and generates', async () => {
     const { selected, output } = arrangeSuccessfulCommand('auto', 'codex');
 
     await expect(runGenerateCommand(input({ aiProviderOverride: 'codex' }))).resolves.toEqual(output);
@@ -209,13 +219,53 @@ describe('runGenerateCommand', () => {
     expect(output.envelope.errors).toEqual([expect.objectContaining({ scope: 'run', code: 'AI_EXECUTOR_UNAVAILABLE' })]);
   });
 
-  it.each([0, 1, 2, 3, 4, 5] as const)('returns a schema-valid report envelope for exit %i', async (exitCode) => {
+  it('passes cancellation into auto probing and classifies an unexpected probe rejection', async () => {
+    const controller = new AbortController();
+    const reason = new Error('stop probing');
+    const isAvailable = vi.fn(async (signal?: AbortSignal) => {
+      expect(signal).toBe(controller.signal);
+      controller.abort(reason);
+      return false;
+    });
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.claudeFactory.mockReturnValue({ name: 'claude-code-cli', isAvailable });
+    const output = reportOutput(3, [{
+      scope: 'run', kind: 'environment', code: 'UNEXPECTED_CRASH', message: 'The generate command crashed unexpectedly.',
+    }]);
+    mocks.buildGenerateReport.mockReturnValue(output);
+
+    await expect(runGenerateCommand(input({ signal: controller.signal }))).resolves.toEqual(output);
+    expect(mocks.codexFactory).not.toHaveBeenCalled();
+    expect(mocks.buildGenerateReport).toHaveBeenCalledWith(expect.objectContaining({
+      error: expect.any(UnexpectedCrashError),
+    }));
+  });
+
+  it('measures a successful command from before configuration loading through report construction', async () => {
+    const { output } = arrangeSuccessfulCommand('codex', 'codex');
+    let monotonicCall = 0;
+    mocks.createSystemClock.mockReturnValue({
+      now: () => new Date('2026-08-08T00:00:00Z'),
+      monotonicMs: () => {
+        monotonicCall += 1;
+        return monotonicCall === 1 ? 10 : 260;
+      },
+    });
+
+    await expect(runGenerateCommand(input())).resolves.toEqual(output);
+
+    expect(mocks.buildGenerateReport).toHaveBeenCalledWith(expect.objectContaining({
+      startedAt: '2026-08-08T00:00:00Z',
+      durationMs: 250,
+    }));
+  });
+
+  it.each([0, 1, 2, 3, 4, 5] as const)('forwards report construction output for exit %i', async (exitCode) => {
     arrangeSuccessfulCommand('codex', 'codex');
     const output = reportOutput(exitCode);
     mocks.buildGenerateReport.mockReturnValue(output);
 
     await expect(runGenerateCommand(input())).resolves.toEqual(output);
-    expect(ReportEnvelope.safeParse(output.envelope).success).toBe(true);
   });
 
   it('passes a classified AI response failure into run-scoped report construction', async () => {

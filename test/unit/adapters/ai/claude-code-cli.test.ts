@@ -73,6 +73,19 @@ describe('createClaudeCodeCliExecutor', () => {
       .rejects.toBeInstanceOf(AiExecutorUnavailableError);
   });
 
+  it('retains a bounded stderr excerpt when the Claude process does not complete', async () => {
+    const stderr = 'e'.repeat(1_001);
+    const executor = createClaudeCodeCliExecutor({
+      run: createFakeCommandRunner([{ outcome: 'exited', stdout: '', stderr, exitCode: 1 }]).run,
+    });
+
+    await expect(executor.execute({ prompt: 'Generate.', responseSchema: schema() }))
+      .rejects.toMatchObject({
+        kind: 'ai-executor-unavailable',
+        details: { provider: 'claude', stderrExcerpt: stderr.slice(0, 1_000) },
+      });
+  });
+
   it('maps a subprocess rejection to AiExecutorUnavailableError', async () => {
     const executor = createClaudeCodeCliExecutor({ run: createFakeCommandRunner([new Error('ENOENT')]).run });
 
@@ -110,6 +123,29 @@ describe('createClaudeCodeCliExecutor', () => {
     const executor = createClaudeCodeCliExecutor({ run: createFakeCommandRunner([result]).run });
 
     await expect(executor.isAvailable()).resolves.toBe(expected);
+  });
+
+  it('forwards an availability-probe cancellation signal to the command runner', async () => {
+    const runner = createFakeCommandRunner([{ outcome: 'exited', stdout: 'claude 1.0.0', stderr: '', exitCode: 0 }]);
+    const executor = createClaudeCodeCliExecutor({ run: runner.run });
+    const controller = new AbortController();
+
+    await expect(executor.isAvailable(controller.signal)).resolves.toBe(true);
+
+    expect(runner.calls[0]?.options?.signal).toBe(controller.signal);
+  });
+
+  it('rejects an oversized inline response schema before spawning Claude', async () => {
+    const runner = createFakeCommandRunner();
+    const executor = createClaudeCodeCliExecutor({ run: runner.run });
+    const responseSchema = {
+      ...schema(),
+      description: 'x'.repeat(200_001),
+    } as ReturnType<typeof schema>;
+
+    await expect(executor.execute({ prompt: 'Generate.', responseSchema }))
+      .rejects.toThrow('The Claude Code CLI response schema is too large to pass as an argument.');
+    expect(runner.calls).toEqual([]);
   });
 
   it('rejects agentic execution without spawning a command', async () => {

@@ -59,9 +59,17 @@ export const PROMPT_ENVELOPE_TEMPLATE = staticGrammar();
  * agentic request framing identical.
  */
 export function buildPromptEnvelope(task: string, context?: unknown): string {
-  const renderedContext = context === undefined
-    ? STATIC_PARTS.absentContext
-    : `${STATIC_PARTS.jsonFenceOpen}${JSON.stringify(context, null, 2)}${STATIC_PARTS.jsonFenceClose}`;
+  let renderedContext: string = STATIC_PARTS.absentContext;
+  if (context !== undefined) {
+    const serialized = JSON.stringify(context, null, 2);
+    if (serialized === undefined) {
+      throw new Error('Prompt context must be JSON-serializable.');
+    }
+
+    // JSON strings can legally contain backticks, but the surrounding Markdown
+    // fence must remain structural data isolation rather than caller content.
+    renderedContext = `${STATIC_PARTS.jsonFenceOpen}${serialized.replace(/`/g, '\\u0060')}${STATIC_PARTS.jsonFenceClose}`;
+  }
 
   return compose(task, renderedContext);
 }

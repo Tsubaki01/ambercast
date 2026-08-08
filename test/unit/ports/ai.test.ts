@@ -90,6 +90,6 @@ describe('AI port shapes', () => {
     expectTypeOf<AiExecutor['executeAgentic']>().toEqualTypeOf<
       (request: AiAgenticRequest) => Promise<AiAgenticResult>
     >();
-    expectTypeOf<AiExecutor['isAvailable']>().toEqualTypeOf<() => Promise<boolean>>();
+    expectTypeOf<AiExecutor['isAvailable']>().toEqualTypeOf<(signal?: AbortSignal) => Promise<boolean>>();
   });
 });

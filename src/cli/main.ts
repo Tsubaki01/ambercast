@@ -8,7 +8,8 @@
  * `--target <name>`, `--ai <claude|codex>`, `--allow-empty`, `--list`,
  * `--json`, `--config <path>`, and `--no-color`. The parser accepts only those
  * provider names, keeping provider selection a runtime concern rather than a
- * usecase option.
+ * usecase option. A bare `--` ends option parsing so a prompt whose literal
+ * path begins with `--` remains addressable.
  *
  * Top-level `--version` and `--help` short-circuit before subcommand lookup;
  * command-local help does likewise after `generate` is recognized. Version
@@ -22,7 +23,8 @@
  * parsed input to runtime. Runtime returns an envelope and selected exit code;
  * `--json` writes exactly `JSON.stringify(envelope)`, while human output renders
  * that same envelope with ANSI styling disabled by `--no-color`. After output
- * has been written, this module makes the single final `process.exit` call.
+ * has been written, this module sets the selected process exit code and lets
+ * Node exit naturally once pending stream writes have drained.
  *
  * The parser stays hand-written because the small fixed flag surface needs no
  * dependency or a second command grammar. This layer imports only runtime:
@@ -83,7 +85,8 @@ function renderHumanReport(envelope: unknown, color: boolean): string {
 }
 
 function parseGenerate(argv: readonly string[], signal: AbortSignal): ParsedGenerateCommand | string {
-  if (argv.includes('--help')) {
+  const separator = argv.indexOf('--');
+  if (argv.slice(0, separator === -1 ? undefined : separator).includes('--help')) {
     return 'help';
   }
 
@@ -101,6 +104,10 @@ function parseGenerate(argv: readonly string[], signal: AbortSignal): ParsedGene
 
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]!;
+    if (argument === '--') {
+      files.push(...argv.slice(index + 1));
+      break;
+    }
     if (!argument.startsWith('--')) {
       files.push(argument);
       continue;
@@ -167,24 +174,24 @@ export async function main(
 ): Promise<void> {
   if (argv.length === 0) {
     writeUsage(stdout);
-    process.exit(0);
+    process.exitCode = 0;
     return;
   }
 
   if (argv[0] === '--version') {
     stdout.write(`ambercast v${__VERSION__}\n`);
-    process.exit(0);
+    process.exitCode = 0;
     return;
   }
   if (argv[0] === '--help') {
     writeUsage(stdout);
-    process.exit(0);
+    process.exitCode = 0;
     return;
   }
   if (argv[0] !== 'generate') {
     stderr.write(`Unknown command: ${argv[0]}.\n`);
     writeUsage(stderr);
-    process.exit(2);
+    process.exitCode = 2;
     return;
   }
 
@@ -193,13 +200,13 @@ export async function main(
   if (typeof parsed === 'string') {
     if (parsed === 'help') {
       writeUsage(stdout);
-      process.exit(0);
+      process.exitCode = 0;
       return;
     }
 
     stderr.write(`${parsed}\n`);
     writeUsage(stderr);
-    process.exit(2);
+    process.exitCode = 2;
     return;
   }
 
@@ -214,9 +221,14 @@ export async function main(
   process.once('SIGTERM', onSigterm);
 
   try {
-    const output = await runGenerateCommand(parsed.input);
-    stdout.write(parsed.json ? `${JSON.stringify(output.envelope)}\n` : renderHumanReport(output.envelope, parsed.color));
-    process.exit(output.exitCode);
+    try {
+      const output = await runGenerateCommand(parsed.input);
+      stdout.write(parsed.json ? `${JSON.stringify(output.envelope)}\n` : renderHumanReport(output.envelope, parsed.color));
+      process.exitCode = output.exitCode;
+    } catch {
+      stderr.write('The generate command crashed unexpectedly.\n');
+      process.exitCode = 3;
+    }
   } finally {
     process.removeListener('SIGINT', onSigint);
     process.removeListener('SIGTERM', onSigterm);

@@ -9,11 +9,7 @@
 
 import { spawn } from 'node:child_process';
 
-import { rejectOnAbort } from '#core/ai/reject-on-abort.js';
-
-function abortReason(signal: AbortSignal): unknown {
-  return signal.reason ?? new DOMException('This operation was aborted', 'AbortError');
-}
+import { abortReason, rejectOnAbort } from '#core/ai/reject-on-abort.js';
 
 /**
  * The terminal state of one child process that was not aborted by its caller.

@@ -16,6 +16,7 @@ describe('TargetUnresolvedError', () => {
     const cause = new Error('target lookup failed');
     const error = new TargetUnresolvedError('The requested target is not configured.', { target: 'staging' }, { cause });
 
+    expect(error.message).toBe('The requested target is not configured.');
     expect(error.details).toEqual({ target: 'staging' });
     expect(error.cause).toBe(cause);
   });

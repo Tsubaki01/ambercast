@@ -101,8 +101,9 @@ export function registerAiExecutorTransportContract(harness: AiExecutorTransport
     it('returns availability as a boolean without exposing probe failures', async () => {
       try {
         const executor = await harness.createExecutor('availability');
+        const controller = new AbortController();
 
-        expect(typeof await executor.isAvailable()).toBe('boolean');
+        expect(typeof await executor.isAvailable(controller.signal)).toBe('boolean');
       } finally {
         await harness.dispose?.();
       }

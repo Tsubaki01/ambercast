@@ -10,6 +10,7 @@ import { createSystemClock } from '#adapters/system/system-clock.js';
 import { loadConfig } from '#config/load.js';
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
+import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
 import { AmbercastError } from '#core/errors/types.js';
 import { isAbsolutePath, joinPath } from '#core/paths.js';
 import { generate } from '#usecases/generate.js';
@@ -74,6 +75,7 @@ export interface GenerateCommandOutput {
 function resolveAiProvider(
   configured: ResolvedConfig['ai']['provider'],
   override: 'claude' | 'codex' | undefined,
+  signal?: AbortSignal,
 ): Promise<'claude' | 'codex'> {
   if (override !== undefined) {
     return Promise.resolve(override);
@@ -84,9 +86,11 @@ function resolveAiProvider(
 
   return (async () => {
     for (const provider of ['claude', 'codex'] as const) {
-      if (await AI_EXECUTOR_FACTORIES[provider]().isAvailable()) {
+      signal?.throwIfAborted();
+      if (await AI_EXECUTOR_FACTORIES[provider]().isAvailable(signal)) {
         return provider;
       }
+      signal?.throwIfAborted();
     }
 
     throw new AiExecutorUnavailableError('No AI provider is available.');
@@ -104,12 +108,15 @@ function resolveAiProvider(
  * outcome or classified error, timing, and command policy to
  * {@link buildGenerateReport}, leaving the CLI to choose only JSON versus
  * text rendering. That usecase helper owns report-shape construction while
- * runtime retains provider selection and concrete dependency composition.
+ * runtime retains provider selection and concrete dependency composition. An
+ * unexpected dependency rejection is classified as `unexpected-crash`, so a
+ * normal command invocation always resolves within the documented report and
+ * exit-code contract.
  */
 export async function runGenerateCommand(input: GenerateCommandInput): Promise<GenerateCommandOutput> {
-  let clock = createSystemClock();
-  let startedAt = reportTimestamp(clock.now());
-  let startedMs = clock.monotonicMs();
+  const clock = createSystemClock();
+  const startedAt = reportTimestamp(clock.now());
+  const startedMs = clock.monotonicMs();
   const reportContext = () => ({
     startedAt,
     durationMs: Math.max(0, Math.round(clock.monotonicMs() - startedMs)),
@@ -128,11 +135,8 @@ export async function runGenerateCommand(input: GenerateCommandInput): Promise<G
       configEnv: readConfigEnvironment(),
       ...(input.configPathOverride === undefined ? {} : { configPathOverride: input.configPathOverride }),
     });
-    const aiProvider = await resolveAiProvider(config.ai.provider, input.aiProviderOverride);
+    const aiProvider = await resolveAiProvider(config.ai.provider, input.aiProviderOverride, input.signal);
     const ambercast = createAmbercast({ config, aiProvider });
-    clock = ambercast.clock;
-    startedAt = reportTimestamp(clock.now());
-    startedMs = clock.monotonicMs();
     const outcome = await generate({
       storage: ambercast.storage,
       layout: ambercast.layout,
@@ -152,10 +156,9 @@ export async function runGenerateCommand(input: GenerateCommandInput): Promise<G
 
     return buildGenerateReport({ ...reportContext(), outcome });
   } catch (error) {
-    if (error instanceof AmbercastError) {
-      return buildGenerateReport({ ...reportContext(), error });
-    }
-
-    throw error;
+    const classified = error instanceof AmbercastError
+      ? error
+      : new UnexpectedCrashError('The generate command crashed unexpectedly.', undefined, { cause: error });
+    return buildGenerateReport({ ...reportContext(), error: classified });
   }
 }

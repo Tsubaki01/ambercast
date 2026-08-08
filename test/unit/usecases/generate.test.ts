@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createHash } from 'node:crypto';
-import { PROMPT_ENVELOPE_TEMPLATE } from '#adapters/ai/shared/prompt-envelope.js';
+import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import {
   PlanDocument,
   type GeneratedPlanResponse,
@@ -108,7 +107,7 @@ async function createFreshPlan(storage: StorageAdapter, testPath: string): Promi
   const inputsDigest = computeInputsDigest({
     normalizedTestMd,
     schemaVersion: 1,
-    generatorPromptTemplateFingerprint: createHash('sha256').update(PROMPT_ENVELOPE_TEMPLATE).digest('hex'),
+    generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
     targetDefinitions: TARGETS,
   });
   const plan: PlanDocument = {
@@ -146,17 +145,15 @@ describe('generate', () => {
     });
   });
 
-  it('reports a zero match for default policy, allow-empty policy, and list policy without calling AI', async () => {
-    for (const options of [
-      DEFAULT_OPTIONS,
-      { ...DEFAULT_OPTIONS, allowEmpty: true },
-      { ...DEFAULT_OPTIONS, list: true },
-    ]) {
-      const { deps, execute } = createScenario({ discoverTestFiles: async () => [] });
+  it.each([
+    ['default', DEFAULT_OPTIONS],
+    ['allow-empty', { ...DEFAULT_OPTIONS, allowEmpty: true }],
+    ['list', { ...DEFAULT_OPTIONS, list: true }],
+  ] as const)('reports a zero match for %s policy without calling AI', async (_policy, options) => {
+    const { deps, execute } = createScenario({ discoverTestFiles: async () => [] });
 
-      await expect(generate(deps, options)).resolves.toEqual({ results: [], noTestsFound: true });
-      expect(execute).not.toHaveBeenCalled();
-    }
+    await expect(generate(deps, options)).resolves.toEqual({ results: [], noTestsFound: true });
+    expect(execute).not.toHaveBeenCalled();
   });
 
   it('gives list precedence over dry-run, force, and strict without reading prompts or writing artifacts', async () => {
@@ -513,6 +510,25 @@ describe('generate', () => {
     await expect(generate(deps, { ...DEFAULT_OPTIONS, dryRun: true, strict: false, force: true })).resolves.toMatchObject({
       results: [{ status: 'would-generate', ambiguities: ['unclear target'] }],
     });
+  });
+
+  it.each([
+    ['generated', { ...DEFAULT_OPTIONS }],
+    ['dry-run', { ...DEFAULT_OPTIONS, dryRun: true }],
+  ] as const)('rejects a literal secret in %s response ambiguities before exposing or writing it', async (_mode, options) => {
+    const secret = 'sk-live-secret-in-ambiguity';
+    const { deps, recordingStorage } = createScenario({
+      aiExecutor: createFakeAiExecutor({
+        execute: async () => ({ data: { steps: [], ambiguities: [secret] }, raw: '{...}' }),
+      }),
+    });
+    await writePrompt(recordingStorage.storage);
+    recordingStorage.reset();
+
+    await expect(generate(deps, options)).resolves.toMatchObject({
+      results: [{ status: 'failed', error: { kind: 'secret-literal-rejected' } }],
+    });
+    expect(recordingStorage.writes).toEqual([]);
   });
 
   it('rejects literal secrets before either artifact write and continues with the next file', async () => {

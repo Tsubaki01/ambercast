@@ -4,6 +4,7 @@
  */
 
 import { Ajv2020, type ErrorObject } from 'ajv/dist/2020.js';
+import addFormats from 'ajv-formats';
 
 import type { TypedJsonSchema } from '#core/ai/typed-json-schema.js';
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
@@ -53,14 +54,16 @@ export function validateAiResponse<T>(raw: string, schema: TypedJsonSchema<T>): 
     );
   }
 
-  const validator = new Ajv2020({ allErrors: true }).compile(schema);
+  const ajv = new Ajv2020({ allErrors: true });
+  addFormats.default(ajv);
+  const validator = ajv.compile(schema);
   if (validator(value)) {
     return value as T;
   }
 
   const issues: readonly AiResponseValidationIssue[] = (validator.errors ?? []).map((error: ErrorObject) => ({
     path: error.keyword === 'required'
-      ? `${error.instancePath}/${String(error.params.missingProperty)}`
+      ? `${error.instancePath}/${String(error.params.missingProperty).replace(/~/g, '~0').replace(/\//g, '~1')}`
       : error.instancePath === '' ? '/' : error.instancePath,
     message: error.message ?? 'JSON Schema validation failed.',
   }));

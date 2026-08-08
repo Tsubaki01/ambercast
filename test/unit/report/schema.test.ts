@@ -278,6 +278,25 @@ describe('valid nested schema fixtures', () => {
       dryRun: false,
     });
   });
+
+  it('requires generated results to retain their plan path and ambiguities', () => {
+    expectRejected(GenerateResult, {
+      id: 'login-succeeds',
+      file: 'tests/login.test.md',
+      status: 'generated',
+      dryRun: false,
+    });
+  });
+
+  it.each([
+    [{ ...GENERATE_RESULT, status: 'generated', dryRun: false, ambiguities: [] }],
+    [{ ...GENERATE_RESULT, status: 'would-generate', dryRun: true, ambiguities: [] }],
+    [{ id: 'login-succeeds', file: 'tests/login.test.md', planFile: 'tests/login.ambercast.plan.json', status: 'skipped-fresh', dryRun: false }],
+    [{ id: 'login-succeeds', file: 'tests/login.test.md', status: 'listed', dryRun: false }],
+    [{ id: 'login-succeeds', file: 'tests/login.test.md', status: 'failed', dryRun: false }],
+  ] as const)('accepts each exact generate-result status branch', (result) => {
+    expectAccepted(GenerateResult, result);
+  });
 });
 
 describe('nested strict object boundaries', () => {
@@ -376,7 +395,6 @@ describe('field boundaries', () => {
   it.each([
     ['run', RunResult, RUN_RESULT, ['passed', 'failed', 'error', 'skipped']],
     ['heal', HealResult, HEAL_RESULT, ['healed', 'partially-healed', 'unresolved', 'no-changes-needed']],
-    ['generate', GenerateResult, GENERATE_RESULT, ['generated', 'skipped-fresh', 'would-generate', 'listed', 'failed']],
     ['check', CheckResult, CHECK_RESULT, ['fresh', 'stale', 'orphaned-plan', 'orphaned-grounding', 'missing-plan']],
     ['review', ReviewResult, REVIEW_RESULT, ['sufficient', 'insufficient']],
   ] as const)('accepts every %s result status enum value', (_command, schema, result, statuses) => {

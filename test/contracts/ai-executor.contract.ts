@@ -368,8 +368,9 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
     it('reports availability as a boolean', async () => {
       try {
         const executor = await harness.createExecutor({ execute: EXECUTE_RESULT, executeAgentic: AGENTIC_RESULT });
+        const controller = new AbortController();
 
-        expect(typeof await executor.isAvailable()).toBe('boolean');
+        expect(typeof await executor.isAvailable(controller.signal)).toBe('boolean');
       } finally {
         await harness.dispose?.();
       }

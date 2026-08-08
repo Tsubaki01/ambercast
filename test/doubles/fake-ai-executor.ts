@@ -57,8 +57,8 @@ export function createFakeAiExecutor(options: FakeAiExecutorOptions = {}): AiExe
         return options.executeAgentic(request);
       });
     },
-    async isAvailable(): Promise<boolean> {
-      return options.available ?? true;
+    async isAvailable(signal?: AbortSignal): Promise<boolean> {
+      return rejectOnAbort(signal, async () => options.available ?? true);
     },
   };
 }

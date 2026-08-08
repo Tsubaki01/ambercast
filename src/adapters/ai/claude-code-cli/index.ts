@@ -3,7 +3,7 @@
  * port without leaking command-line details into callers.
  */
 
-import { rejectOnAbort } from '#core/ai/reject-on-abort.js';
+import { abortReason, rejectOnAbort } from '#core/ai/reject-on-abort.js';
 import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
 import {
@@ -22,10 +22,6 @@ import type {
   AiExecutor,
   AiUsage,
 } from '#ports/ai.js';
-
-function abortReason(signal: AbortSignal): unknown {
-  return signal.reason ?? new DOMException('This operation was aborted', 'AbortError');
-}
 
 function responseInvalid(raw: string, message: string, cause?: unknown): AiResponseInvalidError {
   return new AiResponseInvalidError(message, { raw, issues: [{ path: '', message }] }, { cause });
@@ -60,9 +56,10 @@ function usageFrom(value: unknown): AiUsage | undefined {
  * @remarks
  * `execute` sends an isolated prompt through
  * stdin to `claude -p --output-format json --json-schema <inline-schema>` and
- * validates its JSON result field before returning it. A nonzero, signaled, or
- * unspawnable command becomes `AiExecutorUnavailableError`; availability
- * probes use `claude --version` and fold every failure into `false`.
+ * validates its JSON result field before returning it. A nonzero, signaled,
+ * unspawnable, or argument-oversized command becomes
+ * `AiExecutorUnavailableError`; availability probes use `claude --version`
+ * and fold every failure into `false`.
  *
  * Its `executeAgentic` method first honors an already-aborted signal, then
  * rejects with `AiExecutorUnavailableError` before building a prompt or
@@ -78,11 +75,19 @@ export function createClaudeCodeCliExecutor(deps: { readonly run?: CommandRunner
     name: 'claude-code-cli',
     execute<T>(request: AiExecuteRequest<T>): Promise<AiExecuteResult<T>> {
       return rejectOnAbort(request.signal, async () => {
+        const responseSchema = JSON.stringify(request.responseSchema);
+        if (responseSchema.length > 200_000) {
+          throw new AiExecutorUnavailableError(
+            'The Claude Code CLI response schema is too large to pass as an argument.',
+            { provider: 'claude', schemaLength: responseSchema.length },
+          );
+        }
+
         let result;
         try {
           result = await run(
             'claude',
-            ['-p', '--output-format', 'json', '--json-schema', JSON.stringify(request.responseSchema)],
+            ['-p', '--output-format', 'json', '--json-schema', responseSchema],
             {
               input: buildStructuredPrompt(request),
               ...(request.signal === undefined ? {} : { signal: request.signal }),
@@ -93,7 +98,10 @@ export function createClaudeCodeCliExecutor(deps: { readonly run?: CommandRunner
         }
 
         if (result.outcome !== 'exited' || result.exitCode !== 0) {
-          throw new AiExecutorUnavailableError('The Claude Code CLI did not complete the request.', { provider: 'claude' });
+          throw new AiExecutorUnavailableError('The Claude Code CLI did not complete the request.', {
+            provider: 'claude',
+            ...(result.stderr === '' ? {} : { stderrExcerpt: result.stderr.slice(0, 1_000) }),
+          });
         }
 
         let response: unknown;
@@ -124,9 +132,9 @@ export function createClaudeCodeCliExecutor(deps: { readonly run?: CommandRunner
 
       throw new AiExecutorUnavailableError('Agentic browser-directed execution is unavailable for the Claude Code CLI adapter.');
     },
-    async isAvailable(): Promise<boolean> {
+    async isAvailable(signal?: AbortSignal): Promise<boolean> {
       try {
-        const result = await run('claude', ['--version']);
+        const result = await run('claude', ['--version'], signal === undefined ? undefined : { signal });
         return result.outcome === 'exited' && result.exitCode === 0;
       } catch {
         return false;

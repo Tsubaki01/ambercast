@@ -377,7 +377,20 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
     }
 
     if (options.dryRun) {
+      try {
+        assertNoLiteralSecrets(response.data.ambiguities);
+      } catch (error) {
+        results.push({ file, status: 'failed', error: fileFailure(error, 'The generated ambiguities could not be inspected.') });
+        continue;
+      }
       results.push({ file, status: 'would-generate', planFile: planPath, ambiguities: response.data.ambiguities });
+      continue;
+    }
+
+    try {
+      assertNoLiteralSecrets(response.data.ambiguities);
+    } catch (error) {
+      results.push({ file, status: 'failed', error: fileFailure(error, 'The generated ambiguities could not be inspected.') });
       continue;
     }
 

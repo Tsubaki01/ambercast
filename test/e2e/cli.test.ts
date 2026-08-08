@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, constants, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -39,6 +39,9 @@ async function fixtureProject(): Promise<string> {
   await writeFile(join(directory, 'tests', 'test.test.md'), '# Fixture test\n');
   return directory;
 }
+
+// The published-path check exercises only list mode, so no test can reach a
+// locally installed provider CLI or depend on provider credentials.
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
@@ -86,5 +89,9 @@ describe('bin/ambercast.js (e2e)', () => {
   it('has a #!/usr/bin/env node shebang as its first line', async () => {
     const firstLine = (await readFile(binPath, 'utf8')).split('\n', 1)[0];
     expect(firstLine).toBe('#!/usr/bin/env node');
+  });
+
+  it('is executable as published', async () => {
+    await expect(access(binPath, constants.X_OK)).resolves.toBeUndefined();
   });
 });

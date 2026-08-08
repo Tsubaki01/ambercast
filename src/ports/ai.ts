@@ -194,6 +194,7 @@ export interface AiExecutor {
   /**
    * Checks whether this executor can currently accept requests.
    *
+   * @param signal - Optional cancellation for a potentially slow probe.
    * @returns `true` when callers may issue requests and `false` when it is
    * unavailable.
    * @throws If availability cannot be determined.
@@ -202,5 +203,5 @@ export interface AiExecutor {
    * retains its general throwing allowance for an implementation that genuinely
    * cannot determine availability.
    */
-  isAvailable(): Promise<boolean>;
+  isAvailable(signal?: AbortSignal): Promise<boolean>;
 }

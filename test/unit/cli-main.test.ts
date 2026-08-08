@@ -1,5 +1,5 @@
 import { Writable } from 'node:stream';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ReportEnvelope } from '#report/schema.js';
 import type { GenerateCommandInput } from '#runtime/generate-command.js';
 
@@ -31,11 +31,16 @@ const ENVELOPE = {
   results: [{ id: 'login', file: 'login.test.md', status: 'listed' as const, dryRun: false }],
 };
 
-let exitSpy: ReturnType<typeof vi.spyOn>;
 let cwdSpy: ReturnType<typeof vi.spyOn> | undefined;
+let initialExitCode: typeof process.exitCode;
+
+beforeEach(() => {
+  initialExitCode = process.exitCode;
+  process.exitCode = undefined;
+});
 
 afterEach(() => {
-  exitSpy?.mockRestore();
+  process.exitCode = initialExitCode;
   cwdSpy?.mockRestore();
   cwdSpy = undefined;
   runGenerateCommand.mockReset();
@@ -44,11 +49,10 @@ afterEach(() => {
 async function run(argv: readonly string[]) {
   const stdout = new MemoryWritable();
   const stderr = new MemoryWritable();
-  exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
 
   await main(argv, stdout, stderr);
 
-  return { stdout: stdout.text, stderr: stderr.text, exitCode: exitSpy.mock.calls[0]?.[0] };
+  return { stdout: stdout.text, stderr: stderr.text, exitCode: process.exitCode };
 }
 
 describe('main()', () => {
@@ -116,6 +120,14 @@ describe('main()', () => {
     expect(runGenerateCommand).toHaveBeenCalledWith(expect.objectContaining(expectedInput));
   });
 
+  it('treats values after -- as literal paths, including option-shaped names', async () => {
+    runGenerateCommand.mockResolvedValue({ exitCode: 0, envelope: ENVELOPE });
+
+    await run(['generate', '--', '--not-an-option.test.md']);
+
+    expect(runGenerateCommand).toHaveBeenCalledWith(expect.objectContaining({ files: ['--not-an-option.test.md'] }));
+  });
+
   it('short-circuits command-local generate help before calling runtime', async () => {
     const result = await run(['generate', '--help']);
 
@@ -152,7 +164,16 @@ describe('main()', () => {
   });
 
   it('writes exactly one valid JSON envelope for a parsed dry-run invocation', async () => {
-    const envelope = { ...ENVELOPE, results: [{ ...ENVELOPE.results[0], status: 'would-generate' as const, dryRun: true }] };
+    const envelope = {
+      ...ENVELOPE,
+      results: [{
+        ...ENVELOPE.results[0],
+        status: 'would-generate' as const,
+        dryRun: true,
+        planFile: 'login.ambercast.plan.json',
+        ambiguities: [],
+      }],
+    };
     runGenerateCommand.mockResolvedValue({ exitCode: 1, envelope });
 
     const result = await run(['generate', '--dry-run', '--strict', '--json']);
@@ -161,5 +182,15 @@ describe('main()', () => {
     expect(ReportEnvelope.safeParse(JSON.parse(result.stdout)).success).toBe(true);
     expect(result.stderr).toBe('');
     expect(result.exitCode).toBe(1);
+  });
+
+  it('keeps an unexpected runtime rejection inside the documented exit-code contract', async () => {
+    runGenerateCommand.mockRejectedValue(new Error('unexpected test rejection'));
+
+    const result = await run(['generate']);
+
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toBe('The generate command crashed unexpectedly.\n');
+    expect(result.exitCode).toBe(3);
   });
 });

@@ -3,7 +3,13 @@
  * explicit at the shared AI boundary.
  */
 
-function abortReason(signal: AbortSignal): unknown {
+/**
+ * Gets the reason that callers observe when a signal aborts.
+ *
+ * This fallback keeps every AI boundary aligned with platform cancellation
+ * semantics when a controller omits an explicit reason.
+ */
+export function abortReason(signal: AbortSignal): unknown {
   return signal.reason ?? new DOMException('This operation was aborted', 'AbortError');
 }
 

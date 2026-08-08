@@ -63,7 +63,12 @@ describe('buildGenerateReport', () => {
         caseId: 'login.test.md',
         message: error.message,
       }]);
-      expect(output.envelope.results[0]).toMatchObject({ file: 'login.test.md', status: 'failed', planFile: undefined, ambiguities: undefined });
+      expect(output.envelope.results[0]).toEqual({
+        id: 'login.test.md',
+        file: 'login.test.md',
+        status: 'failed',
+        dryRun: false,
+      });
     },
   );
 
@@ -134,6 +139,17 @@ describe('buildGenerateReport', () => {
     });
 
     expect(output.exitCode).toBe(2);
+  });
+
+  it('uses unexpected-crash when a failed outcome has no classified error', () => {
+    const output = report({
+      outcome: {
+        noTestsFound: false,
+        results: [{ file: 'failed.test.md', status: 'failed' }],
+      },
+    });
+
+    expect(output.exitCode).toBe(3);
   });
 
   it('emits one ordered case-scoped error for every failed file', () => {

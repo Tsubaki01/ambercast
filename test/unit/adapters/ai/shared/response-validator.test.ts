@@ -50,4 +50,25 @@ describe('validateAiResponse', () => {
       expect(error).toMatchObject({ details: { issues: [expect.objectContaining({ path: '/' })] } });
     }
   });
+
+  it('registers standard JSON Schema formats before validating provider data', () => {
+    const urlSchema = typedJsonSchema(z.object({ callbackUrl: z.url() }));
+
+    expect(validateAiResponse('{"callbackUrl":"https://example.test/callback"}', urlSchema))
+      .toEqual({ callbackUrl: 'https://example.test/callback' });
+    expect(() => validateAiResponse('{"callbackUrl":"not a URL"}', urlSchema))
+      .toThrow(AiResponseInvalidError);
+  });
+
+  it('escapes required property names when rendering JSON Pointer paths', () => {
+    const slashKeySchema = typedJsonSchema(z.object({ 'token/key': z.string() }));
+
+    try {
+      validateAiResponse('{}', slashKeySchema);
+    } catch (error) {
+      expect(error).toMatchObject({
+        details: { issues: [expect.objectContaining({ path: '/token~1key' })] },
+      });
+    }
+  });
 });

@@ -1,6 +1,6 @@
 import { access, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { createCodexCliExecutor } from '#adapters/ai/codex-cli/index.js';
 import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
@@ -8,6 +8,18 @@ import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
 import { registerAiExecutorTransportContract, type AiExecutorTransportScenario } from '../../../contracts/ai-executor-transport.contract.js';
 import { createFakeCommandRunner, createDeferredCommandRun } from '../../../doubles/create-fake-command-runner.js';
+
+const tmpdir = vi.hoisted(() => vi.fn(() => '/tmp'));
+
+vi.mock('node:os', async (importOriginal) => ({
+  ...await importOriginal<typeof import('node:os')>(),
+  tmpdir,
+}));
+
+afterEach(() => {
+  tmpdir.mockReset();
+  tmpdir.mockReturnValue('/tmp');
+});
 
 function schema() {
   return typedJsonSchema(z.object({ ok: z.boolean() }));
@@ -101,6 +113,19 @@ describe('createCodexCliExecutor', () => {
       .rejects.toBeInstanceOf(AiExecutorUnavailableError);
   });
 
+  it('classifies temporary-directory setup failure as an unavailable executor', async () => {
+    tmpdir.mockReturnValue('/ambercast-test-guaranteed-missing/tmp');
+    const runner = createFakeCommandRunner();
+    const executor = createCodexCliExecutor({ run: runner.run });
+
+    await expect(executor.execute({ prompt: 'Generate.', responseSchema: schema() }))
+      .rejects.toMatchObject({
+        kind: 'ai-executor-unavailable',
+        message: 'The Codex CLI could not prepare a structured response.',
+      });
+    expect(runner.calls).toEqual([]);
+  });
+
   it.each([
     ['malformed output', 'not JSON'],
     ['schema-invalid output', '{"ok":"no"}'],
@@ -162,6 +187,16 @@ describe('createCodexCliExecutor', () => {
     const executor = createCodexCliExecutor({ run: createFakeCommandRunner([result]).run });
 
     await expect(executor.isAvailable()).resolves.toBe(expected);
+  });
+
+  it('forwards an availability-probe cancellation signal to the command runner', async () => {
+    const runner = createFakeCommandRunner([{ outcome: 'exited', stdout: 'codex 1.0.0', stderr: '', exitCode: 0 }]);
+    const executor = createCodexCliExecutor({ run: runner.run });
+    const controller = new AbortController();
+
+    await expect(executor.isAvailable(controller.signal)).resolves.toBe(true);
+
+    expect(runner.calls[0]?.options?.signal).toBe(controller.signal);
   });
 
   it('rejects agentic execution before creating a temporary command invocation', async () => {

@@ -16,6 +16,7 @@ describe('AiExecutorUnavailableError', () => {
     const cause = new Error('ENOENT');
     const error = new AiExecutorUnavailableError('The provider executable is unavailable.', { provider: 'codex' }, { cause });
 
+    expect(error.message).toBe('The provider executable is unavailable.');
     expect(error.details).toEqual({ provider: 'codex' });
     expect(error.cause).toBe(cause);
   });
