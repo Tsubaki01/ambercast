@@ -27,6 +27,7 @@ const USAGE_REPORT_ERROR_CODES = [
 const ENVIRONMENT_REPORT_ERROR_CODES = [
   'BROWSER_LAUNCH_FAILED',
   'AI_EXECUTOR_UNAVAILABLE',
+  'AI_RESPONSE_INVALID',
   'FS_IO_ERROR',
   'UNEXPECTED_CRASH',
 ] as const;
@@ -223,16 +224,51 @@ export type HealResult = z.infer<typeof HealResult>;
  * Zod schema for one result produced by the `generate` command.
  *
  * This variant gives plan generation its own result vocabulary instead of
- * overloading execution-oriented step results. Ambiguities are restricted to
- * JSON values so every report remains serializable across CLI and MCP
- * boundaries.
+ * overloading execution-oriented step results. `would-generate` previews a
+ * validated write during dry-run mode, while `listed` reports discovery only.
+ * Listed, skipped-fresh, and failed results omit `ambiguities` because no newly
+ * generated provider response exists; listed and failed results also omit
+ * `planFile`. Generated and previewed results retain both, with an empty
+ * ambiguity list when the provider supplied none. Ambiguities are restricted to
+ * JSON values so every report remains serializable across CLI and MCP boundaries.
  */
-export const GenerateResult = z.strictObject({
-  ...ResultIdentityFields,
-  status: z.enum(['generated', 'skipped-fresh', 'failed']),
-  dryRun: z.boolean(),
-  ambiguities: z.array(z.json()),
-});
+export const GenerateResult = z.discriminatedUnion('status', [
+  z.strictObject({
+    id: NonWhitespaceString,
+    file: NonWhitespaceString,
+    planFile: z.string(),
+    status: z.literal('generated'),
+    dryRun: z.literal(false),
+    ambiguities: z.array(z.json()),
+  }),
+  z.strictObject({
+    id: NonWhitespaceString,
+    file: NonWhitespaceString,
+    planFile: z.string(),
+    status: z.literal('would-generate'),
+    dryRun: z.literal(true),
+    ambiguities: z.array(z.json()),
+  }),
+  z.strictObject({
+    id: NonWhitespaceString,
+    file: NonWhitespaceString,
+    planFile: z.string(),
+    status: z.literal('skipped-fresh'),
+    dryRun: z.boolean(),
+  }),
+  z.strictObject({
+    id: NonWhitespaceString,
+    file: NonWhitespaceString,
+    status: z.literal('listed'),
+    dryRun: z.literal(false),
+  }),
+  z.strictObject({
+    id: NonWhitespaceString,
+    file: NonWhitespaceString,
+    status: z.literal('failed'),
+    dryRun: z.boolean(),
+  }),
+]);
 
 /**
  * A result item emitted by a `generate` report.

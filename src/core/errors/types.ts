@@ -33,6 +33,7 @@ export type ErrorKind =
   | 'integrity-violation'
   | 'browser-launch-failed'
   | 'ai-executor-unavailable'
+  | 'ai-response-invalid'
   | 'fs-io-error'
   | 'unexpected-crash'
   | 'no-tests-found';

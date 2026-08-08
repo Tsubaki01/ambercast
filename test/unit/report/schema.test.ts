@@ -142,10 +142,8 @@ const COMMAND_VARIANTS: ReadonlyArray<{
     requiredResultFields: [
       ['id', 1],
       ['file', 1],
-      ['planFile', 1],
       ['status', 1],
       ['dryRun', 'false'],
-      ['ambiguities', 'none'],
     ],
   },
   {
@@ -265,6 +263,40 @@ describe('valid nested schema fixtures', () => {
       ambiguities: [{ stepId: 'submit-login', resolve: () => 'Submit' }],
     });
   });
+
+  it('accepts listed and failed generate results without plan-derived fields', () => {
+    expectAccepted(GenerateResult, {
+      id: 'login-succeeds',
+      file: 'tests/login.test.md',
+      status: 'listed',
+      dryRun: false,
+    });
+    expectAccepted(GenerateResult, {
+      id: 'login-succeeds',
+      file: 'tests/login.test.md',
+      status: 'failed',
+      dryRun: false,
+    });
+  });
+
+  it('requires generated results to retain their plan path and ambiguities', () => {
+    expectRejected(GenerateResult, {
+      id: 'login-succeeds',
+      file: 'tests/login.test.md',
+      status: 'generated',
+      dryRun: false,
+    });
+  });
+
+  it.each([
+    [{ ...GENERATE_RESULT, status: 'generated', dryRun: false, ambiguities: [] }],
+    [{ ...GENERATE_RESULT, status: 'would-generate', dryRun: true, ambiguities: [] }],
+    [{ id: 'login-succeeds', file: 'tests/login.test.md', planFile: 'tests/login.ambercast.plan.json', status: 'skipped-fresh', dryRun: false }],
+    [{ id: 'login-succeeds', file: 'tests/login.test.md', status: 'listed', dryRun: false }],
+    [{ id: 'login-succeeds', file: 'tests/login.test.md', status: 'failed', dryRun: false }],
+  ] as const)('accepts each exact generate-result status branch', (result) => {
+    expectAccepted(GenerateResult, result);
+  });
 });
 
 describe('nested strict object boundaries', () => {
@@ -363,7 +395,6 @@ describe('field boundaries', () => {
   it.each([
     ['run', RunResult, RUN_RESULT, ['passed', 'failed', 'error', 'skipped']],
     ['heal', HealResult, HEAL_RESULT, ['healed', 'partially-healed', 'unresolved', 'no-changes-needed']],
-    ['generate', GenerateResult, GENERATE_RESULT, ['generated', 'skipped-fresh', 'failed']],
     ['check', CheckResult, CHECK_RESULT, ['fresh', 'stale', 'orphaned-plan', 'orphaned-grounding', 'missing-plan']],
     ['review', ReviewResult, REVIEW_RESULT, ['sufficient', 'insufficient']],
   ] as const)('accepts every %s result status enum value', (_command, schema, result, statuses) => {

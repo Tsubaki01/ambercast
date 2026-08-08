@@ -5,9 +5,10 @@ import type {
   AiExecuteResult,
   AiExecutor,
 } from '../../src/ports/ai.js';
+import { rejectOnAbort } from '../../src/core/ai/reject-on-abort.js';
 
 export interface FakeAiExecutorOptions {
-  readonly execute?: (request: AiExecuteRequest) => AiExecuteResult<unknown> | Promise<AiExecuteResult<unknown>>;
+  readonly execute?: (request: AiExecuteRequest<unknown>) => AiExecuteResult<unknown> | Promise<AiExecuteResult<unknown>>;
   readonly executeAgentic?: (request: AiAgenticRequest) => AiAgenticResult | Promise<AiAgenticResult>;
   readonly cannedResponses?: ReadonlyMap<string, AiExecuteResult<unknown>>;
   readonly available?: boolean;
@@ -29,31 +30,35 @@ export interface FakeAiExecutorOptions {
 export function createFakeAiExecutor(options: FakeAiExecutorOptions = {}): AiExecutor {
   return {
     name: 'codex-cli',
-    async execute<T>(request: AiExecuteRequest): Promise<AiExecuteResult<T>> {
-      if (options.execute !== undefined) {
-        return await options.execute(request) as AiExecuteResult<T>;
-      }
+    async execute<T>(request: AiExecuteRequest<T>): Promise<AiExecuteResult<T>> {
+      return rejectOnAbort(request.signal, async () => {
+        if (options.execute !== undefined) {
+          return await options.execute(request as AiExecuteRequest<unknown>) as AiExecuteResult<T>;
+        }
 
-      if (typeof request.context !== 'string') {
-        throw new Error('Unscripted AI execute request: context must be a string canned-response key');
-      }
+        if (typeof request.context !== 'string') {
+          throw new Error('Unscripted AI execute request: context must be a string canned-response key');
+        }
 
-      const cannedResponse = options.cannedResponses?.get(request.context);
-      if (cannedResponse === undefined) {
-        throw new Error(`Unscripted AI execute request for context key: ${request.context}`);
-      }
+        const cannedResponse = options.cannedResponses?.get(request.context);
+        if (cannedResponse === undefined) {
+          throw new Error(`Unscripted AI execute request for context key: ${request.context}`);
+        }
 
-      return cannedResponse as AiExecuteResult<T>;
+        return cannedResponse as AiExecuteResult<T>;
+      });
     },
     async executeAgentic(request: AiAgenticRequest): Promise<AiAgenticResult> {
-      if (options.executeAgentic === undefined) {
-        throw new Error('No override configured for executeAgentic');
-      }
+      return rejectOnAbort(request.signal, async () => {
+        if (options.executeAgentic === undefined) {
+          throw new Error('No override configured for executeAgentic');
+        }
 
-      return options.executeAgentic(request);
+        return options.executeAgentic(request);
+      });
     },
-    async isAvailable(): Promise<boolean> {
-      return options.available ?? true;
+    async isAvailable(signal?: AbortSignal): Promise<boolean> {
+      return rejectOnAbort(signal, async () => options.available ?? true);
     },
   };
 }

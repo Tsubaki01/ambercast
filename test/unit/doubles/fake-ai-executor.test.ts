@@ -1,15 +1,16 @@
 import { describe, expect, it } from 'vitest';
+import { z } from 'zod';
+import { typedJsonSchema } from '../../../src/core/ai/typed-json-schema.js';
 import type { AiAgenticResult, AiExecuteRequest, AiExecuteResult } from '../../../src/ports/ai.js';
 import { createFakeAiActionController } from '../../doubles/fake-ai-action-controller.js';
 import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
 
-const RESPONSE_SCHEMA = { type: 'object' };
 const FIRST_RESULT: AiExecuteResult<unknown> = { data: { answer: 'first' }, raw: '{"answer":"first"}' };
 const SECOND_RESULT: AiExecuteResult<unknown> = { data: { answer: 'second' }, raw: '{"answer":"second"}' };
 const AGENTIC_RESULT: AiAgenticResult = { outcome: 'success' };
 
 function request(context: string): AiExecuteRequest {
-  return { prompt: `respond to ${context}`, responseSchema: RESPONSE_SCHEMA, context };
+  return { prompt: `respond to ${context}`, responseSchema: typedJsonSchema(z.object({ answer: z.string() })), context };
 }
 
 describe('createFakeAiExecutor', () => {
@@ -30,7 +31,7 @@ describe('createFakeAiExecutor', () => {
 
     await expect(executor.execute({
       prompt: 'respond',
-      responseSchema: RESPONSE_SCHEMA,
+      responseSchema: typedJsonSchema(z.object({ answer: z.string() })),
       context: { step: 'one' },
     })).rejects.toThrow('Unscripted AI execute request: context must be a string canned-response key');
   });

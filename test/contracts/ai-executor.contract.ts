@@ -9,13 +9,19 @@ import type {
 } from '../../src/ports/ai.js';
 import type { TraceAction } from '../../src/core/ir/schema.js';
 import type { AssertCheck, PageSnapshot } from '../../src/ports/browser.js';
+import { typedJsonSchema } from '../../src/core/ai/typed-json-schema.js';
+import { z } from 'zod';
 
 export type AiExecutorContractAgenticScript = AiAgenticResult | (
   (request: AiAgenticRequest) => AiAgenticResult | Promise<AiAgenticResult>
 );
 
+export type AiExecutorContractExecuteScript = AiExecuteResult<unknown> | (
+  (request: AiExecuteRequest<unknown>) => AiExecuteResult<unknown> | Promise<AiExecuteResult<unknown>>
+);
+
 export interface AiExecutorContractScript {
-  readonly execute: AiExecuteResult<unknown>;
+  readonly execute: AiExecutorContractExecuteScript;
   readonly executeAgentic: AiExecutorContractAgenticScript;
   /** When present, the implementation must reject `execute` with this error. */
   readonly executeError?: Error;
@@ -27,7 +33,9 @@ export interface AiExecutorContractHarness {
   dispose?(): void | Promise<void>;
 }
 
-const RESPONSE_SCHEMA = { type: 'object', required: ['ok'] };
+function responseSchema() {
+  return typedJsonSchema(z.object({ ok: z.boolean() }));
+}
 const EXECUTE_RESULT: AiExecuteResult<unknown> = {
   data: { ok: true },
   raw: '{"ok":true}',
@@ -83,11 +91,11 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
         const executor = await harness.createExecutor({ execute: EXECUTE_RESULT, executeAgentic: AGENTIC_RESULT });
         const request: AiExecuteRequest = {
           prompt: 'Return a JSON status.',
-          responseSchema: RESPONSE_SCHEMA,
+          responseSchema: responseSchema(),
           context: { step: 'generate' },
         };
 
-        const result = await executor.execute<unknown>(request);
+        const result = await executor.execute(request);
 
         expect(result.data).toEqual(EXECUTE_RESULT.data);
         expect(result.raw).toEqual(EXECUTE_RESULT.raw);
@@ -106,9 +114,9 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
           executeError,
         });
 
-        await expect(executor.execute<unknown>({
+        await expect(executor.execute({
           prompt: 'Return a JSON status.',
-          responseSchema: RESPONSE_SCHEMA,
+          responseSchema: responseSchema(),
         })).rejects.toBe(executeError);
       } finally {
         await harness.dispose?.();
@@ -242,29 +250,116 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
       }
     });
 
-    // This proves the signal reaches the implementation and its rejection is not converted into an outcome; it does not cover a mid-execution abort, which this logic-free port cannot interrupt.
-    it('rejects an already-aborted agentic request', async () => {
+    it('rejects an already-aborted structured request without invoking a signal-insensitive handler', async () => {
+      try {
+        const abortController = new AbortController();
+        const abortReason = new Error('The structured request was aborted.');
+        abortController.abort(abortReason);
+        let handlerCalls = 0;
+        const executor = await harness.createExecutor({
+          execute: () => {
+            handlerCalls += 1;
+            return EXECUTE_RESULT;
+          },
+          executeAgentic: AGENTIC_RESULT,
+        });
+
+        await expect(executor.execute({
+          prompt: 'Return a JSON status.',
+          responseSchema: responseSchema(),
+          signal: abortController.signal,
+        })).rejects.toBe(abortReason);
+        expect(handlerCalls).toBe(0);
+      } finally {
+        await harness.dispose?.();
+      }
+    });
+
+    it('rejects a structured request aborted while a signal-insensitive handler remains pending', async () => {
+      try {
+        let resolveHandler: ((value: AiExecuteResult<unknown>) => void) | undefined;
+        let handlerStarted: (() => void) | undefined;
+        const started = new Promise<void>((resolve) => {
+          handlerStarted = resolve;
+        });
+        const executor = await harness.createExecutor({
+          execute: () => new Promise<AiExecuteResult<unknown>>((resolve) => {
+            resolveHandler = resolve;
+            handlerStarted?.();
+          }),
+          executeAgentic: AGENTIC_RESULT,
+        });
+        const abortController = new AbortController();
+        const abortReason = new Error('The structured request was aborted in flight.');
+        const result = executor.execute({
+          prompt: 'Return a JSON status.',
+          responseSchema: responseSchema(),
+          signal: abortController.signal,
+        });
+
+        await started;
+        abortController.abort(abortReason);
+        await expect(result).rejects.toBe(abortReason);
+        resolveHandler?.(EXECUTE_RESULT);
+      } finally {
+        await harness.dispose?.();
+      }
+    });
+
+    it('rejects an already-aborted agentic request without invoking a signal-insensitive handler', async () => {
       try {
         const recording = createRecordingController(harness);
+        let handlerCalls = 0;
         const executor = await harness.createExecutor({
           execute: EXECUTE_RESULT,
-          executeAgentic: async (request) => {
-            if (request.signal?.aborted) {
-              throw new Error('The scripted agentic request was already aborted.');
-            }
-
+          executeAgentic: async () => {
+            handlerCalls += 1;
             return AGENTIC_RESULT;
           },
         });
         const abortController = new AbortController();
-        abortController.abort();
+        const abortReason = new Error('The agentic request was aborted.');
+        abortController.abort(abortReason);
 
         await expect(executor.executeAgentic({
           instructionPrompt: 'Complete the sign-in.',
           controller: recording.controller,
           signal: abortController.signal,
-        })).rejects.toThrow('already aborted');
+        })).rejects.toBe(abortReason);
         expect(recording.performed).toEqual([]);
+        expect(handlerCalls).toBe(0);
+      } finally {
+        await harness.dispose?.();
+      }
+    });
+
+    it('rejects an agentic request aborted while a signal-insensitive handler remains pending', async () => {
+      try {
+        const recording = createRecordingController(harness);
+        let resolveHandler: ((value: AiAgenticResult) => void) | undefined;
+        let handlerStarted: (() => void) | undefined;
+        const started = new Promise<void>((resolve) => {
+          handlerStarted = resolve;
+        });
+        const executor = await harness.createExecutor({
+          execute: EXECUTE_RESULT,
+          executeAgentic: () => new Promise<AiAgenticResult>((resolve) => {
+            resolveHandler = resolve;
+            handlerStarted?.();
+          }),
+        });
+        const abortController = new AbortController();
+        const abortReason = new Error('The agentic request was aborted in flight.');
+        const result = executor.executeAgentic({
+          instructionPrompt: 'Complete the sign-in.',
+          controller: recording.controller,
+          signal: abortController.signal,
+        });
+
+        await started;
+        abortController.abort(abortReason);
+        await expect(result).rejects.toBe(abortReason);
+        resolveHandler?.(AGENTIC_RESULT);
       } finally {
         await harness.dispose?.();
       }
@@ -273,8 +368,9 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
     it('reports availability as a boolean', async () => {
       try {
         const executor = await harness.createExecutor({ execute: EXECUTE_RESULT, executeAgentic: AGENTIC_RESULT });
+        const controller = new AbortController();
 
-        expect(typeof await executor.isAvailable()).toBe('boolean');
+        expect(typeof await executor.isAvailable(controller.signal)).toBe('boolean');
       } finally {
         await harness.dispose?.();
       }

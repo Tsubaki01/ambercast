@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { join, resolve } from 'node:path';
 import { cruise, type ICruiseResult } from 'dependency-cruiser';
 import { describe, expect, test } from 'vitest';
-// @ts-expect-error -- the docs-first ESM config intentionally has no .d.ts file.
+// @ts-expect-error -- the ESM config has no declaration file.
 import dependencyCruiserConfig from '../../../.dependency-cruiser.mjs';
 
 const FIXTURE_ROOT = fileURLToPath(
@@ -347,7 +347,7 @@ describe('dependency-cruiser architecture rules', () => {
     });
     expect(rejectedDependency).toMatchObject({
       couldNotResolve: false,
-      dependencyTypes: expect.arrayContaining(['npm-dev']),
+      dependencyTypes: expect.arrayContaining(['npm']),
       resolved: expect.stringContaining('node_modules/ajv/'),
     });
     expect(fakeBuiltinDependency).toMatchObject({

@@ -6,4 +6,4 @@
 // process.argv[1] identifies this file, not the module performing the check.
 import { main } from '../dist/cli.js';
 
-main();
+await main();
