@@ -204,6 +204,13 @@ const PressFields = {
 };
 const FillFields = { target: ElementRef, value: InterpolatableText };
 const FillSecretFields = { target: ElementRef, secretRef: SecretRef };
+// Assertion steps and recorded verification use one field contract so an
+// assertion cannot change meaning when it moves from a plan into a trace.
+const TextVisibleFields = { text: InterpolatableText };
+const ElementVisibleFields = { target: ElementRef };
+const TextEqualsFields = { target: ElementRef, text: InterpolatableText };
+const UrlMatchesFields = { pattern: InterpolatableText };
+const ElementCountFields = { target: ElementRef, count: z.int().nonnegative() };
 
 /**
  * Validates an executable `click` action step.
@@ -325,12 +332,14 @@ export type ActionStep = z.infer<typeof ActionStep>;
  * the current page.
  *
  * It has no target because text visibility is not an element-locator check.
+ * The shared field contract also keeps this plan assertion semantically
+ * identical to its trace-verification counterpart.
  */
 export const TextVisibleCheck = z.strictObject({
   ...StepBase,
   kind: z.literal('assert'),
   check: z.literal('text-visible'),
-  text: InterpolatableText,
+  ...TextVisibleFields,
 });
 
 /**
@@ -342,12 +351,14 @@ export type TextVisibleCheck = z.infer<typeof TextVisibleCheck>;
  * Validates an assertion that a particular element is visible.
  *
  * The element locator keeps visibility checks scoped to a particular target.
+ * Reusing its field contract for recorded verification prevents plan and
+ * replay from disagreeing about the evidence a visibility claim requires.
  */
 export const ElementVisibleCheck = z.strictObject({
   ...StepBase,
   kind: z.literal('assert'),
   check: z.literal('element-visible'),
-  target: ElementRef,
+  ...ElementVisibleFields,
 });
 
 /**
@@ -359,14 +370,14 @@ export type ElementVisibleCheck = z.infer<typeof ElementVisibleCheck>;
  * Validates an assertion that an element's text equals an expected value.
  *
  * Its expected text remains non-secret by construction, as with other
- * displayable assertion content.
+ * displayable assertion content. A shared field contract preserves that
+ * secret-safety rule when the assertion is retained as replay evidence.
  */
 export const TextEqualsCheck = z.strictObject({
   ...StepBase,
   kind: z.literal('assert'),
   check: z.literal('text-equals'),
-  target: ElementRef,
-  text: InterpolatableText,
+  ...TextEqualsFields,
 });
 
 /**
@@ -379,13 +390,14 @@ export type TextEqualsCheck = z.infer<typeof TextEqualsCheck>;
  *
  * The expected value is text rather than a URL type because it represents a
  * matching expression and retains the common prohibition on embedded secret
- * tokens.
+ * tokens. Its shared field contract carries that restriction into recorded
+ * verification without a separate trace-only interpretation.
  */
 export const UrlMatchesCheck = z.strictObject({
   ...StepBase,
   kind: z.literal('assert'),
   check: z.literal('url-matches'),
-  pattern: InterpolatableText,
+  ...UrlMatchesFields,
 });
 
 /**
@@ -397,14 +409,14 @@ export type UrlMatchesCheck = z.infer<typeof UrlMatchesCheck>;
  * Validates an assertion about how many elements match a locator.
  *
  * Zero is a valid and useful expected count; negative and fractional values
- * cannot describe a DOM element count.
+ * cannot describe a DOM element count. Sharing the field contract with trace
+ * verification ensures a replay cannot weaken that numeric boundary.
  */
 export const ElementCountCheck = z.strictObject({
   ...StepBase,
   kind: z.literal('assert'),
   check: z.literal('element-count'),
-  target: ElementRef,
-  count: z.int().nonnegative(),
+  ...ElementCountFields,
 });
 
 /**
@@ -417,6 +429,8 @@ export type ElementCountCheck = z.infer<typeof ElementCountCheck>;
  *
  * Keeping the check discriminator flat avoids an awkward nested property and
  * lets the generated nested `oneOf` describe the valid shapes exactly.
+ * Field bundles are shared with trace assertions so executable requirements
+ * do not drift from the verification evidence used for replay.
  */
 export const AssertStep = z.discriminatedUnion('check', [
   TextVisibleCheck,
@@ -454,16 +468,22 @@ export type CaptureStep = z.infer<typeof CaptureStep>;
  *
  * Keeping execution results outside the plan preserves digest stability. When
  * a previously replayed trace exists, it lives solely in
- * {@link GroundingDocument}.
+ * {@link GroundingDocument}. Secret grants are optional rather than defaulted:
+ * omission and an explicit empty list both grant nothing at this boundary, but
+ * remain distinct serialized values for deterministic digesting. Canonical
+ * ordering, deduplication, and omission policy therefore belong before this
+ * schema is used to persist a generated plan, not in validation.
  */
 export const AiStep = z.strictObject({
   ...StepBase,
   kind: z.literal('ai'),
   instruction: InterpolatableText,
+  secrets: z.array(SecretRef).optional(),
 });
 
 /**
- * The parsed AI-step branch.
+ * The parsed AI-step branch, preserving the distinction between omitted
+ * secret grants and an explicitly empty list.
  */
 export type AiStep = z.infer<typeof AiStep>;
 
@@ -581,18 +601,85 @@ export const TraceAction = z.discriminatedUnion('type', [
 export type TraceAction = z.infer<typeof TraceAction>;
 
 /**
- * Validates the ordered recorded actions held exclusively by an `ai`-kind
- * grounding entry.
+ * Validates an assertion observation retained in an AI trace.
  *
- * An empty trace is structurally valid because usefulness policy belongs
- * outside this trust-boundary schema.
+ * Assertion traces use the same two discriminator levels as plan assertions:
+ * the outer trace category keeps them distinct from executable actions, while
+ * the check branch selects its required evidence fields. Reusing the plan
+ * field bundles prevents a recorded verification from accepting a shape that
+ * the equivalent plan assertion rejects, and strict branches keep every
+ * requirement visible to generated JSON Schema.
  */
-export const Trace = z.array(TraceAction);
+export const TraceAssert = z.discriminatedUnion('check', [
+  z.strictObject({
+    type: z.literal('assert'),
+    check: z.literal('text-visible'),
+    ...TextVisibleFields,
+  }),
+  z.strictObject({
+    type: z.literal('assert'),
+    check: z.literal('element-visible'),
+    ...ElementVisibleFields,
+  }),
+  z.strictObject({
+    type: z.literal('assert'),
+    check: z.literal('text-equals'),
+    ...TextEqualsFields,
+  }),
+  z.strictObject({
+    type: z.literal('assert'),
+    check: z.literal('url-matches'),
+    ...UrlMatchesFields,
+  }),
+  z.strictObject({
+    type: z.literal('assert'),
+    check: z.literal('element-count'),
+    ...ElementCountFields,
+  }),
+]);
 
 /**
- * The parsed ordered list of {@link TraceAction} values.
+ * The parsed assertion-observation union narrowed by its `check`
+ * discriminant.
  */
-export type Trace = z.infer<typeof Trace>;
+export type TraceAssert = z.infer<typeof TraceAssert>;
+
+/**
+ * Validates one chronological entry in an AI trace.
+ *
+ * A single outer discriminator gives the trace an ordered journal containing
+ * both actions and observations without blurring their different replay
+ * roles. Its structural branches deliberately replace optional payload
+ * fields or refinement logic, preserving the same contract in JSON Schema.
+ */
+export const TraceEntry = z.discriminatedUnion('type', [TraceAction, TraceAssert]);
+
+/**
+ * The parsed chronological trace-entry union narrowed by its `type`
+ * discriminant.
+ */
+export type TraceEntry = z.infer<typeof TraceEntry>;
+
+/**
+ * Validates the replayable journal recorded for an AI-directed step.
+ *
+ * Event history can be empty when an agent needs only to observe and verify
+ * the page, but replayable success requires at least one verification
+ * assertion. The minimum is structural rather than a refinement so derived
+ * JSON Schema preserves the requirement. Keeping event history and terminal
+ * verification in one shared record prevents grounding storage and agentic
+ * replay inputs from growing independent, subtly different trace shapes.
+ */
+export const TraceRecord = z.strictObject({
+  events: z.array(TraceEntry),
+  verification: z.array(TraceAssert).min(1),
+});
+
+/**
+ * The parsed replayable AI-trace record, including its non-empty terminal
+ * verification evidence.
+ */
+export type TraceRecord = z.infer<typeof TraceRecord>;
 
 /**
  * Validates grounding recorded for an element-based action, assertion, or
@@ -616,15 +703,19 @@ export type ElementGroundingEntry = z.infer<typeof ElementGroundingEntry>;
  *
  * Requiring a complete trace makes an `ai` entry evidence of a successful
  * agentic execution; an absent record expresses that no trace has been
- * recorded yet.
+ * recorded yet. Its events may be empty only when verification is non-empty;
+ * an empty verification list, including a record with both lists empty, is
+ * invalid. As a strict object, the entry also rejects unknown keys, keeping
+ * all four trace-container boundary cases explicit and portable to JSON
+ * Schema.
  */
 export const AiGroundingEntry = z.strictObject({
   kind: z.literal('ai'),
-  trace: Trace,
+  trace: TraceRecord,
 });
 
 /**
- * The parsed `ai` branch of a grounding entry.
+ * The parsed `ai` grounding branch with replayable terminal verification.
  */
 export type AiGroundingEntry = z.infer<typeof AiGroundingEntry>;
 

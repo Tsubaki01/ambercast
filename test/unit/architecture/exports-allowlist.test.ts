@@ -4,6 +4,9 @@
  * layered defenses that preserve a deliberate API boundary. This test validates
  * the approved five-entry exports map's complete content, while
  * scripts/verify-pack.mjs separately validates packed-file presence.
+ * Internal IR schema declarations such as `TraceAssert`, `TraceEntry`, and
+ * `TraceRecord` do not create package subpath exports, so this allowlist is
+ * unaffected by them.
  * The test reads package.json directly and uses strict deep equality for the complete exports object, rather than comparing only its keys, so an existing key silently repointed to a wrong target cannot pass.
  */
 import { readFileSync } from 'node:fs';

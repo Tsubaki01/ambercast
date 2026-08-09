@@ -11,9 +11,14 @@
       },
       "submit-review": {
         "kind": "ai",
-        "trace": [
-          { "type": "click", "target": { "strategy": "accessibility", "role": "button", "name": "Submit" } }
-        ]
+        "trace": {
+          "events": [
+            { "type": "click", "target": { "strategy": "accessibility", "role": "button", "name": "Submit" } }
+          ],
+          "verification": [
+            { "type": "assert", "check": "element-visible", "target": { "strategy": "accessibility", "role": "button", "name": "Submit" } }
+          ]
+        }
       }
     }
   }
