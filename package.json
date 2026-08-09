@@ -55,6 +55,7 @@
     "lint": "eslint .",
     "lint:deps": "depcruise --config .dependency-cruiser.mjs src",
     "test:contract:ai": "vitest run --config vitest.config.contract-ai.ts",
+    "test:contract:browser": "vitest run --config vitest.config.contract-browser.ts",
     "pretest": "npm run build",
     "test": "vitest run"
   },
@@ -72,6 +73,7 @@
   "dependencies": {
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
+    "playwright-core": "^1.62.1",
     "zod": "^4.4.3"
   }
 }

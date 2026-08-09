@@ -10,6 +10,7 @@ export interface BrowserSessionContractSetup {
 
 export interface BrowserSessionContractHarness {
   createSession(setup: BrowserSessionContractSetup): BrowserSession | Promise<BrowserSession>;
+  actualFingerprintFor?(setup: BrowserSessionContractSetup): Fingerprint | Promise<Fingerprint>;
   dispose?(): void | Promise<void>;
 }
 
@@ -18,10 +19,23 @@ const MATCHING_FINGERPRINT: Fingerprint = {
   algorithm: 'a11y-neighborhood-v1',
   hash: 'a'.repeat(64),
 };
-const DIFFERENT_FINGERPRINT: Fingerprint = {
-  algorithm: 'a11y-neighborhood-v1',
-  hash: 'b'.repeat(64),
-};
+
+async function actualFingerprintFor(
+  harness: BrowserSessionContractHarness,
+  setup: BrowserSessionContractSetup,
+): Promise<Fingerprint> {
+  if (harness.actualFingerprintFor === undefined) {
+    return setup.currentFingerprint;
+  }
+
+  return harness.actualFingerprintFor(setup);
+}
+
+function fingerprintWithFlippedLeadingHexCharacter(fingerprint: Fingerprint): Fingerprint {
+  const replacement = fingerprint.hash[0] === '0' ? '1' : '0';
+
+  return { ...fingerprint, hash: `${replacement}${fingerprint.hash.slice(1)}` };
+}
 
 function isJsonValue(value: unknown): boolean {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') {
@@ -67,14 +81,21 @@ async function withSession(
 export function registerBrowserSessionContract(harness: BrowserSessionContractHarness): void {
   describe('BrowserSession contract', () => {
     it('resolves existing grounding when its fingerprint matches exactly', async () => {
-      await withSession(harness, { ref: REF, currentFingerprint: MATCHING_FINGERPRINT, exists: true }, async (session) => {
-        await expect(session.resolveGrounded(REF, MATCHING_FINGERPRINT)).resolves.toEqual({ kind: 'hit', ref: REF });
+      const setup = { ref: REF, currentFingerprint: MATCHING_FINGERPRINT, exists: true };
+
+      await withSession(harness, setup, async (session) => {
+        await expect(session.resolveGrounded(REF, await actualFingerprintFor(harness, setup))).resolves.toEqual({ kind: 'hit', ref: REF });
       });
     });
 
     it('rejects existing grounding when only its fingerprint differs', async () => {
-      await withSession(harness, { ref: REF, currentFingerprint: MATCHING_FINGERPRINT, exists: true }, async (session) => {
-        await expect(session.resolveGrounded(REF, DIFFERENT_FINGERPRINT)).resolves.toEqual({
+      const setup = { ref: REF, currentFingerprint: MATCHING_FINGERPRINT, exists: true };
+
+      await withSession(harness, setup, async (session) => {
+        await expect(session.resolveGrounded(
+          REF,
+          fingerprintWithFlippedLeadingHexCharacter(await actualFingerprintFor(harness, setup)),
+        )).resolves.toEqual({
           kind: 'miss',
           reason: 'fingerprint-mismatch',
         });
@@ -82,8 +103,13 @@ export function registerBrowserSessionContract(harness: BrowserSessionContractHa
     });
 
     it('reports a missing element before considering a fingerprint mismatch', async () => {
-      await withSession(harness, { ref: REF, currentFingerprint: MATCHING_FINGERPRINT, exists: false }, async (session) => {
-        await expect(session.resolveGrounded(REF, DIFFERENT_FINGERPRINT)).resolves.toEqual({
+      const setup = { ref: REF, currentFingerprint: MATCHING_FINGERPRINT, exists: false };
+
+      await withSession(harness, setup, async (session) => {
+        await expect(session.resolveGrounded(
+          REF,
+          fingerprintWithFlippedLeadingHexCharacter(await actualFingerprintFor(harness, setup)),
+        )).resolves.toEqual({
           kind: 'miss',
           reason: 'element-not-found',
         });

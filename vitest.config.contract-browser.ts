@@ -4,17 +4,17 @@ import { defineConfig } from 'vitest/config';
 
 const pkg = JSON.parse(readFileSync(fileURLToPath(new URL('./package.json', import.meta.url)), 'utf8'));
 
-// Matches tsdown.config.js so direct unit-test imports see the build-time value
-// that the real bundle injects.
+// This opt-in lane requires a local Chromium install: `npx playwright install chromium`.
 export default defineConfig({
   define: {
     __VERSION__: JSON.stringify(pkg.version),
   },
   test: {
     environment: 'node',
-    include: ['test/**/*.test.ts'],
-    exclude: ['test/contract-ai/**', 'test/contract-browser/**'],
-    // TypeScript compiler and dependency-cruiser tests can contend for CPU on CI runners.
+    include: ['test/contract-browser/**/*.contract.test.ts'],
+    // Keep command and contract timeouts aligned with the default Vitest lane.
     testTimeout: 30_000,
+    // Cold availability-probe launches must not hit the default hook timeout and fail, rather than skip, this lane.
+    hookTimeout: 30_000,
   },
 });

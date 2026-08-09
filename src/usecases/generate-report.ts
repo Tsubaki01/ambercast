@@ -3,46 +3,16 @@
  * report that runtime returns to the CLI boundary.
  *
  * Keeping report-shape construction in the usecases layer lets runtime
- * compose configuration and concrete adapters without taking an illegal
- * dependency on the report layer. The helper receives only the completed
- * application outcome or classified failure plus command policy and timing;
- * it never loads configuration, selects a provider, or performs I/O.
+ * compose configuration and concrete adapters while reusing report's stable
+ * error mapping. The helper receives only the completed application outcome
+ * or classified failure plus command policy and timing; it never loads
+ * configuration, selects a provider, or performs I/O.
  */
 
-import type { AmbercastError, ErrorKind, ExitCode } from '#core/errors/types.js';
-import type { GenerateResult, ReportEnvelope, ReportError, ReportErrorCode } from '#report/schema.js';
+import type { AmbercastError, ExitCode } from '#core/errors/types.js';
+import { reportError } from '#report/error-mapping.js';
+import type { GenerateResult, ReportEnvelope } from '#report/schema.js';
 import type { GenerateOptions, GenerateOutcome } from './generate.js';
-
-const REPORT_ERROR_DETAILS = {
-  'config-invalid': { kind: 'usage', code: 'CONFIG_INVALID' },
-  'secret-unresolved': { kind: 'usage', code: 'SECRET_UNRESOLVED' },
-  'target-unresolved': { kind: 'usage', code: 'TARGET_UNRESOLVED' },
-  'secret-literal-rejected': { kind: 'usage', code: 'SECRET_LITERAL_REJECTED' },
-  'missing-plan': { kind: 'usage', code: 'MISSING_PLAN' },
-  'stale-ir': { kind: 'usage', code: 'STALE_PLAN' },
-  'integrity-violation': { kind: 'usage', code: 'INTEGRITY_VIOLATION' },
-  'browser-launch-failed': { kind: 'environment', code: 'BROWSER_LAUNCH_FAILED' },
-  'ai-executor-unavailable': { kind: 'environment', code: 'AI_EXECUTOR_UNAVAILABLE' },
-  'ai-response-invalid': { kind: 'environment', code: 'AI_RESPONSE_INVALID' },
-  'fs-io-error': { kind: 'environment', code: 'FS_IO_ERROR' },
-  'unexpected-crash': { kind: 'environment', code: 'UNEXPECTED_CRASH' },
-} as const satisfies Partial<Record<ErrorKind, { readonly kind: 'usage' | 'environment'; readonly code: ReportErrorCode }>>;
-
-function reportError(error: AmbercastError, location: { readonly scope: 'run' }): ReportError;
-function reportError(error: AmbercastError, location: { readonly scope: 'case'; readonly caseId: string }): ReportError;
-function reportError(
-  error: AmbercastError,
-  location: { readonly scope: 'run' } | { readonly scope: 'case'; readonly caseId: string },
-): ReportError {
-  const details = REPORT_ERROR_DETAILS[error.kind as keyof typeof REPORT_ERROR_DETAILS];
-  if (details === undefined) {
-    throw new Error(`Error kind ${error.kind} cannot be serialized as a report error.`);
-  }
-
-  return location.scope === 'run'
-    ? { scope: location.scope, ...details, message: error.message }
-    : { scope: location.scope, ...details, caseId: location.caseId, message: error.message };
-}
 
 function reportResult(
   result: GenerateOutcome['results'][number],
