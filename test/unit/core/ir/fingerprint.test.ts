@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 import {
   computeAccessibilityFingerprint,
   parseAriaSnapshot,
 } from '#core/ir/fingerprint.js';
+import { toCanonicalDigestBytes } from '#core/ir/canonical-json.js';
 import type { ElementRef, Fingerprint, JsonValueT } from '#core/ir/schema.js';
 
 const TARGET: ElementRef = { strategy: 'accessibility', role: 'button', name: 'Submit' };
@@ -73,10 +75,10 @@ describe('parseAriaSnapshot', () => {
           name: 'Main',
           children: [
             {
-              role: 'list:',
+              role: 'list',
               name: '',
               children: [{
-                role: 'listitem:',
+                role: 'listitem',
                 name: '',
                 children: [{ role: 'link', name: 'Home', children: [] }],
               }],
@@ -94,6 +96,14 @@ describe('parseAriaSnapshot', () => {
       role: 'root',
       name: '',
       children: [{ role: 'separator', name: '', children: [] }],
+    });
+  });
+
+  it('removes a structural colon from an unnamed role', () => {
+    expect(parseAriaSnapshot('- listitem:')).toEqual({
+      role: 'root',
+      name: '',
+      children: [{ role: 'listitem', name: '', children: [] }],
     });
   });
 
@@ -168,6 +178,41 @@ describe('computeAccessibilityFingerprint', () => {
   it('keeps the hash unchanged when only a sibling name changes', () => {
     expect(fingerprint(createAccessibilityTree({ siblingName: 'Work email' })).hash)
       .toBe(fingerprint(createAccessibilityTree()).hash);
+  });
+
+  it('excludes the matched node from sibling roles while retaining a same-role sibling', () => {
+    const tree: JsonValueT = {
+      role: 'root',
+      name: '',
+      children: [{
+        role: 'form',
+        name: 'Sign in',
+        children: [
+          { role: 'button', name: 'Cancel', children: [] },
+          { role: 'button', name: 'Submit', children: [] },
+          { role: 'link', name: 'Forgot password?', children: [] },
+        ],
+      }],
+    };
+    const descriptor = {
+      role: 'button',
+      name: 'Submit',
+      parent: { role: 'form', name: 'Sign in' },
+      siblingRoles: ['button', 'link'],
+    };
+    const descriptorIncludingTheMatchedNode = {
+      ...descriptor,
+      siblingRoles: ['button', 'button', 'link'],
+    };
+    const expectedHash = createHash('sha256')
+      .update(toCanonicalDigestBytes(descriptor))
+      .digest('hex');
+    const hashIncludingTheMatchedNode = createHash('sha256')
+      .update(toCanonicalDigestBytes(descriptorIncludingTheMatchedNode))
+      .digest('hex');
+
+    expect(fingerprint(tree).hash).toBe(expectedHash);
+    expect(fingerprint(tree).hash).not.toBe(hashIncludingTheMatchedNode);
   });
 
   it.each([

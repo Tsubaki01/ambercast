@@ -189,6 +189,9 @@ export interface BrowserSession {
   /**
    * Releases resources held by the session.
    *
+   * @remarks
+   * Implementations must treat a second call after closure as a safe no-op rather than an error.
+   *
    * @throws If the underlying browser resources cannot be released.
    */
   close(): Promise<void>;

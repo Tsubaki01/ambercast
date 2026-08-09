@@ -97,7 +97,7 @@ function findAccessibilityMatch(
 export function parseAriaSnapshot(yaml: string): JsonValueT {
   const root: AccessibilityNode = { role: 'root', name: '', children: [] };
   const stack: Array<{ readonly node: AccessibilityNode; readonly depth: number }> = [];
-  const outlinePattern = /^(\s*)-\s+(\S+)(?:\s+"((?:[^"\\]|\\.)*)")?/;
+  const outlinePattern = /^(\s*)-\s+([^\s:]+)(?::(?=\s*$))?(?:\s+"((?:[^"\\]|\\.)*)")?/;
 
   for (const line of yaml.split(/\r?\n/)) {
     const match = outlinePattern.exec(line);
@@ -190,7 +190,9 @@ export function computeAccessibilityFingerprint(
     parent: match.parent === undefined
       ? null
       : { role: match.parent.role, name: match.parent.name },
-    siblingRoles: match.parent?.children.map((sibling) => sibling.role) ?? [],
+    siblingRoles: match.parent?.children
+      .filter((sibling) => sibling !== match.node)
+      .map((sibling) => sibling.role) ?? [],
   };
 
   return {

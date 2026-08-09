@@ -43,9 +43,9 @@ const BROWSER_DRIVER_FACTORIES: Partial<Record<
  * preserves the existing resolver port instead of leaking per-engine
  * construction options into every caller.
  *
- * `BrowserEngine` currently has only the `'chromium'` member, so an
- * unregistered-engine branch is defensive, forward-compatible code rather
- * than a path any schema-valid target can reach today.
+ * The unregistered-engine branch ensures that a schema-valid target whose
+ * engine has no registered factory fails with a classified error rather than
+ * a bare `TypeError`, regardless of the registered engine set.
  */
 export function createBrowserDriverResolver(
   options?: BrowserLaunchOptions,

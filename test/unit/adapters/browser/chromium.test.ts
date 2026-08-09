@@ -171,6 +171,10 @@ class FakePlaywrightPage implements PlaywrightPageHandle {
     readonly role: string;
     readonly options: { readonly name: string; readonly exact: true };
   }[] = [];
+  readonly textCalls: {
+    readonly text: string;
+    readonly options: { readonly exact: true } | undefined;
+  }[] = [];
   readonly locatorCalls: string[] = [];
   readonly urlCalls: undefined[] = [];
   readonly screenshotCalls: undefined[] = [];
@@ -202,6 +206,14 @@ class FakePlaywrightPage implements PlaywrightPageHandle {
   ): PlaywrightLocatorHandle {
     this.roleCalls.push({ role, options });
     return this.roleLocator;
+  }
+
+  getByText(
+    text: string,
+    options?: { readonly exact: true },
+  ): PlaywrightLocatorHandle {
+    this.textCalls.push({ text, options });
+    return this.textLocator;
   }
 
   locator(selector: string): PlaywrightLocatorHandle {
@@ -532,7 +544,8 @@ const ASSERTION_SCENARIOS: readonly AssertionScenario[] = [
       launcher.page.textLocator.visible = expectedPassed;
     },
     assertPlaywright(launcher): void {
-      expect(launcher.page.locatorCalls).toEqual(['text=Welcome']);
+      expect(launcher.page.textCalls).toEqual([{ text: 'Welcome', options: undefined }]);
+      expect(launcher.page.locatorCalls).toEqual([]);
       expect(launcher.page.textLocator.isVisibleCalls).toHaveLength(1);
       expect(launcher.page.roleCalls).toEqual([]);
     },
@@ -608,6 +621,18 @@ describe('ChromiumBrowserSession.evaluateAssert()', () => {
       });
     }
   }
+
+  it('passes selector-syntax characters to a text locator as literal data', async () => {
+    const text = 'Welcome >> "again"';
+
+    await withLaunchedSession({}, async (session, launcher) => {
+      await expect(session.evaluateAssert({ check: 'text-visible', text })).resolves.toEqual({ passed: true });
+
+      expect(launcher.page.textCalls).toEqual([{ text, options: undefined }]);
+      expect(launcher.page.locatorCalls).toEqual([]);
+      expect(launcher.page.textLocator.isVisibleCalls).toHaveLength(1);
+    });
+  });
 
   it('surfaces malformed url-matches patterns as their original RegExp error', async () => {
     await withLaunchedSession({}, async (session, launcher) => {

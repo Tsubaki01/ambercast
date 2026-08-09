@@ -67,6 +67,7 @@ export interface PlaywrightPageHandle {
     role: string,
     options: { readonly name: string; readonly exact: true },
   ): PlaywrightLocatorHandle;
+  getByText(text: string): PlaywrightLocatorHandle;
   locator(selector: string): PlaywrightLocatorHandle;
   url(): string;
   screenshot(): Promise<Uint8Array>;
@@ -153,6 +154,7 @@ function adaptPage(page: PlaywrightPage): PlaywrightPageHandle {
   return {
     goto: (url) => page.goto(url),
     getByRole: (role, options) => adaptLocator(page.getByRole(role as PlaywrightRole, options)),
+    getByText: (text) => adaptLocator(page.getByText(text)),
     locator: (selector) => adaptLocator(page.locator(selector)),
     url: () => page.url(),
     screenshot: () => page.screenshot(),
@@ -225,13 +227,11 @@ class ChromiumBrowserSession implements BrowserSession {
    * Executes a materialized replay action through its Playwright equivalent.
    *
    * @remarks
-   * Click, press, fill, and fill-secret first select
-   * `getByRole(role, { name, exact: true }).first()` and then call the
-   * matching locator action. Navigate calls `goto(url)`: Playwright resolves a
-   * relative URL against the context base URL and passes an absolute URL
-   * through unchanged, so this adapter never joins URLs itself. A fill-secret
-   * uses its already materialized value only for `fill`; no method logs or
-   * returns that value.
+   * Element-targeted actions use the first exact role-and-name match because a
+   * replay action operates on one recorded identity even if the page contains
+   * duplicates. Navigation leaves relative-URL resolution to the context base
+   * URL, avoiding a second URL-resolution rule in this adapter. A materialized
+   * secret is used only to fulfill its action and is never logged or returned.
    */
   async perform(action: PerformableAction): Promise<void> {
     switch (action.type) {
@@ -255,25 +255,20 @@ class ChromiumBrowserSession implements BrowserSession {
    * Evaluates an assertion using page-visible browser evidence.
    *
    * @remarks
-   * `text-visible` has no target, so it looks up
-   * `page.locator(`text=${text}`)` through the generic locator seam and passes
-   * only when `isVisible()` resolves true. `element-visible` selects
-   * `getByRole(role, { name, exact: true }).first()` and passes only when that
-   * locator is visible. `text-equals` selects the same first role match and
-   * passes only when its `innerText()` exactly equals the expected text.
-   * `element-count` keeps the complete `getByRole(role, { name, exact: true })`
-   * match set rather than narrowing it with `first()`, and passes only when
-   * `count()` equals the expected count.
+   * Targeted assertions preserve the exact role-and-name lookup policy used
+   * for actions; checks that require one element narrow duplicate matches to
+   * the first, while a count deliberately retains the full match set. Visible
+   * text uses Playwright's structured text locator so supplied text is data
+   * rather than selector syntax.
    *
-   * `url-matches` passes when `new RegExp(pattern).test(currentUrl)` is true.
-   * A malformed pattern throws at `RegExp` construction; the run usecase folds
-   * that rejection into its unified case-abort stopgap instead of this adapter
-   * assigning it a classification.
+   * A malformed URL pattern remains a `RegExp` construction error. The run
+   * usecase folds that rejection into its unified case-abort stopgap instead of
+   * assigning the adapter a classification it cannot justify.
    */
   async evaluateAssert(check: AssertCheck): Promise<AssertOutcome> {
     switch (check.check) {
       case 'text-visible': {
-        const passed = await this.page.locator(`text=${check.text}`).isVisible();
+        const passed = await this.page.getByText(check.text).isVisible();
         return passed
           ? { passed: true }
           : { passed: false, message: `Text is not visible: ${check.text}` };
@@ -313,8 +308,9 @@ class ChromiumBrowserSession implements BrowserSession {
    * Captures an element value using the requested port mode.
    *
    * @remarks
-   * Both supported capture modes have explicit mappings: `'text'` uses the
-   * visible-text `innerText()` convention and `'value'` uses `inputValue()`.
+   * The port distinguishes rendered text from a control value so callers can
+   * preserve the meaning of later interpolation instead of treating every
+   * element as one generic string source.
    */
   async captureValue(target: ElementRef, mode: CaptureMode): Promise<string> {
     const locator = this.firstRoleLocator(target);
