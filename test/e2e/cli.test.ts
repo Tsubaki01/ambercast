@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
+import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
+import type { JsonValueT } from '#core/ir/schema.js';
 import { ReportEnvelope } from '#report/schema.js';
 
 const execFileAsync = promisify(execFile);
@@ -40,6 +42,15 @@ async function fixtureProject(): Promise<string> {
   return directory;
 }
 
+async function writeStalePlan(project: string): Promise<void> {
+  await writeFile(join(project, 'tests', 'test.ambercast.plan.json'), toCanonicalArtifactText({
+    schemaVersion: 1,
+    source: { inputsDigest: 'f'.repeat(64) },
+    targets: { web: { baseUrl: 'https://example.test', browser: 'chromium' } },
+    steps: [],
+  } as unknown as JsonValueT));
+}
+
 // The published-path check exercises only list mode, so no test can reach a
 // locally installed provider CLI or depend on provider credentials.
 
@@ -58,7 +69,7 @@ describe('bin/ambercast.js (e2e)', () => {
 
   it.each([
     ['--version', /^ambercast v\d+\.\d+\.\d+/, 0],
-    ['--help', /generate/, 0],
+    ['--help', /generate[\s\S]*run/, 0],
   ] as const)('short-circuits %s through the published bin path', async (argument, output, exitCode) => {
     const result = await runCli([argument]);
 
@@ -84,6 +95,63 @@ describe('bin/ambercast.js (e2e)', () => {
     const envelope = JSON.parse(result.stdout);
     expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
     expect(envelope.results).toEqual([expect.objectContaining({ file: expect.stringContaining('test.test.md'), status: 'listed' })]);
+  });
+
+  it('reports a missing run plan through the built CLI with exit 4', async () => {
+    const project = await fixtureProject();
+    const result = await runCli(['run', '--json'], project);
+
+    expect(result.exitCode).toBe(4);
+    expect(result.stderr).toBe('');
+    const envelope = JSON.parse(result.stdout);
+    expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
+    expect(envelope).toMatchObject({
+      command: 'run',
+      errors: [expect.objectContaining({ scope: 'case', code: 'MISSING_PLAN' })],
+    });
+  });
+
+  it('reports a stale run plan through the built CLI with exit 4', async () => {
+    const project = await fixtureProject();
+    await writeStalePlan(project);
+    const result = await runCli(['run', '--json'], project);
+
+    expect(result.exitCode).toBe(4);
+    expect(result.stderr).toBe('');
+    const envelope = JSON.parse(result.stdout);
+    expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
+    expect(envelope).toMatchObject({
+      command: 'run',
+      errors: [expect.objectContaining({ scope: 'case', code: 'STALE_PLAN' })],
+    });
+  });
+
+  it('rejects run stale regeneration with the documented configuration error', async () => {
+    const project = await fixtureProject();
+    const result = await runCli(['run', '--json', '--stale', 'regenerate'], project);
+
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toBe('');
+    const envelope = JSON.parse(result.stdout);
+    expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
+    expect(envelope).toMatchObject({
+      command: 'run',
+      errors: [expect.objectContaining({
+        scope: 'run',
+        code: 'CONFIG_INVALID',
+        message: 'The --stale=regenerate option is not available in this build; only --stale=fail is supported.',
+      })],
+    });
+  });
+
+  it('keeps an invalid run grep regex as a plain-text parse failure', async () => {
+    const project = await fixtureProject();
+    const result = await runCli(['run', '--json', '--grep', '['], project);
+
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/grep.*valid regular expression/i);
+    expect(result.stderr.trim().startsWith('{')).toBe(false);
+    expect(result.exitCode).toBe(2);
   });
 
   it('has a #!/usr/bin/env node shebang as its first line', async () => {

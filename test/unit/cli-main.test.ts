@@ -4,7 +4,9 @@ import { ReportEnvelope } from '#report/schema.js';
 import type { GenerateCommandInput } from '#runtime/generate-command.js';
 
 const runGenerateCommand = vi.hoisted(() => vi.fn());
+const runRunCommand = vi.hoisted(() => vi.fn());
 vi.mock('#runtime/generate-command.js', () => ({ runGenerateCommand }));
+vi.mock('#runtime/run-command.js', () => ({ runRunCommand }));
 
 import { main } from '../../src/cli/main.js';
 
@@ -31,6 +33,16 @@ const ENVELOPE = {
   results: [{ id: 'login', file: 'login.test.md', status: 'listed' as const, dryRun: false }],
 };
 
+const RUN_ENVELOPE = {
+  schemaVersion: '1.0' as const,
+  command: 'run' as const,
+  startedAt: '2026-08-09T00:00:00Z',
+  durationMs: 0,
+  summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 },
+  errors: [],
+  results: [],
+};
+
 let cwdSpy: ReturnType<typeof vi.spyOn> | undefined;
 let initialExitCode: typeof process.exitCode;
 
@@ -44,6 +56,7 @@ afterEach(() => {
   cwdSpy?.mockRestore();
   cwdSpy = undefined;
   runGenerateCommand.mockReset();
+  runRunCommand.mockReset();
 });
 
 async function run(argv: readonly string[]) {
@@ -192,5 +205,111 @@ describe('main()', () => {
     expect(result.stdout).toBe('');
     expect(result.stderr).toBe('The generate command crashed unexpectedly.\n');
     expect(result.exitCode).toBe(3);
+  });
+
+  it('passes every documented run argument to runtime and renders JSON output', async () => {
+    runRunCommand.mockResolvedValue({ exitCode: 0, envelope: RUN_ENVELOPE });
+
+    const result = await run([
+      'run',
+      'login.test.md',
+      'checkout.test.md',
+      '--grep',
+      'login|checkout',
+      '--target',
+      'web',
+      '--headed',
+      '--json',
+      '--cache-only',
+      '--stale',
+      'regenerate',
+      '--ai',
+      'claude',
+    ]);
+
+    expect(runRunCommand).toHaveBeenCalledWith(expect.objectContaining({
+      files: ['login.test.md', 'checkout.test.md'],
+      grep: expect.any(RegExp),
+      target: 'web',
+      headed: true,
+      cacheOnly: true,
+      stale: 'regenerate',
+      aiProviderOverride: 'claude',
+    }));
+    const commandInput = runRunCommand.mock.calls[0]?.[0] as { grep?: RegExp };
+    expect(commandInput.grep).toEqual(/login|checkout/);
+    expect(JSON.parse(result.stdout)).toEqual(RUN_ENVELOPE);
+    expect(result.stderr).toBe('');
+    expect(result.exitCode).toBe(0);
+  });
+
+  it('accepts Codex as a run provider override', async () => {
+    runRunCommand.mockResolvedValue({ exitCode: 0, envelope: RUN_ENVELOPE });
+
+    await run(['run', '--ai', 'codex']);
+
+    expect(runRunCommand).toHaveBeenCalledWith(expect.objectContaining({ aiProviderOverride: 'codex' }));
+  });
+
+  it('accepts fail as an explicit run stale policy', async () => {
+    runRunCommand.mockResolvedValue({ exitCode: 0, envelope: RUN_ENVELOPE });
+
+    await run(['run', '--stale', 'fail']);
+
+    expect(runRunCommand).toHaveBeenCalledWith(expect.objectContaining({ stale: 'fail' }));
+  });
+
+  it('treats values after -- as literal paths, including option-shaped names', async () => {
+    runRunCommand.mockResolvedValue({ exitCode: 0, envelope: RUN_ENVELOPE });
+
+    await run(['run', '--', '--not-an-option.test.md']);
+
+    expect(runRunCommand).toHaveBeenCalledWith(expect.objectContaining({ files: ['--not-an-option.test.md'] }));
+  });
+
+  it.each([
+    ['unknown run flag even with JSON requested', ['run', '--json', '--unknown']],
+    ['missing grep value', ['run', '--grep']],
+    ['missing target value', ['run', '--target']],
+    ['missing stale value', ['run', '--stale']],
+    ['missing AI provider value', ['run', '--ai']],
+    ['unsupported provider', ['run', '--ai', 'other']],
+  ] as const)('writes plain usage to stderr and exits 2 for %s', async (_description, argv) => {
+    const result = await run(argv);
+
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/usage|unknown|missing|must be/i);
+    expect(result.stderr.trim().startsWith('{')).toBe(false);
+    expect(result.exitCode).toBe(2);
+    expect(runRunCommand).not.toHaveBeenCalled();
+  });
+
+  it('rejects a malformed run grep pattern before command composition', async () => {
+    const result = await run(['run', '--json', '--grep', '[']);
+
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/grep.*valid regular expression/i);
+    expect(result.stderr.trim().startsWith('{')).toBe(false);
+    expect(result.exitCode).toBe(2);
+    expect(runRunCommand).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unsupported run stale policy as a parse-usage error', async () => {
+    const result = await run(['run', '--stale', 'other']);
+
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/stale.*fail.*regenerate/i);
+    expect(result.stderr.trim().startsWith('{')).toBe(false);
+    expect(result.exitCode).toBe(2);
+    expect(runRunCommand).not.toHaveBeenCalled();
+  });
+
+  it('short-circuits command-local run help before calling runtime', async () => {
+    const result = await run(['run', '--help']);
+
+    expect(result.stdout).toMatch(/run \[files\.\.\.\].*replay deterministic plans/i);
+    expect(result.stderr).toBe('');
+    expect(result.exitCode).toBe(0);
+    expect(runRunCommand).not.toHaveBeenCalled();
   });
 });
