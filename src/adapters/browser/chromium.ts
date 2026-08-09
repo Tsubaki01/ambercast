@@ -280,10 +280,11 @@ class ChromiumBrowserSession implements BrowserSession {
           : { passed: false, message: `Element is not visible: ${check.target.name}` };
       }
       case 'text-equals': {
-        const passed = await this.firstRoleLocator(check.target).innerText() === check.text;
+        const actualText = await this.firstRoleLocator(check.target).innerText();
+        const passed = actualText === check.text;
         return passed
           ? { passed: true }
-          : { passed: false, message: `Element text does not equal: ${check.target.name}` };
+          : { passed: false, message: `Element text does not equal: ${check.target.name}; expected "${check.text}", received "${actualText}".` };
       }
       case 'url-matches': {
         const expression = new RegExp(check.pattern);
@@ -293,13 +294,14 @@ class ChromiumBrowserSession implements BrowserSession {
           : { passed: false, message: `Current URL does not match: ${check.pattern}` };
       }
       case 'element-count': {
-        const passed = await this.page.getByRole(
+        const actualCount = await this.page.getByRole(
           check.target.role,
           { name: check.target.name, exact: true },
-        ).count() === check.count;
+        ).count();
+        const passed = actualCount === check.count;
         return passed
           ? { passed: true }
-          : { passed: false, message: `Element count does not equal: ${check.count}` };
+          : { passed: false, message: `Element count does not equal: ${check.target.name}; expected ${check.count}, received ${actualCount}.` };
       }
     }
   }

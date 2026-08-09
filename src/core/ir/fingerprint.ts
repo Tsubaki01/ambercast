@@ -75,12 +75,15 @@ function findAccessibilityMatch(
  * trailing content on that matched line is outside both identity captures and
  * is always discarded uniformly: bracketed attributes with or without a
  * value, a trailing structural colon, and every other suffix do not affect a
- * node's identity. Within a quoted name, `\"` represents a literal `"`.
+ * node's identity. Within a quoted name, an escaped quote represents a
+ * literal quote and an escaped backslash represents a literal backslash.
  *
  * A line that does not match the leading `- ` outline marker is skipped,
- * contributes no node, and does not stop parsing later lines. For example, a
- * `/key: value` metadata line follows this general fallback rule rather than
- * receiving attribute-specific handling; malformed input never throws.
+ * contributes no node, and does not stop parsing later lines. A matched
+ * `/key: value` metadata line is also skipped: its slash-prefixed role token
+ * identifies link metadata rather than an accessibility node, so it must not
+ * alter the indentation stack or any node's neighborhood. Malformed input
+ * never throws.
  *
  * Indentation uses two-space units, so a line's depth is its indentation
  * length divided by two. A stack builds parent/child edges by popping entries
@@ -114,9 +117,13 @@ export function parseAriaSnapshot(yaml: string): JsonValueT {
       continue;
     }
 
+    if (role.startsWith('/')) {
+      continue;
+    }
+
     const node: AccessibilityNode = {
       role,
-      name: capturedName?.replace(/\\"/g, '"') ?? '',
+      name: capturedName?.replace(/\\(["\\])/g, '$1') ?? '',
       children: [],
     };
     const depth = indentation.length / 2;

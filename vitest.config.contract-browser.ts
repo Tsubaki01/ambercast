@@ -14,5 +14,7 @@ export default defineConfig({
     include: ['test/contract-browser/**/*.contract.test.ts'],
     // Keep command and contract timeouts aligned with the default Vitest lane.
     testTimeout: 30_000,
+    // Cold availability-probe launches must not hit the default hook timeout and fail, rather than skip, this lane.
+    hookTimeout: 30_000,
   },
 });

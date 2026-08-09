@@ -95,7 +95,7 @@ describe('fake vertical slice', () => {
 
       const fingerprint: Fingerprint = {
         algorithm: 'a11y-neighborhood-v1',
-        hash: String(index + 1).repeat(64),
+        hash: String(index + 1).padStart(64, '0'),
       };
       return { stepId: step.id, target: step.target, fingerprint };
     });

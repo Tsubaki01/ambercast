@@ -259,6 +259,19 @@ describe('main()', () => {
     expect(runRunCommand).toHaveBeenCalledWith(expect.objectContaining({ stale: 'fail' }));
   });
 
+  it('disables ANSI styling for human run output with --no-color', async () => {
+    runRunCommand.mockResolvedValue({
+      exitCode: 1,
+      envelope: { ...RUN_ENVELOPE, results: [{ file: 'login.test.md', status: 'failed' }] },
+    });
+
+    const result = await run(['run', '--no-color']);
+
+    expect(runRunCommand).toHaveBeenCalledOnce();
+    expect(result.stdout).toContain('failed login.test.md');
+    expect(result.stdout).not.toMatch(/\u001B\[/);
+  });
+
   it('treats values after -- as literal paths, including option-shaped names', async () => {
     runRunCommand.mockResolvedValue({ exitCode: 0, envelope: RUN_ENVELOPE });
 
@@ -308,6 +321,11 @@ describe('main()', () => {
     const result = await run(['run', '--help']);
 
     expect(result.stdout).toMatch(/run \[files\.\.\.\].*replay deterministic plans/i);
+    const runOptions = result.stdout.slice(result.stdout.indexOf('Run options:'));
+    expect(runOptions).toContain('--stale <fail>');
+    expect(runOptions).toContain('--no-color');
+    expect(runOptions).not.toContain('--stale <fail|regenerate>');
+    expect(runOptions).not.toContain('--ai <claude|codex>');
     expect(result.stderr).toBe('');
     expect(result.exitCode).toBe(0);
     expect(runRunCommand).not.toHaveBeenCalled();

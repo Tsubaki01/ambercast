@@ -108,7 +108,7 @@ export function registerBrowserSessionContract(harness: BrowserSessionContractHa
       await withSession(harness, setup, async (session) => {
         await expect(session.resolveGrounded(
           REF,
-          fingerprintWithFlippedLeadingHexCharacter(setup.currentFingerprint),
+          fingerprintWithFlippedLeadingHexCharacter(await actualFingerprintFor(harness, setup)),
         )).resolves.toEqual({
           kind: 'miss',
           reason: 'element-not-found',

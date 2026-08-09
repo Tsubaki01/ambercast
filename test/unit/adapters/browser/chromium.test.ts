@@ -8,7 +8,7 @@ import type {
   Fingerprint,
   JsonValueT,
   TargetDefinition,
-} from '../../../../src/core/ir/schema.js';
+} from '#core/ir/schema.js';
 import type { AssertCheck, BrowserSession } from '../../../../src/ports/browser.js';
 import {
   createChromiumBrowserDriver,
@@ -532,6 +532,7 @@ describe('ChromiumBrowserSession.perform()', () => {
 interface AssertionScenario {
   readonly description: string;
   readonly check: AssertCheck;
+  readonly failureMessage?: string;
   configure(launcher: FakePlaywrightLauncher, expectedPassed: boolean): void;
   assertPlaywright(launcher: FakePlaywrightLauncher): void;
 }
@@ -564,6 +565,7 @@ const ASSERTION_SCENARIOS: readonly AssertionScenario[] = [
   {
     description: 'text-equals',
     check: { check: 'text-equals', target: SUBMIT_BUTTON, text: 'Send form' },
+    failureMessage: 'Element text does not equal: Submit; expected "Send form", received "Send later".',
     configure(launcher, expectedPassed): void {
       launcher.page.roleLocator.text = expectedPassed ? 'Send form' : 'Send later';
     },
@@ -575,6 +577,7 @@ const ASSERTION_SCENARIOS: readonly AssertionScenario[] = [
   {
     description: 'element-count',
     check: { check: 'element-count', target: SUBMIT_BUTTON, count: 2 },
+    failureMessage: 'Element count does not equal: Submit; expected 2, received 1.',
     configure(launcher, expectedPassed): void {
       launcher.page.roleLocator.resultCount = expectedPassed ? 2 : 1;
     },
@@ -615,6 +618,9 @@ describe('ChromiumBrowserSession.evaluateAssert()', () => {
           expect(outcome.passed).toBe(expectedPassed);
           if (!outcome.passed) {
             expect(outcome.message).toBeTypeOf('string');
+            if (scenario.failureMessage !== undefined) {
+              expect(outcome.message).toBe(scenario.failureMessage);
+            }
           }
           scenario.assertPlaywright(launcher);
         });

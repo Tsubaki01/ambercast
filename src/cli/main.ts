@@ -6,7 +6,7 @@
  * positionals as literal prompt paths, delegating an empty list to configured
  * discovery. Generate parses generation policy and rendering flags; run parses
  * replay policy including path grep, target, headed execution, cache policy,
- * stale handling, provider override, and JSON rendering. The parser accepts
+ * stale handling, provider override, color control, and JSON rendering. The parser accepts
  * only the supported provider names, keeping provider selection a runtime
  * concern rather than a usecase option. A bare `--` ends option parsing so a
  * prompt whose literal path begins with `--` remains addressable.
@@ -23,7 +23,7 @@
  * input to the matching runtime command. Runtime returns an envelope and
  * selected exit code; `--json` writes exactly `JSON.stringify(envelope)`,
  * while human output renders that same envelope with ANSI styling disabled by
- * `--no-color` where that option applies. After output has been written, this
+ * `--no-color`. After output has been written, this
  * module sets the selected process exit code and lets Node exit naturally once
  * pending stream writes have drained.
  *
@@ -71,7 +71,7 @@ interface ParsedRunCommand {
   readonly color: boolean;
 }
 
-const USAGE = `Usage: ambercast <command> [options]\n\nCommands:\n  generate [files...]  Generate deterministic plans\n  run [files...]       Replay deterministic plans\n\nGenerate options:\n  --strict  --force  --dry-run  --target <name>  --ai <claude|codex>\n  --allow-empty  --list  --json  --config <path>  --no-color\n\nRun options:\n  --grep <pattern>  --target <name>  --headed  --json  --cache-only\n  --stale <fail|regenerate>  --ai <claude|codex>\n`;
+const USAGE = `Usage: ambercast <command> [options]\n\nCommands:\n  generate [files...]  Generate deterministic plans\n  run [files...]       Replay deterministic plans\n\nGenerate options:\n  --strict  --force  --dry-run  --target <name>  --ai <claude|codex>\n  --allow-empty  --list  --json  --config <path>  --no-color\n\nRun options:\n  --grep <pattern>  --target <name>  --headed  --json  --cache-only  --no-color\n  --stale <fail>\n`;
 
 function writeUsage(stream: NodeJS.WritableStream): void {
   stream.write(USAGE);
@@ -193,12 +193,13 @@ function parseGenerate(argv: readonly string[], signal: AbortSignal): ParsedGene
  *
  * Positional files identify literal prompts; with none, runtime uses configured
  * discovery. `--grep` filters those paths, `--target` selects a configured
- * target, `--headed` requests visible browser execution, and `--json` selects
- * the report rendering. `--cache-only` is accepted for forward compatibility but
- * has no effect because replay never falls back to AI resolution. `--stale` accepts
- * `fail` and `regenerate` as enum values, while runtime rejects `regenerate` as
- * an unavailable option before touching files. `--ai` retains the shared CLI
- * provider-override syntax without making replay resolve a provider.
+ * target, `--headed` requests visible browser execution, `--json` selects the
+ * report rendering, and `--no-color` disables its ANSI styling. `--cache-only`
+ * is accepted for forward compatibility but has no effect because replay never
+ * falls back to AI resolution. `--stale` accepts `fail` and `regenerate` as enum
+ * values, while runtime rejects `regenerate` as an unavailable option before
+ * touching files. `--ai` retains the shared CLI provider-override syntax without
+ * making replay resolve a provider.
  *
  * `--grep` constructs its regular expression here rather than deferring it to
  * runtime. A malformed pattern is argument-shape validation, like the
@@ -220,6 +221,7 @@ function parseRun(argv: readonly string[], signal: AbortSignal): ParsedRunComman
   let cacheOnly = false;
   let stale: 'fail' | 'regenerate' = 'fail';
   let aiProviderOverride: 'claude' | 'codex' | undefined;
+  let color = true;
 
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]!;
@@ -238,6 +240,8 @@ function parseRun(argv: readonly string[], signal: AbortSignal): ParsedRunComman
       json = true;
     } else if (argument === '--cache-only') {
       cacheOnly = true;
+    } else if (argument === '--no-color') {
+      color = false;
     } else if (argument === '--grep' || argument === '--target' || argument === '--stale' || argument === '--ai') {
       const value = argv[index + 1];
       if (value === undefined || value.startsWith('--')) {
@@ -282,7 +286,7 @@ function parseRun(argv: readonly string[], signal: AbortSignal): ParsedRunComman
       signal,
     },
     json,
-    color: true,
+    color,
   };
 }
 

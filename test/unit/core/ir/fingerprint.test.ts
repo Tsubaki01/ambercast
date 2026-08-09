@@ -115,6 +115,39 @@ describe('parseAriaSnapshot', () => {
     });
   });
 
+  it.each([
+    ['C:\\Temp\\file', '- button "C:\\\\Temp\\\\file"'],
+    ['C:\\Temp\\file "quoted" here', '- button "C:\\\\Temp\\\\file \\"quoted\\" here"'],
+  ] as const)('unescapes literal backslashes in a quoted name', (name, snapshot) => {
+    expect(parseAriaSnapshot(snapshot)).toEqual({
+      role: 'root',
+      name: '',
+      children: [{ role: 'button', name, children: [] }],
+    });
+  });
+
+  it('skips slash-prefixed metadata without making it a genuine child or sibling', () => {
+    const snapshot = [
+      '- link "Download":',
+      '  - /url: /downloads/ambercast',
+      '  - text: Download the release',
+    ].join('\n');
+    const expectedTree: JsonValueT = {
+      role: 'root',
+      name: '',
+      children: [{
+        role: 'link',
+        name: 'Download',
+        children: [{ role: 'text', name: '', children: [] }],
+      }],
+    };
+    const textRef: ElementRef = { strategy: 'accessibility', role: 'text', name: '' };
+
+    expect(parseAriaSnapshot(snapshot)).toEqual(expectedTree);
+    expect(fingerprint(parseAriaSnapshot(snapshot), textRef).hash)
+      .toBe(fingerprint(expectedTree, textRef).hash);
+  });
+
   it('discards an attribute suffix without preventing later lines from parsing', () => {
     expect(parseAriaSnapshot('- heading "Sign in" [level=1]\n- button "Continue"')).toEqual({
       role: 'root',
