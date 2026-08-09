@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { BrowserLaunchFailedError } from '#core/errors/browser-launch-failed-error.js';
+import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
 import { FsIoError } from '#core/errors/fs-io-error.js';
 import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
 import { MissingPlanError } from '#core/errors/missing-plan-error.js';
@@ -10,15 +11,19 @@ import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
-import type {
-  ElementRef,
-  Fingerprint,
+import {
   GroundingDocument,
-  JsonValueT,
-  PlanDocument,
-  Step,
+  type ElementRef,
+  type Fingerprint,
+  type JsonValueT,
+  type PlanDocument,
+  type Step,
+  type TraceAssert,
+  type TraceEntry,
+  type TraceRecord,
 } from '#core/ir/schema.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
+import type { AiAgenticRequest } from '#ports/ai.js';
 import type { BrowserDriver, BrowserEngine, BrowserSession, PerformableAction } from '#ports/browser.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { Clock } from '#ports/system.js';
@@ -33,6 +38,7 @@ import {
   type FakeBrowserSessionEntry,
 } from '../../doubles/fake-browser-session.js';
 import { createFakeSecretsProvider } from '../../doubles/fake-secrets-provider.js';
+import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
 
 const TEST_DIR = '/workspace/tests';
 const RUNS_DIR = '/workspace/tests/.runs';
@@ -53,6 +59,7 @@ interface RecordingStorage {
   readonly storage: StorageAdapter;
   readonly reads: string[];
   readonly exists: string[];
+  readonly writes: Array<{ readonly path: string; readonly text: string }>;
 }
 
 interface Scenario {
@@ -61,16 +68,19 @@ interface Scenario {
   readonly events: ReturnType<typeof createRecordingEventSink>;
   readonly recordingStorage: RecordingStorage;
   readonly sessionFactory: ReturnType<typeof vi.fn<() => BrowserSession>>;
+  readonly resolveAiExecutor: ReturnType<typeof vi.fn<RunDeps['resolveAiExecutor']>>;
 }
 
 function createRecordingStorage(): RecordingStorage {
   const backing = createInMemoryStorage();
   const reads: string[] = [];
   const exists: string[] = [];
+  const writes: Array<{ readonly path: string; readonly text: string }> = [];
 
   return {
     reads,
     exists,
+    writes,
     storage: {
       ...backing,
       async readText(path) {
@@ -80,6 +90,10 @@ function createRecordingStorage(): RecordingStorage {
       async exists(path) {
         exists.push(path);
         return backing.exists(path);
+      },
+      async writeText(path, text) {
+        writes.push({ path, text });
+        return backing.writeText(path, text);
       },
     },
   };
@@ -91,12 +105,16 @@ function createScenario(overrides: Partial<RunDeps> = {}): Scenario {
   const sessionFactory = vi.fn<() => BrowserSession>(() => createFakeBrowserSession(new Map()));
   const driver = createFakeBrowserDriver(sessionFactory);
   const browserDriver = vi.fn<(engine: BrowserEngine) => BrowserDriver>(() => driver);
+  const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => {
+    throw new Error('The scenario did not permit an AI fallback.');
+  });
   const deps: RunDeps = {
     storage: recordingStorage.storage,
     layout: createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR }),
     clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 0),
     browserDriver,
     secrets: createFakeSecretsProvider(new Map()),
+    resolveAiExecutor,
     events: events.sink,
     discoverTestFiles: vi.fn(async () => ['login.test.md']),
     config: {
@@ -109,7 +127,7 @@ function createScenario(overrides: Partial<RunDeps> = {}): Scenario {
     ...overrides,
   };
 
-  return { deps, browserDriver, events, recordingStorage, sessionFactory };
+  return { deps, browserDriver, events, recordingStorage, sessionFactory, resolveAiExecutor };
 }
 
 function elementGrounding(stepIds: readonly string[]): GroundingDocument['entries'] {
@@ -170,6 +188,39 @@ async function seedFreshArtifacts(
 
   await storage.writeText(layout.groundingPathFor(testPath), toCanonicalArtifactText(grounding as unknown as JsonValueT));
   return plan;
+}
+
+function trace(events: readonly TraceEntry[], verification: readonly TraceAssert[]): TraceRecord {
+  return { events: [...events], verification: [...verification] };
+}
+
+function aiGrounding(traceRecord: TraceRecord): GroundingDocument['entries'] {
+  return { 'recorded-ai': { kind: 'ai', trace: traceRecord } };
+}
+
+function passingText(text: string): TraceAssert {
+  return { type: 'assert', check: 'text-visible', text };
+}
+
+function aiCalls(events: ReturnType<typeof createRecordingEventSink>): readonly { readonly type: 'ai-call'; readonly stepId: string }[] {
+  return events.emitted().filter((event): event is { readonly type: 'ai-call'; readonly stepId: string } => event.type === 'ai-call');
+}
+
+async function readGrounding(storage: StorageAdapter, testPath: string): Promise<GroundingDocument> {
+  const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
+  return GroundingDocument.parse(JSON.parse(await storage.readText(layout.groundingPathFor(testPath))));
+}
+
+function aiStep(
+  id = 'recorded-ai',
+  secrets?: Extract<Step, { kind: 'ai' }>['secrets'],
+): Extract<Step, { kind: 'ai' }> {
+  return {
+    id,
+    kind: 'ai',
+    instruction: 'Complete the sign-in flow and verify the dashboard.',
+    ...(secrets === undefined ? {} : { secrets: [...secrets] }),
+  };
 }
 
 function expectStopgapOutcome(
@@ -519,7 +570,7 @@ describe('run', () => {
     expect(sessionFactory).not.toHaveBeenCalled();
   });
 
-  it('uses the unclassified case-abort stopgap for an AI step and closes the session', async () => {
+  it('uses the unclassified case-abort stopgap for a cold AI step in cache-only mode and closes the session', async () => {
     const closed = vi.fn();
     const session = createFakeBrowserSession(new Map(), { onClose: closed });
     const { deps, recordingStorage } = createScenario({
@@ -533,7 +584,7 @@ describe('run', () => {
     ];
     await seedFreshArtifacts(recordingStorage.storage, testPath, steps);
 
-    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const outcome = await run(deps, { ...DEFAULT_OPTIONS, cacheOnly: true });
 
     expectStopgapOutcome(outcome, 'recorded-ai', 'after-ai', 'before-ai');
     expect(closed).toHaveBeenCalledTimes(1);
@@ -543,7 +594,7 @@ describe('run', () => {
     ['an absent grounding entry', {} as GroundingDocument['entries'], new Map<string, FakeBrowserSessionEntry>(), false],
     ['an element-not-found grounding miss', elementGrounding(['click-submit']), new Map<string, FakeBrowserSessionEntry>(), true],
     ['a fingerprint-mismatch grounding miss', elementGrounding(['click-submit']), liveEntries([SUBMIT], DIFFERENT_FINGERPRINT), true],
-  ] as const)('uses the unclassified case-abort stopgap for %s and closes the session', async (_description, entries, live, resolvesGrounding) => {
+  ] as const)('uses the unclassified case-abort stopgap for %s in cache-only mode and closes the session', async (_description, entries, live, resolvesGrounding) => {
     const closed = vi.fn();
     const session = createFakeBrowserSession(live, { onClose: closed });
     const resolveGrounded = vi.spyOn(session, 'resolveGrounded');
@@ -558,7 +609,7 @@ describe('run', () => {
     ];
     await seedFreshArtifacts(recordingStorage.storage, testPath, steps, entries);
 
-    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const outcome = await run(deps, { ...DEFAULT_OPTIONS, cacheOnly: true });
 
     expectStopgapOutcome(outcome, 'click-submit', 'after-grounding', 'before-grounding');
     if (resolvesGrounding) {
@@ -588,7 +639,7 @@ describe('run', () => {
         } as unknown as JsonValueT),
       );
     }],
-  ] as const)('degrades %s to the grounding-miss case-abort stopgap', async (_description, arrangeGrounding) => {
+  ] as const)('degrades %s to the cache-only grounding-miss case-abort stopgap', async (_description, arrangeGrounding) => {
     const closed = vi.fn();
     const session = createFakeBrowserSession(liveEntries([SUBMIT]), { onClose: closed });
     const resolveGrounded = vi.spyOn(session, 'resolveGrounded');
@@ -603,7 +654,7 @@ describe('run', () => {
     ];
     await arrangeGrounding(recordingStorage.storage, testPath, steps);
 
-    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const outcome = await run(deps, { ...DEFAULT_OPTIONS, cacheOnly: true });
 
     expectStopgapOutcome(outcome, 'click-submit', 'after-grounding', 'before-grounding');
     expect(resolveGrounded).not.toHaveBeenCalled();
@@ -737,5 +788,1118 @@ describe('run', () => {
 
     expect(outcome.noTestsFound).toBe(true);
     expect(outcome.results).toEqual([]);
+  });
+});
+
+describe('run agentic fallback pipeline', () => {
+  it('records one cold-start AI call, persists its unresolved trace, then replays it without an AI call or write', async () => {
+    const firstSession = createFakeBrowserSession(new Map());
+    const secondSession = createFakeBrowserSession(new Map());
+    const sessions = [firstSession, secondSession];
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'navigate', url: '/dashboard' });
+        await request.controller.evaluateAssert(passingText('Dashboard'));
+        return { outcome: 'success' };
+      },
+    });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => sessions.shift()!)),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()]);
+    recordingStorage.writes.length = 0;
+
+    const coldStart = await run(deps, DEFAULT_OPTIONS);
+
+    const expectedTrace = trace(
+      [{ type: 'navigate', url: '/dashboard' }],
+      [passingText('Dashboard')],
+    );
+    expect(coldStart.results[0]?.result).toMatchObject({ status: 'passed' });
+    expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'recorded-ai' }]);
+    expect(resolveAiExecutor).toHaveBeenCalledTimes(1);
+    expect(executor.agenticRequests).toHaveLength(1);
+    expect(executor.agenticRequests[0]).toMatchObject({
+      allowedSecretRefs: [],
+      allowedRunRefs: [],
+    });
+    expect(executor.agenticRequests[0]).not.toHaveProperty('priorTrace');
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual({
+      'recorded-ai': { kind: 'ai', trace: expectedTrace },
+    });
+    expect(events.emitted().filter((event) => event.type === 'step-result')).toEqual([
+      { type: 'step-result', stepId: 'recorded-ai', via: 'ai-resolve' },
+    ]);
+
+    const callsBeforeReplay = aiCalls(events).length;
+    const writesBeforeReplay = recordingStorage.writes.length;
+    const groundingBeforeReplay = await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`);
+    const replay = await run(deps, DEFAULT_OPTIONS);
+
+    expect(replay.results[0]?.result).toMatchObject({ status: 'passed' });
+    expect(aiCalls(events).slice(callsBeforeReplay)).toEqual([]);
+    expect(executor.agenticRequests).toHaveLength(1);
+    expect(resolveAiExecutor).toHaveBeenCalledTimes(1);
+    expect(recordingStorage.writes.slice(writesBeforeReplay)).toEqual([]);
+    expect(await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`)).toBe(groundingBeforeReplay);
+    expect(secondSession.operations()).toEqual([
+      { type: 'perform', action: { type: 'navigate', url: '/dashboard' } },
+      { type: 'evaluate-assert', check: { check: 'text-visible', text: 'Dashboard' } },
+    ]);
+    expect(events.emitted().filter((event) => event.type === 'step-result').at(-1)).toEqual({
+      type: 'step-result',
+      stepId: 'recorded-ai',
+      via: 'trace-replay',
+    });
+  });
+
+  it('uses exactly one agentic fallback for a behavioral trace miss and passes the unresolved prior trace', async () => {
+    const priorTrace = trace(
+      [{ type: 'navigate', url: '/cached-route' }],
+      [passingText('Cached dashboard')],
+    );
+    const session = createFakeBrowserSession(new Map(), { assertOutcomes: [
+      { passed: false, message: 'The cached dashboard is absent.' },
+      { passed: true, message: 'The refreshed dashboard is visible.' },
+    ] });
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'press', target: SUBMIT, key: 'Enter' });
+        await request.controller.evaluateAssert(passingText('Refreshed dashboard'));
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()], aiGrounding(priorTrace));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result).toMatchObject({ status: 'passed' });
+    expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'recorded-ai' }]);
+    expect(executor.agenticRequests).toHaveLength(1);
+    expect(executor.agenticRequests[0]?.priorTrace).toEqual(priorTrace);
+    expect(session.operations()).toEqual([
+      { type: 'perform', action: { type: 'navigate', url: '/cached-route' } },
+      { type: 'evaluate-assert', check: { check: 'text-visible', text: 'Cached dashboard' } },
+      { type: 'perform', action: { type: 'press', target: SUBMIT, key: 'Enter' } },
+      { type: 'evaluate-assert', check: { check: 'text-visible', text: 'Refreshed dashboard' } },
+    ]);
+    expect(events.emitted().filter((event) => event.type === 'step-result')).toEqual([
+      { type: 'step-result', stepId: 'recorded-ai', via: 'ai-resolve' },
+    ]);
+  });
+
+  it.each([
+    ['a rejected cached action', (session: ReturnType<typeof createFakeBrowserSession>) => {
+      let calls = 0;
+      vi.spyOn(session, 'perform').mockImplementation(async () => {
+        calls += 1;
+        if (calls === 1) {
+          throw new Error('cached target detached');
+        }
+      });
+    }],
+    ['a false cached assertion', () => undefined],
+    ['a non-integrity cached assertion rejection', (session: ReturnType<typeof createFakeBrowserSession>) => {
+      vi.spyOn(session, 'evaluateAssert').mockRejectedValueOnce(new Error('browser evaluation failed'));
+    }],
+  ] as const)('treats %s as a behavioral path-C miss rather than an integrity failure', async (_description, arrange) => {
+    const priorTrace = trace([{ type: 'navigate', url: '/cached' }], [passingText('Cached')]);
+    const session = createFakeBrowserSession(new Map(), { assertOutcomes: [
+      { passed: false, message: 'Cached assertion failed.' },
+      { passed: true },
+    ] });
+    arrange(session);
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.evaluateAssert(passingText('Recovered'));
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()], aiGrounding(priorTrace));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'recorded-ai' }]);
+    expect(executor.agenticRequests[0]?.priorTrace).toEqual(priorTrace);
+  });
+
+  it('suppresses a behavioral trace fallback in cache-only mode without resolving an AI executor', async () => {
+    const session = createFakeBrowserSession(new Map(), {
+      assertOutcome: { passed: false, message: 'The cached page changed.' },
+    });
+    const { deps, events, recordingStorage, resolveAiExecutor } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep()],
+      aiGrounding(trace([], [passingText('Cached dashboard')])),
+    );
+
+    const outcome = await run(deps, { ...DEFAULT_OPTIONS, cacheOnly: true });
+
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(outcome.results[0]?.result).toMatchObject({
+      status: 'error',
+      steps: [{ id: 'recorded-ai', status: 'error', kind: 'environment' }],
+    });
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(aiCalls(events)).toEqual([]);
+    expect(session.operations()).toEqual([
+      { type: 'evaluate-assert', check: { check: 'text-visible', text: 'Cached dashboard' } },
+    ]);
+  });
+});
+
+describe('run path-B element recovery', () => {
+  it('keeps a fingerprint hit deterministic and never resolves an AI executor', async () => {
+    const session = createFakeBrowserSession(liveEntries([SUBMIT]));
+    const { deps, events, recordingStorage, resolveAiExecutor } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [{ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }],
+      elementGrounding(['click-submit']),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(aiCalls(events)).toEqual([]);
+    expect(events.emitted().filter((event) => event.type === 'step-result')).toEqual([
+      { type: 'step-result', stepId: 'click-submit', via: 'grounding' },
+    ]);
+  });
+
+  it('re-resolves an element miss with exactly one AI call, persists the fresh fingerprint, and marks the result ai-resolve', async () => {
+    const snapshot = { accessibilityTree: { role: 'document' }, screenshot: new Uint8Array([1, 2, 3]) };
+    const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT), { snapshot });
+    const executor = createFakeAiExecutor({
+      execute: () => ({ data: { fingerprint: DIFFERENT_FINGERPRINT }, raw: '{"fingerprint":"fresh"}' }),
+    });
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [{ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }],
+      elementGrounding(['click-submit']),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'click-submit' }]);
+    expect(executor.structuredRequests).toHaveLength(1);
+    expect(executor.structuredRequests[0]).toMatchObject({
+      context: {
+        target: SUBMIT,
+        snapshot: { accessibilityTree: snapshot.accessibilityTree, screenshotBase64: 'AQID' },
+      },
+    });
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual({
+      'click-submit': { kind: 'element', fingerprint: DIFFERENT_FINGERPRINT },
+    });
+    expect(session.operations()).toEqual([
+      { type: 'resolve-grounded', target: SUBMIT, fingerprint: FINGERPRINT },
+      { type: 'snapshot-for-resolution' },
+      { type: 'perform', action: { type: 'click', target: SUBMIT } },
+    ]);
+    expect(events.emitted().filter((event) => event.type === 'step-result')).toEqual([
+      { type: 'step-result', stepId: 'click-submit', via: 'ai-resolve' },
+    ]);
+  });
+
+  it('flushes a refreshed fingerprint even when the original action subsequently fails', async () => {
+    const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT), {
+      onPerform() {
+        throw new Error('The refreshed target detached before click.');
+      },
+    });
+    const executor = createFakeAiExecutor({
+      execute: () => ({ data: { fingerprint: DIFFERENT_FINGERPRINT }, raw: '{"fingerprint":"fresh"}' }),
+    });
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [{ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }],
+      elementGrounding(['click-submit']),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('error');
+    expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'click-submit' }]);
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual({
+      'click-submit': { kind: 'element', fingerprint: DIFFERENT_FINGERPRINT },
+    });
+  });
+
+  it.each([
+    ['a schema-invalid re-resolution response', 'The AI response did not match the fingerprint schema.'],
+    ['an AI refusal to confirm the authored locator', 'The AI cannot confirm the locator on this page.'],
+  ] as const)('fails closed for %s without performing or replacing the previous fingerprint', async (_description, message) => {
+    const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT));
+    const executor = createFakeAiExecutor({
+      execute: () => {
+        throw new AiResponseInvalidError(message, { raw: '{"status":"unconfirmed"}', issues: [] });
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [{ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }],
+      elementGrounding(['click-submit']),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.error).toBeInstanceOf(AiResponseInvalidError);
+    expect(session.operations()).toEqual([
+      { type: 'resolve-grounded', target: SUBMIT, fingerprint: FINGERPRINT },
+      { type: 'snapshot-for-resolution' },
+    ]);
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual(elementGrounding(['click-submit']));
+  });
+
+  it('leaves the prior fingerprint untouched when the path-B snapshot fails before any AI request', async () => {
+    const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT));
+    vi.spyOn(session, 'snapshotForResolution').mockRejectedValueOnce(new Error('The browser could not capture evidence.'));
+    const executor = createFakeAiExecutor();
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [{ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }],
+      elementGrounding(['click-submit']),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('error');
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(executor.structuredRequests).toEqual([]);
+    expect(aiCalls(events)).toEqual([]);
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual(elementGrounding(['click-submit']));
+  });
+
+  it('suppresses an element-miss fallback in cache-only mode with exactly zero AI calls', async () => {
+    const session = createFakeBrowserSession(new Map());
+    const { deps, events, recordingStorage, resolveAiExecutor } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [{ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }],
+    );
+
+    const outcome = await run(deps, { ...DEFAULT_OPTIONS, cacheOnly: true });
+
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(outcome.results[0]?.result.status).toBe('error');
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(aiCalls(events)).toEqual([]);
+    expect(session.operations()).toEqual([]);
+  });
+});
+
+describe('run path-C pre-scan', () => {
+  it.each([
+    [
+      'an ungranted secret reference in events after a valid action',
+      trace(
+        [
+          { type: 'navigate', url: '/valid-first' },
+          { type: 'fill-secret', target: PASSWORD, secretRef: '{{secrets.other.password}}' },
+        ],
+        [passingText('Verified')],
+      ),
+    ],
+    [
+      'an ungranted run reference in events after a valid action',
+      trace(
+        [
+          { type: 'navigate', url: '/valid-first' },
+          { type: 'navigate', url: '/users/{{run.ungranted}}' },
+        ],
+        [passingText('Verified')],
+      ),
+    ],
+    [
+      'a malformed run reference in events after a valid action',
+      trace(
+        [
+          { type: 'navigate', url: '/valid-first' },
+          { type: 'navigate', url: '/users/{{run.unclosed' },
+        ],
+        [passingText('Verified')],
+      ),
+    ],
+    [
+      'an ungranted run reference in verification after a valid assertion',
+      trace(
+        [{ type: 'navigate', url: '/valid-first' }],
+        [passingText('Verified'), passingText('User {{run.ungranted}}')],
+      ),
+    ],
+    [
+      'a malformed run reference in verification after a valid assertion',
+      trace(
+        [{ type: 'navigate', url: '/valid-first' }],
+        [passingText('Verified'), passingText('User {{run.unclosed')],
+      ),
+    ],
+  ] as const)('rejects %s before any browser or executor operation', async (_description, priorTrace) => {
+    const session = createFakeBrowserSession(new Map());
+    const executor = createFakeAiExecutor();
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()], aiGrounding(priorTrace));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+    expect(session.operations()).toEqual([]);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(executor.agenticRequests).toEqual([]);
+    expect(executor.structuredRequests).toEqual([]);
+    expect(aiCalls(events)).toEqual([]);
+  });
+
+  it('rejects an ungranted run reference in a trace before a later capture could grant it', async () => {
+    const session = createFakeBrowserSession(new Map());
+    const executor = createFakeAiExecutor();
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    const priorTrace = trace(
+      [{ type: 'navigate', url: '/valid-first' }, { type: 'navigate', url: '/users/{{run.later}}' }],
+      [passingText('Verified')],
+    );
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      aiStep(),
+      { id: 'capture-later', kind: 'capture', target: EMAIL, variable: 'later' },
+    ], aiGrounding(priorTrace));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+    expect(session.operations()).toEqual([]);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(aiCalls(events)).toEqual([]);
+  });
+
+  it('treats an allowed but unresolved secret during replay as an integrity failure without agentic fallback', async () => {
+    const secretRef = '{{secrets.auth.required}}';
+    const session = createFakeBrowserSession(new Map());
+    const executor = createFakeAiExecutor();
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor,
+      secrets: createFakeSecretsProvider(new Map()),
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep('recorded-ai', [secretRef])],
+      aiGrounding(trace([{ type: 'fill-secret', target: PASSWORD, secretRef }], [passingText('Verified')])),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.error).toMatchObject({ kind: 'secret-unresolved' });
+    expect(session.operations()).toEqual([]);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(executor.agenticRequests).toEqual([]);
+    expect(aiCalls(events)).toEqual([]);
+  });
+});
+
+describe('run agentic wrapper state machine', () => {
+  it('writes a trace with a single trailing passed assertion and retains earlier actions as events', async () => {
+    const session = createFakeBrowserSession(new Map());
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'navigate', url: '/settings' });
+        await request.controller.evaluateAssert(passingText('Settings'));
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()]);
+
+    await expect(run(deps, DEFAULT_OPTIONS)).resolves.toMatchObject({
+      results: [{ result: { status: 'passed' } }],
+    });
+
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual(aiGrounding(trace(
+      [{ type: 'navigate', url: '/settings' }],
+      [passingText('Settings')],
+    )));
+  });
+
+  it('writes every final passed assertion as verification when the trailing run has length greater than one', async () => {
+    const session = createFakeBrowserSession(new Map());
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'navigate', url: '/dashboard' });
+        await request.controller.evaluateAssert(passingText('Dashboard'));
+        await request.controller.evaluateAssert(passingText('Signed in as Ari'));
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()]);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual(aiGrounding(trace(
+      [{ type: 'navigate', url: '/dashboard' }],
+      [passingText('Dashboard'), passingText('Signed in as Ari')],
+    )));
+  });
+
+  it.each([
+    ['a snapshot', async (request: AiAgenticRequest) => request.controller.snapshotForResolution(), [{ passed: true }, { passed: true }] as const],
+    ['a failed assertion', async (request: AiAgenticRequest) => request.controller.evaluateAssert(passingText('Intermediate miss')), [
+      { passed: true },
+      { passed: false, message: 'Intermediate miss.' },
+      { passed: true },
+    ] as const],
+  ] as const)('resets a passed-assert run after %s and retains only the later terminal assertion as verification', async (_description, interrupt, assertOutcomes) => {
+    const session = createFakeBrowserSession(new Map(), { assertOutcomes });
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'navigate', url: '/dashboard' });
+        await request.controller.evaluateAssert(passingText('Earlier dashboard'));
+        await interrupt(request);
+        await request.controller.evaluateAssert(passingText('Terminal dashboard'));
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()]);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual(aiGrounding(trace(
+      [
+        { type: 'navigate', url: '/dashboard' },
+        passingText('Earlier dashboard'),
+      ],
+      [passingText('Terminal dashboard')],
+    )));
+  });
+
+  it.each([
+    ['a perform after an earlier passed assertion', async (request: AiAgenticRequest) => {
+      await request.controller.perform({ type: 'navigate', url: '/dashboard' });
+      await request.controller.evaluateAssert(passingText('Dashboard'));
+      await request.controller.perform({ type: 'press', target: SUBMIT, key: 'Enter' });
+    }],
+    ['only a bare perform', async (request: AiAgenticRequest) => {
+      await request.controller.perform({ type: 'navigate', url: '/dashboard' });
+    }],
+    ['zero observations', async () => undefined],
+  ] as const)('rejects a nominal agentic success with %s instead of writing grounding', async (_description, script) => {
+    const session = createFakeBrowserSession(new Map());
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await script(request);
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()]);
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(outcome.results[0]?.result).toMatchObject({
+      status: 'error',
+      steps: [{ id: 'recorded-ai', status: 'error', kind: 'environment' }],
+    });
+    expect(recordingStorage.writes).toEqual([]);
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual({});
+  });
+
+  it.each([
+    ['a terminal snapshot', async (request: AiAgenticRequest) => request.controller.snapshotForResolution()],
+    ['a terminal failed assertion', async (request: AiAgenticRequest) => request.controller.evaluateAssert(passingText('Not yet visible'))],
+  ] as const)('allows %s on a cold start without writing an empty grounding entry', async (_description, terminalObservation) => {
+    const session = createFakeBrowserSession(new Map(), {
+      assertOutcome: { passed: false, message: 'Not yet visible.' },
+    });
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await terminalObservation(request);
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()]);
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(recordingStorage.writes).toEqual([]);
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual({});
+  });
+
+  it.each([
+    ['a terminal snapshot', async (request: AiAgenticRequest) => request.controller.snapshotForResolution(), [{ passed: false, message: 'Cached trace missed.' }] as const],
+    ['a terminal failed assertion', async (request: AiAgenticRequest) => request.controller.evaluateAssert(passingText('Fresh miss')), [
+      { passed: false, message: 'Cached trace missed.' },
+      { passed: false, message: 'Fresh miss.' },
+    ] as const],
+  ] as const)('deletes a stale replay trace when fallback ends with %s and no new replayable trace', async (_description, terminalObservation, assertOutcomes) => {
+    const staleTrace = trace([], [passingText('Cached trace')]);
+    const session = createFakeBrowserSession(new Map(), { assertOutcomes });
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await terminalObservation(request);
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()], aiGrounding(staleTrace));
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(recordingStorage.writes).toHaveLength(1);
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual({});
+  });
+
+  it('overwrites a behavioral-miss trace with fresh terminal verification rather than merging journals', async () => {
+    const staleTrace = trace([{ type: 'navigate', url: '/stale' }], [passingText('Stale')]);
+    const session = createFakeBrowserSession(new Map(), { assertOutcomes: [
+      { passed: false, message: 'Stale trace missed.' },
+      { passed: true },
+    ] });
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'navigate', url: '/fresh' });
+        await request.controller.evaluateAssert(passingText('Fresh'));
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()], aiGrounding(staleTrace));
+
+    await expect(run(deps, DEFAULT_OPTIONS)).resolves.toMatchObject({ results: [{ result: { status: 'passed' } }] });
+
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual(aiGrounding(trace(
+      [{ type: 'navigate', url: '/fresh' }],
+      [passingText('Fresh')],
+    )));
+  });
+
+  it.each([
+    ['a provider outcome of failure', async (_request: AiAgenticRequest) => ({ outcome: 'failure' as const })],
+    ['a provider rejection', async () => {
+      throw new Error('The provider transport disconnected.');
+    }],
+    ['cancellation after partial observations', async (request: AiAgenticRequest, controller: AbortController) => {
+      controller.abort(new Error('Stop the agentic call.'));
+      return { outcome: 'success' as const };
+    }],
+  ] as const)('discards partial journal observations and leaves prior grounding untouched after %s', async (_description, finish) => {
+    const staleTrace = trace([], [passingText('Cached trace')]);
+    const abortController = new AbortController();
+    const session = createFakeBrowserSession(new Map(), { assertOutcomes: [
+      { passed: false, message: 'Cached trace missed.' },
+      { passed: true },
+    ] });
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'navigate', url: '/partial' });
+        await request.controller.evaluateAssert(passingText('Partial success'));
+        return finish(request, abortController);
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+      signal: abortController.signal,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()], aiGrounding(staleTrace));
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('error');
+    expect(recordingStorage.writes).toEqual([]);
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual(aiGrounding(staleTrace));
+  });
+});
+
+describe('run agentic materialization boundary', () => {
+  it('redacts overlapping secret and run values from grounding, results, errors, details, and events after proving each surface is populated', async () => {
+    const secretRef = '{{secrets.auth.token}}';
+    const secretValue = 'SECRET-RUN-SENTINEL';
+    const runValue = 'RUN-SENTINEL';
+    let adapterMessage: string | undefined;
+    const successfulSession = createFakeBrowserSession(liveEntries([EMAIL, PASSWORD]), {
+      captureValues: new Map([[elementRefKey(EMAIL), { text: runValue, value: '' }]]),
+      assertOutcome: { passed: true, message: `Observed ${secretValue} beside ${runValue}.` },
+    });
+    const successfulExecutor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef });
+        const assertion = await request.controller.evaluateAssert({
+          type: 'assert',
+          check: 'text-visible',
+          text: '{{run.token}}',
+        });
+        adapterMessage = assertion.message;
+        return { outcome: 'success' };
+      },
+    });
+    const successful = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => successfulSession)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor: async () => successfulExecutor,
+    });
+    const successfulPath = await writePrompt(successful.recordingStorage.storage);
+    await seedFreshArtifacts(successful.recordingStorage.storage, successfulPath, [
+      { id: 'capture-token', kind: 'capture', target: EMAIL, variable: 'token' },
+      aiStep('recorded-ai', [secretRef]),
+    ], elementGrounding(['capture-token']));
+
+    const successfulOutcome = await run(successful.deps, DEFAULT_OPTIONS);
+    const successfulGroundingText = await successful.recordingStorage.storage.readText(
+      `${TEST_DIR}/login.ambercast.grounding.json`,
+    );
+
+    expect((await readGrounding(successful.recordingStorage.storage, successfulPath)).entries['recorded-ai']).toMatchObject({
+      kind: 'ai',
+      trace: { events: [{ type: 'fill-secret', secretRef }], verification: [passingText('{{run.token}}')] },
+    });
+    expect(adapterMessage).toBe(`Observed ${secretRef} beside {{run.token}}.`);
+    expect(successfulOutcome.results[0]?.result).toMatchObject({
+      status: 'passed',
+      steps: [
+        { id: 'capture-token', status: 'passed' },
+        { id: 'recorded-ai', status: 'passed' },
+      ],
+    });
+    expect(aiCalls(successful.events)).toEqual([{ type: 'ai-call', stepId: 'recorded-ai' }]);
+    expect(successful.events.emitted().filter((event) => event.type === 'step-result' && event.stepId === 'recorded-ai')).toEqual([
+      { type: 'step-result', stepId: 'recorded-ai', via: 'ai-resolve' },
+    ]);
+
+    const failingSession = createFakeBrowserSession(liveEntries([EMAIL, PASSWORD]), {
+      captureValues: new Map([[elementRefKey(EMAIL), { text: runValue, value: '' }]]),
+      onPerform(action) {
+        if (action.type === 'fill') {
+          throw new IntegrityViolationError(`Browser rejected ${secretValue} and ${runValue}.`, {
+            secret: secretValue,
+            run: runValue,
+          });
+        }
+      },
+    });
+    const failingExecutor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef });
+        await request.controller.perform({ type: 'fill', target: EMAIL, value: '{{run.token}}' });
+        return { outcome: 'success' };
+      },
+    });
+    const failing = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => failingSession)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor: async () => failingExecutor,
+    });
+    const failingPath = await writePrompt(failing.recordingStorage.storage);
+    await seedFreshArtifacts(failing.recordingStorage.storage, failingPath, [
+      { id: 'capture-token', kind: 'capture', target: EMAIL, variable: 'token' },
+      aiStep('recorded-ai', [secretRef]),
+    ], elementGrounding(['capture-token']));
+
+    const failingOutcome = await run(failing.deps, DEFAULT_OPTIONS);
+    const failure = failingOutcome.results[0]?.error;
+
+    expect(failure).toBeInstanceOf(IntegrityViolationError);
+    expect(failure?.message).toBe(`Browser rejected ${secretRef} and {{run.token}}.`);
+    expect(failure?.details).toBeUndefined();
+    expect(failingOutcome.results[0]?.result).toMatchObject({
+      status: 'error',
+      steps: [
+        { id: 'capture-token', status: 'passed' },
+        { id: 'recorded-ai', status: 'error', kind: 'environment' },
+      ],
+    });
+    expect(aiCalls(failing.events)).toEqual([{ type: 'ai-call', stepId: 'recorded-ai' }]);
+    for (const surface of [
+      successfulGroundingText,
+      JSON.stringify(successfulOutcome.results[0]?.result),
+      failure?.message ?? '',
+      JSON.stringify(failure?.details ?? {}),
+      JSON.stringify(failingOutcome.results[0]?.result),
+      JSON.stringify(successful.events.emitted()),
+      JSON.stringify(failing.events.emitted()),
+    ]) {
+      expect(surface).not.toContain(secretValue);
+      expect(surface).not.toContain(runValue);
+    }
+  });
+
+  it.each([
+    ['a captured run value', async (request: AiAgenticRequest) => {
+      await request.controller.perform({ type: 'navigate', url: 'RUN-LITERAL-SENTINEL' });
+    }],
+    ['a resolved secret value', async (request: AiAgenticRequest) => {
+      await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: '{{secrets.auth.literal}}' });
+      await request.controller.perform({ type: 'fill', target: EMAIL, value: 'SECRET-LITERAL-SENTINEL' });
+    }],
+  ] as const)('rejects a provider echo of %s as a literal before it reaches the browser journal', async (_description, script) => {
+    const secretRef = '{{secrets.auth.literal}}';
+    const runValue = 'RUN-LITERAL-SENTINEL';
+    const session = createFakeBrowserSession(liveEntries([EMAIL, PASSWORD]), {
+      captureValues: new Map([[elementRefKey(EMAIL), { text: runValue, value: '' }]]),
+    });
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await script(request);
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, 'SECRET-LITERAL-SENTINEL']])),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'capture-token', kind: 'capture', target: EMAIL, variable: 'token' },
+      aiStep('recorded-ai', [secretRef]),
+    ], elementGrounding(['capture-token']));
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+    expect(recordingStorage.writes).toEqual([]);
+    expect(session.operations().filter((operation) => operation.type === 'perform')).toEqual(
+      _description === 'a captured run value'
+        ? []
+        : [{ type: 'perform', action: { type: 'fill-secret', target: PASSWORD, value: 'SECRET-LITERAL-SENTINEL' } }],
+    );
+  });
+
+  it.each([
+    ['an empty secret value', '', undefined, 'empty secret marker'],
+    ['an empty run value', undefined, '', 'empty run marker'],
+  ] as const)('does not template %s in an assertion diagnostic', async (_description, secretValue, runValue, message) => {
+    const secretRef = '{{secrets.auth.empty}}';
+    let adapterMessage: string | undefined;
+    const session = createFakeBrowserSession(liveEntries([EMAIL, PASSWORD]), {
+      captureValues: new Map([[elementRefKey(EMAIL), { text: runValue ?? 'unused', value: '' }]]),
+      assertOutcome: { passed: true, message },
+    });
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        if (secretValue !== undefined) {
+          await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef });
+        }
+        const outcome = await request.controller.evaluateAssert(passingText('Visible'));
+        adapterMessage = outcome.message;
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue ?? 'unused']])),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    const steps: Step[] = secretValue === undefined
+      ? [
+        { id: 'capture-empty', kind: 'capture', target: EMAIL, variable: 'empty' },
+        aiStep('recorded-ai'),
+      ]
+      : [aiStep('recorded-ai', [secretRef])];
+    const entries = secretValue === undefined ? elementGrounding(['capture-empty']) : {};
+    await seedFreshArtifacts(recordingStorage.storage, testPath, steps, entries);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(adapterMessage).toBe(message);
+  });
+
+  it('templates repeated diagnostics longest-first with the secret-before-run tie-break', async () => {
+    const shortRun = 'prefix';
+    const tiedValue = 'same';
+    const longValue = 'prefix-long';
+    const tiedSecretRef = '{{secrets.auth.tied}}';
+    const longSecretRef = '{{secrets.auth.long}}';
+    let adapterMessage: string | undefined;
+    const session = createFakeBrowserSession(liveEntries([EMAIL, SUBMIT, PASSWORD]), {
+      captureValues: new Map([
+        [elementRefKey(EMAIL), { text: shortRun, value: '' }],
+        [elementRefKey(SUBMIT), { text: tiedValue, value: '' }],
+      ]),
+      assertOutcome: { passed: true, message: `${longValue} ${shortRun} ${tiedValue} ${tiedValue}` },
+    });
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: tiedSecretRef });
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: longSecretRef });
+        const outcome = await request.controller.evaluateAssert(passingText('Visible'));
+        adapterMessage = outcome.message;
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([
+        [tiedSecretRef, tiedValue],
+        [longSecretRef, longValue],
+      ])),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'capture-prefix', kind: 'capture', target: EMAIL, variable: 'prefix' },
+      { id: 'capture-same', kind: 'capture', target: SUBMIT, variable: 'same' },
+      aiStep('recorded-ai', [tiedSecretRef, longSecretRef]),
+    ], elementGrounding(['capture-prefix', 'capture-same']));
+
+    await expect(run(deps, DEFAULT_OPTIONS)).resolves.toMatchObject({ results: [{ result: { status: 'passed' } }] });
+
+    expect(adapterMessage).toBe(`${longSecretRef} {{run.prefix}} ${tiedSecretRef} ${tiedSecretRef}`);
+  });
+});
+
+describe('run per-case grounding flush and dispatch wiring', () => {
+  it('surfaces a grounding flush failure as FsIoError after an otherwise-clean agentic case', async () => {
+    const session = createFakeBrowserSession(new Map());
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.evaluateAssert(passingText('Dashboard'));
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()]);
+    const writeText = vi.spyOn(recordingStorage.storage, 'writeText').mockRejectedValueOnce(new Error('disk full'));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(outcome.results[0]?.error).toBeInstanceOf(FsIoError);
+    expect(outcome.results[0]?.error).toMatchObject({ kind: 'fs-io-error', exitCode: 3 });
+    expect(outcome.results[0]?.result).toMatchObject({
+      status: 'error',
+      explanation: 'The grounding cache could not be written.',
+      steps: [{ id: 'recorded-ai', status: 'passed' }],
+    });
+  });
+
+  it('does not let a flush failure override an execution failure after a prior successful grounding mutation', async () => {
+    const session = createFakeBrowserSession(new Map(), {
+      onPerform(action) {
+        if (action.type === 'navigate') {
+          throw new Error('The next deterministic step failed.');
+        }
+      },
+    });
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.evaluateAssert(passingText('Dashboard'));
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      aiStep(),
+      { id: 'later-failure', kind: 'action', action: 'navigate', url: '/later' },
+    ]);
+    const writeText = vi.spyOn(recordingStorage.storage, 'writeText').mockRejectedValueOnce(new Error('disk full'));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(outcome.results[0]?.result).toMatchObject({
+      status: 'error',
+      explanation: 'The browser session could not complete this case and no deterministic fallback is available.',
+      steps: [
+        { id: 'recorded-ai', status: 'passed' },
+        { id: 'later-failure', status: 'error', kind: 'environment' },
+      ],
+    });
+  });
+
+  it('flushes a successful earlier grounding mutation even when a later step in the same case fails', async () => {
+    const session = createFakeBrowserSession(new Map(), {
+      onPerform(action) {
+        if (action.type === 'navigate') {
+          throw new Error('The next deterministic step failed.');
+        }
+      },
+    });
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.evaluateAssert(passingText('Dashboard'));
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      aiStep(),
+      { id: 'later-failure', kind: 'action', action: 'navigate', url: '/later' },
+    ]);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('error');
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual(aiGrounding(trace(
+      [],
+      [passingText('Dashboard')],
+    )));
+  });
+
+  it('memoizes one lazy executor across path-C and path-B fallbacks while incrementally granting earlier captures', async () => {
+    const capturedValue = 'Ari';
+    const session = createFakeBrowserSession(new Map([
+      [elementRefKey(EMAIL), { exists: true, currentFingerprint: FINGERPRINT }],
+      [elementRefKey(SUBMIT), { exists: true, currentFingerprint: DIFFERENT_FINGERPRINT }],
+    ]), {
+      captureValues: new Map([[elementRefKey(EMAIL), { text: capturedValue, value: '' }]]),
+    });
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        expect(request.allowedRunRefs).toEqual(['name']);
+        await request.controller.evaluateAssert({ type: 'assert', check: 'text-visible', text: '{{run.name}}' });
+        return { outcome: 'success' };
+      },
+      execute: () => ({ data: { fingerprint: DIFFERENT_FINGERPRINT }, raw: '{"fingerprint":"fresh"}' }),
+    });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'capture-name', kind: 'capture', target: EMAIL, variable: 'name' },
+      aiStep(),
+      { id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT },
+    ], elementGrounding(['capture-name', 'click-submit']));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(resolveAiExecutor).toHaveBeenCalledTimes(1);
+    expect(executor.agenticRequests).toHaveLength(1);
+    expect(executor.structuredRequests).toHaveLength(1);
+    expect(aiCalls(events)).toEqual([
+      { type: 'ai-call', stepId: 'recorded-ai' },
+      { type: 'ai-call', stepId: 'click-submit' },
+    ]);
+    expect(events.emitted().filter((event) => event.type === 'step-result')).toEqual([
+      { type: 'step-result', stepId: 'capture-name', via: 'grounding' },
+      { type: 'step-result', stepId: 'recorded-ai', via: 'ai-resolve' },
+      { type: 'step-result', stepId: 'click-submit', via: 'ai-resolve' },
+    ]);
   });
 });

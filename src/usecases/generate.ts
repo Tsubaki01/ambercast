@@ -27,7 +27,7 @@ import type { LayoutResolver } from '#core/layout/resolve.js';
 import { joinPath } from '#core/paths.js';
 import type { AiExecutor } from '#ports/ai.js';
 import type { StorageAdapter } from '#ports/storage.js';
-import { assertNoLiteralSecrets } from './generator-secret-policy.js';
+import { assertNoLiteralSecrets, normalizeAiStepSecretGrants } from './generator-secret-policy.js';
 
 const GENERATED_PLAN_RESPONSE_SCHEMA = typedJsonSchema(GeneratedPlanResponse);
 
@@ -349,12 +349,13 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
       continue;
     }
 
+    const normalizedSteps = normalizeAiStepSecretGrants(response.data.steps);
     const candidate = {
       schemaVersion: 1,
       source: { inputsDigest },
       ...(response.data.generatorMeta === undefined ? {} : { generatorMeta: response.data.generatorMeta }),
       targets: resolvedTargets,
-      steps: response.data.steps,
+      steps: normalizedSteps,
     };
     const parsedPlan = PlanDocument.safeParse(candidate);
     if (!parsedPlan.success) {

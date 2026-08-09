@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import type { PlanDocument } from '#core/ir/schema.js';
+import type { PlanDocument, Step } from '#core/ir/schema.js';
 import { SecretLiteralRejectedError } from '#core/errors/secret-literal-rejected-error.js';
-import { assertNoLiteralSecrets } from '#usecases/generator-secret-policy.js';
+import { assertNoLiteralSecrets, normalizeAiStepSecretGrants } from '#usecases/generator-secret-policy.js';
 
 // This is a valid SHA-256-shaped value with exactly 4.0 bits of Shannon
 // entropy per character, so removing the path exemption would reject it.
@@ -34,6 +34,73 @@ function expectRejected(document: PlanDocument, rejectedLiteral: string, detecto
     expect(JSON.stringify(thrown)).not.toContain(rejectedLiteral);
   }
 }
+
+describe('normalizeAiStepSecretGrants', () => {
+  it('deduplicates and ASCII-sorts declared secret grants', () => {
+    const normalized = normalizeAiStepSecretGrants([{
+      id: 'complete-payment',
+      kind: 'ai',
+      instruction: 'Complete the payment flow.',
+      secrets: [
+        '{{secrets.zeta}}',
+        '{{secrets.Alpha}}',
+        '{{secrets.alpha}}',
+        '{{secrets.zeta}}',
+      ],
+    }]);
+
+    expect(normalized).toEqual([{
+      id: 'complete-payment',
+      kind: 'ai',
+      instruction: 'Complete the payment flow.',
+      secrets: ['{{secrets.Alpha}}', '{{secrets.alpha}}', '{{secrets.zeta}}'],
+    }]);
+  });
+
+  it('omits an explicit empty secret-grants field', () => {
+    const normalized = normalizeAiStepSecretGrants([{
+      id: 'complete-payment',
+      kind: 'ai',
+      instruction: 'Complete the payment flow.',
+      secrets: [],
+    }]);
+
+    expect(normalized).toEqual([{
+      id: 'complete-payment',
+      kind: 'ai',
+      instruction: 'Complete the payment flow.',
+    }]);
+    expect(normalized[0]).not.toHaveProperty('secrets');
+  });
+
+  it('passes a non-AI step through unchanged', () => {
+    const action: Step = {
+      id: 'open-payment',
+      kind: 'action',
+      action: 'navigate',
+      url: '/payment',
+    };
+
+    const normalized = normalizeAiStepSecretGrants([action]);
+
+    expect(normalized).toEqual([action]);
+    expect(normalized[0]).toBe(action);
+  });
+
+  it('passes an AI step with omitted secret grants through unchanged', () => {
+    const aiStep: Step = {
+      id: 'complete-payment',
+      kind: 'ai',
+      instruction: 'Complete the payment flow.',
+    };
+
+    const normalized = normalizeAiStepSecretGrants([aiStep]);
+
+    expect(normalized).toEqual([aiStep]);
+    expect(normalized[0]).toBe(aiStep);
+    expect(normalized[0]).not.toHaveProperty('secrets');
+  });
+});
 
 describe('assertNoLiteralSecrets', () => {
   it.each([

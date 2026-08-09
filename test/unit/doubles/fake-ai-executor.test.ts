@@ -72,15 +72,46 @@ describe('createFakeAiExecutor', () => {
     });
     const controller = createFakeAiActionController();
 
-    await expect(executor.executeAgentic({ instructionPrompt: 'Complete sign-in.', controller })).resolves.toBe(AGENTIC_RESULT);
+    await expect(executor.executeAgentic({
+      instructionPrompt: 'Complete sign-in.',
+      allowedSecretRefs: [],
+      allowedRunRefs: [],
+      controller,
+    })).resolves.toBe(AGENTIC_RESULT);
     expect(receivedController).toBe(controller);
+  });
+
+  it('retains structured and agentic request histories for scenario assertions', async () => {
+    const executor = createFakeAiExecutor({
+      execute: () => FIRST_RESULT,
+      executeAgentic: () => AGENTIC_RESULT,
+    });
+    const structured = request('history');
+    const controller = createFakeAiActionController();
+    const agentic = {
+      instructionPrompt: 'Complete sign-in.',
+      allowedSecretRefs: [],
+      allowedRunRefs: [],
+      controller,
+    } as const;
+
+    await executor.execute(structured);
+    await executor.executeAgentic(agentic);
+
+    expect(executor.structuredRequests).toEqual([structured]);
+    expect(executor.agenticRequests).toEqual([agentic]);
   });
 
   it('rejects an unscripted agentic request instead of silently returning a result', async () => {
     const controller = createFakeAiActionController();
     const executor = createFakeAiExecutor();
 
-    await expect(executor.executeAgentic({ instructionPrompt: 'Complete sign-in.', controller }))
+    await expect(executor.executeAgentic({
+      instructionPrompt: 'Complete sign-in.',
+      allowedSecretRefs: [],
+      allowedRunRefs: [],
+      controller,
+    }))
       .rejects.toThrow(/override|configured|unscripted/i);
   });
 

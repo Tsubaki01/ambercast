@@ -10,7 +10,12 @@
 import {
   buildPromptEnvelope,
 } from '#core/ai/prompt-envelope.js';
-import type { JsonValueT, TraceAction } from '#core/ir/schema.js';
+import type {
+  JsonValueT,
+  RunVariableName,
+  SecretRef,
+  TraceRecord,
+} from '#core/ir/schema.js';
 
 export {
   PROMPT_ENVELOPE_TEMPLATE,
@@ -33,12 +38,26 @@ export function buildStructuredPrompt(request: {
 /**
  * Builds the isolated envelope for a browser-directed agentic request.
  *
- * @param request - Agentic instruction text and optional prior action trace.
+ * Trusted plan grants occupy a fixed top-level metadata object. Other caller
+ * data remains nested under `untrustedContext`, so snapshots and DOM content
+ * cannot occupy the authority-bearing path even when they mimic its fields.
+ *
+ * @param request - Agentic instruction, trusted grants, and optional evidence.
  * @returns The shared fixed framing followed by task and JSON context sections.
  */
 export function buildAgenticPrompt(request: {
   readonly instructionPrompt: string;
-  readonly priorTrace?: readonly TraceAction[];
+  readonly allowedSecretRefs: readonly SecretRef[];
+  readonly allowedRunRefs: readonly RunVariableName[];
+  readonly priorTrace?: TraceRecord;
+  readonly context?: JsonValueT;
 }): string {
-  return buildPromptEnvelope(request.instructionPrompt, request.priorTrace);
+  return buildPromptEnvelope(request.instructionPrompt, {
+    trustedPlanMetadata: {
+      allowedSecretRefs: request.allowedSecretRefs,
+      allowedRunRefs: request.allowedRunRefs,
+    },
+    ...(request.priorTrace === undefined ? {} : { priorTrace: request.priorTrace }),
+    ...(request.context === undefined ? {} : { untrustedContext: request.context }),
+  });
 }

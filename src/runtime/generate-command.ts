@@ -3,13 +3,10 @@
  * argument parsing and lower-layer configuration, adapters, and use cases.
  */
 
-import { AI_EXECUTOR_FACTORIES } from '#adapters/ai/registry.js';
 import { createFsStorage } from '#adapters/storage/fs-storage.js';
 import { readConfigEnvironment } from '#adapters/system/process-config-environment.js';
 import { createSystemClock } from '#adapters/system/system-clock.js';
 import { loadConfig } from '#config/load.js';
-import type { ResolvedConfig } from '#core/config/schema.js';
-import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
 import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
 import { AmbercastError } from '#core/errors/types.js';
 import { isAbsolutePath, joinPath } from '#core/paths.js';
@@ -19,6 +16,7 @@ import {
   type GenerateReportOutput,
 } from '#usecases/generate-report.js';
 import { createAmbercast } from './create-ambercast.js';
+import { resolveAiProvider } from './resolve-ai-provider.js';
 
 function reportTimestamp(date: Date): string {
   return date.toISOString().replace(/\.\d{3}Z$/, 'Z');
@@ -61,40 +59,6 @@ export interface GenerateCommandOutput {
 
   /** Structured report for either JSON serialization or text rendering. */
   readonly envelope: GenerateReportOutput['envelope'];
-}
-
-/**
- * Resolves a concrete provider before runtime composition.
- *
- * @remarks
- * A command-line override wins, explicit configured providers pass through,
- * and `auto` probes lazy Claude then Codex factories in that fixed order.
- * If neither probe is available it throws `AiExecutorUnavailableError`
- * before a prompt file is read or a plan is touched.
- */
-function resolveAiProvider(
-  configured: ResolvedConfig['ai']['provider'],
-  override: 'claude' | 'codex' | undefined,
-  signal?: AbortSignal,
-): Promise<'claude' | 'codex'> {
-  if (override !== undefined) {
-    return Promise.resolve(override);
-  }
-  if (configured !== 'auto') {
-    return Promise.resolve(configured);
-  }
-
-  return (async () => {
-    for (const provider of ['claude', 'codex'] as const) {
-      signal?.throwIfAborted();
-      if (await AI_EXECUTOR_FACTORIES[provider]().isAvailable(signal)) {
-        return provider;
-      }
-      signal?.throwIfAborted();
-    }
-
-    throw new AiExecutorUnavailableError('No AI provider is available.');
-  })();
 }
 
 /**

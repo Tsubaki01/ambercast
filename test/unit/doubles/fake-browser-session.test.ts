@@ -107,6 +107,28 @@ describe('createFakeBrowserSession', () => {
     await expect(session.evaluateAssert({ check: 'element-visible', target: REF })).resolves.toBe(outcome);
   });
 
+  it('records browser-facing work in order while leaving teardown outside the operation log', async () => {
+    const session = createFakeBrowserSession(entries(), {
+      assertOutcomes: [
+        { passed: true },
+        { passed: false, message: 'The second check failed.' },
+      ],
+    });
+
+    await session.perform({ type: 'click', target: REF });
+    await session.evaluateAssert({ check: 'element-visible', target: REF });
+    await session.evaluateAssert({ check: 'text-visible', text: 'Missing' });
+    await session.snapshotForResolution();
+    await session.close();
+
+    expect(session.operations()).toEqual([
+      { type: 'perform', action: { type: 'click', target: REF } },
+      { type: 'evaluate-assert', check: { check: 'element-visible', target: REF } },
+      { type: 'evaluate-assert', check: { check: 'text-visible', text: 'Missing' } },
+      { type: 'snapshot-for-resolution' },
+    ]);
+  });
+
   it('returns each configured snapshot view from the same snapshot', async () => {
     const snapshot = {
       accessibilityTree: { role: 'document', name: 'Sign in' },

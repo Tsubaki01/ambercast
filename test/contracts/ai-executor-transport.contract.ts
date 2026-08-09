@@ -115,6 +115,8 @@ export function registerAiExecutorTransportContract(harness: AiExecutorTransport
 
         await expect(executor.executeAgentic({
           instructionPrompt: 'Complete sign-in.',
+          allowedSecretRefs: [],
+          allowedRunRefs: [],
           controller: createFakeAiActionController(),
         })).rejects.toThrow(/agentic|browser|unavailable/i);
       } finally {
@@ -131,6 +133,8 @@ export function registerAiExecutorTransportContract(harness: AiExecutorTransport
 
         await expect(executor.executeAgentic({
           instructionPrompt: 'Complete sign-in.',
+          allowedSecretRefs: [],
+          allowedRunRefs: [],
           controller: createFakeAiActionController(),
           signal: controller.signal,
         })).rejects.toBe(reason);

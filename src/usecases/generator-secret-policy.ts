@@ -3,7 +3,7 @@
  * reaching a reviewable plan artifact.
  */
 
-import { SecretRef } from '#core/ir/schema.js';
+import { SecretRef, type Step } from '#core/ir/schema.js';
 import { SecretLiteralRejectedError } from '#core/errors/secret-literal-rejected-error.js';
 
 type SecretDetector =
@@ -13,6 +13,50 @@ type SecretDetector =
   | 'high-entropy-token';
 
 const REDACTED_KEY_PATH_SEGMENT = '[redacted-key]';
+
+/**
+ * Canonicalizes declared secret grants on generated AI steps.
+ *
+ * @param steps - Provider-authored plan steps that have not yet been persisted.
+ * @returns New step-array storage with AI-step grants deduplicated, ASCII
+ * sorted, and omitted when empty.
+ * @remarks
+ * Grant canonicalization is generator policy rather than schema policy:
+ * validation deliberately preserves the digest-visible distinction between an
+ * omitted `AiStep.secrets` field and an explicit empty list. Applying this
+ * policy before plan validation gives generated artifacts one stable form
+ * without changing the meaning or representation of every other step kind.
+ * Secret references use an ASCII-only schema, so direct lexical comparison
+ * produces the required deterministic ASCII order without locale-dependent
+ * collation.
+ */
+export function normalizeAiStepSecretGrants(steps: readonly Step[]): Step[] {
+  return steps.map((step) => {
+    if (step.kind !== 'ai') {
+      return step;
+    }
+
+    if (step.secrets === undefined) {
+      return step;
+    }
+
+    if (step.secrets.length === 0) {
+      const normalizedStep = { ...step };
+      delete normalizedStep.secrets;
+      return normalizedStep;
+    }
+
+    return {
+      ...step,
+      secrets: [...new Set(step.secrets)].sort((left, right) => {
+        if (left < right) {
+          return -1;
+        }
+        return left > right ? 1 : 0;
+      }),
+    };
+  });
+}
 
 function hasHighEntropy(value: string): boolean {
   if (value.length < 32) {

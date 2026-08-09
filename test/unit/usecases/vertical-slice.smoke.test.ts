@@ -124,6 +124,9 @@ describe('fake vertical slice', () => {
       clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 0),
       browserDriver: () => createFakeBrowserDriver(() => session),
       secrets: createFakeSecretsProvider(new Map()),
+      resolveAiExecutor: async () => {
+        throw new Error('The fully grounded vertical slice must not resolve an AI executor.');
+      },
       events: events.sink,
       discoverTestFiles: async () => [],
       config: {

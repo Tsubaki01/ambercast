@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { ConfigInvalidError } from '#core/errors/config-invalid-error.js';
@@ -17,6 +16,8 @@ import { createFakeBrowserSession } from '../../doubles/fake-browser-session.js'
 import { createFakeSecretsProvider } from '../../doubles/fake-secrets-provider.js';
 
 const mocks = vi.hoisted(() => ({
+  claudeFactory: vi.fn(),
+  codexFactory: vi.fn(),
   createBrowserDriverResolver: vi.fn(),
   createEnvSecretsProvider: vi.fn(),
   createFsStorage: vi.fn(),
@@ -24,10 +25,14 @@ const mocks = vi.hoisted(() => ({
   createNoopEventSink: vi.fn(),
   createSystemClock: vi.fn(),
   loadConfig: vi.fn(),
+  resolveAiProvider: vi.fn(),
   run: vi.fn(),
   buildRunReport: vi.fn(),
 }));
 
+vi.mock('#adapters/ai/registry.js', () => ({
+  AI_EXECUTOR_FACTORIES: { claude: mocks.claudeFactory, codex: mocks.codexFactory },
+}));
 vi.mock('#adapters/browser/registry.js', () => ({
   createBrowserDriverResolver: mocks.createBrowserDriverResolver,
 }));
@@ -39,6 +44,7 @@ vi.mock('#adapters/system/noop-event-sink.js', () => ({ createNoopEventSink: moc
 vi.mock('#adapters/system/system-clock.js', () => ({ createSystemClock: mocks.createSystemClock }));
 vi.mock('#config/load.js', () => ({ loadConfig: mocks.loadConfig }));
 vi.mock('#runtime/create-ambercast.js', () => ({ createAmbercast: mocks.createAmbercast }));
+vi.mock('#runtime/resolve-ai-provider.js', () => ({ resolveAiProvider: mocks.resolveAiProvider }));
 vi.mock('#usecases/run.js', () => ({ run: mocks.run }));
 vi.mock('#usecases/run-report.js', () => ({ buildRunReport: mocks.buildRunReport }));
 
@@ -186,6 +192,7 @@ describe('runRunCommand', () => {
       events: events.sink,
       discoverTestFiles,
       config: CONFIG,
+      resolveAiExecutor: expect.any(Function),
     }, {
       files: ['/workspace/login.test.md'],
       grep,
@@ -263,16 +270,30 @@ describe('runRunCommand', () => {
     }));
   });
 
-  it('has no AI executor dependency in its own executable source', () => {
-    // A mock call count could prove only that this scenario skipped AI. Reading
-    // the source proves replay has no dependency to resolve or accidentally invoke.
-    const source = readFileSync(new URL('../../../src/runtime/run-command.ts', import.meta.url), 'utf8');
-    // Design decision 16 requires the JSDoc to name AiExecutor, so exclude comments.
-    const executableSource = source
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .replace(/\/\/.*$/gm, '');
+  it('defers AI provider resolution and executor creation when replay needs no fallback', async () => {
+    const storage = createInMemoryStorage();
+    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn() };
+    const discoverTestFiles = vi.fn(async () => []);
+    const outcome = { results: [], noTestsFound: false };
+    const output = reportOutput(0);
 
-    expect(executableSource).not.toContain('AiExecutor');
-    expect(executableSource).not.toContain('AI_EXECUTOR_FACTORIES');
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.createAmbercast.mockReturnValue({
+      storage,
+      layout,
+      clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 20),
+      discoverTestFiles,
+    });
+    // A resolved run outcome models a complete grounding hit, which does not
+    // dereference the lazy per-case fallback resolver passed to `run()`.
+    mocks.run.mockResolvedValue(outcome);
+    mocks.buildRunReport.mockReturnValue(output);
+
+    await expect(runRunCommand(input())).resolves.toEqual(output);
+
+    expect(mocks.resolveAiProvider).not.toHaveBeenCalled();
+    expect(mocks.claudeFactory).not.toHaveBeenCalled();
+    expect(mocks.codexFactory).not.toHaveBeenCalled();
   });
 });

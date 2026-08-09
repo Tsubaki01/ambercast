@@ -32,6 +32,14 @@ export interface FakeBrowserSessionEntry {
 export interface FakeBrowserSessionOptions {
   readonly captureValues?: ReadonlyMap<string, { readonly text: string; readonly value: string }>;
   readonly assertOutcome?: AssertOutcome;
+  /**
+   * Ordered assertion outcomes for scenarios that model multiple observations.
+   *
+   * Supplying this list makes an exhausted script fail loudly instead of
+   * silently repeating a result, so a test cannot accidentally omit a browser
+   * observation while still receiving a plausible replay outcome.
+   */
+  readonly assertOutcomes?: readonly AssertOutcome[];
   readonly snapshot?: PageSnapshot;
   readonly onPerform?: (action: PerformableAction) => void;
   readonly onEvaluateAssert?: (check: AssertCheck) => void;
@@ -42,6 +50,28 @@ export interface FakeBrowserSessionOptions {
    * hook again; shared teardown can therefore close safely without duplicate signals.
    */
   readonly onClose?: () => void;
+}
+
+/**
+ * A browser-facing operation observed by the session fake.
+ *
+ * Resource cleanup is deliberately absent: tests use this log to prove that
+ * replay's trust pre-scan performed no browser work, while every completed
+ * session still receives its required `close()` call in production code.
+ */
+export type FakeBrowserSessionOperation =
+  | { readonly type: 'perform'; readonly action: PerformableAction }
+  | { readonly type: 'evaluate-assert'; readonly check: AssertCheck }
+  | { readonly type: 'capture-value'; readonly target: ElementRef; readonly mode: CaptureMode }
+  | { readonly type: 'resolve-grounded'; readonly target: ElementRef; readonly fingerprint: Fingerprint }
+  | { readonly type: 'snapshot-for-resolution' };
+
+/**
+ * The public browser contract plus scenario-local operation inspection.
+ */
+export interface FakeBrowserSession extends BrowserSession {
+  /** Returns a fresh copy of browser-facing work in the order it occurred. */
+  operations(): readonly FakeBrowserSessionOperation[];
 }
 
 /**
@@ -102,26 +132,42 @@ export function fingerprintsEqual(left: Fingerprint, right: Fingerprint): boolea
 export function createFakeBrowserSession(
   entries: ReadonlyMap<string, FakeBrowserSessionEntry>,
   options: FakeBrowserSessionOptions = {},
-): BrowserSession {
+): FakeBrowserSession {
   const assertOutcome = options.assertOutcome ?? { passed: true };
   const snapshot = options.snapshot ?? {
     accessibilityTree: {},
     screenshot: new Uint8Array(),
   };
   let closed = false;
+  let assertOutcomeIndex = 0;
+  const operations: FakeBrowserSessionOperation[] = [];
 
   return {
     async perform(action): Promise<void> {
+      operations.push({ type: 'perform', action });
       options.onPerform?.(action);
     },
     async evaluateAssert(check): Promise<AssertOutcome> {
+      operations.push({ type: 'evaluate-assert', check });
       options.onEvaluateAssert?.(check);
-      return assertOutcome;
+      if (options.assertOutcomes === undefined) {
+        return assertOutcome;
+      }
+
+      const outcome = options.assertOutcomes[assertOutcomeIndex];
+      assertOutcomeIndex += 1;
+      if (outcome === undefined) {
+        throw new Error('No scripted assertion outcome remains.');
+      }
+
+      return outcome;
     },
     async captureValue(target: ElementRef, mode: CaptureMode): Promise<string> {
+      operations.push({ type: 'capture-value', target, mode });
       return options.captureValues?.get(elementRefKey(target))?.[mode] ?? '';
     },
     async resolveGrounded(ref: ElementRef, fp: Fingerprint): Promise<GroundedResolution> {
+      operations.push({ type: 'resolve-grounded', target: ref, fingerprint: fp });
       const entry = entries.get(elementRefKey(ref));
       if (entry === undefined || !entry.exists) {
         return { kind: 'miss', reason: 'element-not-found' };
@@ -134,6 +180,7 @@ export function createFakeBrowserSession(
       return { kind: 'hit', ref };
     },
     async snapshotForResolution(): Promise<PageSnapshot> {
+      operations.push({ type: 'snapshot-for-resolution' });
       return snapshot;
     },
     async screenshot(): Promise<Uint8Array> {
@@ -149,6 +196,9 @@ export function createFakeBrowserSession(
 
       closed = true;
       options.onClose?.();
+    },
+    operations(): readonly FakeBrowserSessionOperation[] {
+      return operations.map((operation) => ({ ...operation }));
     },
   };
 }

@@ -3,9 +3,16 @@
  * agentic work.
  */
 import type { TypedJsonSchema } from '#core/ai/typed-json-schema.js';
-import type { JsonValueT, TraceAction } from '#core/ir/schema.js';
+import type {
+  JsonValueT,
+  RunVariableName,
+  SecretRef,
+  TraceAction,
+  TraceAssert,
+  TraceRecord,
+} from '#core/ir/schema.js';
 
-import type { AssertCheck, AssertOutcome, PageSnapshot } from './browser.js';
+import type { AssertOutcome, PageSnapshot } from './browser.js';
 
 /**
  * Optional provider-reported token accounting for one AI call.
@@ -73,12 +80,18 @@ export interface AiExecuteResult<T> {
  * `outcome: 'failure'`, which describes a completed interaction that did not
  * reach its goal.
  *
+ * Both controller methods enforce the current request's trusted secret and
+ * run-reference grants before materializing provider-directed data. They
+ * reject an integrity violation rather than allowing untrusted provider output
+ * to direct the browser; adapters may handle their own transport retries but
+ * must not turn that boundary failure into an in-band agentic outcome.
+ *
  * The wrapper is the sole recorder of performed actions; adapters do not
  * report a second trace. A TypeScript type alone does not validate an action
- * received from an external provider process, so an executor that constructs
- * actions from that output validates them against the exported
- * {@link TraceAction} zod schema before calling {@link perform}. This port
- * contains no runtime logic that can provide that validation itself.
+ * or assertion received from an external provider process, so the
+ * run-pipeline controller validates each against the exported
+ * {@link TraceAction} or {@link TraceAssert} zod schema at controller entry.
+ * This port contains no runtime logic that can provide that validation itself.
  */
 export interface AiActionController {
   /**
@@ -86,19 +99,24 @@ export interface AiActionController {
    *
    * @param action - An unresolved action that remains safe to record.
    * @returns Resolves after the action completes.
-   * @throws If the action cannot be materialized or the browser cannot execute
-   * it, including when its secret reference cannot be resolved.
+   * @throws IntegrityViolationError if the action violates trusted plan grants
+   * or cannot be safely materialized.
+   * @throws SecretUnresolvedError if an allowed secret reference cannot be
+   * resolved.
+   * @throws If the browser cannot execute the action.
    */
   perform(action: TraceAction): Promise<void>;
 
   /**
-   * Evaluates an assertion with values materialized for the current run.
+   * Materializes and evaluates one recorded assertion observation.
    *
-   * @param check - The assertion to evaluate.
+   * @param check - An unresolved assertion that remains safe to record.
    * @returns A passing or diagnosable failing outcome.
-   * @throws If the assertion cannot be evaluated.
+   * @throws IntegrityViolationError if the assertion violates trusted plan
+   * grants or cannot be safely materialized.
+   * @throws If the browser cannot evaluate the assertion.
    */
-  evaluateAssert(check: AssertCheck): Promise<AssertOutcome>;
+  evaluateAssert(check: TraceAssert): Promise<AssertOutcome>;
 
   /**
    * Captures the page evidence available for action resolution.
@@ -110,26 +128,36 @@ export interface AiActionController {
 }
 
 /**
- * Inputs for an AI-directed browser interaction.
+ * Inputs for an AI-directed browser interaction and its trusted plan grants.
+ *
+ * Required allow-lists make omitted consent a compile-time error. They are
+ * plan-derived metadata, never instructions inferred from page snapshots or
+ * other provider-visible context, so untrusted page content cannot expand an
+ * agentic call's authority.
  */
 export interface AiAgenticRequest {
   /** Instructions that guide the browser-directed interaction. */
   readonly instructionPrompt: string;
 
+  /** Secret references the controller may resolve for this interaction. */
+  readonly allowedSecretRefs: readonly SecretRef[];
+
+  /** Captured run-variable names the controller may interpolate. */
+  readonly allowedRunRefs: readonly RunVariableName[];
+
   /** Browser operations the adapter may direct while handling this request. */
   readonly controller: AiActionController;
 
   /**
-   * Recorded actions from an earlier successful interaction, when they aid
-   * context.
+   * Replayable evidence from an earlier successful interaction, when it aids
+   * recovery.
    *
-   * For a `fill-secret` action, its `secretRef` remains an unresolved reference
-   * when carried in the trace. `readonly` protects the array reference
-   * rather than its nested fields; that shallow guarantee matches
-   * {@link TraceAction} and its grounding-storage and replay consumers, so
-   * callers do not mutate supplied or received action elements.
+   * Its events and verification assertions remain unresolved so neither secret
+   * nor run-derived values cross into provider context. Before executing an
+   * agentic request, the run pipeline verifies that every trace secret
+   * reference is still covered by this request's current secret grants.
    */
-  readonly priorTrace?: readonly TraceAction[];
+  readonly priorTrace?: TraceRecord;
 
   /** Cancellation signal forwarded to a provider that supports cancellation. */
   readonly signal?: AbortSignal;
@@ -144,9 +172,14 @@ export interface AiAgenticRequest {
  * either be trusted, allowing a fabricated action to poison committed replay
  * data, or be verified against the caller's own record, which adds ceremony
  * without information.
+ *
+ * `outcome: 'success'` is necessary but not sufficient for a successful run
+ * step. The run-pipeline wrapper independently requires terminal verification
+ * evidence and may reclassify a nominally successful agentic result as a step
+ * failure when that evidence is absent.
  */
 export interface AiAgenticResult {
-  /** Whether the interaction completed its requested outcome. */
+  /** Whether the provider reports that the interaction completed its goal. */
   readonly outcome: 'success' | 'failure';
 
   /** Provider accounting, when the provider supplies it. */
@@ -179,10 +212,11 @@ export interface AiExecutor {
   /**
    * Performs an AI-directed interaction through the supplied controller.
    *
-   * A completed call may return `outcome: 'failure'` after partially
-   * performing actions; the controller retains that record. Cancellation,
-   * including an aborted signal, always rejects rather than returning an
-   * outcome. Transport and execution errors also reject.
+   * The run-pipeline wrapper discards its entire journal after any result
+   * other than a fully verified success, including `outcome: 'failure'`,
+   * rejection, or cancellation. Cancellation, including an aborted signal,
+   * always rejects rather than returning an outcome. Transport and execution
+   * errors also reject.
    *
    * @param request - Instructions, browser controller, and optional prior
    * trace.

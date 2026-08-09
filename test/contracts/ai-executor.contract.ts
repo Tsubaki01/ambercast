@@ -7,8 +7,8 @@ import type {
   AiExecuteResult,
   AiExecutor,
 } from '../../src/ports/ai.js';
-import type { TraceAction } from '../../src/core/ir/schema.js';
-import type { AssertCheck, PageSnapshot } from '../../src/ports/browser.js';
+import type { TraceAction, TraceAssert, TraceRecord } from '../../src/core/ir/schema.js';
+import type { PageSnapshot } from '../../src/ports/browser.js';
 import { typedJsonSchema } from '../../src/core/ai/typed-json-schema.js';
 import { z } from 'zod';
 
@@ -45,7 +45,7 @@ const AGENTIC_RESULT: AiAgenticResult = { outcome: 'success' };
 const EMPTY_SNAPSHOT: PageSnapshot = { accessibilityTree: {}, screenshot: new Uint8Array() };
 const ACTION_A: TraceAction = { type: 'click', target: { strategy: 'accessibility', role: 'button', name: 'Submit' } };
 const ACTION_B: TraceAction = { type: 'navigate', url: 'https://example.test/second-action' };
-const CHECK: AssertCheck = { check: 'element-visible', target: ACTION_A.target };
+const CHECK: TraceAssert = { type: 'assert', check: 'element-visible', target: ACTION_A.target };
 const SECRET_FILL_ACTION: TraceAction = {
   type: 'fill-secret',
   target: ACTION_A.target,
@@ -55,13 +55,13 @@ const SECRET_FILL_ACTION: TraceAction = {
 interface RecordingController {
   readonly controller: AiActionController;
   readonly performed: TraceAction[];
-  readonly evaluated: AssertCheck[];
+  readonly evaluated: TraceAssert[];
   readonly snapshotCalls: { count: number };
 }
 
 function createRecordingController(harness: AiExecutorContractHarness): RecordingController {
   const performed: TraceAction[] = [];
-  const evaluated: AssertCheck[] = [];
+  const evaluated: TraceAssert[] = [];
   const snapshotCalls = { count: 0 };
 
   return {
@@ -138,8 +138,10 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
 
         const result = await executor.executeAgentic({
           instructionPrompt: 'Complete the sign-in.',
+          allowedSecretRefs: [],
+          allowedRunRefs: [],
           controller: recording.controller,
-          priorTrace: [ACTION_B],
+          priorTrace: { events: [ACTION_B], verification: [CHECK] },
         });
 
         expect(recording.performed).toEqual([ACTION_A]);
@@ -154,7 +156,11 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
     it('forwards the full prior trace to agentic execution', async () => {
       try {
         const recording = createRecordingController(harness);
-        let receivedPriorTrace: readonly TraceAction[] | undefined;
+        let receivedPriorTrace: TraceRecord | undefined;
+        const priorTrace: TraceRecord = {
+          events: [ACTION_B, SECRET_FILL_ACTION],
+          verification: [CHECK],
+        };
         const executor = await harness.createExecutor({
           execute: EXECUTE_RESULT,
           executeAgentic: (request) => {
@@ -165,11 +171,13 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
 
         const result = await executor.executeAgentic({
           instructionPrompt: 'Complete the sign-in.',
+          allowedSecretRefs: ['{{secrets.LOGIN_PASSWORD}}'],
+          allowedRunRefs: [],
           controller: recording.controller,
-          priorTrace: [ACTION_B, SECRET_FILL_ACTION],
+          priorTrace,
         });
 
-        expect(receivedPriorTrace).toEqual([ACTION_B, SECRET_FILL_ACTION]);
+        expect(receivedPriorTrace).toEqual(priorTrace);
         expect(result.outcome).toBe('success');
       } finally {
         await harness.dispose?.();
@@ -189,8 +197,10 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
 
         const result = await executor.executeAgentic({
           instructionPrompt: 'Complete the sign-in.',
+          allowedSecretRefs: [],
+          allowedRunRefs: [],
           controller: recording.controller,
-          priorTrace: [ACTION_B],
+          priorTrace: { events: [ACTION_B], verification: [CHECK] },
         });
 
         expect(recording.performed).toEqual([ACTION_A]);
@@ -214,6 +224,8 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
 
         const result = await executor.executeAgentic({
           instructionPrompt: 'Complete the sign-in.',
+          allowedSecretRefs: ['{{secrets.LOGIN_PASSWORD}}'],
+          allowedRunRefs: [],
           controller: recording.controller,
         });
 
@@ -243,6 +255,8 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
 
         await expect(executor.executeAgentic({
           instructionPrompt: 'Complete the sign-in.',
+          allowedSecretRefs: [],
+          allowedRunRefs: [],
           controller,
         })).rejects.toBe(controllerError);
       } finally {
@@ -323,6 +337,8 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
 
         await expect(executor.executeAgentic({
           instructionPrompt: 'Complete the sign-in.',
+          allowedSecretRefs: [],
+          allowedRunRefs: [],
           controller: recording.controller,
           signal: abortController.signal,
         })).rejects.toBe(abortReason);
@@ -352,6 +368,8 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
         const abortReason = new Error('The agentic request was aborted in flight.');
         const result = executor.executeAgentic({
           instructionPrompt: 'Complete the sign-in.',
+          allowedSecretRefs: [],
+          allowedRunRefs: [],
           controller: recording.controller,
           signal: abortController.signal,
         });
