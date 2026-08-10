@@ -1,8 +1,8 @@
-import { beforeAll, beforeEach, describe } from 'vitest';
+import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { chromium } from 'playwright-core';
 import { createChromiumBrowserDriver } from '#adapters/browser/chromium.js';
 import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
-import type { Fingerprint, TargetDefinition } from '#core/ir/schema.js';
+import type { ElementRef, Fingerprint, TargetDefinition } from '#core/ir/schema.js';
 import type { BrowserSession } from '#ports/browser.js';
 import { registerBrowserDriverContract } from '../contracts/browser-driver.contract.js';
 import { resolveChromiumAvailability } from './support/chromium-availability.js';
@@ -38,6 +38,36 @@ const MISSING_ELEMENT_PAGE = `data:text/html,${encodeURIComponent(`<!doctype htm
     </main>
   </body>
 </html>`)}`;
+
+const FIRST_AMBIGUOUS_SUBMIT_CANDIDATE_PAGE = `data:text/html,${encodeURIComponent(`<!doctype html>
+<html lang="en">
+  <body>
+    <main aria-label="Application">
+      <form aria-label="Primary form">
+        <label>Email <input aria-label="Email" /></label>
+        <button type="button">Submit</button>
+      </form>
+    </main>
+  </body>
+</html>`)}`;
+
+const AMBIGUOUS_SUBMIT_PAGE = `data:text/html,${encodeURIComponent(`<!doctype html>
+<html lang="en">
+  <body>
+    <main aria-label="Application">
+      <form aria-label="Primary form">
+        <label>Email <input aria-label="Email" /></label>
+        <button type="button">Submit</button>
+      </form>
+      <section aria-label="Secondary controls">
+        <label>Search <input aria-label="Search" /></label>
+        <button type="button">Submit</button>
+      </section>
+    </main>
+  </body>
+</html>`)}`;
+
+const SUBMIT: ElementRef = { strategy: 'accessibility', role: 'button', name: 'Submit' };
 
 let chromiumAvailable = false;
 let activeSession: BrowserSession | undefined;
@@ -98,5 +128,27 @@ describe('Chromium real-browser contract', () => {
     dispose: () => {
       activeSession = undefined;
     },
+  });
+
+  it('reports ambiguous-match for a separate duplicate fixture even when one candidate has the stored hash', async () => {
+    const session = await createChromiumBrowserDriver().launch(TARGET);
+
+    try {
+      await session.perform({ type: 'navigate', url: FIRST_AMBIGUOUS_SUBMIT_CANDIDATE_PAGE });
+      const firstCandidateSnapshot = await session.snapshotForResolution();
+      const firstCandidateFingerprint = computeAccessibilityFingerprint(firstCandidateSnapshot.accessibilityTree, SUBMIT);
+      if (firstCandidateFingerprint === undefined) {
+        throw new Error('The single-candidate duplicate fixture must yield a Submit fingerprint.');
+      }
+
+      await session.perform({ type: 'navigate', url: AMBIGUOUS_SUBMIT_PAGE });
+
+      await expect(session.resolveGrounded(SUBMIT, firstCandidateFingerprint)).resolves.toEqual({
+        kind: 'miss',
+        reason: 'ambiguous-match',
+      });
+    } finally {
+      await session.close();
+    }
   });
 });

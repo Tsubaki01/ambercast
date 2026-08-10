@@ -10,9 +10,9 @@ import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { AmbercastError, type AmbercastError as AmbercastErrorType } from '#core/errors/types.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
+import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import {
-  Fingerprint,
   GroundingDocument,
   PlanDocument,
   RunRef,
@@ -101,8 +101,23 @@ const RUN_REFERENCE_START = '{{run.';
  */
 const MIN_SECRET_MATCH_LENGTH = 3;
 
-const FINGERPRINT_RESPONSE = z.strictObject({ fingerprint: Fingerprint });
-const FINGERPRINT_RESPONSE_SCHEMA = typedJsonSchema(FINGERPRINT_RESPONSE);
+/**
+ * Defines the confirmation-only response accepted from AI-assisted element
+ * re-resolution.
+ *
+ * The run pipeline derives the fingerprint from unredacted local snapshot
+ * evidence before an AI call, so the provider has no authority to supply a
+ * value that later becomes grounding. A strict binary judgment retains the
+ * provider's semantic role while allowing an explicit denial and rejecting
+ * invented response fields.
+ */
+const CONFIRMATION_RESPONSE = z.strictObject({ confirmed: z.boolean() });
+
+/**
+ * Couples the confirmation response's runtime validation to the structured AI
+ * request without exposing a second, hand-maintained wire schema.
+ */
+const CONFIRMATION_RESPONSE_SCHEMA = typedJsonSchema(CONFIRMATION_RESPONSE);
 
 /**
  * Marks an abort that has no reportable error kind while retaining a useful
@@ -1226,14 +1241,22 @@ async function executeAiStep(
 }
 
 /**
- * Re-resolves an element grounding miss through a structured, fingerprint-only
- * AI request when the caller has allowed fallback.
+ * Re-resolves an element grounding miss through a structured AI confirmation
+ * request when the caller has allowed fallback.
  *
  * The authored `ElementRef` remains immutable because grounding stores no
- * alternate locator. The newly observed fingerprint is nevertheless persisted
- * before the subsequent browser work: it is a page fact that remains useful
- * even if that work fails and is intentionally accumulated for the case's
- * single final atomic flush.
+ * alternate locator. After capturing resolution evidence, this path derives
+ * the fingerprint from the unredacted accessibility tree before it resolves
+ * an AI executor or emits an `ai-call` event. An absent or ambiguous local
+ * match has no safe target for confirmation, so it raises `CaseAbort` without
+ * provider work or a grounding write.
+ *
+ * The AI receives a redacted copy of the evidence and answers only whether
+ * the existing locator identifies the intended element. A denial raises
+ * `CaseAbort`; confirmation persists only the already-derived local
+ * fingerprint before subsequent browser work. Persisting that page fact
+ * before the action remains intentional: it survives a later action failure
+ * and joins the case's single final atomic grounding flush.
  */
 async function groundedTarget(
   context: DispatchContext,
@@ -1253,17 +1276,22 @@ async function groundedTarget(
   }
 
   const snapshot = await context.session.snapshotForResolution();
+  const fingerprint = computeAccessibilityFingerprint(snapshot.accessibilityTree, target);
+  if (fingerprint === undefined) {
+    throw new CaseAbort('The supplied locator cannot be unambiguously identified from current accessibility evidence.');
+  }
+
   const executor = await context.resolveAiExecutor();
   context.events.emit({ type: 'ai-call', stepId: step.id });
   const response = await executor.execute({
-    prompt: 'Confirm that the supplied locator still identifies the intended element and return its current stable accessibility-neighborhood fingerprint.',
-    responseSchema: FINGERPRINT_RESPONSE_SCHEMA,
+    prompt: 'Confirm whether the supplied locator still identifies the intended element.',
+    responseSchema: CONFIRMATION_RESPONSE_SCHEMA,
     /**
-     * The structured request keeps the authored locator and the accessibility
-     * tree needed for fingerprint recovery, but not screenshot pixels, which
-     * cannot be safely redacted with string substitution. Redacting string
-     * values and object keys keeps materialized secrets and run values out of
-     * provider input without altering the tree's JSON structure.
+     * The redacted accessibility tree lets the provider make its confirm/deny
+     * semantic judgment. Screenshot pixels are excluded because string
+     * substitution cannot safely redact them; redacting string values and
+     * object keys keeps materialized secrets and run values out of provider
+     * input without altering the tree's JSON structure.
      */
     context: {
       target: target as unknown as JsonValueT,
@@ -1278,7 +1306,11 @@ async function groundedTarget(
     ...(context.signal === undefined ? {} : { signal: context.signal }),
   });
 
-  context.updateGroundingEntry(step.id, { kind: 'element', fingerprint: response.data.fingerprint });
+  if (response.data.confirmed === false) {
+    throw new CaseAbort('The AI could not confirm that the supplied locator identifies the intended element.');
+  }
+
+  context.updateGroundingEntry(step.id, { kind: 'element', fingerprint });
   context.resolvedVias.set(step.id, 'ai-resolve');
   return target;
 }

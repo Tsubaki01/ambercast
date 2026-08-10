@@ -534,11 +534,27 @@ describe('run secret sinks', () => {
       const { schemaPath, outputPath } = commandPaths(call.args);
       fingerprintSchemaPath = schemaPath;
       fingerprintSchema = await readFile(schemaPath, 'utf8');
-      await writeFile(outputPath, JSON.stringify({ fingerprint: FINGERPRINT }));
+      await writeFile(outputPath, JSON.stringify({ confirmed: true }));
       return { outcome: 'exited', stdout: '', stderr: '', exitCode: 0 };
     }]);
     const runExecutor = createCodexCliExecutor({ run: runRunner.run });
-    const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT));
+    const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT), {
+      snapshot: {
+        accessibilityTree: {
+          role: 'root',
+          name: '',
+          children: [{
+            role: 'form',
+            name: 'Sign in',
+            children: [
+              { role: 'textbox', name: 'Email', children: [] },
+              { role: 'button', name: 'Submit', children: [] },
+            ],
+          }],
+        },
+        screenshot: new Uint8Array(),
+      },
+    });
     const runScenario = createRunScenario(session, runExecutor);
     const testPath = await writePrompt(runScenario.recordingStorage.storage);
     await seedFreshArtifacts(
