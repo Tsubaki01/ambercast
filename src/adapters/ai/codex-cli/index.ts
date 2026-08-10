@@ -36,8 +36,14 @@ import type {
  * then validates the output file's text. A best-effort `finally` path attempts
  * directory removal after every provider outcome without replacing that
  * outcome when cleanup fails. Nonzero, signaled, spawn-failure, and temporary
- * artifact-preparation outcomes classify as an unavailable executor; `codex
- * --version` probes never throw.
+ * artifact-preparation outcomes classify as an unavailable executor.
+ * Retaining a bounded stderr excerpt gives operators enough signal to
+ * distinguish CLI failure causes such as authentication, sandbox, or
+ * model-availability errors without allowing unbounded provider output to
+ * inflate caller error details or logs. Accordingly, nonzero exits and
+ * signaled outcomes include non-empty child stderr in `stderrExcerpt`, capped
+ * at the first 1,000 UTF-16 code units; the field is omitted when stderr is
+ * empty. `codex --version` probes never throw.
  *
  * Its `executeAgentic` method gives an already-aborted signal precedence,
  * then rejects before spawning because this adapter has no browser session to
@@ -76,7 +82,10 @@ export function createCodexCliExecutor(deps: { readonly run?: CommandRunner } = 
               }
 
               if (result.outcome !== 'exited' || result.exitCode !== 0) {
-                throw new AiExecutorUnavailableError('The Codex CLI did not complete the request.', { provider: 'codex' });
+                throw new AiExecutorUnavailableError('The Codex CLI did not complete the request.', {
+                  provider: 'codex',
+                  ...(result.stderr === '' ? {} : { stderrExcerpt: result.stderr.slice(0, 1_000) }),
+                });
               }
 
               let raw: string;
