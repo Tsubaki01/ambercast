@@ -340,6 +340,10 @@ function materializeTrustedRunText(value: string, context: DispatchContext): str
  * schema constraint because the browser must still resolve valid relative
  * paths, fragments, and other target-relative forms. It rejects an
  * unresolvable or different origin as an `IntegrityViolationError`.
+ * Resolving against `baseUrl` is sound because `ChromiumBrowserDriver.launch()`
+ * configures its Playwright context with the identical `target.baseUrl` via
+ * `browser.newContext({ baseURL: target.baseUrl })`, so this guard and
+ * `page.goto()` resolve the same relative string against the same fixed base.
  *
  * Its error contract remains fully static: destination-derived text might
  * be a captured or secret value transformed by URL normalization, so

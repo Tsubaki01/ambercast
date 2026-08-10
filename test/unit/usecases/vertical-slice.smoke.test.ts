@@ -241,6 +241,8 @@ describe('fake vertical slice', () => {
     });
     expect(events.emitted().filter((event) => event.type === 'ai-call')).toEqual([]);
     expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(JSON.stringify(outcome.results[0])).not.toContain('resolved-at-run-time');
+    expect(await storage.readText(layout.groundingPathFor(TEST_PATH))).not.toContain('resolved-at-run-time');
   });
 
   // A cold-start miss through path B is intentionally outside this vertical-slice test's scope.

@@ -166,6 +166,7 @@ describe('hand-authored trace replay against real Chromium', () => {
       expect(resolveAiExecutor).not.toHaveBeenCalled();
     } finally {
       if (server.listening) {
+        server.closeAllConnections();
         await new Promise<void>((resolve, reject) => {
           server.close((error) => error === undefined ? resolve() : reject(error));
         });
