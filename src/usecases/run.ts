@@ -56,6 +56,15 @@ interface DispatchContext {
   readonly grounding: GroundingDocumentType;
   readonly runState: Map<RunVariableName, string>;
   readonly secrets: SecretsProvider;
+  /**
+   * Every non-empty value resolved for a secret reference during this case.
+   *
+   * A provider may legitimately return a different value for a later
+   * resolution of the same reference, so this registry retains all observed
+   * non-empty values until every diagnostic and persistence boundary has
+   * completed.
+   */
+  readonly resolvedSecrets: Map<string, Set<string>>;
   readonly allowedRunRefs: ReadonlySet<RunVariableName>;
   readonly resolveAiExecutor: () => Promise<AiExecutor>;
   readonly cacheOnly: boolean;
@@ -296,19 +305,41 @@ function materializeTrustedRunText(value: string, context: DispatchContext): str
 }
 
 /**
+ * Retains every non-empty resolved secret value for every later redaction
+ * boundary in this case.
+ *
+ * A set prevents a rotation-aware or retrying provider from overwriting an
+ * earlier value that may still be present in browser diagnostics. The registry
+ * remains keyed by the stable reference so replacement can restore that
+ * reference without persisting the materialized value itself. An empty input
+ * is a no-op because it cannot safely form a redaction candidate.
+ */
+function recordResolvedSecret(registry: Map<string, Set<string>>, ref: string, value: string): void {
+  if (value === '') {
+    return;
+  }
+
+  const values = registry.get(ref) ?? new Set<string>();
+  values.add(value);
+  registry.set(ref, values);
+}
+
+/**
  * Converts a trusted unresolved trace action into the browser port's
  * materialized action shape immediately before execution.
  *
  * Trace actions intentionally carry the authored element locator unchanged.
  * The wrapper does not attempt a second grounding lookup because a recorded
  * trace is itself the replay recipe; only run interpolation and secret lookup
- * are runtime-bound fields.
+ * are runtime-bound fields. Every non-empty resolved secret is retained in
+ * the case-wide registry before browser work so later diagnostics can redact
+ * both replayed and freshly resolved values.
  */
 function materializeTraceAction(
   action: TraceAction,
   context: DispatchContext,
   secretRefs: ReadonlySet<string>,
-  resolvedSecrets?: Map<string, string>,
+  resolvedSecrets: Map<string, Set<string>>,
 ): PerformableAction {
   switch (action.type) {
     case 'click':
@@ -331,7 +362,7 @@ function materializeTraceAction(
         throw new SecretUnresolvedError('The referenced secret is unavailable.', { secretRef: action.secretRef });
       }
 
-      resolvedSecrets?.set(action.secretRef, value);
+      recordResolvedSecret(resolvedSecrets, action.secretRef, value);
       return { type: 'fill-secret', target: action.target, value };
     }
   }
@@ -444,7 +475,7 @@ async function replayTrace(
       continue;
     }
 
-    await context.session.perform(materializeTraceAction(entry, context, secretRefs));
+    await context.session.perform(materializeTraceAction(entry, context, secretRefs, context.resolvedSecrets));
   }
 
   for (const assertion of trace.verification) {
@@ -474,7 +505,7 @@ type MaterializedValueCandidate = {
 function assertNoMaterializedLiteral(
   entry: TraceAction | TraceAssert,
   context: DispatchContext,
-  resolvedSecrets: ReadonlyMap<string, string>,
+  resolvedSecrets: ReadonlyMap<string, ReadonlySet<string>>,
 ): void {
   let value: string | undefined;
 
@@ -504,7 +535,7 @@ function assertNoMaterializedLiteral(
 
   if (
     [...context.runState.values()].some((candidate) => candidate === value)
-    || [...resolvedSecrets.values()].some((candidate) => candidate === value)
+    || [...resolvedSecrets.values()].some((values) => [...values].some((candidate) => candidate === value))
   ) {
     throw new IntegrityViolationError('The AI adapter supplied a materialized value instead of an unresolved reference.');
   }
@@ -515,20 +546,24 @@ function assertNoMaterializedLiteral(
  *
  * The candidate set joins secrets and captures before scanning, rather than
  * applying separate redaction passes that could split an overlapping secret
- * into fragments. Longest-first selection preserves the most specific value
- * at each position; source and lexical tie-breaks make diagnostics stable
- * without ever rescanning replacement text.
+ * into fragments. Every non-empty value observed for a secret reference
+ * participates, so diagnostics remain safe if a provider rotates or
+ * re-resolves a secret during one case. Longest-first selection preserves the
+ * most specific value at each position; source and lexical tie-breaks make
+ * diagnostics stable without ever rescanning replacement text.
  */
 function templateMaterializedValues(
   message: string,
-  resolvedSecrets: ReadonlyMap<string, string>,
+  resolvedSecrets: ReadonlyMap<string, ReadonlySet<string>>,
   runState: ReadonlyMap<RunVariableName, string>,
 ): string {
   const candidates: MaterializedValueCandidate[] = [];
 
-  for (const [secretRef, value] of resolvedSecrets) {
-    if (value !== '') {
-      candidates.push({ source: 'secret', value, replacement: secretRef });
+  for (const [secretRef, values] of resolvedSecrets) {
+    for (const value of values) {
+      if (value !== '') {
+        candidates.push({ source: 'secret', value, replacement: secretRef });
+      }
     }
   }
 
@@ -562,16 +597,88 @@ function templateMaterializedValues(
   return rendered;
 }
 
+const UNSUPPORTED_JSON_VALUE_PLACEHOLDER = '[unsupported-value-omitted]';
+// A defensive backstop against accidental deep nesting, not a claim about a specific adversarial threat.
+const MAX_REDACTION_DEPTH = 20;
+
 /**
- * Rebuilds a browser rejection without retaining a materialized diagnostic.
+ * Recursively redacts every string in a JSON-shaped value, including object
+ * keys.
+ *
+ * Rebuilding only arrays and plain records keeps diagnostics structurally safe
+ * without retaining a mutable reference to the input. Functions and objects
+ * with a non-plain prototype can execute custom serialization or expose
+ * implementation-specific state, so they are replaced instead of being
+ * decomposed. A shared visited set makes a repeated object or array safe to
+ * omit rather than following a cycle while case-error handling is already in
+ * progress. A depth limit also omits accidentally deep diagnostics before
+ * error handling can exhaust the stack.
+ */
+function redactJsonStrings(
+  value: unknown,
+  resolvedSecrets: ReadonlyMap<string, ReadonlySet<string>>,
+  runState: ReadonlyMap<RunVariableName, string>,
+  visited: WeakSet<object> = new WeakSet<object>(),
+  depth = 0,
+): unknown {
+  if (depth > MAX_REDACTION_DEPTH) {
+    return UNSUPPORTED_JSON_VALUE_PLACEHOLDER;
+  }
+
+  if (typeof value === 'string') {
+    return templateMaterializedValues(value, resolvedSecrets, runState);
+  }
+
+  if (Array.isArray(value)) {
+    if (visited.has(value)) {
+      return UNSUPPORTED_JSON_VALUE_PLACEHOLDER;
+    }
+
+    visited.add(value);
+    return value.map((item) => redactJsonStrings(item, resolvedSecrets, runState, visited, depth + 1));
+  }
+
+  if (
+    value !== null
+    && typeof value === 'object'
+    && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)
+  ) {
+    if (visited.has(value)) {
+      return UNSUPPORTED_JSON_VALUE_PLACEHOLDER;
+    }
+
+    visited.add(value);
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        templateMaterializedValues(key, resolvedSecrets, runState),
+        redactJsonStrings(item, resolvedSecrets, runState, visited, depth + 1),
+      ]),
+    );
+  }
+
+  if (value === null || value === undefined || typeof value === 'number' || typeof value === 'boolean') {
+    return value;
+  }
+
+  return UNSUPPORTED_JSON_VALUE_PLACEHOLDER;
+}
+
+/**
+ * Rebuilds an error without retaining a materialized diagnostic.
  *
  * Classified errors retain their constructor so report policy continues to
- * recognize them, but neither details nor a causal error are carried over:
- * either may retain the browser's unsanitized value.
+ * recognize them. Their details are rebuilt with every string leaf and own
+ * enumerable object key redacted at any nesting depth, so structured
+ * diagnostics cannot retain a materialized value below their top level.
+ *
+ * A causal error is always omitted: it may be an arbitrary underlying error
+ * object that cannot safely rely on structured redaction. This
+ * shared reconstruction keeps browser-controller and case-report error
+ * boundaries on the same redaction contract.
  */
-function scrubBrowserRejection(
+function redactedError(
   error: unknown,
-  resolvedSecrets: ReadonlyMap<string, string>,
+  resolvedSecrets: ReadonlyMap<string, ReadonlySet<string>>,
   runState: ReadonlyMap<RunVariableName, string>,
 ): Error {
   const message = templateMaterializedValues(
@@ -581,11 +688,36 @@ function scrubBrowserRejection(
   );
 
   if (error instanceof AmbercastError) {
-    const ErrorConstructor = error.constructor as new (message: string) => AmbercastError;
-    return new ErrorConstructor(message);
+    const ErrorConstructor = error.constructor as new (
+      message: string,
+      details?: Record<string, unknown>,
+    ) => AmbercastError;
+    if (error.details === undefined) {
+      return new ErrorConstructor(message);
+    }
+
+    const details = redactJsonStrings(error.details, resolvedSecrets, runState) as Record<string, unknown>;
+    return new ErrorConstructor(message, details);
   }
 
   return new Error(message);
+}
+
+/**
+ * Applies the shared error-redaction contract at the browser-controller
+ * boundary.
+ *
+ * Keeping this thin wrapper preserves the pipeline's boundary-specific name
+ * while ensuring case-level reporting reuses exactly the same constructor-
+ * preserving reconstruction and omission of the potentially unsafe causal
+ * error chain.
+ */
+function scrubBrowserRejection(
+  error: unknown,
+  resolvedSecrets: ReadonlyMap<string, ReadonlySet<string>>,
+  runState: ReadonlyMap<RunVariableName, string>,
+): Error {
+  return redactedError(error, resolvedSecrets, runState);
 }
 
 /**
@@ -594,11 +726,13 @@ function scrubBrowserRejection(
  * Only browser diagnostics cross back to the adapter, so this is the sole
  * place reverse substitution is allowed. The unresolved journal remains
  * untouched, preserving the stronger rule that resolved values never enter
- * grounding or other replay artifacts.
+ * grounding or other replay artifacts. The registry includes every observed
+ * non-empty value for each reference so a later provider interaction cannot
+ * surface an earlier resolution.
  */
 function templateAssertOutcome(
   outcome: AssertOutcome,
-  resolvedSecrets: ReadonlyMap<string, string>,
+  resolvedSecrets: ReadonlyMap<string, ReadonlySet<string>>,
   runState: ReadonlyMap<RunVariableName, string>,
 ): AssertOutcome {
   if (outcome.message === undefined) {
@@ -623,7 +757,6 @@ type LastAgenticObservation = 'none' | 'perform' | 'snapshot' | 'failed-assert' 
  */
 class AgenticRunPipeline implements AiActionController {
   readonly #journal: Array<TraceAction | TraceAssert> = [];
-  readonly #resolvedSecrets = new Map<string, string>();
   readonly #secretRefs: ReadonlySet<string>;
   #trailingPassedAssertRun = 0;
   #lastObservation: LastAgenticObservation = 'none';
@@ -655,12 +788,12 @@ class AgenticRunPipeline implements AiActionController {
 
     this.#trailingPassedAssertRun = 0;
     this.#lastObservation = 'perform';
-    assertNoMaterializedLiteral(parsed.data, this.context, this.#resolvedSecrets);
-    const materialized = materializeTraceAction(parsed.data, this.context, this.#secretRefs, this.#resolvedSecrets);
+    assertNoMaterializedLiteral(parsed.data, this.context, this.context.resolvedSecrets);
+    const materialized = materializeTraceAction(parsed.data, this.context, this.#secretRefs, this.context.resolvedSecrets);
     try {
       await this.context.session.perform(materialized);
     } catch (error) {
-      throw scrubBrowserRejection(error, this.#resolvedSecrets, this.context.runState);
+      throw scrubBrowserRejection(error, this.context.resolvedSecrets, this.context.runState);
     }
     this.#journal.push(parsed.data);
   }
@@ -680,13 +813,13 @@ class AgenticRunPipeline implements AiActionController {
       });
     }
 
-    assertNoMaterializedLiteral(parsed.data, this.context, this.#resolvedSecrets);
+    assertNoMaterializedLiteral(parsed.data, this.context, this.context.resolvedSecrets);
     const materialized = materializeTraceAssert(parsed.data, this.context);
     let outcome: AssertOutcome;
     try {
       outcome = await this.context.session.evaluateAssert(materialized);
     } catch (error) {
-      throw scrubBrowserRejection(error, this.#resolvedSecrets, this.context.runState);
+      throw scrubBrowserRejection(error, this.context.resolvedSecrets, this.context.runState);
     }
     if (outcome.passed) {
       this.#trailingPassedAssertRun += 1;
@@ -697,7 +830,7 @@ class AgenticRunPipeline implements AiActionController {
       this.#lastObservation = 'failed-assert';
     }
 
-    return templateAssertOutcome(outcome, this.#resolvedSecrets, this.context.runState);
+    return templateAssertOutcome(outcome, this.context.resolvedSecrets, this.context.runState);
   }
 
   /**
@@ -923,6 +1056,7 @@ async function executeAction(step: Step, context: DispatchContext): Promise<Disp
         throw new SecretUnresolvedError('The referenced secret is unavailable.', { secretRef: step.secretRef });
       }
 
+      recordResolvedSecret(context.resolvedSecrets, step.secretRef, value);
       action = { type: 'fill-secret', target, value };
       break;
     }
@@ -1250,6 +1384,8 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
   let aiExecutorPromise: Promise<AiExecutor> | undefined;
   let classifiedError: AmbercastErrorType | undefined;
   let result: ResultWithoutDuration | undefined;
+  let resolvedSecrets: Map<string, Set<string>> | undefined;
+  let runState: Map<RunVariableName, string> | undefined;
 
   try {
     let testMd: string;
@@ -1305,11 +1441,14 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
 
     const allowedRunRefs = new Set<RunVariableName>();
     const resolvedVias = new Map<Step['id'], ResolutionVia>();
+    resolvedSecrets = new Map<string, Set<string>>();
+    runState = new Map<RunVariableName, string>();
     const context: DispatchContext = {
       session,
       grounding: loadedGrounding,
-      runState: new Map<RunVariableName, string>(),
+      runState,
       secrets: deps.secrets,
+      resolvedSecrets,
       allowedRunRefs,
       resolveAiExecutor: () => {
         aiExecutorPromise ??= deps.resolveAiExecutor(deps.signal);
@@ -1338,6 +1477,13 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
         ? await executeAiStep(step, context, options.cacheOnly)
         : await DISPATCH_TABLE[step.kind](step, context);
       if (outcome.kind === 'assertion-failed') {
+        /*
+         * Assertion diagnostics cross the case-report boundary only after
+         * materialized values are restored to their stable references. This
+         * keeps deterministic assertions on the same reference-only contract
+         * as agentic diagnostics without giving browser adapters secret or
+         * case-state access.
+         */
         result = {
           ...identity,
           status: 'failed',
@@ -1346,7 +1492,11 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
             stepResult(originalStep, 'failed', 'assertion'),
             ...skippedSteps(planSteps, index),
           ],
-          explanation: outcome.message,
+          explanation: templateMaterializedValues(
+            outcome.message,
+            resolvedSecrets ?? new Map(),
+            runState ?? new Map(),
+          ),
         };
         break;
       }
@@ -1370,9 +1520,24 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
       explanation: 'Replay completed successfully.',
     };
   } catch (error) {
+    /*
+     * Classified errors cross both case explanation and report-error
+     * boundaries, so they are reconstructed with materialized values restored
+     * to stable references before either surface retains them. Hoisted maps
+     * make this safe for failures before context construction, where redaction
+     * correctly becomes a no-op.
+     *
+     * CaseAbort throw sites construct static explanations. Plain generic
+     * errors retain the fixed fallback explanation without examining their
+     * message, so neither branch carries materialized case data.
+     */
     if (error instanceof AmbercastError) {
-      classifiedError = error;
-      result = resultForAbort(identity, planSteps, completed, currentStep, error.message);
+      classifiedError = redactedError(
+        error,
+        resolvedSecrets ?? new Map(),
+        runState ?? new Map(),
+      ) as AmbercastErrorType;
+      result = resultForAbort(identity, planSteps, completed, currentStep, classifiedError.message);
     } else {
       const explanation = error instanceof CaseAbort
         ? error.message
@@ -1397,7 +1562,11 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
         );
       } catch (error) {
         if (result?.status === 'passed') {
-          const flushError = fsIoError('The grounding cache could not be written.', error);
+          const flushError = redactedError(
+            fsIoError('The grounding cache could not be written.', error),
+            resolvedSecrets ?? new Map(),
+            runState ?? new Map(),
+          ) as FsIoError;
           classifiedError = flushError;
           result = { ...result, status: 'error', explanation: flushError.message };
         }
