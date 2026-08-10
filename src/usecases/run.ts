@@ -80,6 +80,17 @@ type StepExecutor = (step: Step, context: DispatchContext) => Promise<DispatchOu
 const RUN_REFERENCE_PATTERN = /\{\{run\.([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\}\}/g;
 const RUN_REFERENCE_START = '{{run.';
 
+/**
+ * Smallest resolved secret length that is safe to treat as a substring
+ * indicator.
+ *
+ * Short values still require exact-field protection, but common prose and
+ * URLs naturally contain very short sequences. Keeping substring detection
+ * above that collision-prone range rejects a materialized credential without
+ * turning ordinary provider diagnostics into integrity failures.
+ */
+const MIN_SECRET_MATCH_LENGTH = 3;
+
 const FINGERPRINT_RESPONSE = z.strictObject({ fingerprint: Fingerprint });
 const FINGERPRINT_RESPONSE_SCHEMA = typedJsonSchema(FINGERPRINT_RESPONSE);
 
@@ -398,36 +409,45 @@ function materializeTraceAssert(check: TraceAssert, context: DispatchContext): A
 /**
  * Checks the dynamic authority requirements of one already-parsed trace item.
  *
- * `readUsableGrounding` has already validated the complete document shape, so
- * this deliberately checks only facts that parsing cannot know: the current
- * step's secret grants and the current case's run grants and captured values.
+ * `readUsableGrounding` has already validated the complete document shape and
+ * `preScanTrace` has validated and resolved every trace secret. This checks
+ * the remaining runtime facts: current-case run grants, captured values, and
+ * materialized values in fields that can cross the replay boundary.
  */
 function preScanTraceEntry(
   entry: TraceAction | TraceAssert,
   context: DispatchContext,
-  secretRefs: ReadonlySet<string>,
 ): void {
-  if (entry.type === 'fill-secret' && !secretRefs.has(entry.secretRef)) {
-    throw new IntegrityViolationError('An AI trace references a secret that this step is not allowed to use.', {
-      secretRef: entry.secretRef,
-    });
-  }
+  /*
+   * `preScanTrace` primes the resolved-secret registry from the complete trace
+   * before this validation pass, making each inspection independent of journal
+   * order. The four fields mirror the live provider guard: navigate URLs, fill
+   * values, assertion text, and URL-match patterns. Rejecting them before replay
+   * prevents a contaminated historical trace from reaching either browser
+   * execution or an AI adapter as `priorTrace`.
+   */
+  const assertSafeTraceField = (value: string): void => {
+    assertTrustedRunReferences(value, context);
+    if (containsResolvedSecret(value, context.resolvedSecrets)) {
+      throw new IntegrityViolationError('An AI trace contains a materialized secret value.');
+    }
+  };
 
   switch (entry.type === 'assert' ? entry.check : entry.type) {
     case 'navigate':
-      assertTrustedRunReferences((entry as Extract<TraceAction, { type: 'navigate' }>).url, context);
+      assertSafeTraceField((entry as Extract<TraceAction, { type: 'navigate' }>).url);
       return;
     case 'fill':
-      assertTrustedRunReferences((entry as Extract<TraceAction, { type: 'fill' }>).value, context);
+      assertSafeTraceField((entry as Extract<TraceAction, { type: 'fill' }>).value);
       return;
     case 'text-visible':
-      assertTrustedRunReferences((entry as Extract<TraceAssert, { check: 'text-visible' }>).text, context);
+      assertSafeTraceField((entry as Extract<TraceAssert, { check: 'text-visible' }>).text);
       return;
     case 'text-equals':
-      assertTrustedRunReferences((entry as Extract<TraceAssert, { check: 'text-equals' }>).text, context);
+      assertSafeTraceField((entry as Extract<TraceAssert, { check: 'text-equals' }>).text);
       return;
     case 'url-matches':
-      assertTrustedRunReferences((entry as Extract<TraceAssert, { check: 'url-matches' }>).pattern, context);
+      assertSafeTraceField((entry as Extract<TraceAssert, { check: 'url-matches' }>).pattern);
       return;
     default:
       return;
@@ -444,12 +464,47 @@ function preScanTraceEntry(
  * cannot survive `readUsableGrounding` with an invalid static shape.
  */
 function preScanTrace(trace: z.infer<typeof TraceRecord>, context: DispatchContext, secretRefs: ReadonlySet<string>): void {
+  /*
+   * The first pass resolves every granted `fill-secret` reference in both trace
+   * lists and retains its value in `context.resolvedSecrets`. Priming the full
+   * registry makes subsequent field checks independent of journal order: a
+   * literal that precedes its trace's fill-secret action is still rejected
+   * before replay. Missing values and ungranted references retain their
+   * classified failure behavior rather than becoming a permissive cache miss.
+   */
+  const primeResolvedSecret = (entry: TraceAction | TraceAssert): void => {
+    if (entry.type !== 'fill-secret') {
+      return;
+    }
+
+    if (!secretRefs.has(entry.secretRef)) {
+      throw new IntegrityViolationError('An AI trace references a secret that this step is not allowed to use.', {
+        secretRef: entry.secretRef,
+      });
+    }
+
+    const value = context.secrets.resolve(entry.secretRef);
+    if (value === undefined) {
+      throw new SecretUnresolvedError('The referenced secret is unavailable.', { secretRef: entry.secretRef });
+    }
+
+    recordResolvedSecret(context.resolvedSecrets, entry.secretRef, value);
+  };
+
   for (const entry of trace.events) {
-    preScanTraceEntry(entry, context, secretRefs);
+    primeResolvedSecret(entry);
   }
 
   for (const assertion of trace.verification) {
-    preScanTraceEntry(assertion, context, secretRefs);
+    primeResolvedSecret(assertion);
+  }
+
+  for (const entry of trace.events) {
+    preScanTraceEntry(entry, context);
+  }
+
+  for (const assertion of trace.verification) {
+    preScanTraceEntry(assertion, context);
   }
 }
 
@@ -495,12 +550,51 @@ type MaterializedValueCandidate = {
 };
 
 /**
+ * Determines whether a provider-controlled candidate retains a resolved
+ * secret literal.
+ *
+ * A non-empty secret at or above the minimum safe length is forbidden
+ * anywhere in the candidate. Non-empty shorter secrets remain protected
+ * only when they comprise the entire candidate, avoiding broad false
+ * positives from incidental short text. Empty values are excluded from both
+ * modes because every string contains the empty string and it is not a
+ * meaningful materialized credential.
+ *
+ * @param candidate - Provider-controlled text to examine before it can cross
+ * a persistence or browser boundary.
+ * @param resolvedSecrets - All non-empty values resolved so far, grouped by
+ * their stable secret references.
+ * @returns `true` when the candidate contains a long-enough resolved secret
+ * or exactly equals any non-empty resolved secret.
+ */
+function containsResolvedSecret(
+  candidate: string,
+  resolvedSecrets: ReadonlyMap<string, ReadonlySet<string>>,
+): boolean {
+  for (const values of resolvedSecrets.values()) {
+    for (const value of values) {
+      if (value === '') {
+        continue;
+      }
+
+      if (candidate === value || (value.length >= MIN_SECRET_MATCH_LENGTH && candidate.includes(value))) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
  * Rejects a provider literal that crosses back over the materialization
  * boundary instead of using its unresolved reference.
  *
- * Only complete field equality is significant: ordinary provider prose may
- * legitimately contain a captured word, but a whole actionable field equal to
- * a captured or previously resolved secret value cannot be persisted safely.
+ * Resolved secrets are more sensitive than captured run values: a sufficiently
+ * long secret substring cannot remain in a provider field because later
+ * persistence could retain it irreversibly. Captured values keep exact-field
+ * matching because ordinary provider prose may legitimately contain them as
+ * a substring; widening that existing run-state rule would reject valid work.
  */
 function assertNoMaterializedLiteral(
   entry: TraceAction | TraceAssert,
@@ -534,8 +628,8 @@ function assertNoMaterializedLiteral(
   }
 
   if (
-    [...context.runState.values()].some((candidate) => candidate === value)
-    || [...resolvedSecrets.values()].some((values) => [...values].some((candidate) => candidate === value))
+    (value !== undefined && containsResolvedSecret(value, resolvedSecrets))
+    || [...context.runState.values()].some((candidate) => candidate === value)
   ) {
     throw new IntegrityViolationError('The AI adapter supplied a materialized value instead of an unresolved reference.');
   }
@@ -661,6 +755,77 @@ function redactJsonStrings(
   }
 
   return UNSUPPORTED_JSON_VALUE_PLACEHOLDER;
+}
+
+/**
+ * Reports whether a JSON-shaped value retains a resolved secret in a string
+ * leaf and, by default, a plain-object key.
+ *
+ * This mirrors the redaction traversal rather than serializing and searching
+ * text: JSON escaping can conceal a raw literal from a serialized scan. Only
+ * arrays and plain records are traversed; the plain-object-prototype check
+ * structurally excludes non-plain objects from traversal at this persistence
+ * boundary. A shared cycle guard and the existing depth ceiling make malformed diagnostic
+ * trees safe to inspect, while returning on the first hit avoids examining
+ * more of a value that is already unsafe to persist.
+ *
+ * @param value - Parsed JSON-shaped tree considered for persistence.
+ * @param resolvedSecrets - Every secret value observed during the case.
+ * @param options - Controls whether plain-object keys are scanned. Key
+ * scanning remains the default for diagnostic and accessibility trees, whose
+ * keys cannot be assumed independent of provider-controlled values. The
+ * grounding-persistence boundary disables it because `GroundingDocument`
+ * entry keys are authored plan step identifiers, not resolved runtime data.
+ * @returns `true` when a supported string value or, unless disabled, object
+ * key contains a resolved secret according to `containsResolvedSecret`.
+ */
+function jsonContainsResolvedSecret(
+  value: unknown,
+  resolvedSecrets: ReadonlyMap<string, ReadonlySet<string>>,
+  options: { readonly scanObjectKeys?: boolean } = {},
+): boolean {
+  const visited = new WeakSet<object>();
+  const scanObjectKeys = options.scanObjectKeys ?? true;
+
+  const scan = (current: unknown, depth: number): boolean => {
+    if (depth > MAX_REDACTION_DEPTH) {
+      return false;
+    }
+
+    if (typeof current === 'string') {
+      return containsResolvedSecret(current, resolvedSecrets);
+    }
+
+    if (Array.isArray(current)) {
+      if (visited.has(current)) {
+        return false;
+      }
+
+      visited.add(current);
+      return current.some((item) => scan(item, depth + 1));
+    }
+
+    if (
+      current !== null
+      && typeof current === 'object'
+      && (Object.getPrototypeOf(current) === Object.prototype || Object.getPrototypeOf(current) === null)
+    ) {
+      if (visited.has(current)) {
+        return false;
+      }
+
+      visited.add(current);
+      for (const [key, item] of Object.entries(current)) {
+        if ((scanObjectKeys && containsResolvedSecret(key, resolvedSecrets)) || scan(item, depth + 1)) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  };
+
+  return scan(value, 0);
 }
 
 /**
@@ -1578,12 +1743,36 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
 
     if (groundingDirty && groundingPath !== undefined && grounding !== undefined) {
       try {
+        /*
+         * Immediately before serialization, this persistence boundary inspects
+         * the parsed grounding tree with `jsonContainsResolvedSecret`. A match
+         * refuses `writeText` and unconditionally reclassifies the case with
+         * an IntegrityViolationError, so every blocked persistence attempt
+         * follows the classified-error/status transition. The scan inspects
+         * the object tree's string values without relying on JSON's escaped
+         * text representation. Its entry keys are authored plan step
+         * identifiers, structurally independent of resolved values, so
+         * scanning them would create false positives from incidental
+         * identifier overlap.
+         */
+        if (jsonContainsResolvedSecret(grounding, resolvedSecrets ?? new Map(), { scanObjectKeys: false })) {
+          throw new IntegrityViolationError('The grounding cache contains a materialized secret value.');
+        }
+
         await deps.storage.writeText(
           groundingPath,
           toCanonicalArtifactText(grounding as unknown as JsonValueT),
         );
       } catch (error) {
-        if (result?.status === 'passed') {
+        if (error instanceof IntegrityViolationError) {
+          const integrityError = redactedError(
+            error,
+            resolvedSecrets ?? new Map(),
+            runState ?? new Map(),
+          ) as IntegrityViolationError;
+          classifiedError = integrityError;
+          result = { ...result!, status: 'error', explanation: integrityError.message };
+        } else if (result?.status === 'passed') {
           const flushError = redactedError(
             fsIoError('The grounding cache could not be written.', error),
             resolvedSecrets ?? new Map(),
