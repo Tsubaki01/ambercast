@@ -1089,21 +1089,33 @@ describe('run path-B element recovery', () => {
   });
 
   it('re-resolves an element miss with exactly one AI call, persists the fresh fingerprint, and marks the result ai-resolve', async () => {
-    const snapshot = { accessibilityTree: { role: 'document' }, screenshot: new Uint8Array([1, 2, 3]) };
-    const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT), { snapshot });
+    const secretRef = '{{secrets.AMBERCAST_SECRET_DUMMY}}';
+    const secretValue = 'AMBERCAST_SECRET_DUMMY_VALUE';
+    const snapshot = {
+      accessibilityTree: { role: 'document', name: `The password field contains ${secretValue}.` },
+      screenshot: new Uint8Array([1, 2, 3]),
+    };
+    const session = createFakeBrowserSession(new Map([
+      [elementRefKey(PASSWORD), { exists: true, currentFingerprint: FINGERPRINT }],
+      [elementRefKey(SUBMIT), { exists: true, currentFingerprint: DIFFERENT_FINGERPRINT }],
+    ]), { snapshot });
     const executor = createFakeAiExecutor({
       execute: () => ({ data: { fingerprint: DIFFERENT_FINGERPRINT }, raw: '{"fingerprint":"fresh"}' }),
     });
     const { deps, events, recordingStorage } = createScenario({
       browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
       resolveAiExecutor: async () => executor,
     });
-    const testPath = await writePrompt(recordingStorage.storage);
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
     await seedFreshArtifacts(
       recordingStorage.storage,
       testPath,
-      [{ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }],
-      elementGrounding(['click-submit']),
+      [
+        { id: 'fill-password-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef },
+        { id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT },
+      ],
+      elementGrounding(['fill-password-secret', 'click-submit']),
     );
 
     const outcome = await run(deps, DEFAULT_OPTIONS);
@@ -1111,21 +1123,30 @@ describe('run path-B element recovery', () => {
     expect(outcome.results[0]?.result.status).toBe('passed');
     expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'click-submit' }]);
     expect(executor.structuredRequests).toHaveLength(1);
-    expect(executor.structuredRequests[0]).toMatchObject({
-      context: {
-        target: SUBMIT,
-        snapshot: { accessibilityTree: snapshot.accessibilityTree, screenshotBase64: 'AQID' },
+    const requestContext = executor.structuredRequests[0]?.context as {
+      readonly target: ElementRef;
+      readonly snapshot: { readonly accessibilityTree: JsonValueT };
+    };
+    expect(requestContext.target).toStrictEqual(SUBMIT);
+    expect(requestContext.snapshot).toStrictEqual({
+      accessibilityTree: {
+        role: 'document',
+        name: `The password field contains ${secretRef}.`,
       },
     });
     expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual({
+      'fill-password-secret': { kind: 'element', fingerprint: FINGERPRINT },
       'click-submit': { kind: 'element', fingerprint: DIFFERENT_FINGERPRINT },
     });
     expect(session.operations()).toEqual([
+      { type: 'resolve-grounded', target: PASSWORD, fingerprint: FINGERPRINT },
+      { type: 'perform', action: { type: 'fill-secret', target: PASSWORD, value: secretValue } },
       { type: 'resolve-grounded', target: SUBMIT, fingerprint: FINGERPRINT },
       { type: 'snapshot-for-resolution' },
       { type: 'perform', action: { type: 'click', target: SUBMIT } },
     ]);
     expect(events.emitted().filter((event) => event.type === 'step-result')).toEqual([
+      { type: 'step-result', stepId: 'fill-password-secret', via: 'grounding' },
       { type: 'step-result', stepId: 'click-submit', via: 'ai-resolve' },
     ]);
   });
@@ -1937,6 +1958,72 @@ describe('run deterministic redaction boundary', () => {
 });
 
 describe('run agentic materialization boundary', () => {
+  it('redacts secret and run values from an agentic resolution snapshot and omits screenshot bytes', async () => {
+    const secretRef = '{{secrets.AMBERCAST_SECRET_DUMMY_SNAPSHOT}}';
+    const secretValue = 'AMBERCAST_SECRET_DUMMY_SNAPSHOT_VALUE';
+    const runValue = 'RUN_SNAPSHOT_VALUE';
+    const snapshot = {
+      accessibilityTree: {
+        role: 'document',
+        [`Secret label ${secretValue}`]: {
+          name: `Visible ${secretValue} beside ${runValue}.`,
+          children: [{
+            role: 'text',
+            name: 'Public content',
+            count: 3,
+            checked: false,
+            nested: { empty: '', enabled: true },
+          }],
+        },
+      },
+      screenshot: new Uint8Array([4, 5, 6]),
+    };
+    let resolutionSnapshot: Awaited<ReturnType<AiAgenticRequest['controller']['snapshotForResolution']>> | undefined;
+    const session = createFakeBrowserSession(liveEntries([EMAIL, PASSWORD]), {
+      captureValues: new Map([[elementRefKey(EMAIL), { text: runValue, value: '' }]]),
+      snapshot,
+    });
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef });
+        resolutionSnapshot = await request.controller.snapshotForResolution();
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'capture-token', kind: 'capture', target: EMAIL, variable: 'token' },
+      aiStep('agentic-snapshot', [secretRef]),
+    ], elementGrounding(['capture-token']));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    if (resolutionSnapshot === undefined) {
+      throw new Error('The agentic executor did not receive a resolution snapshot.');
+    }
+    expect(resolutionSnapshot).toStrictEqual({
+      accessibilityTree: {
+        role: 'document',
+        [`Secret label ${secretRef}`]: {
+          name: `Visible ${secretRef} beside {{run.token}}.`,
+          children: [{
+            role: 'text',
+            name: 'Public content',
+            count: 3,
+            checked: false,
+            nested: { empty: '', enabled: true },
+          }],
+        },
+      },
+    });
+  });
+
   it('redacts overlapping secret and run values from grounding, results, errors, details, and events after proving each surface is populated', async () => {
     const secretRef = '{{secrets.auth.token}}';
     const secretValue = 'SECRET-RUN-SENTINEL';

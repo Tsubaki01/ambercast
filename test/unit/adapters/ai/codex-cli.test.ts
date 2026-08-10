@@ -6,6 +6,7 @@ import { createCodexCliExecutor } from '#adapters/ai/codex-cli/index.js';
 import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
 import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
+import type { AiResolutionSnapshot } from '#ports/ai.js';
 import { registerAiExecutorTransportContract, type AiExecutorTransportScenario } from '../../../contracts/ai-executor-transport.contract.js';
 import { createFakeCommandRunner, createDeferredCommandRun } from '../../../doubles/create-fake-command-runner.js';
 
@@ -261,7 +262,7 @@ describe('createCodexCliExecutor', () => {
       instructionPrompt: 'Drive the browser.',
       allowedSecretRefs: [],
       allowedRunRefs: [],
-      controller: { perform: async () => undefined, evaluateAssert: async () => ({ passed: true }), snapshotForResolution: async () => ({ accessibilityTree: {}, screenshot: new Uint8Array() }) },
+      controller: { perform: async () => undefined, evaluateAssert: async () => ({ passed: true }), snapshotForResolution: async (): Promise<AiResolutionSnapshot> => ({ accessibilityTree: {} }) },
     })).rejects.toBeInstanceOf(AiExecutorUnavailableError);
     expect(runner.calls).toEqual([]);
   });
