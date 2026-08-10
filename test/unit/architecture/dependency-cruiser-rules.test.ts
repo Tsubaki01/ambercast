@@ -5,6 +5,8 @@ import { cruise, type ICruiseResult } from 'dependency-cruiser';
 import { describe, expect, test } from 'vitest';
 // @ts-expect-error -- the ESM config has no declaration file.
 import dependencyCruiserConfig from '../../../.dependency-cruiser.mjs';
+// @ts-expect-error -- the ESM policy table has no declaration file.
+import { LAYERS } from '../../../tools/architecture-policy.mjs';
 
 const FIXTURE_ROOT = fileURLToPath(
   new URL('../../fixtures/architecture/dependency-cruiser/', import.meta.url),
@@ -23,11 +25,13 @@ interface EdgeCase {
 function expectedCompliantDependency(target: string) {
   return target.startsWith('src/')
     ? { resolved: target }
-    : { module: target };
+    : { module: target.replace(/^node:/, '') };
 }
 
 function expectedViolationTarget(target: string | RegExp) {
-  return typeof target === 'string' ? target : expect.stringMatching(target);
+  return typeof target === 'string'
+    ? target.replace(/^node:/, '')
+    : expect.stringMatching(target);
 }
 
 const edgeCases: readonly EdgeCase[] = [
@@ -176,6 +180,14 @@ const edgeCases: readonly EdgeCase[] = [
     compliantTarget: 'src/ports/storage.ts',
   },
   {
+    id: 'adapters-external',
+    expectedRuleId: 'adapters-external-allowlist',
+    source: 'src/adapters/synthetic/synthetic-adapter.ts',
+    target: 'node:vm',
+    compliantSource: 'src/adapters/synthetic/synthetic-adapter.ts',
+    compliantTarget: 'node:child_process',
+  },
+  {
     id: 'ports-runtime',
     expectedRuleId: 'ports-boundary',
     source: 'src/ports/synthetic-port.ts',
@@ -248,6 +260,19 @@ async function cruiseFixture(root: string, entry = 'src'): Promise<ICruiseResult
 }
 
 describe('dependency-cruiser architecture rules', () => {
+  test('keeps the adapters external-dependency allowlist closed and exact', () => {
+    expect([...LAYERS.adapters.externalAllow].sort()).toEqual([
+      'node:child_process',
+      'node:crypto',
+      'node:fs/promises',
+      'node:os',
+      'node:path',
+      'ajv',
+      'ajv-formats',
+      'playwright-core',
+    ].sort());
+  });
+
   test('generates one internal boundary for every policy role', () => {
     expect(dependencyCruiserConfig.forbidden.map((rule: { readonly name: string }) => rule.name)).toEqual(expect.arrayContaining([
       'core-is-leaf',

@@ -5,6 +5,7 @@ import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
 import type { Fingerprint, TargetDefinition } from '#core/ir/schema.js';
 import type { BrowserSession } from '#ports/browser.js';
 import { registerBrowserDriverContract } from '../contracts/browser-driver.contract.js';
+import { resolveChromiumAvailability } from './support/chromium-availability.js';
 import {
   registerBrowserSessionContract,
   type BrowserSessionContractSetup,
@@ -53,6 +54,14 @@ async function createFixtureSession(setup: BrowserSessionContractSetup): Promise
 }
 
 async function actualFingerprintFor(setup: BrowserSessionContractSetup): Promise<Fingerprint> {
+  // This fixed fixture needs only its placeholder: `resolveGrounded` returns
+  // `element-not-found` when its own live fingerprint capture is undefined,
+  // strictly before it reads the supplied fingerprint. The short circuit does
+  // not imply that missing elements bypass snapshot capture in general.
+  if (!setup.exists) {
+    return setup.currentFingerprint;
+  }
+
   if (activeSession === undefined) {
     throw new Error('The real-browser contract did not create a session before requesting its fingerprint.');
   }
@@ -68,13 +77,7 @@ async function actualFingerprintFor(setup: BrowserSessionContractSetup): Promise
 
 describe('Chromium real-browser contract', () => {
   beforeAll(async () => {
-    try {
-      const browser = await chromium.launch();
-      await browser.close();
-      chromiumAvailable = true;
-    } catch {
-      chromiumAvailable = false;
-    }
+    chromiumAvailable = await resolveChromiumAvailability(() => chromium.launch());
   });
 
   // Shared contract registration owns the individual `it` callbacks. This

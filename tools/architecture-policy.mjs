@@ -37,9 +37,20 @@
  *   module. A flat module directly below `src/adapters/` is instead an
  *   `adapters-root-file` fallback with no import permissions: it is malformed
  *   for the family convention, so the safest contract prevents its filename
- *   from becoming a fictitious family. The specialized `src/adapters/http` matcher may import `runtime`
- *   only. The standard adapter policy compares the captured adapter and port
- *   families, and fixture tests exercise that convention with synthetic names.
+ *   from becoming a fictitious family. Its `externalAllow` entry is a closed
+ *   dependency list because standard adapters are the layer with concrete
+ *   external integrations: browser automation, filesystem access, subprocess
+ *   execution, and third-party validation libraries. Adapters joins core in
+ *   having a closed external-dependency contract; the remaining product roles
+ *   (`ports`, `usecases`, `report`, `config`, `runtime`, and `cli`) currently
+ *   have none because none imports anything external today. This closed
+ *   allowlist applies to that matcher only,
+ *   not to the `adapters-http` carve-out, which remains outside this
+ *   enforcement. An unrestricted standard-adapter external surface would be
+ *   a live enforcement gap. The specialized `src/adapters/http` matcher may
+ *   import `runtime` only. The standard adapter policy compares the captured
+ *   adapter and port families, and fixture tests exercise that convention
+ *   with synthetic names.
  * - `usecases` is rooted at `src/usecases` and may import `core`, `usecases`,
  *   and `report`, plus `ports` through a type-only edge.
  * - `report` is rooted at `src/report` and may import `report` plus `core`
@@ -106,6 +117,16 @@ export const LAYERS = Object.freeze({
       { layer: 'core' },
       { layer: 'ports', matchingFamily: true },
       { layer: 'adapters', sameFamily: true },
+    ],
+    externalAllow: [
+      'node:child_process',
+      'node:crypto',
+      'node:fs/promises',
+      'node:os',
+      'node:path',
+      'ajv',
+      'ajv-formats',
+      'playwright-core',
     ],
     carveOut: {
       root: 'src/adapters/http',
