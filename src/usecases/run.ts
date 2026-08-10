@@ -10,7 +10,7 @@ import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { AmbercastError, type AmbercastError as AmbercastErrorType } from '#core/errors/types.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
-import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
+import { computeAccessibilityFingerprint, countAccessibilityMatches } from '#core/ir/fingerprint.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import {
   GroundingDocument,
@@ -1278,6 +1278,15 @@ async function groundedTarget(
   const snapshot = await context.session.snapshotForResolution();
   const fingerprint = computeAccessibilityFingerprint(snapshot.accessibilityTree, target);
   if (fingerprint === undefined) {
+    const matchCount = countAccessibilityMatches(snapshot.accessibilityTree, target);
+    if (matchCount === 0) {
+      throw new CaseAbort('The supplied locator has no matching element in the current accessibility evidence.');
+    }
+
+    if (matchCount !== undefined && matchCount > 1) {
+      throw new CaseAbort('The supplied locator matches more than one element in the current accessibility evidence and cannot be trusted.');
+    }
+
     throw new CaseAbort('The supplied locator cannot be unambiguously identified from current accessibility evidence.');
   }
 

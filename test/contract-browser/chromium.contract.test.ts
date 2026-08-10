@@ -2,7 +2,7 @@ import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { chromium } from 'playwright-core';
 import { createChromiumBrowserDriver } from '#adapters/browser/chromium.js';
 import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
-import type { ElementRef, Fingerprint, TargetDefinition } from '#core/ir/schema.js';
+import type { ElementRef, Fingerprint, JsonValueT, TargetDefinition } from '#core/ir/schema.js';
 import type { BrowserSession } from '#ports/browser.js';
 import { registerBrowserDriverContract } from '../contracts/browser-driver.contract.js';
 import { resolveChromiumAvailability } from './support/chromium-availability.js';
@@ -71,6 +71,34 @@ const SUBMIT: ElementRef = { strategy: 'accessibility', role: 'button', name: 'S
 
 let chromiumAvailable = false;
 let activeSession: BrowserSession | undefined;
+
+function treeContainingFirstCandidate(tree: JsonValueT, target: ElementRef): JsonValueT | undefined {
+  if (typeof tree !== 'object' || tree === null || Array.isArray(tree)) {
+    return undefined;
+  }
+
+  const { children } = tree;
+  if (!Array.isArray(children)) {
+    return undefined;
+  }
+
+  for (const child of children) {
+    if (typeof child !== 'object' || child === null || Array.isArray(child)) {
+      continue;
+    }
+
+    if (child.role === target.role && child.name === target.name) {
+      return { role: 'root', name: '', children: [tree] };
+    }
+
+    const candidateTree = treeContainingFirstCandidate(child, target);
+    if (candidateTree !== undefined) {
+      return candidateTree;
+    }
+  }
+
+  return undefined;
+}
 
 function fixtureFor(setup: BrowserSessionContractSetup): string {
   return setup.exists ? FIXTURE_PAGE : MISSING_ELEMENT_PAGE;
@@ -142,6 +170,13 @@ describe('Chromium real-browser contract', () => {
       }
 
       await session.perform({ type: 'navigate', url: AMBIGUOUS_SUBMIT_PAGE });
+      const ambiguousSnapshot = await session.snapshotForResolution();
+      const firstCandidateTree = treeContainingFirstCandidate(ambiguousSnapshot.accessibilityTree, SUBMIT);
+      if (firstCandidateTree === undefined) {
+        throw new Error('The ambiguous fixture must retain its first Submit candidate.');
+      }
+
+      expect(computeAccessibilityFingerprint(firstCandidateTree, SUBMIT)).toEqual(firstCandidateFingerprint);
 
       await expect(session.resolveGrounded(SUBMIT, firstCandidateFingerprint)).resolves.toEqual({
         kind: 'miss',

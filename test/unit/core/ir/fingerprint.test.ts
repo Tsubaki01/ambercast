@@ -265,6 +265,7 @@ describe('computeAccessibilityFingerprint', () => {
     };
 
     const expectedHash = handHash(descriptor);
+    // This fixed known answer independently guards canonical JSON encoding; do not refresh it merely to match handHash after a regression.
     expect(expectedHash).toBe('a0725a4bd3e4503098e9bd10839afa0ab8ae10d75801e7f35baa4f85cfb50e92');
 
     expect(fingerprint({

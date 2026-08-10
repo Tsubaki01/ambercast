@@ -1444,47 +1444,10 @@ describe('run path-B element recovery', () => {
     });
   });
 
-  it('aborts an absent captured target without writing grounding or performing a browser action', async () => {
-    const absentTargetTree: JsonValueT = {
-      role: 'root',
-      name: '',
-      children: [{ role: 'main', name: 'Application', children: [] }],
-    };
-    const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT), {
-      snapshot: { accessibilityTree: absentTargetTree, screenshot: new Uint8Array() },
-    });
-    const executor = createFakeAiExecutor();
-    const { deps, events, recordingStorage } = createScenario({
-      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
-      resolveAiExecutor: async () => executor,
-    });
-    const testPath = await writePrompt(recordingStorage.storage);
-    const steps: Step[] = [
-      { id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT },
-      { id: 'after-click', kind: 'action', action: 'navigate', url: '/after' },
-    ];
-    await seedFreshArtifacts(recordingStorage.storage, testPath, steps, elementGrounding(['click-submit']));
-    const groundingBefore = await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`);
-    recordingStorage.writes.length = 0;
-
-    const outcome = await run(deps, DEFAULT_OPTIONS);
-
-    expectStopgapOutcome(outcome, 'click-submit', 'after-click');
-    expect(outcome.results[0]?.result.explanation).toBe('The supplied locator cannot be unambiguously identified from current accessibility evidence.');
-    expect(recordingStorage.writes).toEqual([]);
-    expect(await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`)).toBe(groundingBefore);
-    expect(session.operations()).toEqual([
-      { type: 'resolve-grounded', target: SUBMIT, fingerprint: FINGERPRINT },
-      { type: 'snapshot-for-resolution' },
-    ]);
-    expect(executor.structuredRequests).toEqual([]);
-    expect(aiCalls(events)).toEqual([]);
-  });
-
   it.each([
     ['an absent target', {
       role: 'root', name: '', children: [{ role: 'main', name: 'Application', children: [] }],
-    }],
+    }, 'The supplied locator has no matching element in the current accessibility evidence.'],
     ['ambiguous targets', {
       role: 'root', name: '', children: [{
         role: 'form', name: 'Sign in', children: [
@@ -1492,8 +1455,8 @@ describe('run path-B element recovery', () => {
           { role: 'button', name: 'Submit', children: [] },
         ],
       }],
-    }],
-  ])('does not call AI before failing closed for %s in captured evidence', async (_description, accessibilityTree) => {
+    }, 'The supplied locator matches more than one element in the current accessibility evidence and cannot be trusted.'],
+  ])('does not call AI before failing closed for %s in captured evidence', async (_description, accessibilityTree, explanation) => {
     const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT), {
       snapshot: { accessibilityTree, screenshot: new Uint8Array() },
     });
@@ -1506,7 +1469,10 @@ describe('run path-B element recovery', () => {
     await seedFreshArtifacts(
       recordingStorage.storage,
       testPath,
-      [{ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }],
+      [
+        { id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT },
+        { id: 'after-click', kind: 'action', action: 'navigate', url: '/after' },
+      ],
       elementGrounding(['click-submit']),
     );
     const groundingBefore = await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`);
@@ -1514,14 +1480,17 @@ describe('run path-B element recovery', () => {
 
     const outcome = await run(deps, DEFAULT_OPTIONS);
 
-    expect(outcome.results[0]?.result.status).toBe('error');
-    expect(outcome.results[0]?.result.explanation).toBe('The supplied locator cannot be unambiguously identified from current accessibility evidence.');
+    expectStopgapOutcome(outcome, 'click-submit', 'after-click');
+    expect(outcome.results[0]?.result.explanation).toBe(explanation);
     expect(resolveAiExecutor).not.toHaveBeenCalled();
     expect(executor.structuredRequests).toEqual([]);
     expect(aiCalls(events)).toEqual([]);
     expect(recordingStorage.writes).toEqual([]);
     expect(await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`)).toBe(groundingBefore);
-    expect(session.operations().filter((operation) => operation.type === 'perform')).toEqual([]);
+    expect(session.operations()).toEqual([
+      { type: 'resolve-grounded', target: SUBMIT, fingerprint: FINGERPRINT },
+      { type: 'snapshot-for-resolution' },
+    ]);
   });
 
   it('honors a confirmation denial and persists no locally recomputed fingerprint', async () => {

@@ -149,6 +149,27 @@ function findAllAccessibilityMatches(
 }
 
 /**
+ * Counts the physical accessibility nodes that match a locator.
+ *
+ * @param tree - The serializable accessibility tree captured from the page.
+ * @param ref - The accessibility role and name to match.
+ * @returns The number of normalized role-and-name matches, or `undefined`
+ *   when the tree is malformed.
+ *
+ * @remarks
+ * This exposes match-count evidence without exposing the traversal's internal
+ * node and position records. Callers that cannot compute a fingerprint can
+ * use it to distinguish no local target from duplicate local targets while
+ * preserving malformed evidence as a separate condition.
+ */
+export function countAccessibilityMatches(
+  tree: JsonValueT,
+  ref: AccessibilityElementRef,
+): number | undefined {
+  return isAccessibilityNode(tree) ? findAllAccessibilityMatches(tree, ref).length : undefined;
+}
+
+/**
  * Builds the bounded neighborhood descriptor for one unambiguous match.
  *
  * @param match - A candidate whose parent and child position came from the
@@ -176,6 +197,35 @@ function descriptorFor(match: AccessibilityMatch): AccessibilityFingerprintDescr
     parent: identityFor(match.parent),
     siblingBefore: siblingBefore === undefined ? null : identityFor(siblingBefore),
     siblingAfter: siblingAfter === undefined ? null : identityFor(siblingAfter),
+  };
+}
+
+/**
+ * Hashes one unambiguous accessibility match into its versioned fingerprint.
+ *
+ * The shared conversion keeps computation and resolution byte-identical while
+ * retaining their distinct match-count classifications. An unpaired surrogate
+ * has no canonical JSON byte representation, so it remains the one ordinary
+ * no-fingerprint outcome; other canonicalization and hashing failures retain
+ * their original propagation behavior.
+ */
+function hashMatch(match: AccessibilityMatch): Fingerprint | undefined {
+  const descriptor = descriptorFor(match);
+  let canonicalBytes: Uint8Array;
+
+  try {
+    canonicalBytes = toCanonicalDigestBytes(descriptor);
+  } catch (error) {
+    if (isUnpairedSurrogateError(error)) {
+      return undefined;
+    }
+
+    throw error;
+  }
+
+  return {
+    algorithm: 'a11y-neighborhood-v1',
+    hash: createHash('sha256').update(canonicalBytes).digest('hex'),
   };
 }
 
@@ -317,23 +367,7 @@ export function computeAccessibilityFingerprint(
     return undefined;
   }
 
-  const descriptor = descriptorFor(match);
-  let canonicalBytes: Uint8Array;
-
-  try {
-    canonicalBytes = toCanonicalDigestBytes(descriptor);
-  } catch (error) {
-    if (isUnpairedSurrogateError(error)) {
-      return undefined;
-    }
-
-    throw error;
-  }
-
-  return {
-    algorithm: 'a11y-neighborhood-v1',
-    hash: createHash('sha256').update(canonicalBytes).digest('hex'),
-  };
+  return hashMatch(match);
 }
 
 /**
@@ -391,22 +425,12 @@ export function resolveAccessibilityFingerprint(
     return 'element-not-found';
   }
 
-  const descriptor = descriptorFor(match);
-  let canonicalBytes: Uint8Array;
-
-  try {
-    canonicalBytes = toCanonicalDigestBytes(descriptor);
-  } catch (error) {
-    if (isUnpairedSurrogateError(error)) {
-      return 'element-not-found';
-    }
-
-    throw error;
+  const fingerprint = hashMatch(match);
+  if (fingerprint === undefined) {
+    return 'element-not-found';
   }
 
-  const hash = createHash('sha256').update(canonicalBytes).digest('hex');
-
-  return expected.algorithm === 'a11y-neighborhood-v1' && hash === expected.hash
+  return expected.algorithm === fingerprint.algorithm && expected.hash === fingerprint.hash
     ? 'hit'
     : 'fingerprint-mismatch';
 }
