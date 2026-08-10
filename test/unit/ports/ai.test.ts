@@ -1,5 +1,13 @@
 import { describe, expectTypeOf, it } from 'vitest';
-import type { ElementRef, JsonValueT, TraceAction } from '../../../src/core/ir/schema.js';
+import type {
+  ElementRef,
+  JsonValueT,
+  RunVariableName,
+  SecretRef,
+  TraceAction,
+  TraceAssert,
+  TraceRecord,
+} from '../../../src/core/ir/schema.js';
 import type { TypedJsonSchema } from '../../../src/core/ai/typed-json-schema.js';
 import type {
   AiActionController,
@@ -59,13 +67,15 @@ describe('AI port shapes', () => {
   it('defines the narrow controller and agentic request/result shapes', () => {
     expectTypeOf<AiActionController>().toEqualTypeOf<{
       perform(action: TraceAction): Promise<void>;
-      evaluateAssert(check: AssertCheck): Promise<AssertOutcome>;
+      evaluateAssert(check: TraceAssert): Promise<AssertOutcome>;
       snapshotForResolution(): Promise<PageSnapshot>;
     }>();
     expectTypeOf<AiAgenticRequest>().toEqualTypeOf<{
       readonly instructionPrompt: string;
+      readonly allowedSecretRefs: readonly SecretRef[];
+      readonly allowedRunRefs: readonly RunVariableName[];
       readonly controller: AiActionController;
-      readonly priorTrace?: readonly TraceAction[];
+      readonly priorTrace?: TraceRecord;
       readonly signal?: AbortSignal;
     }>();
     expectTypeOf<AiAgenticResult>().toEqualTypeOf<{

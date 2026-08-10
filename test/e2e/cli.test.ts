@@ -51,8 +51,9 @@ async function writeStalePlan(project: string): Promise<void> {
   } as unknown as JsonValueT));
 }
 
-// The published-path check exercises only list mode, so no test can reach a
-// locally installed provider CLI or depend on provider credentials.
+// Successful list-mode checks and run scenarios that end before fallback
+// resolution exercise the published path without requiring a local provider
+// CLI or provider credentials.
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
@@ -139,7 +140,7 @@ describe('bin/ambercast.js (e2e)', () => {
       errors: [expect.objectContaining({
         scope: 'run',
         code: 'CONFIG_INVALID',
-        message: 'The --stale=regenerate option is not available in this build; only --stale=fail is supported.',
+        message: 'The --stale=regenerate option is unsupported; only --stale=fail is supported.',
       })],
     });
   });

@@ -1,3 +1,4 @@
+import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { BrowserLaunchFailedError } from '#core/errors/browser-launch-failed-error.js';
 import { FsIoError } from '#core/errors/fs-io-error.js';
@@ -11,12 +12,18 @@ import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import {
+  Fingerprint,
   GroundingDocument,
   PlanDocument,
+  RunRef,
+  TraceAction,
+  TraceAssert,
+  TraceRecord,
   type ActionStep,
   type AssertStep,
   type CaptureStep,
   type ElementRef,
+  type GroundingEntry,
   type GroundingDocument as GroundingDocumentType,
   type JsonValueT,
   type PlanDocument as PlanDocumentType,
@@ -27,16 +34,20 @@ import {
 import type { LayoutResolver } from '#core/layout/resolve.js';
 import { joinPath, relativeWithin } from '#core/paths.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
-import type { AssertCheck, BrowserSession, PerformableAction } from '#ports/browser.js';
+import type { AiActionController, AiExecutor } from '#ports/ai.js';
+import type { AssertCheck, AssertOutcome, BrowserSession, PerformableAction } from '#ports/browser.js';
 import type { BrowserDriverResolver } from '#ports/index.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { Clock, EventSink, SecretsProvider } from '#ports/system.js';
 import type { RunResult, StepResult } from '#report/schema.js';
+import { z } from 'zod';
 
 type ResultWithoutDuration = Omit<RunResult, 'durationMs'>;
 
+type ResolutionVia = 'grounding' | 'ai-resolve' | 'trace-replay';
+
 type DispatchOutcome =
-  | { readonly kind: 'passed' }
+  | { readonly kind: 'passed'; readonly via?: ResolutionVia }
   | { readonly kind: 'assertion-failed'; readonly message: string };
 
 interface DispatchContext {
@@ -44,16 +55,27 @@ interface DispatchContext {
   readonly grounding: GroundingDocumentType;
   readonly runState: Map<RunVariableName, string>;
   readonly secrets: SecretsProvider;
+  readonly allowedRunRefs: ReadonlySet<RunVariableName>;
+  readonly resolveAiExecutor: () => Promise<AiExecutor>;
+  readonly cacheOnly: boolean;
+  readonly events: EventSink;
+  readonly updateGroundingEntry: (stepId: Step['id'], entry: GroundingEntry) => void;
+  readonly deleteGroundingEntry: (stepId: Step['id']) => void;
+  readonly resolvedVias: Map<Step['id'], ResolutionVia>;
+  readonly signal?: AbortSignal;
 }
 
 type StepExecutor = (step: Step, context: DispatchContext) => Promise<DispatchOutcome>;
 
 const RUN_REFERENCE_PATTERN = /\{\{run\.([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\}\}/g;
+const RUN_REFERENCE_START = '{{run.';
+
+const FINGERPRINT_RESPONSE = z.strictObject({ fingerprint: Fingerprint });
+const FINGERPRINT_RESPONSE_SCHEMA = typedJsonSchema(FINGERPRINT_RESPONSE);
 
 /**
  * Marks an abort that has no reportable error kind while retaining a useful
- * case-level explanation. Issue #8 replaces this temporary fallback with
- * AI-assisted resolution rather than extending a second error vocabulary.
+ * case-level explanation.
  */
 class CaseAbort extends Error {}
 
@@ -194,29 +216,676 @@ function materializeStep(step: Step, runState: ReadonlyMap<RunVariableName, stri
           return step;
       }
     case 'ai':
-      return { ...step, instruction: materializeText(step.instruction, runState) };
+      // Agentic instructions retain unresolved run references as trusted plan
+      // metadata; the controller alone materializes provider-directed actions.
+      return step;
     case 'capture':
       return step;
   }
 }
 
+/**
+ * Verifies provider-controlled run references against the current case before
+ * any browser operation can receive their materialized values.
+ *
+ * The persisted trace schema deliberately permits generic interpolatable
+ * text, because a trace's authority depends on the current case rather than
+ * on its static JSON shape. This guard therefore treats malformed, ungranted,
+ * or unavailable references as integrity violations instead of allowing a
+ * provider or stale trace to select an arbitrary browser value.
+ */
+function assertTrustedRunReferences(value: string, context: DispatchContext): void {
+  let cursor = 0;
+
+  while (true) {
+    const start = value.indexOf(RUN_REFERENCE_START, cursor);
+    if (start < 0) {
+      return;
+    }
+
+    const end = value.indexOf('}}', start + RUN_REFERENCE_START.length);
+    if (end < 0) {
+      throw new IntegrityViolationError('An AI trace contains a malformed run reference.');
+    }
+
+    const reference = value.slice(start, end + 2);
+    if (!RunRef.safeParse(reference).success) {
+      throw new IntegrityViolationError('An AI trace contains a malformed run reference.');
+    }
+
+    const name = reference.slice(RUN_REFERENCE_START.length, -2) as RunVariableName;
+    if (!context.allowedRunRefs.has(name)) {
+      throw new IntegrityViolationError('An AI trace references a run value that this step is not allowed to use.', {
+        runRef: name,
+      });
+    }
+
+    if (!context.runState.has(name)) {
+      throw new IntegrityViolationError('An AI trace references a run value that is unavailable in this case.', {
+        runRef: name,
+      });
+    }
+
+    cursor = end + 2;
+  }
+}
+
+/**
+ * Resolves trusted run templates only at the browser-call boundary.
+ *
+ * The prior validation makes a missing map value unreachable in ordinary
+ * execution, but the second check keeps this trust boundary fail-closed if
+ * case state changes between validation and replacement in a future async
+ * integration.
+ */
+function materializeTrustedRunText(value: string, context: DispatchContext): string {
+  assertTrustedRunReferences(value, context);
+
+  return value.replace(RUN_REFERENCE_PATTERN, (_reference, path: string) => {
+    const name = path as RunVariableName;
+    const captured = context.runState.get(name);
+    if (captured === undefined) {
+      throw new IntegrityViolationError('An AI trace references a run value that is unavailable in this case.', {
+        runRef: name,
+      });
+    }
+
+    return captured;
+  });
+}
+
+/**
+ * Converts a trusted unresolved trace action into the browser port's
+ * materialized action shape immediately before execution.
+ *
+ * Trace actions intentionally carry the authored element locator unchanged.
+ * The wrapper does not attempt a second grounding lookup because a recorded
+ * trace is itself the replay recipe; only run interpolation and secret lookup
+ * are runtime-bound fields.
+ */
+function materializeTraceAction(
+  action: TraceAction,
+  context: DispatchContext,
+  secretRefs: ReadonlySet<string>,
+  resolvedSecrets?: Map<string, string>,
+): PerformableAction {
+  switch (action.type) {
+    case 'click':
+      return { type: 'click', target: action.target };
+    case 'navigate':
+      return { type: 'navigate', url: materializeTrustedRunText(action.url, context) };
+    case 'press':
+      return { type: 'press', target: action.target, key: action.key };
+    case 'fill':
+      return { type: 'fill', target: action.target, value: materializeTrustedRunText(action.value, context) };
+    case 'fill-secret': {
+      if (!secretRefs.has(action.secretRef)) {
+        throw new IntegrityViolationError('An AI action references a secret that this step is not allowed to use.', {
+          secretRef: action.secretRef,
+        });
+      }
+
+      const value = context.secrets.resolve(action.secretRef);
+      if (value === undefined) {
+        throw new SecretUnresolvedError('The referenced secret is unavailable.', { secretRef: action.secretRef });
+      }
+
+      resolvedSecrets?.set(action.secretRef, value);
+      return { type: 'fill-secret', target: action.target, value };
+    }
+  }
+}
+
+/**
+ * Converts a trusted unresolved trace assertion to the browser's materialized
+ * check shape immediately before evaluation.
+ *
+ * Assertions never resolve secrets, but their text and URL expectations may
+ * reference a captured case value and must therefore use the same grant and
+ * availability checks as trace actions.
+ */
+function materializeTraceAssert(check: TraceAssert, context: DispatchContext): AssertCheck {
+  switch (check.check) {
+    case 'text-visible':
+      return { check: 'text-visible', text: materializeTrustedRunText(check.text, context) };
+    case 'element-visible':
+      return { check: 'element-visible', target: check.target };
+    case 'text-equals':
+      return {
+        check: 'text-equals',
+        target: check.target,
+        text: materializeTrustedRunText(check.text, context),
+      };
+    case 'url-matches':
+      return { check: 'url-matches', pattern: materializeTrustedRunText(check.pattern, context) };
+    case 'element-count':
+      return { check: 'element-count', target: check.target, count: check.count };
+  }
+}
+
+/**
+ * Checks the dynamic authority requirements of one already-parsed trace item.
+ *
+ * `readUsableGrounding` has already validated the complete document shape, so
+ * this deliberately checks only facts that parsing cannot know: the current
+ * step's secret grants and the current case's run grants and captured values.
+ */
+function preScanTraceEntry(
+  entry: TraceAction | TraceAssert,
+  context: DispatchContext,
+  secretRefs: ReadonlySet<string>,
+): void {
+  if (entry.type === 'fill-secret' && !secretRefs.has(entry.secretRef)) {
+    throw new IntegrityViolationError('An AI trace references a secret that this step is not allowed to use.', {
+      secretRef: entry.secretRef,
+    });
+  }
+
+  switch (entry.type === 'assert' ? entry.check : entry.type) {
+    case 'navigate':
+      assertTrustedRunReferences((entry as Extract<TraceAction, { type: 'navigate' }>).url, context);
+      return;
+    case 'fill':
+      assertTrustedRunReferences((entry as Extract<TraceAction, { type: 'fill' }>).value, context);
+      return;
+    case 'text-visible':
+      assertTrustedRunReferences((entry as Extract<TraceAssert, { check: 'text-visible' }>).text, context);
+      return;
+    case 'text-equals':
+      assertTrustedRunReferences((entry as Extract<TraceAssert, { check: 'text-equals' }>).text, context);
+      return;
+    case 'url-matches':
+      assertTrustedRunReferences((entry as Extract<TraceAssert, { check: 'url-matches' }>).pattern, context);
+      return;
+    default:
+      return;
+  }
+}
+
+/**
+ * Performs path C's complete dynamic-trust pass before replay touches the
+ * browser.
+ *
+ * Events precede verification in both storage and execution. Walking both
+ * lists here keeps a later bad reference from allowing an earlier action to
+ * run, while intentionally avoiding redundant zod validation of entries that
+ * cannot survive `readUsableGrounding` with an invalid static shape.
+ */
+function preScanTrace(trace: z.infer<typeof TraceRecord>, context: DispatchContext, secretRefs: ReadonlySet<string>): void {
+  for (const entry of trace.events) {
+    preScanTraceEntry(entry, context, secretRefs);
+  }
+
+  for (const assertion of trace.verification) {
+    preScanTraceEntry(assertion, context, secretRefs);
+  }
+}
+
+/**
+ * Replays a trusted trace in journal order and returns whether the browser
+ * confirmed every recorded observation.
+ *
+ * A false assertion is an expected behavioral miss. Browser rejections are
+ * left to the caller so it can distinguish ordinary behavioral failure from
+ * the classified integrity and resolution failures emitted by materialization.
+ */
+async function replayTrace(
+  trace: z.infer<typeof TraceRecord>,
+  context: DispatchContext,
+  secretRefs: ReadonlySet<string>,
+): Promise<boolean> {
+  for (const entry of trace.events) {
+    if (entry.type === 'assert') {
+      const outcome = await context.session.evaluateAssert(materializeTraceAssert(entry, context));
+      if (!outcome.passed) {
+        return false;
+      }
+      continue;
+    }
+
+    await context.session.perform(materializeTraceAction(entry, context, secretRefs));
+  }
+
+  for (const assertion of trace.verification) {
+    const outcome = await context.session.evaluateAssert(materializeTraceAssert(assertion, context));
+    if (!outcome.passed) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+type MaterializedValueCandidate = {
+  readonly source: 'secret' | 'run';
+  readonly value: string;
+  readonly replacement: string;
+};
+
+/**
+ * Rejects a provider literal that crosses back over the materialization
+ * boundary instead of using its unresolved reference.
+ *
+ * Only complete field equality is significant: ordinary provider prose may
+ * legitimately contain a captured word, but a whole actionable field equal to
+ * a captured or previously resolved secret value cannot be persisted safely.
+ */
+function assertNoMaterializedLiteral(
+  entry: TraceAction | TraceAssert,
+  context: DispatchContext,
+  resolvedSecrets: ReadonlyMap<string, string>,
+): void {
+  let value: string | undefined;
+
+  switch (entry.type) {
+    case 'navigate':
+      value = entry.url;
+      break;
+    case 'fill':
+      value = entry.value;
+      break;
+    case 'assert':
+      switch (entry.check) {
+        case 'text-visible':
+        case 'text-equals':
+          value = entry.text;
+          break;
+        case 'url-matches':
+          value = entry.pattern;
+          break;
+        default:
+          return;
+      }
+      break;
+    default:
+      return;
+  }
+
+  if (
+    [...context.runState.values()].some((candidate) => candidate === value)
+    || [...resolvedSecrets.values()].some((candidate) => candidate === value)
+  ) {
+    throw new IntegrityViolationError('The AI adapter supplied a materialized value instead of an unresolved reference.');
+  }
+}
+
+/**
+ * Replaces materialized diagnostics with their stable references in one pass.
+ *
+ * The candidate set joins secrets and captures before scanning, rather than
+ * applying separate redaction passes that could split an overlapping secret
+ * into fragments. Longest-first selection preserves the most specific value
+ * at each position; source and lexical tie-breaks make diagnostics stable
+ * without ever rescanning replacement text.
+ */
+function templateMaterializedValues(
+  message: string,
+  resolvedSecrets: ReadonlyMap<string, string>,
+  runState: ReadonlyMap<RunVariableName, string>,
+): string {
+  const candidates: MaterializedValueCandidate[] = [];
+
+  for (const [secretRef, value] of resolvedSecrets) {
+    if (value !== '') {
+      candidates.push({ source: 'secret', value, replacement: secretRef });
+    }
+  }
+
+  for (const [name, value] of runState) {
+    if (value !== '') {
+      candidates.push({ source: 'run', value, replacement: `{{run.${name}}}` });
+    }
+  }
+
+  candidates.sort((left, right) => (
+    right.value.length - left.value.length
+    || (left.source === right.source ? 0 : left.source === 'secret' ? -1 : 1)
+    || (left.value < right.value ? -1 : left.value > right.value ? 1 : 0)
+    || (left.replacement < right.replacement ? -1 : left.replacement > right.replacement ? 1 : 0)
+  ));
+
+  let rendered = '';
+  let cursor = 0;
+  while (cursor < message.length) {
+    const candidate = candidates.find(({ value }) => message.startsWith(value, cursor));
+    if (candidate === undefined) {
+      rendered += message[cursor];
+      cursor += 1;
+      continue;
+    }
+
+    rendered += candidate.replacement;
+    cursor += candidate.value.length;
+  }
+
+  return rendered;
+}
+
+/**
+ * Rebuilds a browser rejection without retaining a materialized diagnostic.
+ *
+ * Classified errors retain their constructor so report policy continues to
+ * recognize them, but neither details nor a causal error are carried over:
+ * either may retain the browser's unsanitized value.
+ */
+function scrubBrowserRejection(
+  error: unknown,
+  resolvedSecrets: ReadonlyMap<string, string>,
+  runState: ReadonlyMap<RunVariableName, string>,
+): Error {
+  const message = templateMaterializedValues(
+    error instanceof Error ? error.message : String(error),
+    resolvedSecrets,
+    runState,
+  );
+
+  if (error instanceof AmbercastError) {
+    const ErrorConstructor = error.constructor as new (message: string) => AmbercastError;
+    return new ErrorConstructor(message);
+  }
+
+  return new Error(message);
+}
+
+/**
+ * Produces an assertion outcome safe to return to an AI adapter.
+ *
+ * Only browser diagnostics cross back to the adapter, so this is the sole
+ * place reverse substitution is allowed. The unresolved journal remains
+ * untouched, preserving the stronger rule that resolved values never enter
+ * grounding or other replay artifacts.
+ */
+function templateAssertOutcome(
+  outcome: AssertOutcome,
+  resolvedSecrets: ReadonlyMap<string, string>,
+  runState: ReadonlyMap<RunVariableName, string>,
+): AssertOutcome {
+  if (outcome.message === undefined) {
+    return outcome;
+  }
+
+  const message = templateMaterializedValues(outcome.message, resolvedSecrets, runState);
+  return outcome.passed ? { passed: true, message } : { passed: false, message };
+}
+
+type LastAgenticObservation = 'none' | 'perform' | 'snapshot' | 'failed-assert' | 'passed-assert';
+
+/**
+ * Wraps one live browser session for exactly one agentic execution.
+ *
+ * The wrapper is the authority that both materializes provider instructions
+ * and decides whether a nominal agentic success has sufficient terminal
+ * evidence to become replayable grounding. It records only successful actions
+ * and passing assertions in unresolved form, while a separate raw-observation
+ * counter prevents unjournaled sensing from being mistaken for adjacent final
+ * verification.
+ */
+class AgenticRunPipeline implements AiActionController {
+  readonly #journal: Array<TraceAction | TraceAssert> = [];
+  readonly #resolvedSecrets = new Map<string, string>();
+  readonly #secretRefs: ReadonlySet<string>;
+  #trailingPassedAssertRun = 0;
+  #lastObservation: LastAgenticObservation = 'none';
+
+  constructor(
+    private readonly context: DispatchContext,
+    secretRefs: readonly string[],
+    private readonly step: Extract<Step, { kind: 'ai' }>,
+    private readonly fallbackFromReplay: boolean,
+  ) {
+    this.#secretRefs = new Set(secretRefs);
+  }
+
+  /**
+   * Materializes and performs one provider-supplied action before recording it.
+   *
+   * External adapters can bypass TypeScript types, so zod validation happens
+   * before materialization and a successful browser call is the only event
+   * that enters the journal. A perform always breaks terminal verification,
+   * even when the call later rejects and aborts the entire agentic execution.
+   */
+  async perform(action: TraceAction): Promise<void> {
+    const parsed = TraceAction.safeParse(action);
+    if (!parsed.success) {
+      throw new IntegrityViolationError('The AI adapter supplied an invalid browser action.', {
+        issues: parsed.error.issues,
+      });
+    }
+
+    this.#trailingPassedAssertRun = 0;
+    this.#lastObservation = 'perform';
+    assertNoMaterializedLiteral(parsed.data, this.context, this.#resolvedSecrets);
+    const materialized = materializeTraceAction(parsed.data, this.context, this.#secretRefs, this.#resolvedSecrets);
+    try {
+      await this.context.session.perform(materialized);
+    } catch (error) {
+      throw scrubBrowserRejection(error, this.#resolvedSecrets, this.context.runState);
+    }
+    this.#journal.push(parsed.data);
+  }
+
+  /**
+   * Materializes and evaluates one provider-supplied assertion observation.
+   *
+   * A passing observation is journaled and extends the final verification run;
+   * every other assertion outcome breaks it. Its diagnostic is redacted only
+   * in the value returned to the adapter, never in the unresolved record.
+   */
+  async evaluateAssert(check: TraceAssert): Promise<AssertOutcome> {
+    const parsed = TraceAssert.safeParse(check);
+    if (!parsed.success) {
+      throw new IntegrityViolationError('The AI adapter supplied an invalid assertion observation.', {
+        issues: parsed.error.issues,
+      });
+    }
+
+    assertNoMaterializedLiteral(parsed.data, this.context, this.#resolvedSecrets);
+    const materialized = materializeTraceAssert(parsed.data, this.context);
+    let outcome: AssertOutcome;
+    try {
+      outcome = await this.context.session.evaluateAssert(materialized);
+    } catch (error) {
+      throw scrubBrowserRejection(error, this.#resolvedSecrets, this.context.runState);
+    }
+    if (outcome.passed) {
+      this.#trailingPassedAssertRun += 1;
+      this.#lastObservation = 'passed-assert';
+      this.#journal.push(parsed.data);
+    } else {
+      this.#trailingPassedAssertRun = 0;
+      this.#lastObservation = 'failed-assert';
+    }
+
+    return templateAssertOutcome(outcome, this.#resolvedSecrets, this.context.runState);
+  }
+
+  /**
+   * Captures current browser evidence without making it replayable history.
+   *
+   * Snapshotting is still an observation for terminal-verification purposes:
+   * an agent cannot inspect new page evidence after a passing assertion and
+   * then claim that the earlier assertion was its final proof of success.
+   */
+  async snapshotForResolution() {
+    this.#trailingPassedAssertRun = 0;
+    this.#lastObservation = 'snapshot';
+    return this.context.session.snapshotForResolution();
+  }
+
+  /**
+   * Classifies a resolved agentic result and applies its complete grounding
+   * mutation, if any.
+   *
+   * A failure outcome discards the journal through the unified case-abort
+   * result, while a rejected execution never reaches this method. A successful
+   * result persists a trace only with terminal passing assertions; a snapshot
+   * or failed assertion completes terminal negative sensing without a record.
+   * A bare action or no observation produces the unified case-abort result.
+   */
+  finalize(outcome: 'success' | 'failure'): DispatchOutcome {
+    if (outcome === 'failure') {
+      throw new CaseAbort('The AI-directed interaction did not complete successfully.');
+    }
+
+    if (this.#trailingPassedAssertRun >= 1) {
+      const splitAt = this.#journal.length - this.#trailingPassedAssertRun;
+      const events = this.#journal.slice(0, splitAt);
+      const verification = this.#journal.slice(splitAt).map((entry) => {
+        if (entry.type !== 'assert') {
+          throw new IntegrityViolationError('The AI verification journal is internally inconsistent.');
+        }
+        return entry;
+      });
+      const parsed = TraceRecord.safeParse({ events, verification });
+      if (!parsed.success) {
+        throw new IntegrityViolationError('The AI verification journal is internally inconsistent.', {
+          issues: parsed.error.issues,
+        });
+      }
+
+      this.context.updateGroundingEntry(this.step.id, { kind: 'ai', trace: parsed.data });
+      return { kind: 'passed', via: 'ai-resolve' };
+    }
+
+    if (this.#lastObservation === 'snapshot' || this.#lastObservation === 'failed-assert') {
+      if (this.fallbackFromReplay) {
+        this.context.deleteGroundingEntry(this.step.id);
+      }
+      return { kind: 'passed', via: 'ai-resolve' };
+    }
+
+    throw new CaseAbort('The AI-directed interaction completed without terminal verification evidence.');
+  }
+}
+
+/**
+ * Performs one lazy agentic fallback and lets its fresh wrapper classify the
+ * resulting journal.
+ *
+ * A case resolves its executor only when this function is entered, preserving
+ * pure cache-hit replay on machines without an installed provider. Each call
+ * gets an independent controller and journal so a rejected interaction cannot
+ * leak partial observations into a later retry or another plan step.
+ */
+async function executeAgentic(
+  step: Extract<Step, { kind: 'ai' }>,
+  context: DispatchContext,
+  priorTrace: z.infer<typeof TraceRecord> | undefined,
+  fallbackFromReplay: boolean,
+): Promise<DispatchOutcome> {
+  const secretRefs = step.secrets ?? [];
+  if (priorTrace !== undefined) {
+    preScanTrace(priorTrace, context, new Set(secretRefs));
+  }
+
+  const executor = await context.resolveAiExecutor();
+  const pipeline = new AgenticRunPipeline(context, secretRefs, step, fallbackFromReplay);
+  context.events.emit({ type: 'ai-call', stepId: step.id });
+  const result = await executor.executeAgentic({
+    instructionPrompt: step.instruction,
+    allowedSecretRefs: secretRefs,
+    allowedRunRefs: [...context.allowedRunRefs],
+    controller: pipeline,
+    ...(priorTrace === undefined ? {} : { priorTrace }),
+    ...(context.signal === undefined ? {} : { signal: context.signal }),
+  });
+
+  return pipeline.finalize(result.outcome);
+}
+
+/**
+ * Executes an AI step by replaying trusted grounding first, then falling back
+ * to one fresh agentic interaction only for a behavioral trace miss.
+ *
+ * The pre-scan is an integrity gate rather than a hint: an entry whose grants
+ * no longer fit this case is never partially replayed and never handed back to
+ * an AI provider. `cacheOnly` suppresses both cold-start and behavioral-miss
+ * calls, producing the same case-abort outcome as replay that permits no AI
+ * fallback.
+ */
+async function executeAiStep(
+  step: Extract<Step, { kind: 'ai' }>,
+  context: DispatchContext,
+  cacheOnly: boolean,
+): Promise<DispatchOutcome> {
+  const entry = context.grounding.entries[step.id];
+  const secretRefs = new Set(step.secrets ?? []);
+  if (entry?.kind !== 'ai') {
+    if (cacheOnly) {
+      throw new CaseAbort('AI-directed replay has no usable trace while cache-only mode is enabled.');
+    }
+
+    return executeAgentic(step, context, undefined, false);
+  }
+
+  preScanTrace(entry.trace, context, secretRefs);
+  try {
+    if (await replayTrace(entry.trace, context, secretRefs)) {
+      return { kind: 'passed', via: 'trace-replay' };
+    }
+  } catch (error) {
+    if (error instanceof IntegrityViolationError || error instanceof SecretUnresolvedError || error instanceof CaseAbort) {
+      throw error;
+    }
+  }
+
+  context.signal?.throwIfAborted();
+
+  if (cacheOnly) {
+    throw new CaseAbort('AI trace replay missed while cache-only mode is enabled.');
+  }
+
+  return executeAgentic(step, context, entry.trace, true);
+}
+
+/**
+ * Re-resolves an element grounding miss through a structured, fingerprint-only
+ * AI request when the caller has allowed fallback.
+ *
+ * The authored `ElementRef` remains immutable because grounding stores no
+ * alternate locator. The newly observed fingerprint is nevertheless persisted
+ * before the subsequent browser work: it is a page fact that remains useful
+ * even if that work fails and is intentionally accumulated for the case's
+ * single final atomic flush.
+ */
 async function groundedTarget(
-  session: BrowserSession,
-  grounding: GroundingDocumentType,
+  context: DispatchContext,
   step: ActionStep | AssertStep | CaptureStep,
   target: ElementRef,
 ): Promise<ElementRef> {
-  const entry = grounding.entries[step.id];
-  if (entry?.kind !== 'element') {
-    throw new CaseAbort('AI-assisted re-resolution is unavailable because this step has no usable grounding entry.');
+  const entry = context.grounding.entries[step.id];
+  if (entry?.kind === 'element') {
+    const resolved = await context.session.resolveGrounded(target, entry.fingerprint);
+    if (resolved.kind === 'hit') {
+      return resolved.ref;
+    }
   }
 
-  const resolved = await session.resolveGrounded(target, entry.fingerprint);
-  if (resolved.kind !== 'hit') {
-    throw new CaseAbort('AI-assisted re-resolution is unavailable because recorded grounding no longer matches the page.');
+  if (context.cacheOnly) {
+    throw new CaseAbort('Element grounding is unavailable while cache-only mode is enabled.');
   }
 
-  return resolved.ref;
+  const snapshot = await context.session.snapshotForResolution();
+  const executor = await context.resolveAiExecutor();
+  context.events.emit({ type: 'ai-call', stepId: step.id });
+  const response = await executor.execute({
+    prompt: 'Confirm that the supplied locator still identifies the intended element and return its current stable accessibility-neighborhood fingerprint.',
+    responseSchema: FINGERPRINT_RESPONSE_SCHEMA,
+    // Screenshot bytes are encoded because AI request context is JSON-only;
+    // keeping the locator unchanged confines this path to fingerprint refresh.
+    context: {
+      target: target as unknown as JsonValueT,
+      snapshot: {
+        accessibilityTree: snapshot.accessibilityTree,
+        screenshotBase64: Buffer.from(snapshot.screenshot).toString('base64'),
+      },
+    },
+    ...(context.signal === undefined ? {} : { signal: context.signal }),
+  });
+
+  context.updateGroundingEntry(step.id, { kind: 'element', fingerprint: response.data.fingerprint });
+  context.resolvedVias.set(step.id, 'ai-resolve');
+  return target;
 }
 
 async function executeAction(step: Step, context: DispatchContext): Promise<DispatchOutcome> {
@@ -227,7 +896,7 @@ async function executeAction(step: Step, context: DispatchContext): Promise<Disp
   let action: PerformableAction;
   switch (step.action) {
     case 'click':
-      action = { type: 'click', target: await groundedTarget(context.session, context.grounding, step, step.target) };
+      action = { type: 'click', target: await groundedTarget(context, step, step.target) };
       break;
     case 'navigate':
       action = { type: 'navigate', url: step.url };
@@ -235,19 +904,19 @@ async function executeAction(step: Step, context: DispatchContext): Promise<Disp
     case 'press':
       action = {
         type: 'press',
-        target: await groundedTarget(context.session, context.grounding, step, step.target),
+        target: await groundedTarget(context, step, step.target),
         key: step.key,
       };
       break;
     case 'fill':
       action = {
         type: 'fill',
-        target: await groundedTarget(context.session, context.grounding, step, step.target),
+        target: await groundedTarget(context, step, step.target),
         value: step.value,
       };
       break;
     case 'fill-secret': {
-      const target = await groundedTarget(context.session, context.grounding, step, step.target);
+      const target = await groundedTarget(context, step, step.target);
       const value = context.secrets.resolve(step.secretRef);
       if (value === undefined) {
         throw new SecretUnresolvedError('The referenced secret is unavailable.', { secretRef: step.secretRef });
@@ -275,13 +944,13 @@ async function executeAssert(step: Step, context: DispatchContext): Promise<Disp
     case 'element-visible':
       check = {
         check: 'element-visible',
-        target: await groundedTarget(context.session, context.grounding, step, step.target),
+        target: await groundedTarget(context, step, step.target),
       };
       break;
     case 'text-equals':
       check = {
         check: 'text-equals',
-        target: await groundedTarget(context.session, context.grounding, step, step.target),
+        target: await groundedTarget(context, step, step.target),
         text: step.text,
       };
       break;
@@ -291,7 +960,7 @@ async function executeAssert(step: Step, context: DispatchContext): Promise<Disp
     case 'element-count':
       check = {
         check: 'element-count',
-        target: await groundedTarget(context.session, context.grounding, step, step.target),
+        target: await groundedTarget(context, step, step.target),
         count: step.count,
       };
       break;
@@ -306,7 +975,7 @@ async function executeCapture(step: Step, context: DispatchContext): Promise<Dis
     throw new Error('The capture dispatcher received a non-capture step.');
   }
 
-  const target = await groundedTarget(context.session, context.grounding, step, step.target);
+  const target = await groundedTarget(context, step, step.target);
   const value = await context.session.captureValue(target, 'text');
   context.runState.set(step.variable, value);
   return { kind: 'passed' };
@@ -358,7 +1027,7 @@ function grepMatches(grep: RegExp, path: string, testDir: string): boolean {
 }
 
 /**
- * Declares zero-AI replay policy for one run batch.
+ * Declares replay selection and AI-fallback policy for one run batch.
  *
  * @remarks
  * A caller may give literal prompt paths or let the use case ask the injected
@@ -383,7 +1052,7 @@ export interface RunOptions {
   /** Optional configured target name whose definition contributes to freshness. */
   readonly target?: string;
 
-  /** Accepted compatibility policy; replay remains cache-only without an AI fallback. */
+  /** Whether grounding misses and trace misses must fail without an AI fallback. */
   readonly cacheOnly: boolean;
 
   /** Parsed stale-artifact policy; regeneration is rejected before replay begins. */
@@ -394,10 +1063,9 @@ export interface RunOptions {
  * Dependencies at the deterministic replay boundary.
  *
  * @remarks
- * This deliberately has no `AiExecutor` dependency. Unlike generation, a
- * fully grounded replay must run on a machine without an AI provider, and a
- * grounding miss is an explicit case abort rather than a request to repair
- * the artifact. Storage, target configuration, and browser launch are kept
+ * A fully grounded replay must run on a machine without an AI provider, so
+ * AI resolution remains lazy and is reached only by an allowed grounding or
+ * trace fallback. Storage, target configuration, and browser launch are kept
  * separate so plan trust can be established before a browser process exists.
  */
 export interface RunDeps {
@@ -424,10 +1092,20 @@ export interface RunDeps {
   readonly secrets: SecretsProvider;
 
   /**
-   * Receives successful grounded-step lifecycle events without affecting replay.
+   * Lazily resolves the executor used only by an allowed per-case fallback.
    *
-   * Successful steps emit their start and grounded result through this port;
-   * deterministic replay never emits an `ai-call` event.
+   * `runCase` memoizes this resolver after the first actual fallback, so path
+   * B and path C calls in the same case share one executor without probing a
+   * provider for cache-only or complete-cache replay.
+   */
+  readonly resolveAiExecutor: (signal?: AbortSignal) => Promise<AiExecutor>;
+
+  /**
+   * Receives successful step and real AI-call lifecycle events without affecting replay.
+   *
+   * Result events identify deterministic grounding, AI element resolution, or
+   * successful trace replay. Each actual executor invocation emits one
+   * `ai-call` event, while cache hits and cache-only aborts emit none.
    */
   readonly events: EventSink;
 
@@ -506,98 +1184,28 @@ export interface RunOutcome {
  * scheduler before another case starts, but returns the outcomes already
  * completed; it does not discard them.
  *
- * Each `RunResult.durationMs` brackets one case's work with
- * `deps.clock.monotonicMs()`: timing starts before target and freshness
- * resolution and ends once that case's `RunCaseOutcome` is ready. This follows
- * the monotonic-duration convention already used for command-level batch
- * timing in `generate-command.ts`.
+ * Each result uses a monotonic per-case duration so elapsed time remains
+ * meaningful when wall-clock time changes. Replay validates the plan before
+ * browser startup because only a canonical artifact with current inputs may
+ * direct browser work. Grounding is a recoverable cache: an absent, malformed,
+ * or stale cache falls back to empty grounding rather than invalidating the
+ * trusted plan.
  *
- * Each case resolves its configured target before recomputing the same inputs
- * digest used by generation: normalized prompt text, schema version, generator
- * prompt-template fingerprint, and the one resolved target definition all
- * participate. It then establishes plan trust in this fixed order, before
- * `driver.launch()` is ever called: an absent plan raises
- * `MissingPlanError`; unreadable JSON, a schema-invalid document, or bytes
- * that differ from canonical serialization raise `IntegrityViolationError`;
- * and only a valid canonical plan whose current digest differs raises
- * `StaleIrError`. This ordering preserves the no-browser-startup-cost failure
- * path for every invalid artifact. In particular, parseable but non-canonical
- * text is an integrity violation, not stale IR: `generate()` may treat such
- * text as merely not fresh and regenerate it, but replay has no regeneration
- * path and must reject an untrustworthy committed artifact.
+ * Deterministic steps materialize run and secret values only immediately
+ * before browser operations. Agentic instructions, provider-visible context,
+ * and committed traces retain unresolved references; trusted trace replay
+ * precedes a lazy agentic fallback when `cacheOnly` permits it. These
+ * boundaries prevent materialized secrets and run values from crossing back
+ * into provider-visible or persisted data.
  *
- * Grounding has a deliberately softer trust rule than the plan. A missing
- * grounding file, malformed grounding text, or a grounding document whose own
- * digest differs from the plan digest is legal: replay creates an empty-entry
- * grounding document keyed to the valid plan's digest, and every
- * element-bearing step consequently misses. Only the plan document takes the
- * strict integrity and staleness path; a stale or unusable grounding cache
- * degrades gracefully instead of becoming an integrity failure.
- *
- * Execution uses one dispatch executor for each outer plan-step kind:
- * `action`, `assert`, and `capture`. The action executor alone selects among
- * click, navigation, key press, ordinary fill, and secret fill when it builds
- * a `PerformableAction`; this keeps outer-kind ownership unambiguous. `ai`
- * steps are rejected outright through the unified case-abort path because
- * deterministic replay does not execute recorded AI traces. Element-bearing work proceeds only after
- * its grounding entry and `resolveGrounded` produce a hit, so stale grounding
- * cannot reach the browser action or check.
- *
- * A case owns a `Map<RunVariableName, string>` populated by successful
- * captures. Immediately before the use case builds a step's materialized
- * action or assertion check, and before it consults grounding, it scans every
- * interpolatable text field for `{{run.<name>}}` substrings and replaces every
- * occurrence with the captured string. This is substring replace-all rather
- * than whole-value substitution because free text may contain surrounding
- * content. Captures are plain strings, so only one name segment is supported:
- * `{{run.a.b}}`, or a single segment not captured earlier in the same case,
- * takes the unified case-abort path rather than inventing another error kind.
- * Capture itself always requests `'text'`; keeping that choice in replay
- * leaves the browser adapter's two capture modes explicit rather than making
- * the adapter silently choose a default.
- *
- * A `fill-secret` resolves through `SecretsProvider.resolve()` immediately
- * before its `PerformableAction` is built. An absent value raises
- * `SecretUnresolvedError` (exit 2) and never reaches `BrowserSession.perform`,
- * which fails closed against unresolved secret references.
- *
- * An assertion outcome of `{ passed: false }` is a result, not a thrown
- * failure: the case becomes `status: 'failed'`, the failing `StepResult` is
- * `status: 'failed', kind: 'assertion'`, later steps are `status: 'skipped'`,
- * and no `errors[]` entry is emitted. Its diagnostic belongs in
- * `RunResult.explanation`, because `StepResult` deliberately has no message
- * field. The
- * `error-code-correspondence.test.ts` contract also requires that
- * `assertion-failed` never be passed to report-error serialization.
- *
- * A failure before step dispatch begins—`target-unresolved`, `missing-plan`,
- * `stale-ir`, `integrity-violation`, or `browser-launch-failed`—produces a
- * `RunResult` with `status: 'error'` and empty `steps: []`: no step was
- * attempted, so there is no step evidence to record. `RunResult.explanation`
- * still carries the diagnostic. `RunResult` legally permits an empty
- * `StepResult` array, making this the correct empty-evidence shape rather
- * than a degenerate error state.
- *
- * A failure while dispatching a specific step, whether a classified error
- * arises mid-step or the unified case-abort stopgap applies, follows the
- * step-level progression: completed steps have `status: 'passed'`; the
- * aborting step has `status: 'error', kind: 'environment'`; and later steps
- * have `status: 'skipped'`. The case-level explanation carries the diagnostic
- * because a `StepResult` has no message field.
- *
- * The per-case try/catch boundary lets the first classified failure abort only
- * its own case, not merely one step, and preserves later cases; failures
- * scoped to the usecase call itself, such as configuration loading before any
- * case, propagate to command-level reporting. Every launched session closes
- * in `finally`, even after a failed assertion or abort. The same case-abort
- * result is used for a grounding miss, an uncaptured single-segment run
- * reference or any multi-segment run reference, and any `BrowserSession` error
- * not classified here. It records `status: 'error'`, skips later steps, and
- * explains the unavailable fallback, but deliberately has no `ErrorKind` and
- * therefore no `errors[]` entry: none of the twelve reportable kinds describes
- * an unavailable fallback, and `error-code-correspondence.test.ts` fixes that
- * set. `buildRunReport()` recognizes this error status during its whole-batch
- * scan, preventing a stopgap-only batch from exiting successfully.
+ * A failed assertion is a failed result rather than a reportable error.
+ * Failures before dispatch have no step evidence, whereas a dispatched-step
+ * failure preserves completed steps and skips the rest. Each case isolates its
+ * own failure so later cases may continue, closes its browser session, and
+ * flushes accumulated grounding atomically; a flush error changes only an
+ * otherwise successful case. The unified case-abort result covers suppressed
+ * fallback and unavailable capture or verification evidence without inventing
+ * an error kind that misrepresents those conditions.
  */
 export async function run(deps: RunDeps, options: RunOptions): Promise<RunOutcome> {
   const discovered = options.files.length === 0
@@ -635,6 +1243,10 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
   let planSteps: readonly Step[] = [];
   let currentStep: Step | undefined;
   let session: BrowserSession | undefined;
+  let groundingPath: string | undefined;
+  let grounding: GroundingDocumentType | undefined;
+  let groundingDirty = false;
+  let aiExecutorPromise: Promise<AiExecutor> | undefined;
   let classifiedError: AmbercastErrorType | undefined;
   let result: ResultWithoutDuration | undefined;
 
@@ -660,8 +1272,9 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
     });
     const plan = await readTrustedPlan(deps.storage, planPath, inputsDigest);
     planSteps = plan.steps;
-    const groundingPath = deps.layout.groundingPathFor(file);
-    const grounding = await readUsableGrounding(deps.storage, groundingPath, plan);
+    groundingPath = deps.layout.groundingPathFor(file);
+    const loadedGrounding = await readUsableGrounding(deps.storage, groundingPath, plan);
+    grounding = loadedGrounding;
     const [targetName] = Object.keys(resolvedTargets);
     const target = targetName === undefined ? undefined : resolvedTargets[targetName];
 
@@ -681,23 +1294,40 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
       throw new BrowserLaunchFailedError('The browser session could not be launched.', undefined, { cause: error });
     }
 
+    const allowedRunRefs = new Set<RunVariableName>();
+    const resolvedVias = new Map<Step['id'], ResolutionVia>();
     const context: DispatchContext = {
       session,
-      grounding,
+      grounding: loadedGrounding,
       runState: new Map<RunVariableName, string>(),
       secrets: deps.secrets,
+      allowedRunRefs,
+      resolveAiExecutor: () => {
+        aiExecutorPromise ??= deps.resolveAiExecutor(deps.signal);
+        return aiExecutorPromise;
+      },
+      cacheOnly: options.cacheOnly,
+      events: deps.events,
+      updateGroundingEntry: (stepId, entry) => {
+        loadedGrounding.entries[stepId] = entry;
+        groundingDirty = true;
+      },
+      deleteGroundingEntry: (stepId) => {
+        if (Object.hasOwn(loadedGrounding.entries, stepId)) {
+          delete loadedGrounding.entries[stepId];
+          groundingDirty = true;
+        }
+      },
+      resolvedVias,
+      ...(deps.signal === undefined ? {} : { signal: deps.signal }),
     };
 
     for (const [index, originalStep] of planSteps.entries()) {
       currentStep = originalStep;
-      const step = materializeStep(originalStep, context.runState);
-      const dispatcher = step.kind === 'ai' ? undefined : DISPATCH_TABLE[step.kind];
-
-      if (dispatcher === undefined) {
-        throw new CaseAbort('AI-directed plan steps have no deterministic replay path.');
-      }
-
-      const outcome = await dispatcher(step, context);
+      const step = originalStep.kind === 'ai' ? originalStep : materializeStep(originalStep, context.runState);
+      const outcome = step.kind === 'ai'
+        ? await executeAiStep(step, context, options.cacheOnly)
+        : await DISPATCH_TABLE[step.kind](step, context);
       if (outcome.kind === 'assertion-failed') {
         result = {
           ...identity,
@@ -713,8 +1343,15 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
       }
 
       completed.push(stepResult(originalStep, 'passed'));
+      if (originalStep.kind === 'capture') {
+        allowedRunRefs.add(originalStep.variable);
+      }
       deps.events.emit({ type: 'step-start', stepId: originalStep.id });
-      deps.events.emit({ type: 'step-result', stepId: originalStep.id, via: 'grounding' });
+      deps.events.emit({
+        type: 'step-result',
+        stepId: originalStep.id,
+        via: outcome.via ?? resolvedVias.get(originalStep.id) ?? 'grounding',
+      });
     }
 
     result ??= {
@@ -740,6 +1377,21 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
       } catch {
         // Teardown cannot leak an unclassified rejection after the case already
         // has a stable outcome; the session port remains responsible for release.
+      }
+    }
+
+    if (groundingDirty && groundingPath !== undefined && grounding !== undefined) {
+      try {
+        await deps.storage.writeText(
+          groundingPath,
+          toCanonicalArtifactText(grounding as unknown as JsonValueT),
+        );
+      } catch (error) {
+        if (result?.status === 'passed') {
+          const flushError = fsIoError('The grounding cache could not be written.', error);
+          classifiedError = flushError;
+          result = { ...result, status: 'error', explanation: flushError.message };
+        }
       }
     }
   }

@@ -205,6 +205,8 @@ describe('createCodexCliExecutor', () => {
 
     await expect(executor.executeAgentic({
       instructionPrompt: 'Drive the browser.',
+      allowedSecretRefs: [],
+      allowedRunRefs: [],
       controller: { perform: async () => undefined, evaluateAssert: async () => ({ passed: true }), snapshotForResolution: async () => ({ accessibilityTree: {}, screenshot: new Uint8Array() }) },
     })).rejects.toBeInstanceOf(AiExecutorUnavailableError);
     expect(runner.calls).toEqual([]);

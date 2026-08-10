@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import type { ElementRef, TraceAction } from '../../../src/core/ir/schema.js';
-import type { AssertCheck, AssertOutcome, PageSnapshot } from '../../../src/ports/browser.js';
+import type { ElementRef, TraceAction, TraceAssert } from '../../../src/core/ir/schema.js';
+import type { AssertOutcome, PageSnapshot } from '../../../src/ports/browser.js';
 import { createFakeAiActionController } from '../../doubles/fake-ai-action-controller.js';
 
 const REF: ElementRef = { strategy: 'accessibility', role: 'button', name: 'Submit' };
 const ACTION: TraceAction = { type: 'click', target: REF };
-const CHECK: AssertCheck = { check: 'element-visible', target: REF };
+const CHECK: TraceAssert = { type: 'assert', check: 'element-visible', target: REF };
 const OUTCOME: AssertOutcome = { passed: true, message: 'Visible' };
 const SNAPSHOT: PageSnapshot = {
   accessibilityTree: { role: 'document' },
@@ -15,7 +15,7 @@ const SNAPSHOT: PageSnapshot = {
 describe('createFakeAiActionController', () => {
   it('forwards every operation to its supplied override and returns its result', async () => {
     const performed: TraceAction[] = [];
-    const evaluated: AssertCheck[] = [];
+    const evaluated: TraceAssert[] = [];
     const snapshotArguments: [][] = [];
     const controller = createFakeAiActionController({
       perform: async (action) => {
@@ -40,6 +40,9 @@ describe('createFakeAiActionController', () => {
     expect(evaluated).toHaveLength(1);
     expect(evaluated[0]).toBe(CHECK);
     expect(snapshotArguments).toEqual([[]]);
+    expect(controller.performed).toEqual([ACTION]);
+    expect(controller.evaluated).toEqual([CHECK]);
+    expect(controller.snapshots).toBe(1);
   });
 
   it('rejects an operation without an override with a descriptive error', async () => {
