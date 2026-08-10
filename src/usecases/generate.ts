@@ -27,7 +27,12 @@ import type { LayoutResolver } from '#core/layout/resolve.js';
 import { joinPath } from '#core/paths.js';
 import type { AiExecutor } from '#ports/ai.js';
 import type { StorageAdapter } from '#ports/storage.js';
-import { assertNoLiteralSecrets, normalizeAiStepSecretGrants } from './generator-secret-policy.js';
+import {
+  assertNoLiteralSecrets,
+  assertSecretRefsGrounded,
+  extractDeclaredSecretRefs,
+  normalizeAiStepSecretGrants,
+} from './generator-secret-policy.js';
 
 const GENERATED_PLAN_RESPONSE_SCHEMA = typedJsonSchema(GeneratedPlanResponse);
 
@@ -372,6 +377,12 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
 
     try {
       assertNoLiteralSecrets(parsedPlan.data);
+      /*
+       * Keeping declaration validation before either preview or persistence
+       * makes undeclared secret usage fail uniformly without writing artifacts.
+       */
+      const declaredRefs = extractDeclaredSecretRefs(normalizedTestMd);
+      assertSecretRefsGrounded(parsedPlan.data, declaredRefs);
     } catch (error) {
       results.push({ file, status: 'failed', error: fileFailure(error, 'The generated plan could not be inspected.') });
       continue;

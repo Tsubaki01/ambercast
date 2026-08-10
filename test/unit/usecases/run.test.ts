@@ -5,6 +5,7 @@ import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.j
 import { FsIoError } from '#core/errors/fs-io-error.js';
 import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
 import { MissingPlanError } from '#core/errors/missing-plan-error.js';
+import { SecretRefUndeclaredError } from '#core/errors/secret-ref-undeclared-error.js';
 import { SecretUnresolvedError } from '#core/errors/secret-unresolved-error.js';
 import { StaleIrError } from '#core/errors/stale-ir-error.js';
 import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
@@ -294,6 +295,66 @@ describe('run', () => {
     expect(browserDriver).not.toHaveBeenCalled();
   });
 
+  it.each([
+    [
+      'fill-secret action',
+      [{
+        id: 'fill-password',
+        kind: 'action',
+        action: 'fill-secret',
+        target: PASSWORD,
+        secretRef: '{{secrets.FOO}}',
+      }] satisfies readonly Step[],
+      'fill-password',
+    ],
+    [
+      'AI-step secret grant',
+      [aiStep('complete-sign-in', ['{{secrets.FOO}}'])] satisfies readonly Step[],
+      'complete-sign-in',
+    ],
+  ] as const)('rejects a pre-existing ungrounded %s before launching a browser', async (_description, steps, stepId) => {
+    const { deps, browserDriver, recordingStorage } = createScenario();
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, steps);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.error).toBeInstanceOf(SecretRefUndeclaredError);
+    if (outcome.results[0]?.error instanceof SecretRefUndeclaredError) {
+      expect(outcome.results[0].error.details).toStrictEqual({ secretRef: '{{secrets.FOO}}', stepId });
+    }
+    expect(browserDriver).not.toHaveBeenCalled();
+  });
+
+  it('replays normally when every fill-secret and AI-step grant is declared by the prompt', async () => {
+    const secretRef = '{{secrets.LOGIN_PASSWORD}}';
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]));
+    const browserDriver = vi.fn(() => createFakeBrowserDriver(() => session));
+    const { deps, recordingStorage } = createScenario({
+      browserDriver,
+      secrets: createFakeSecretsProvider(new Map([[secretRef, 'resolved-at-run-time']])),
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [
+        { id: 'fill-password', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef },
+        aiStep('recorded-ai', [secretRef]),
+      ],
+      {
+        ...elementGrounding(['fill-password']),
+        ...aiGrounding(trace([], [passingText('Dashboard')])),
+      },
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(browserDriver).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps a plan fresh for its default target and rejects the same plan for another configured target', async () => {
     const { deps, browserDriver, recordingStorage } = createScenario({
       config: {
@@ -383,7 +444,7 @@ describe('run', () => {
       browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
       secrets: createFakeSecretsProvider(new Map([[secretRef, 'not-in-the-plan']])),
     });
-    const testPath = await writePrompt(recordingStorage.storage);
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
     const steps: Step[] = [
       { id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT },
       { id: 'open-dashboard', kind: 'action', action: 'navigate', url: '/dashboard' },
@@ -478,7 +539,7 @@ describe('run', () => {
       browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
       secrets,
     });
-    const testPath = await writePrompt(recordingStorage.storage);
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
     const steps: Step[] = [{ id: 'fill-password', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef }];
     await seedFreshArtifacts(recordingStorage.storage, testPath, steps, elementGrounding(['fill-password']));
 
@@ -498,7 +559,7 @@ describe('run', () => {
       browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
       secrets: createFakeSecretsProvider(new Map()),
     });
-    const testPath = await writePrompt(recordingStorage.storage);
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
     const steps: Step[] = [
       { id: 'fill-password', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef },
       { id: 'after-password', kind: 'action', action: 'navigate', url: '/after' },
@@ -1281,7 +1342,7 @@ describe('run path-C pre-scan', () => {
       resolveAiExecutor,
       secrets: createFakeSecretsProvider(new Map()),
     });
-    const testPath = await writePrompt(recordingStorage.storage);
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
     await seedFreshArtifacts(
       recordingStorage.storage,
       testPath,
@@ -1579,7 +1640,11 @@ describe('run agentic materialization boundary', () => {
       secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
       resolveAiExecutor: async () => successfulExecutor,
     });
-    const successfulPath = await writePrompt(successful.recordingStorage.storage);
+    const successfulPath = await writePrompt(
+      successful.recordingStorage.storage,
+      'login.test.md',
+      `${PROMPT}\n${secretRef}\n`,
+    );
     await seedFreshArtifacts(successful.recordingStorage.storage, successfulPath, [
       { id: 'capture-token', kind: 'capture', target: EMAIL, variable: 'token' },
       aiStep('recorded-ai', [secretRef]),
@@ -1630,7 +1695,11 @@ describe('run agentic materialization boundary', () => {
       secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
       resolveAiExecutor: async () => failingExecutor,
     });
-    const failingPath = await writePrompt(failing.recordingStorage.storage);
+    const failingPath = await writePrompt(
+      failing.recordingStorage.storage,
+      'login.test.md',
+      `${PROMPT}\n${secretRef}\n`,
+    );
     await seedFreshArtifacts(failing.recordingStorage.storage, failingPath, [
       { id: 'capture-token', kind: 'capture', target: EMAIL, variable: 'token' },
       aiStep('recorded-ai', [secretRef]),
@@ -1689,7 +1758,7 @@ describe('run agentic materialization boundary', () => {
       secrets: createFakeSecretsProvider(new Map([[secretRef, 'SECRET-LITERAL-SENTINEL']])),
       resolveAiExecutor: async () => executor,
     });
-    const testPath = await writePrompt(recordingStorage.storage);
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
     await seedFreshArtifacts(recordingStorage.storage, testPath, [
       { id: 'capture-token', kind: 'capture', target: EMAIL, variable: 'token' },
       aiStep('recorded-ai', [secretRef]),
@@ -1732,7 +1801,11 @@ describe('run agentic materialization boundary', () => {
       secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue ?? 'unused']])),
       resolveAiExecutor: async () => executor,
     });
-    const testPath = await writePrompt(recordingStorage.storage);
+    const testPath = await writePrompt(
+      recordingStorage.storage,
+      'login.test.md',
+      secretValue === undefined ? PROMPT : `${PROMPT}\n${secretRef}\n`,
+    );
     const steps: Step[] = secretValue === undefined
       ? [
         { id: 'capture-empty', kind: 'capture', target: EMAIL, variable: 'empty' },
@@ -1779,7 +1852,11 @@ describe('run agentic materialization boundary', () => {
       ])),
       resolveAiExecutor: async () => executor,
     });
-    const testPath = await writePrompt(recordingStorage.storage);
+    const testPath = await writePrompt(
+      recordingStorage.storage,
+      'login.test.md',
+      `${PROMPT}\n${tiedSecretRef}\n${longSecretRef}\n`,
+    );
     await seedFreshArtifacts(recordingStorage.storage, testPath, [
       { id: 'capture-prefix', kind: 'capture', target: EMAIL, variable: 'prefix' },
       { id: 'capture-same', kind: 'capture', target: SUBMIT, variable: 'same' },

@@ -1,10 +1,21 @@
 /**
- * Defines the post-generation policy that prevents literal secrets from
- * reaching a reviewable plan artifact.
+ * Defines the secret-policy boundary shared by generated and replayed plans.
+ *
+ * This module keeps reviewable artifacts free of literal secrets while also
+ * requiring every permitted secret reference to have a textual declaration in
+ * the test prompt. Owning both checks together gives generation and replay one
+ * authorization boundary before a plan can rely on an externally resolved
+ * value.
  */
 
-import { SecretRef, type Step } from '#core/ir/schema.js';
+import {
+  SECRET_REF_SOURCE,
+  SecretRef,
+  type PlanDocument as PlanDocumentType,
+  type Step,
+} from '#core/ir/schema.js';
 import { SecretLiteralRejectedError } from '#core/errors/secret-literal-rejected-error.js';
+import { SecretRefUndeclaredError } from '#core/errors/secret-ref-undeclared-error.js';
 
 type SecretDetector =
   | 'credential-prefix-sk'
@@ -56,6 +67,72 @@ export function normalizeAiStepSecretGrants(steps: readonly Step[]): Step[] {
       }),
     };
   });
+}
+
+/**
+ * Collects secret references declared literally by a normalized test prompt.
+ *
+ * @param normalizedTestMd - Canonical test Markdown whose literal reference
+ * tokens define the declarations available to a generated plan.
+ * @returns A deduplicated set of complete secret-reference tokens found in the
+ * prompt text.
+ * @remarks
+ * This is a pure function: it only reads its input, returns a new set, and
+ * never mutates its argument.
+ *
+ * It scans with the shared unanchored secret-reference grammar so accepted
+ * dotted paths cannot drift from IR validation. Every literal match is a
+ * declaration, including a token in code fences or negative prose, because
+ * this boundary proves textual presence rather than interpreting Markdown
+ * semantics.
+ */
+export function extractDeclaredSecretRefs(normalizedTestMd: string): ReadonlySet<string> {
+  return new Set(normalizedTestMd.match(new RegExp(SECRET_REF_SOURCE, 'g')) ?? []);
+}
+
+/**
+ * Verifies that every secret reference used by a plan is declared by its test
+ * prompt.
+ *
+ * @param plan - A schema-validated plan whose secret-bearing steps require
+ * declaration checks.
+ * @param declaredRefs - Complete literal reference tokens extracted from the
+ * normalized test Markdown.
+ * @throws {import('#core/errors/secret-ref-undeclared-error.js').SecretRefUndeclaredError}
+ * When a `fill-secret` action or AI-step grant uses a reference outside
+ * `declaredRefs`. The error details object has exactly two keys: `secretRef`,
+ * the ungrounded reference string, and `stepId`, the `id` field of the plan
+ * step where that reference appears.
+ * @remarks
+ * This is a pure function: it only reads `plan` and `declaredRefs`, then either
+ * returns or throws, and never mutates either argument.
+ *
+ * It walks `plan.steps` in array order. For an action
+ * step whose action is `fill-secret`, it checks that step's single `secretRef`.
+ * For an AI step, it checks entries in its `secrets` array in array order. The
+ * first ungrounded reference encountered in this walk is the one reported,
+ * rather than accepting a partial plan or emitting a warning.
+ */
+export function assertSecretRefsGrounded(
+  plan: PlanDocumentType,
+  declaredRefs: ReadonlySet<string>,
+): void {
+  for (const step of plan.steps) {
+    const secretRefs = step.kind === 'action' && step.action === 'fill-secret'
+      ? [step.secretRef]
+      : step.kind === 'ai'
+        ? step.secrets ?? []
+        : [];
+
+    for (const secretRef of secretRefs) {
+      if (!declaredRefs.has(secretRef)) {
+        throw new SecretRefUndeclaredError(
+          'The generated plan uses a secret reference that the test prompt does not declare.',
+          { secretRef, stepId: step.id },
+        );
+      }
+    }
+  }
 }
 
 function hasHighEntropy(value: string): boolean {
