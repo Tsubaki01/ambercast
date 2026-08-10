@@ -348,13 +348,18 @@ function materializeTrustedRunText(value: string, context: DispatchContext): str
 }
 
 /**
- * Establishes the same-origin boundary for every navigation that can reach
- * the browser port.
+ * Establishes the HTTP(S)-scheme and same-origin boundary for every
+ * navigation that can reach the browser port.
  *
  * Navigate URLs remain interpolatable rather than receiving an HTTP-only
  * schema constraint because the browser must still resolve valid relative
- * paths, fragments, and other target-relative forms. It rejects an
- * unresolvable or different origin as an `IntegrityViolationError`.
+ * paths, fragments, and other target-relative forms. The resolved destination
+ * must use HTTP(S) before origin equality is compared. That order is
+ * essential: a `blob:` URL inherits its creating context's HTTP(S) origin and
+ * could otherwise appear same-origin even though its scheme is outside this
+ * browser boundary's trust. It rejects a destination that cannot be resolved,
+ * uses a non-HTTP(S) scheme, or resolves to a different origin as an
+ * `IntegrityViolationError`.
  * Resolving against `baseUrl` is sound because `ChromiumBrowserDriver.launch()`
  * configures its Playwright context with the identical `target.baseUrl` via
  * `browser.newContext({ baseURL: target.baseUrl })`, so this guard and
@@ -371,21 +376,26 @@ function materializeTrustedRunText(value: string, context: DispatchContext): str
  *
  * @param url - The navigation destination after any permitted interpolation.
  * @param baseUrl - The configured base URL of the resolved replay target.
- * @throws {IntegrityViolationError} When the destination cannot be resolved
- *   or does not remain on the replay target's origin.
+ * @throws {IntegrityViolationError} When the destination cannot be resolved,
+ *   uses a non-HTTP(S) scheme, or does not remain on the replay target's
+ *   origin.
  */
 function assertSameOriginNavigation(url: string, baseUrl: string): void {
   let baseOrigin: string;
-  let destinationOrigin: string;
+  let destination: URL;
 
   try {
     baseOrigin = new URL(baseUrl).origin;
-    destinationOrigin = new URL(url, baseUrl).origin;
+    destination = new URL(url, baseUrl);
   } catch {
     throw new IntegrityViolationError('A navigation URL cannot be resolved against the replay target.');
   }
 
-  if (destinationOrigin !== baseOrigin) {
+  if (destination.protocol !== 'http:' && destination.protocol !== 'https:') {
+    throw new IntegrityViolationError('A navigation URL must use the replay target\'s HTTP(S) scheme.');
+  }
+
+  if (destination.origin !== baseOrigin) {
     throw new IntegrityViolationError('A navigation URL must remain on the replay target origin.');
   }
 }

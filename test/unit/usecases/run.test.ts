@@ -527,6 +527,24 @@ describe('run', () => {
     expect(session.operations()).toEqual([]);
   });
 
+  it('rejects a same-origin-looking blob: deterministic navigate before it reaches the browser', async () => {
+    const session = createFakeBrowserSession(new Map());
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'leave-target', kind: 'action', action: 'navigate', url: 'blob:https://example.test/guard-test' },
+    ]);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const error = outcome.results[0]?.error;
+
+    expect(error).toBeInstanceOf(IntegrityViolationError);
+    expect(error?.message).toBe('A navigation URL must use the replay target\'s HTTP(S) scheme.');
+    expect(session.operations()).toEqual([]);
+  });
+
   it('allows same-origin absolute and relative deterministic navigate URLs', async () => {
     const session = createFakeBrowserSession(new Map());
     const { deps, recordingStorage } = createScenario({
@@ -1762,6 +1780,38 @@ describe('run path-C pre-scan', () => {
     expect(aiCalls(events)).toEqual([]);
   });
 
+  it('rejects a same-origin-looking blob: trace navigate before any browser action can run', async () => {
+    const session = createFakeBrowserSession(new Map());
+    const executor = createFakeAiExecutor();
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep()],
+      aiGrounding(trace(
+        [
+          { type: 'navigate', url: '/valid-first' },
+          { type: 'navigate', url: 'blob:https://example.test/guard-test' },
+        ],
+        [passingText('Verified')],
+      )),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const error = outcome.results[0]?.error;
+
+    expect(error).toBeInstanceOf(IntegrityViolationError);
+    expect(error?.message).toBe('A navigation URL must use the replay target\'s HTTP(S) scheme.');
+    expect(session.operations()).toEqual([]);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(aiCalls(events)).toEqual([]);
+  });
+
   it('rejects an opaque-origin trace navigate before any browser action can run', async () => {
     const session = createFakeBrowserSession(new Map());
     const executor = createFakeAiExecutor();
@@ -1785,8 +1835,10 @@ describe('run path-C pre-scan', () => {
     );
 
     const outcome = await run(deps, DEFAULT_OPTIONS);
+    const error = outcome.results[0]?.error;
 
-    expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+    expect(error).toBeInstanceOf(IntegrityViolationError);
+    expect(error?.message).toBe('A navigation URL must use the replay target\'s HTTP(S) scheme.');
     expect(session.operations()).toEqual([]);
     expect(resolveAiExecutor).not.toHaveBeenCalled();
     expect(aiCalls(events)).toEqual([]);
