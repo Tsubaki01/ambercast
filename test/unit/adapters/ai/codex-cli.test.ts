@@ -113,6 +113,60 @@ describe('createCodexCliExecutor', () => {
       .rejects.toBeInstanceOf(AiExecutorUnavailableError);
   });
 
+  describe('retains bounded stderr diagnostics for non-completion', () => {
+    const nonCompletionOutcomes = [
+      ['an exited command', { outcome: 'exited' as const, stdout: '', exitCode: 1 }],
+      ['a signaled command', { outcome: 'signaled' as const, stdout: '', signal: 'SIGTERM' as const }],
+    ] as const;
+
+    it.each(nonCompletionOutcomes.flatMap(([description, outcome]) => [
+      999,
+      1_000,
+      1_001,
+    ].map((length) => [`${description} with ${length} stderr code units`, outcome, length] as const)))
+    ('preserves the first stderr code units at the boundary for %s', async (_description, outcome, length) => {
+      const prefix = 'provider failed: ';
+      const stderr = `${prefix}${'a'.repeat(length - prefix.length - 1)}Z`;
+      const executor = createCodexCliExecutor({
+        run: createFakeCommandRunner([{ ...outcome, stderr }]).run,
+      });
+
+      const error = await executor.execute({ prompt: 'Generate.', responseSchema: schema() })
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(AiExecutorUnavailableError);
+      const unavailable = error as AiExecutorUnavailableError;
+      expect(unavailable.details?.stderrExcerpt).toBe(stderr.slice(0, 1_000));
+    });
+
+    it.each(nonCompletionOutcomes)('omits the stderr excerpt for %s when the command produces no stderr', async (_description, outcome) => {
+      const executor = createCodexCliExecutor({
+        run: createFakeCommandRunner([{ ...outcome, stderr: '' }]).run,
+      });
+
+      const error = await executor.execute({ prompt: 'Generate.', responseSchema: schema() })
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(AiExecutorUnavailableError);
+      const unavailable = error as AiExecutorUnavailableError;
+      expect(unavailable.details).not.toHaveProperty('stderrExcerpt');
+    });
+
+    it.each(nonCompletionOutcomes)('preserves a surrogate-pair boundary for %s', async (_description, outcome) => {
+      const stderr = 'a'.repeat(998) + '😀' + 'Z';
+      const executor = createCodexCliExecutor({
+        run: createFakeCommandRunner([{ ...outcome, stderr }]).run,
+      });
+
+      const error = await executor.execute({ prompt: 'Generate.', responseSchema: schema() })
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(AiExecutorUnavailableError);
+      const unavailable = error as AiExecutorUnavailableError;
+      expect(unavailable.details?.stderrExcerpt).toBe(stderr.slice(0, 1_000));
+    });
+  });
+
   it('classifies temporary-directory setup failure as an unavailable executor', async () => {
     tmpdir.mockReturnValue('/ambercast-test-guaranteed-missing/tmp');
     const runner = createFakeCommandRunner();
