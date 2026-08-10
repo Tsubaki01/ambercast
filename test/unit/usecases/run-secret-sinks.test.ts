@@ -180,7 +180,10 @@ function createRunScenario(
   };
 }
 
-function createGenerateScenario(aiExecutor: AiExecutor): { readonly deps: GenerateDeps; readonly recordingStorage: RecordingStorage } {
+function createGenerateScenario(
+  aiExecutor: AiExecutor,
+  aiTimeoutMs = 100,
+): { readonly deps: GenerateDeps; readonly recordingStorage: RecordingStorage } {
   const recordingStorage = createRecordingStorage();
   return {
     recordingStorage,
@@ -195,7 +198,7 @@ function createGenerateScenario(aiExecutor: AiExecutor): { readonly deps: Genera
         testIgnore: ['**/.runs/**'],
         targets: TARGETS,
         defaultTarget: 'web',
-        ai: { provider: 'codex', timeoutMs: 100 },
+        ai: { provider: 'codex', timeoutMs: aiTimeoutMs },
       },
     },
   };
@@ -517,7 +520,8 @@ describe('run secret sinks', () => {
       return { outcome: 'exited', stdout: '', stderr: '', exitCode: 0 };
     }]);
     const generateExecutor = createCodexCliExecutor({ run: generateRunner.run });
-    const generateScenario = createGenerateScenario(generateExecutor);
+    // This sink exercises the real adapter's filesystem I/O, unlike the fake-executor cases above.
+    const generateScenario = createGenerateScenario(generateExecutor, 5_000);
     await writePrompt(generateScenario.recordingStorage.storage);
 
     await expect(generate(generateScenario.deps, GENERATE_OPTIONS)).resolves.toMatchObject({
