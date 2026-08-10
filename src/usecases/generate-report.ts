@@ -12,6 +12,7 @@
 import type { AmbercastError, ExitCode } from '#core/errors/types.js';
 import { reportError } from '#report/error-mapping.js';
 import type { GenerateResult, ReportEnvelope } from '#report/schema.js';
+import { selectExitCode } from './exit-code-priority.js';
 import type { GenerateOptions, GenerateOutcome } from './generate.js';
 
 function reportResult(
@@ -92,20 +93,26 @@ export interface GenerateReportOutput {
  * `errored` and `skipped` remain zero because generate has neither outcome.
  *
  * Every failed file becomes one case-scoped `ReportError` whose `caseId` is
- * the file path. The existing error-kind correspondence selects its usage or
+ * the file path. The error-kind correspondence selects its usage or
  * environment kind and stable report code. A top-level `AmbercastError`, such
  * as a configuration-load or provider-resolution failure before file work,
  * instead becomes one run-scoped error with an empty result list.
  *
- * Exit selection is deterministic when several conditions coexist: a thrown
- * top-level error wins with its own exit code; then a disallowed zero match
- * (`noTestsFound` without `allowEmpty` or `list`) selects 5; then the first
- * failed result in file order supplies its error's exit code (or the generic
- * exit 3 fallback if a malformed outcome omitted that error); then strict mode
- * selects 1 when any generated or previewed result has ambiguities; otherwise
- * the command succeeds with 0. The zero-match envelope is error-free with an
- * all-zero summary. Runtime composes and invokes this helper; the CLI only
- * renders the resulting envelope and exits.
+ * A top-level thrown error retains its own exit code because no completed batch
+ * exists. For a completed batch, this builder contributes every applicable
+ * code to `selectExitCode()`: failures contribute their classified code or the
+ * generic exit-3 fallback when malformed input supplies no classification, and
+ * strict ambiguities contribute exit 1. The shared 2, 3, 4, 1, 5, 0 order then
+ * selects the highest-priority condition across the batch, independent of
+ * file order.
+ *
+ * A disallowed zero-match condition contributes exit 5 to that same list,
+ * instead of returning early. The normal zero-match outcome has no results,
+ * but representing it as a candidate also makes malformed yet type-valid
+ * outcomes obey the one common priority policy when another condition is
+ * present. `allowEmpty` and `list` still decide whether zero matches count as
+ * a failure; they do not decide how it ranks. The zero-match envelope is
+ * error-free with an all-zero summary.
  */
 export function buildGenerateReport(input: GenerateReportInput): GenerateReportOutput {
   if ('error' in input && input.error !== undefined) {
@@ -132,15 +139,20 @@ export function buildGenerateReport(input: GenerateReportInput): GenerateReportO
   ));
   const failed = outcome.results.filter((result) => result.status === 'failed');
   const passed = outcome.results.length - failed.length;
+  const candidates: ExitCode[] = failed.map<ExitCode>((result) => result.error?.exitCode ?? 3);
+  const hasStrictAmbiguities = input.options.strict && outcome.results.some((result) => (
+    (result.status === 'generated' || result.status === 'would-generate')
+    && (result.ambiguities?.length ?? 0) > 0
+  ));
 
-  const exitCode: ExitCode = outcome.noTestsFound && !input.options.allowEmpty && !input.options.list
-    ? 5
-    : failed.length > 0
-      ? failed[0]?.error?.exitCode ?? 3
-      : input.options.strict && outcome.results.some((result) => (
-        (result.status === 'generated' || result.status === 'would-generate')
-        && (result.ambiguities?.length ?? 0) > 0
-      )) ? 1 : 0;
+  if (hasStrictAmbiguities) {
+    candidates.push(1);
+  }
+  if (outcome.noTestsFound && !input.options.allowEmpty && !input.options.list) {
+    candidates.push(5);
+  }
+
+  const exitCode = selectExitCode(candidates);
 
   return {
     exitCode,

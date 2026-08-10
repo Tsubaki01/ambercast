@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
 import { FsIoError } from '#core/errors/fs-io-error.js';
+import { MissingPlanError } from '#core/errors/missing-plan-error.js';
 import { SecretLiteralRejectedError } from '#core/errors/secret-literal-rejected-error.js';
 import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { buildGenerateReport, type GenerateReportInput } from '#usecases/generate-report.js';
@@ -127,18 +128,48 @@ describe('buildGenerateReport', () => {
     expect(output.exitCode).toBe(0);
   });
 
-  it('uses the first failed file in deterministic result order when failures have different exit codes', () => {
+  it('selects the highest-priority exit code across all failed files regardless of order', () => {
+    const results = [
+      { file: 'first.test.md', status: 'failed' as const, error: new AiResponseInvalidError('first') },
+      { file: 'second.test.md', status: 'failed' as const, error: new TargetUnresolvedError('second') },
+    ];
     const output = report({
       outcome: {
         noTestsFound: false,
-        results: [
-          { file: 'first.test.md', status: 'failed', error: new TargetUnresolvedError('first') },
-          { file: 'second.test.md', status: 'failed', error: new AiResponseInvalidError('second') },
-        ],
+        results,
       },
+    });
+    const reversedOutput = report({
+      outcome: { noTestsFound: false, results: [...results].reverse() },
     });
 
     expect(output.exitCode).toBe(2);
+    expect(reversedOutput.exitCode).toBe(2);
+  });
+
+  it('lets a failed file outrank a disallowed zero-match outcome', () => {
+    const output = report({
+      outcome: {
+        noTestsFound: true,
+        results: [{ file: 'failed.test.md', status: 'failed', error: new AiResponseInvalidError('invalid response') }],
+      },
+    });
+
+    expect(output.exitCode).toBe(3);
+  });
+
+  it('selects exit 3 over exit 4 across failed files regardless of order', () => {
+    const results = [
+      { file: 'environment.test.md', status: 'failed' as const, error: new AiResponseInvalidError('invalid response') },
+      { file: 'artifact.test.md', status: 'failed' as const, error: new MissingPlanError('plan is missing') },
+    ];
+    const output = report({ outcome: { noTestsFound: false, results } });
+    const reversedOutput = report({
+      outcome: { noTestsFound: false, results: [...results].reverse() },
+    });
+
+    expect(output.exitCode).toBe(3);
+    expect(reversedOutput.exitCode).toBe(3);
   });
 
   it('uses unexpected-crash when a failed outcome has no classified error', () => {
