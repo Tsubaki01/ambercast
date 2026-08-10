@@ -4,6 +4,7 @@ import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.j
 import { FsIoError } from '#core/errors/fs-io-error.js';
 import { MissingPlanError } from '#core/errors/missing-plan-error.js';
 import { SecretLiteralRejectedError } from '#core/errors/secret-literal-rejected-error.js';
+import { SecretRefUndeclaredError } from '#core/errors/secret-ref-undeclared-error.js';
 import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { buildGenerateReport, type GenerateReportInput } from '#usecases/generate-report.js';
 
@@ -20,6 +21,10 @@ function report(input: Omit<GenerateReportInput, keyof typeof BASE>): ReturnType
 const GENERATION_ERROR_MAPPINGS = [
   [new TargetUnresolvedError('target missing'), 'TARGET_UNRESOLVED', 'usage', 2],
   [new SecretLiteralRejectedError('literal secret'), 'SECRET_LITERAL_REJECTED', 'usage', 2],
+  [new SecretRefUndeclaredError('undeclared secret reference', {
+    secretRef: '{{secrets.PAYMENT_TOKEN}}',
+    stepId: 'complete-payment',
+  }), 'SECRET_REF_UNDECLARED', 'usage', 2],
   [new AiExecutorUnavailableError('provider unavailable'), 'AI_EXECUTOR_UNAVAILABLE', 'environment', 3],
   [new AiResponseInvalidError('invalid response'), 'AI_RESPONSE_INVALID', 'environment', 3],
   [new FsIoError('storage failed'), 'FS_IO_ERROR', 'environment', 3],
@@ -170,6 +175,27 @@ describe('buildGenerateReport', () => {
 
     expect(output.exitCode).toBe(3);
     expect(reversedOutput.exitCode).toBe(3);
+  });
+
+  it('surfaces an undeclared secret reference from the first failed file with exit code 2', () => {
+    const output = report({
+      outcome: {
+        noTestsFound: false,
+        results: [
+          {
+            file: 'first.test.md',
+            status: 'failed',
+            error: new SecretRefUndeclaredError('undeclared reference', {
+              secretRef: '{{secrets.PAYMENT_TOKEN}}',
+              stepId: 'complete-payment',
+            }),
+          },
+          { file: 'second.test.md', status: 'failed', error: new AiResponseInvalidError('invalid response') },
+        ],
+      },
+    });
+
+    expect(output.exitCode).toBe(2);
   });
 
   it('uses unexpected-crash when a failed outcome has no classified error', () => {

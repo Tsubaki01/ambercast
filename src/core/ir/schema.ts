@@ -19,7 +19,16 @@
 import { z } from 'zod';
 
 // A dotted-path resolver must use own-property-safe access (Object.hasOwn or Map), never plain-object bracket access.
-const SECRET_REF_PATTERN = /^\{\{secrets\.[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*\}\}$/;
+/**
+ * Matches the unanchored source text of a valid secret reference.
+ *
+ * Keeping this grammar in one exported fragment prevents generation policy
+ * from duplicating the schema's allowed reference syntax. Consumers that scan
+ * larger text use it unanchored, while this module anchors it for whole-value
+ * validation.
+ */
+export const SECRET_REF_SOURCE = String.raw`\{\{secrets\.[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*\}\}`;
+const SECRET_REF_PATTERN = new RegExp(`^${SECRET_REF_SOURCE}$`);
 const HEX_SHA256_PATTERN = /^[0-9a-f]{64}$/;
 // This flag-independent pattern keeps zod's runtime validator and the generated public JSON Schema aligned: JSON Schema's `pattern` keyword carries no flags, and `z.toJSONSchema()` emits only a regex's source. It rejects a contiguous `{{secrets.` marker at the start of a multi-line string, immediately after an embedded newline, or anywhere later, while accepting a near-miss with a newline inside the marker such as `{{secrets\n.TOKEN}}` because the marker text is not contiguous.
 const NO_SECRETS_LITERAL_PATTERN = /^(?![\s\S]*\{\{secrets\.)[\s\S]*$/;

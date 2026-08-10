@@ -41,6 +41,7 @@ import type { StorageAdapter } from '#ports/storage.js';
 import type { Clock, EventSink, SecretsProvider } from '#ports/system.js';
 import type { RunResult, StepResult } from '#report/schema.js';
 import { z } from 'zod';
+import { assertSecretRefsGrounded, extractDeclaredSecretRefs } from './generator-secret-policy.js';
 
 type ResultWithoutDuration = Omit<RunResult, 'durationMs'>;
 
@@ -1271,6 +1272,14 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
       targetDefinitions: resolvedTargets,
     });
     const plan = await readTrustedPlan(deps.storage, planPath, inputsDigest);
+    /*
+     * Rechecking a trusted plan before replay prepares grounding or launches a
+     * browser prevents a pre-existing artifact from bypassing declaration
+     * policy that generation-time validation could not have applied
+     * retroactively.
+     */
+    const declaredRefs = extractDeclaredSecretRefs(normalizedTestMd);
+    assertSecretRefsGrounded(plan, declaredRefs);
     planSteps = plan.steps;
     groundingPath = deps.layout.groundingPathFor(file);
     const loadedGrounding = await readUsableGrounding(deps.storage, groundingPath, plan);

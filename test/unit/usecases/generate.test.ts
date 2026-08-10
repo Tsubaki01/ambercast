@@ -12,6 +12,7 @@ import { normalizeTestMd } from '#core/ir/normalize.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
 import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
+import { SecretRefUndeclaredError } from '#core/errors/secret-ref-undeclared-error.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/generate.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
@@ -22,6 +23,36 @@ const RUNS_DIR = '/workspace/tests/.runs';
 const TARGETS = { web: { baseUrl: 'https://example.test', browser: 'chromium' } } as const;
 const PROMPT = '# Sign in\n\nWhen I submit valid credentials, I reach the dashboard.\n';
 const RESPONSE: GeneratedPlanResponse = { steps: [], ambiguities: [] };
+const UNDECLARED_SECRET_REF = '{{secrets.FOO}}';
+const PASSWORD_TARGET = { strategy: 'accessibility', role: 'textbox', name: 'Password' } as const;
+
+const UNDECLARED_SECRET_RESPONSES = [
+  [
+    'fill-secret action',
+    {
+      steps: [{
+        id: 'fill-password',
+        kind: 'action',
+        action: 'fill-secret',
+        target: PASSWORD_TARGET,
+        secretRef: UNDECLARED_SECRET_REF,
+      }],
+      ambiguities: [],
+    },
+  ],
+  [
+    'AI-step secret grant',
+    {
+      steps: [{
+        id: 'complete-sign-in',
+        kind: 'ai',
+        instruction: 'Complete the sign-in flow.',
+        secrets: [UNDECLARED_SECRET_REF],
+      }],
+      ambiguities: [],
+    },
+  ],
+] as const satisfies readonly (readonly [string, GeneratedPlanResponse])[];
 
 const DEFAULT_OPTIONS: GenerateOptions = {
   files: [],
@@ -552,6 +583,81 @@ describe('generate', () => {
     });
     expect(recordingStorage.writes.map(({ path }) => path)).not.toContain(`${TEST_DIR}/unsafe.ambercast.plan.json`);
     expect(recordingStorage.writes.map(({ path }) => path)).not.toContain(`${TEST_DIR}/unsafe.ambercast.grounding.json`);
+  });
+
+  it.each(UNDECLARED_SECRET_RESPONSES)(
+    'rejects an ungrounded %s before writing generated artifacts',
+    async (_description, response) => {
+      const { deps, recordingStorage } = createScenario({
+        aiExecutor: createFakeAiExecutor({
+          execute: async () => ({ data: response, raw: JSON.stringify(response) }),
+        }),
+      });
+      const testPath = await writePrompt(recordingStorage.storage);
+      recordingStorage.reset();
+
+      const outcome = await generate(deps, DEFAULT_OPTIONS);
+
+      expect(outcome.results[0]).toMatchObject({ file: testPath, status: 'failed' });
+      expect(outcome.results[0]?.error).toBeInstanceOf(SecretRefUndeclaredError);
+      expect(recordingStorage.writes).toEqual([]);
+    },
+  );
+
+  it.each(UNDECLARED_SECRET_RESPONSES)(
+    'rejects an ungrounded %s through the --dry-run path without writing artifacts',
+    async (_description, response) => {
+      const { deps, recordingStorage } = createScenario({
+        aiExecutor: createFakeAiExecutor({
+          execute: async () => ({ data: response, raw: JSON.stringify(response) }),
+        }),
+      });
+      const testPath = await writePrompt(recordingStorage.storage);
+      recordingStorage.reset();
+
+      const outcome = await generate(deps, { ...DEFAULT_OPTIONS, dryRun: true });
+
+      expect(outcome.results[0]).toMatchObject({ file: testPath, status: 'failed' });
+      expect(outcome.results[0]?.error).toBeInstanceOf(SecretRefUndeclaredError);
+      expect(recordingStorage.writes).toEqual([]);
+    },
+  );
+
+  it.each([
+    ['generated', DEFAULT_OPTIONS, 'generated'],
+    ['dry-run', { ...DEFAULT_OPTIONS, dryRun: true }, 'would-generate'],
+  ] as const)('keeps grounded secret usage on the existing %s path', async (_mode, options, status) => {
+    const declaredSecretRef = '{{secrets.LOGIN_PASSWORD}}';
+    const response: GeneratedPlanResponse = {
+      steps: [
+        {
+          id: 'fill-password',
+          kind: 'action',
+          action: 'fill-secret',
+          target: PASSWORD_TARGET,
+          secretRef: declaredSecretRef,
+        },
+        {
+          id: 'complete-sign-in',
+          kind: 'ai',
+          instruction: 'Complete the sign-in flow.',
+          secrets: [declaredSecretRef],
+        },
+      ],
+      ambiguities: [],
+    };
+    const { deps, recordingStorage } = createScenario({
+      aiExecutor: createFakeAiExecutor({
+        execute: async () => ({ data: response, raw: JSON.stringify(response) }),
+      }),
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${declaredSecretRef}\n`);
+    recordingStorage.reset();
+
+    const outcome = await generate(deps, options);
+
+    expect(outcome.results[0]).toMatchObject({ file: testPath, status });
+    expect(recordingStorage.writes).toHaveLength(options.dryRun ? 0 : 2);
   });
 
   it('classifies duplicate assembled plan step IDs as a final PlanDocument validation failure', async () => {
