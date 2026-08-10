@@ -853,6 +853,354 @@ describe('run', () => {
   });
 });
 
+describe('navigate origin guard', () => {
+  const NAVIGATION_CASES = [
+    { name: 'relative path', url: '/dashboard', expectation: 'accepted', errorMessage: undefined },
+    { name: 'query-only relative reference', url: '?x=1', expectation: 'accepted', errorMessage: undefined },
+    { name: 'fragment-only relative reference', url: '#section', expectation: 'accepted', errorMessage: undefined },
+    {
+      name: 'absolute same-origin URL',
+      url: 'https://example.test/other?x=1#y',
+      expectation: 'accepted',
+      errorMessage: undefined,
+    },
+    {
+      name: 'same-host HTTP URL',
+      url: 'http://example.test/',
+      expectation: 'rejected',
+      errorMessage: 'A navigate action targets an origin outside the configured target.',
+    },
+    {
+      name: 'protocol-relative URL',
+      url: '//attacker.example/x',
+      expectation: 'rejected',
+      errorMessage: 'A navigate action targets an origin outside the configured target.',
+    },
+    {
+      name: 'backslash-authority URL',
+      url: String.raw`\\attacker.example\x`,
+      expectation: 'rejected',
+      errorMessage: 'A navigate action targets an origin outside the configured target.',
+    },
+    {
+      name: 'different-origin URL',
+      url: 'https://attacker.example/',
+      expectation: 'rejected',
+      errorMessage: 'A navigate action targets an origin outside the configured target.',
+    },
+    {
+      name: 'different-port URL',
+      url: 'https://example.test:9443/',
+      expectation: 'rejected',
+      errorMessage: 'A navigate action targets an origin outside the configured target.',
+    },
+    {
+      name: 'same-origin-looking blob URL',
+      url: 'blob:https://example.test/guard-test',
+      expectation: 'rejected',
+      errorMessage: 'A navigate action targets a non-HTTP(S) URL scheme.',
+    },
+    {
+      name: 'javascript URL',
+      url: 'javascript:alert(1)',
+      expectation: 'rejected',
+      errorMessage: 'A navigate action targets a non-HTTP(S) URL scheme.',
+    },
+    {
+      name: 'data URL',
+      url: 'data:text/plain,x',
+      expectation: 'rejected',
+      errorMessage: 'A navigate action targets a non-HTTP(S) URL scheme.',
+    },
+    {
+      name: 'malformed URL',
+      url: 'http://',
+      expectation: 'rejected',
+      errorMessage: 'A navigate action targets a malformed URL.',
+    },
+  ] as const;
+
+  it('applies the table-driven origin matrix to plan navigate actions', async () => {
+    const cases = await Promise.all(NAVIGATION_CASES.map(async (navigateCase) => {
+      const session = createFakeBrowserSession(new Map());
+      const { deps, recordingStorage } = createScenario({
+        browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+        config: {
+          testDir: TEST_DIR,
+          testMatch: ['**/*.test.md'],
+          testIgnore: ['**/.runs/**'],
+          targets: MULTI_TARGETS,
+          defaultTarget: 'web',
+        },
+      });
+      const testPath = await writePrompt(recordingStorage.storage);
+      await seedFreshArtifacts(recordingStorage.storage, testPath, [
+        { id: 'navigate-under-test', kind: 'action', action: 'navigate', url: navigateCase.url },
+      ]);
+
+      return { navigateCase, outcome: await run(deps, { ...DEFAULT_OPTIONS, target: 'web' }), session };
+    }));
+
+    for (const { navigateCase, outcome, session } of cases) {
+      if (navigateCase.expectation === 'accepted') {
+        expect(outcome.results[0]?.result.status).toBe('passed');
+        expect(outcome.results[0]?.error).toBeUndefined();
+        expect(session.operations()).toEqual([
+          { type: 'perform', action: { type: 'navigate', url: navigateCase.url } },
+        ]);
+        continue;
+      }
+
+      expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+      expect(outcome.results[0]?.error).toMatchObject({
+        kind: 'integrity-violation',
+        message: navigateCase.errorMessage,
+        details: { url: navigateCase.url },
+      });
+      expect(session.operations()).toEqual([]);
+    }
+  });
+
+  it('applies the table-driven origin matrix to replayed trace navigation before later entries', async () => {
+    const cases = await Promise.all(NAVIGATION_CASES.map(async (navigateCase) => {
+      const session = createFakeBrowserSession(new Map());
+      const { deps, recordingStorage } = createScenario({
+        browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+        config: {
+          testDir: TEST_DIR,
+          testMatch: ['**/*.test.md'],
+          testIgnore: ['**/.runs/**'],
+          targets: MULTI_TARGETS,
+          defaultTarget: 'web',
+        },
+      });
+      const testPath = await writePrompt(recordingStorage.storage);
+      await seedFreshArtifacts(
+        recordingStorage.storage,
+        testPath,
+        [aiStep()],
+        aiGrounding(trace(
+          [
+            { type: 'navigate', url: navigateCase.url },
+            { type: 'press', target: SUBMIT, key: 'Enter' },
+          ],
+          [passingText('Navigate guard trace verification')],
+        )),
+      );
+
+      return { navigateCase, outcome: await run(deps, { ...DEFAULT_OPTIONS, target: 'web' }), session };
+    }));
+
+    for (const { navigateCase, outcome, session } of cases) {
+      if (navigateCase.expectation === 'accepted') {
+        expect(outcome.results[0]?.result.status).toBe('passed');
+        expect(outcome.results[0]?.error).toBeUndefined();
+        expect(session.operations()).toEqual([
+          { type: 'perform', action: { type: 'navigate', url: navigateCase.url } },
+          { type: 'perform', action: { type: 'press', target: SUBMIT, key: 'Enter' } },
+          { type: 'evaluate-assert', check: { check: 'text-visible', text: 'Navigate guard trace verification' } },
+        ]);
+        continue;
+      }
+
+      expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+      expect(outcome.results[0]?.error).toMatchObject({
+        kind: 'integrity-violation',
+        message: navigateCase.errorMessage,
+        details: { url: navigateCase.url },
+      });
+      expect(session.operations()).toEqual([]);
+    }
+  });
+
+  it('applies the table-driven origin matrix to fresh agentic navigation before browser work or grounding', async () => {
+    const cases = await Promise.all(NAVIGATION_CASES.map(async (navigateCase) => {
+      const session = createFakeBrowserSession(new Map());
+      const executor = createFakeAiExecutor({
+        async executeAgentic(request) {
+          await request.controller.perform({ type: 'navigate', url: navigateCase.url });
+          await request.controller.perform({ type: 'press', target: SUBMIT, key: 'Enter' });
+          await request.controller.evaluateAssert(passingText('Navigate guard agentic verification'));
+          return { outcome: 'success' };
+        },
+      });
+      const { deps, recordingStorage } = createScenario({
+        browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+        resolveAiExecutor: async () => executor,
+        config: {
+          testDir: TEST_DIR,
+          testMatch: ['**/*.test.md'],
+          testIgnore: ['**/.runs/**'],
+          targets: MULTI_TARGETS,
+          defaultTarget: 'web',
+        },
+      });
+      const testPath = await writePrompt(recordingStorage.storage);
+      await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()]);
+      recordingStorage.writes.length = 0;
+
+      return {
+        navigateCase,
+        outcome: await run(deps, { ...DEFAULT_OPTIONS, target: 'web' }),
+        session,
+        writes: recordingStorage.writes,
+        grounding: await readGrounding(recordingStorage.storage, testPath),
+      };
+    }));
+
+    for (const { navigateCase, outcome, session, writes, grounding } of cases) {
+      if (navigateCase.expectation === 'accepted') {
+        expect(outcome.results[0]?.result.status).toBe('passed');
+        expect(outcome.results[0]?.error).toBeUndefined();
+        expect(session.operations()).toEqual([
+          { type: 'perform', action: { type: 'navigate', url: navigateCase.url } },
+          { type: 'perform', action: { type: 'press', target: SUBMIT, key: 'Enter' } },
+          { type: 'evaluate-assert', check: { check: 'text-visible', text: 'Navigate guard agentic verification' } },
+        ]);
+        expect(grounding.entries['recorded-ai']).toMatchObject({ kind: 'ai' });
+        continue;
+      }
+
+      expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+      expect(outcome.results[0]?.error).toMatchObject({
+        kind: 'integrity-violation',
+        message: navigateCase.errorMessage,
+        details: { url: navigateCase.url },
+      });
+      expect(session.operations()).toEqual([]);
+      expect(writes).toEqual([]);
+      expect(grounding.entries).not.toHaveProperty('recorded-ai');
+    }
+  });
+
+  it('binds absolute navigation to the target selected for the case', async () => {
+    const targetCases = [
+      { target: 'web' as const, url: 'https://example.test/account', expectation: 'accepted' },
+      { target: 'web' as const, url: 'https://staging.example.test/account', expectation: 'rejected' },
+      { target: 'staging' as const, url: 'https://staging.example.test/account', expectation: 'accepted' },
+      { target: 'staging' as const, url: 'https://example.test/account', expectation: 'rejected' },
+    ];
+    const cases = await Promise.all(targetCases.map(async (targetCase) => {
+      const session = createFakeBrowserSession(new Map());
+      const { deps, recordingStorage } = createScenario({
+        browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+        config: {
+          testDir: TEST_DIR,
+          testMatch: ['**/*.test.md'],
+          testIgnore: ['**/.runs/**'],
+          targets: MULTI_TARGETS,
+          defaultTarget: 'web',
+        },
+      });
+      const testPath = await writePrompt(recordingStorage.storage);
+      const targetDefinitions = targetCase.target === 'web'
+        ? { web: MULTI_TARGETS.web }
+        : { staging: MULTI_TARGETS.staging };
+      await createFreshPlan(
+        recordingStorage.storage,
+        testPath,
+        [{ id: 'navigate-under-test', kind: 'action', action: 'navigate', url: targetCase.url }],
+        targetDefinitions,
+      );
+
+      return { targetCase, outcome: await run(deps, { ...DEFAULT_OPTIONS, target: targetCase.target }), session };
+    }));
+
+    for (const { targetCase, outcome, session } of cases) {
+      if (targetCase.expectation === 'accepted') {
+        expect(outcome.results[0]?.result.status).toBe('passed');
+        expect(outcome.results[0]?.error).toBeUndefined();
+        expect(session.operations()).toEqual([
+          { type: 'perform', action: { type: 'navigate', url: targetCase.url } },
+        ]);
+        continue;
+      }
+
+      expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+      expect(outcome.results[0]?.error).toMatchObject({
+        kind: 'integrity-violation',
+        message: 'A navigate action targets an origin outside the configured target.',
+        details: { url: targetCase.url },
+      });
+      expect(session.operations()).toEqual([]);
+    }
+  });
+
+  it('rejects a cross-origin navigation assembled from a captured run value after materialization', async () => {
+    const destination = '//attacker.example/';
+    const url = '{{run.destination}}';
+
+    const planSession = createFakeBrowserSession(liveEntries([EMAIL]), {
+      captureValues: new Map([[elementRefKey(EMAIL), { text: destination, value: '' }]]),
+    });
+    const planScenario = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => planSession)),
+    });
+    const planPath = await writePrompt(planScenario.recordingStorage.storage);
+    await seedFreshArtifacts(planScenario.recordingStorage.storage, planPath, [
+      { id: 'capture-destination', kind: 'capture', target: EMAIL, variable: 'destination' },
+      { id: 'navigate-under-test', kind: 'action', action: 'navigate', url },
+    ], elementGrounding(['capture-destination']));
+
+    const replaySession = createFakeBrowserSession(liveEntries([EMAIL]), {
+      captureValues: new Map([[elementRefKey(EMAIL), { text: destination, value: '' }]]),
+    });
+    const replayScenario = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => replaySession)),
+    });
+    const replayPath = await writePrompt(replayScenario.recordingStorage.storage);
+    await seedFreshArtifacts(replayScenario.recordingStorage.storage, replayPath, [
+      { id: 'capture-destination', kind: 'capture', target: EMAIL, variable: 'destination' },
+      aiStep(),
+    ], {
+      ...elementGrounding(['capture-destination']),
+      ...aiGrounding(trace([{ type: 'navigate', url }], [passingText('Captured destination trace verification')])),
+    });
+
+    const freshSession = createFakeBrowserSession(liveEntries([EMAIL]), {
+      captureValues: new Map([[elementRefKey(EMAIL), { text: destination, value: '' }]]),
+    });
+    const freshExecutor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'navigate', url });
+        await request.controller.evaluateAssert(passingText('Captured destination agentic verification'));
+        return { outcome: 'success' };
+      },
+    });
+    const freshScenario = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => freshSession)),
+      resolveAiExecutor: async () => freshExecutor,
+    });
+    const freshPath = await writePrompt(freshScenario.recordingStorage.storage);
+    await seedFreshArtifacts(freshScenario.recordingStorage.storage, freshPath, [
+      { id: 'capture-destination', kind: 'capture', target: EMAIL, variable: 'destination' },
+      aiStep(),
+    ], elementGrounding(['capture-destination']));
+    freshScenario.recordingStorage.writes.length = 0;
+
+    const [planOutcome, replayOutcome, freshOutcome] = await Promise.all([
+      run(planScenario.deps, DEFAULT_OPTIONS),
+      run(replayScenario.deps, DEFAULT_OPTIONS),
+      run(freshScenario.deps, DEFAULT_OPTIONS),
+    ]);
+    const freshGrounding = await readGrounding(freshScenario.recordingStorage.storage, freshPath);
+
+    for (const outcome of [planOutcome, replayOutcome, freshOutcome]) {
+      expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+      expect(outcome.results[0]?.error).toMatchObject({
+        kind: 'integrity-violation',
+        message: 'A navigate action targets an origin outside the configured target.',
+        details: { url },
+      });
+    }
+    for (const session of [planSession, replaySession, freshSession]) {
+      expect(session.operations().filter((operation) => operation.type === 'perform')).toEqual([]);
+    }
+    expect(freshScenario.recordingStorage.writes).toEqual([]);
+    expect(freshGrounding.entries).not.toHaveProperty('recorded-ai');
+  });
+});
+
 describe('run agentic fallback pipeline', () => {
   it('records one cold-start AI call, persists its unresolved trace, then replays it without an AI call or write', async () => {
     const firstSession = createFakeBrowserSession(new Map());
@@ -915,6 +1263,69 @@ describe('run agentic fallback pipeline', () => {
       type: 'step-result',
       stepId: 'recorded-ai',
       via: 'trace-replay',
+    });
+  });
+
+  /*
+   * Path C replay materializes TraceFill references from this run's live
+   * captured value, not one cached or templated in an earlier run. A same-key
+   * overwrite could also satisfy this test, so it does not establish how run
+   * state is allocated between calls.
+   */
+  it('replays a TraceFill `{{run.*}}` reference against the current run\'s freshly captured value, not an earlier run\'s', async () => {
+    const firstSession = createFakeBrowserSession(liveEntries([EMAIL]), {
+      captureValues: new Map([[elementRefKey(EMAIL), { text: 'first-value', value: '' }]]),
+    });
+    const secondSession = createFakeBrowserSession(liveEntries([EMAIL]), {
+      captureValues: new Map([[elementRefKey(EMAIL), { text: 'second-value', value: '' }]]),
+    });
+    const sessions = [firstSession, secondSession];
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'fill', target: PASSWORD, value: 'Hello, {{run.name}}' });
+        await request.controller.evaluateAssert(passingText('Current run value recorded'));
+        return { outcome: 'success' };
+      },
+    });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => sessions.shift()!)),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'capture-name', kind: 'capture', target: EMAIL, variable: 'name' },
+      aiStep(),
+    ], elementGrounding(['capture-name']));
+
+    const coldStart = await run(deps, DEFAULT_OPTIONS);
+
+    expect(coldStart.results[0]?.result.status).toBe('passed');
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries['recorded-ai']).toEqual({
+      kind: 'ai',
+      trace: trace(
+        [{ type: 'fill', target: PASSWORD, value: 'Hello, {{run.name}}' }],
+        [passingText('Current run value recorded')],
+      ),
+    });
+    expect(firstSession.operations()).toContainEqual({
+      type: 'perform',
+      action: { type: 'fill', target: PASSWORD, value: 'Hello, first-value' },
+    });
+
+    const aiCallsBeforeReplay = aiCalls(events).length;
+    const replay = await run(deps, DEFAULT_OPTIONS);
+
+    expect(replay.results[0]?.result.status).toBe('passed');
+    expect(aiCalls(events).slice(aiCallsBeforeReplay)).toEqual([]);
+    expect(resolveAiExecutor).toHaveBeenCalledTimes(1);
+    expect(secondSession.operations()).toContainEqual({
+      type: 'perform',
+      action: { type: 'fill', target: PASSWORD, value: 'Hello, second-value' },
+    });
+    expect(secondSession.operations()).not.toContainEqual({
+      type: 'perform',
+      action: { type: 'fill', target: PASSWORD, value: 'Hello, first-value' },
     });
   });
 

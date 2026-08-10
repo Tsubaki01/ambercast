@@ -230,7 +230,9 @@ class ChromiumBrowserSession implements BrowserSession {
    * Element-targeted actions use the first exact role-and-name match because a
    * replay action operates on one recorded identity even if the page contains
    * duplicates. Navigation leaves relative-URL resolution to the context base
-   * URL, avoiding a second URL-resolution rule in this adapter. A materialized
+   * URL, avoiding a second URL-resolution rule in this adapter. In `run.ts`,
+   * the replay boundary validates a navigation origin before constructing its
+   * `navigate` `PerformableAction`. A materialized
    * secret is used only to fulfill its action and is never logged or returned.
    */
   async perform(action: PerformableAction): Promise<void> {

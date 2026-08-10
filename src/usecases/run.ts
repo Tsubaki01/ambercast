@@ -72,6 +72,13 @@ interface DispatchContext {
   readonly updateGroundingEntry: (stepId: Step['id'], entry: GroundingEntry) => void;
   readonly deleteGroundingEntry: (stepId: Step['id']) => void;
   readonly resolvedVias: Map<Step['id'], ResolutionVia>;
+  /**
+   * Base URL of the target resolved for this case.
+   *
+   * Navigation materialization uses it to reject actions that leave the
+   * target's origin.
+   */
+  readonly targetBaseUrl: string;
   readonly signal?: AbortSignal;
 }
 
@@ -215,12 +222,19 @@ function materializeText(value: string, runState: ReadonlyMap<RunVariableName, s
   });
 }
 
-function materializeStep(step: Step, runState: ReadonlyMap<RunVariableName, string>): Step {
+function materializeStep(
+  step: Step,
+  runState: ReadonlyMap<RunVariableName, string>,
+  targetBaseUrl: string,
+): Step {
   switch (step.kind) {
     case 'action':
       switch (step.action) {
-        case 'navigate':
-          return { ...step, url: materializeText(step.url, runState) };
+        case 'navigate': {
+          const url = materializeText(step.url, runState);
+          assertSameOriginNavigation(url, targetBaseUrl);
+          return { ...step, url };
+        }
         case 'fill':
           return { ...step, value: materializeText(step.value, runState) };
         default:
@@ -316,6 +330,37 @@ function materializeTrustedRunText(value: string, context: DispatchContext): str
 }
 
 /**
+ * Rejects a materialized navigation URL outside the resolved target's allowed
+ * HTTP(S) origin.
+ *
+ * Relative references inherit the target base URL's origin during WHATWG
+ * resolution, so they need no separate exception. The protocol allow-list is
+ * still necessary because a `blob:` URL can carry its creator's origin while
+ * using a navigation scheme this boundary does not trust. A malformed target
+ * base is a configuration defect and therefore propagates as an unclassified
+ * error; malformed action content and policy mismatches remain distinct
+ * replay-boundary integrity failures.
+ */
+function assertSameOriginNavigation(url: string, targetBaseUrl: string): void {
+  const baseOrigin = new URL(targetBaseUrl).origin;
+
+  let resolved: URL;
+  try {
+    resolved = new URL(url, targetBaseUrl);
+  } catch (error) {
+    throw new IntegrityViolationError('A navigate action targets a malformed URL.', { url }, { cause: error });
+  }
+
+  if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') {
+    throw new IntegrityViolationError('A navigate action targets a non-HTTP(S) URL scheme.', { url });
+  }
+
+  if (resolved.origin !== baseOrigin) {
+    throw new IntegrityViolationError('A navigate action targets an origin outside the configured target.', { url });
+  }
+}
+
+/**
  * Retains every non-empty resolved secret value for every later redaction
  * boundary in this case.
  *
@@ -355,8 +400,11 @@ function materializeTraceAction(
   switch (action.type) {
     case 'click':
       return { type: 'click', target: action.target };
-    case 'navigate':
-      return { type: 'navigate', url: materializeTrustedRunText(action.url, context) };
+    case 'navigate': {
+      const url = materializeTrustedRunText(action.url, context);
+      assertSameOriginNavigation(url, context.targetBaseUrl);
+      return { type: 'navigate', url };
+    }
     case 'press':
       return { type: 'press', target: action.target, key: action.key };
     case 'fill':
@@ -1654,12 +1702,15 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
         }
       },
       resolvedVias,
+      targetBaseUrl: target.baseUrl,
       ...(deps.signal === undefined ? {} : { signal: deps.signal }),
     };
 
     for (const [index, originalStep] of planSteps.entries()) {
       currentStep = originalStep;
-      const step = originalStep.kind === 'ai' ? originalStep : materializeStep(originalStep, context.runState);
+      const step = originalStep.kind === 'ai'
+        ? originalStep
+        : materializeStep(originalStep, context.runState, context.targetBaseUrl);
       const outcome = step.kind === 'ai'
         ? await executeAiStep(step, context, options.cacheOnly)
         : await DISPATCH_TABLE[step.kind](step, context);
