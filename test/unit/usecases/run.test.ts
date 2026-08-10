@@ -1380,6 +1380,110 @@ describe('run path-C pre-scan', () => {
     expect(executor.agenticRequests).toEqual([]);
     expect(aiCalls(events)).toEqual([]);
   });
+
+  it.each([
+    ['navigate URL before fill-secret', (secretRef: string, secretValue: string) => trace(
+      [
+        { type: 'navigate', url: `/account/${secretValue}/settings` },
+        { type: 'fill-secret', target: PASSWORD, secretRef },
+      ],
+      [passingText('Dashboard')],
+    )],
+    ['navigate URL', (secretRef: string, secretValue: string) => trace(
+      [
+        { type: 'fill-secret', target: PASSWORD, secretRef },
+        { type: 'navigate', url: `/account/${secretValue}/settings` },
+      ],
+      [passingText('Dashboard')],
+    )],
+    ['fill value', (secretRef: string, secretValue: string) => trace(
+      [
+        { type: 'fill-secret', target: PASSWORD, secretRef },
+        { type: 'fill', target: EMAIL, value: `token=${secretValue}` },
+      ],
+      [passingText('Dashboard')],
+    )],
+    ['assertion text', (secretRef: string, secretValue: string) => trace(
+      [{ type: 'fill-secret', target: PASSWORD, secretRef }],
+      [{ type: 'assert', check: 'text-visible', text: `Welcome ${secretValue}.` }],
+    )],
+    ['assertion text equals', (secretRef: string, secretValue: string) => trace(
+      [{ type: 'fill-secret', target: PASSWORD, secretRef }],
+      [{ type: 'assert', check: 'text-equals', target: PASSWORD, text: `Welcome ${secretValue}.` }],
+    )],
+    ['assertion URL pattern', (secretRef: string, secretValue: string) => trace(
+      [{ type: 'fill-secret', target: PASSWORD, secretRef }],
+      [{ type: 'assert', check: 'url-matches', pattern: `/account/${secretValue}/.*` }],
+    )],
+  ] as const)('rejects a materialized secret literal in a prior trace %s before replay begins', async (_description, buildTrace) => {
+    const secretRef = '{{secrets.AMBERCAST_SECRET_DUMMY}}';
+    const secretValue = 'sk-AMBERCAST_SECRET_DUMMY';
+    const session = createFakeBrowserSession(liveEntries([EMAIL, PASSWORD]));
+    const executor = createFakeAiExecutor();
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep('recorded-ai', [secretRef])],
+      aiGrounding(buildTrace(secretRef, secretValue)),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+    expect(session.operations()).toEqual([]);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(executor.agenticRequests).toEqual([]);
+    expect(aiCalls(events)).toEqual([]);
+  });
+
+  it('rejects an unsafe trace before a replay miss could hand it to an AI adapter as priorTrace', async () => {
+    const secretRef = '{{secrets.AMBERCAST_SECRET_DUMMY}}';
+    const secretValue = 'sk-AMBERCAST_SECRET_DUMMY';
+    const priorTrace = trace(
+      [
+        { type: 'fill-secret', target: PASSWORD, secretRef },
+        { type: 'navigate', url: `/account/${secretValue}/settings` },
+      ],
+      [passingText('Cached dashboard')],
+    );
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcomes: [{ passed: false, message: 'Cached dashboard changed.' }, { passed: true }],
+    });
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.evaluateAssert(passingText('Fresh dashboard'));
+        return { outcome: 'success' };
+      },
+    });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep('recorded-ai', [secretRef])],
+      aiGrounding(priorTrace),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+    expect(session.operations()).toEqual([]);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(executor.agenticRequests).toEqual([]);
+    expect(aiCalls(events)).toEqual([]);
+  });
 });
 
 describe('run agentic wrapper state machine', () => {
@@ -2186,6 +2290,95 @@ describe('run agentic materialization boundary', () => {
         ? []
         : [{ type: 'perform', action: { type: 'fill-secret', target: PASSWORD, value: 'SECRET-LITERAL-SENTINEL' } }],
     );
+  });
+
+  it.each([
+    ['an empty secret', '', 'ordinary provider text', 'passed'],
+    ['a one-character secret as a substring', 'x', 'prefix-xsuffix', 'passed'],
+    ['a one-character secret as an exact value', 'x', 'x', 'rejected'],
+    ['a two-character secret as a substring', 'xy', 'prefix-xysuffix', 'passed'],
+    ['a two-character secret as an exact value', 'xy', 'xy', 'rejected'],
+    ['a three-character secret as a substring', 'xyz', 'prefix-xyzsuffix', 'rejected'],
+    ['a four-character secret as a substring', 'wxyz', 'prefix-wxyzsuffix', 'rejected'],
+  ] as const)('applies the resolved-secret boundary matrix to %s', async (_description, secretValue, candidate, expectation) => {
+    const secretRef = '{{secrets.AMBERCAST_SECRET_DUMMY}}';
+    const session = createFakeBrowserSession(liveEntries([EMAIL, PASSWORD]));
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef });
+        await request.controller.perform({ type: 'fill', target: EMAIL, value: candidate });
+        await request.controller.evaluateAssert(passingText('Dashboard'));
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep('recorded-ai', [secretRef])]);
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    if (expectation === 'rejected') {
+      expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+      expect(recordingStorage.writes).toEqual([]);
+      expect(session.operations()).toEqual([
+        { type: 'perform', action: { type: 'fill-secret', target: PASSWORD, value: secretValue } },
+      ]);
+      return;
+    }
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(recordingStorage.writes).toHaveLength(1);
+  });
+
+  it.each([
+    ['navigate URL', async (request: AiAgenticRequest, runValue: string) => {
+      await request.controller.perform({ type: 'navigate', url: `/users/${runValue}/settings` });
+    }],
+    ['fill value', async (request: AiAgenticRequest, runValue: string) => {
+      await request.controller.perform({ type: 'fill', target: PASSWORD, value: `welcome-${runValue}` });
+    }],
+    ['assertion text', async (request: AiAgenticRequest, runValue: string) => {
+      await request.controller.evaluateAssert({ type: 'assert', check: 'text-visible', text: `Welcome ${runValue}.` });
+    }],
+    ['assertion URL pattern', async (request: AiAgenticRequest, runValue: string) => {
+      await request.controller.evaluateAssert({ type: 'assert', check: 'url-matches', pattern: `/users/${runValue}/.*` });
+    }],
+  ] as const)('keeps captured run-state values exact-match-only for %s', async (_description, script) => {
+    const runValue = 'AMBERCAST_SECRET_DUMMY_RUN_VALUE';
+    const session = createFakeBrowserSession(liveEntries([EMAIL, PASSWORD]), {
+      captureValues: new Map([[elementRefKey(EMAIL), { text: runValue, value: '' }]]),
+    });
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await script(request, runValue);
+        await request.controller.evaluateAssert(passingText('Dashboard'));
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [
+        { id: 'capture-token', kind: 'capture', target: EMAIL, variable: 'token' },
+        aiStep(),
+      ],
+      elementGrounding(['capture-token']),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(outcome.results[0]?.error).toBeUndefined();
   });
 
   it.each([
