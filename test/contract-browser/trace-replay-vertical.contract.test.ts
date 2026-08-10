@@ -17,6 +17,7 @@ import { createFixedClock } from '../doubles/create-fixed-clock.js';
 import { createInMemoryStorage } from '../doubles/create-in-memory-storage.js';
 import { createRecordingEventSink } from '../doubles/create-recording-event-sink.js';
 import { createFakeSecretsProvider } from '../doubles/fake-secrets-provider.js';
+import { resolveChromiumAvailability } from './support/chromium-availability.js';
 
 const TEST_DIR = '/workspace/trace-replay-contract';
 const RUNS_DIR = '/workspace/trace-replay-contract/.runs';
@@ -86,17 +87,9 @@ let chromiumAvailable = false;
 
 describe('hand-authored trace replay against real Chromium', () => {
   beforeAll(async () => {
-    try {
-      const browser = await chromium.launch();
-      await browser.close();
-      chromiumAvailable = true;
-    } catch {
-      chromiumAvailable = false;
-    }
+    chromiumAvailable = await resolveChromiumAvailability(() => chromium.launch());
   });
 
-  // Match the existing Chromium contract's opt-in behavior when Playwright's
-  // local browser binary has not been installed.
   beforeEach((context) => {
     if (!chromiumAvailable) {
       context.skip('Chromium is unavailable for this opt-in contract lane; run `npx playwright install chromium` once.');
