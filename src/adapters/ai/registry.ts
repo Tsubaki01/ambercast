@@ -20,7 +20,7 @@ export type AiProviderName = 'claude' | 'codex';
  * provider resolution owns the `auto` policy and asks only for the provider
  * it needs, avoiding a startup probe or command spawn for an unused executor.
  */
-export const AI_EXECUTOR_FACTORIES: Readonly<Record<AiProviderName, (deps?: { readonly run?: CommandRunner }) => AiExecutor>> = {
+export const AI_EXECUTOR_FACTORIES: Readonly<Record<AiProviderName, (deps: { readonly run: CommandRunner }) => AiExecutor>> = {
   claude: createClaudeCodeCliExecutor,
   codex: createCodexCliExecutor,
 };

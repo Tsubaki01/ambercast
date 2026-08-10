@@ -330,8 +330,8 @@ describe('createSpawnCommandRunner', () => {
     });
     const controller = new AbortController();
     const reason = new Error('stop cooperative child');
-    const running = runner(process.execPath, ['-e', [
-      'const { renameSync, writeFileSync } = require("node:fs");',
+    const running = runner(process.execPath, ['--input-type=module', '-e', [
+      'import { renameSync, writeFileSync } from "node:fs";',
       'writeFileSync(`${process.env.AMBERCAST_TEST_PID_FILE}.ready`, String(process.pid));',
       'renameSync(`${process.env.AMBERCAST_TEST_PID_FILE}.ready`, process.env.AMBERCAST_TEST_PID_FILE);',
       'setInterval(() => {}, 1_000);',
@@ -395,8 +395,8 @@ describe('createSpawnCommandRunner', () => {
     });
     const controller = new AbortController();
     const reason = new Error('stop SIGTERM-ignoring child');
-    const running = runner(process.execPath, ['-e', [
-      'const { renameSync, writeFileSync } = require("node:fs");',
+    const running = runner(process.execPath, ['--input-type=module', '-e', [
+      'import { renameSync, writeFileSync } from "node:fs";',
       'process.on("SIGTERM", () => {});',
       'writeFileSync(`${process.env.AMBERCAST_TEST_PID_FILE}.ready`, String(process.pid));',
       'renameSync(`${process.env.AMBERCAST_TEST_PID_FILE}.ready`, process.env.AMBERCAST_TEST_PID_FILE);',
