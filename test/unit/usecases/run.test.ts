@@ -472,6 +472,85 @@ describe('run', () => {
     ]);
   });
 
+  it('rejects a cross-origin deterministic navigate before it reaches the browser', async () => {
+    const session = createFakeBrowserSession(new Map());
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'leave-target', kind: 'action', action: 'navigate', url: 'https://evil.test/phish' },
+    ]);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+    expect(session.operations()).toEqual([]);
+  });
+
+  it('allows same-origin absolute and relative deterministic navigate URLs', async () => {
+    const session = createFakeBrowserSession(new Map());
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'open-same-origin', kind: 'action', action: 'navigate', url: 'https://example.test/ok' },
+      { id: 'open-relative', kind: 'action', action: 'navigate', url: '/relative' },
+    ]);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(session.operations()).toEqual([
+      { type: 'perform', action: { type: 'navigate', url: 'https://example.test/ok' } },
+      { type: 'perform', action: { type: 'navigate', url: '/relative' } },
+    ]);
+  });
+
+  it('classifies an unresolvable deterministic navigate URL as an integrity violation', async () => {
+    const session = createFakeBrowserSession(new Map());
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'open-malformed', kind: 'action', action: 'navigate', url: 'https://[::1' },
+    ]);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+    expect(session.operations()).toEqual([]);
+  });
+
+  it('does not retain a captured hostname in a rejected deterministic navigate result', async () => {
+    const capturedHost = 'SENTINEL-HOST';
+    const session = createFakeBrowserSession(liveEntries([EMAIL]), {
+      captureValues: new Map([[elementRefKey(EMAIL), { text: capturedHost, value: 'unused' }]]),
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [
+        { id: 'capture-host', kind: 'capture', target: EMAIL, variable: 'captured' },
+        { id: 'leave-target', kind: 'action', action: 'navigate', url: 'https://{{run.captured}}.evil.test' },
+      ],
+      elementGrounding(['capture-host']),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const serializedResult = JSON.stringify(outcome.results[0]);
+
+    expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+    expect(serializedResult).not.toContain(capturedHost);
+    expect(serializedResult).not.toContain(capturedHost.toLowerCase());
+  });
+
   it('captures text and interpolates it in the middle of a later action value', async () => {
     const performed: PerformableAction[] = [];
     const session = createFakeBrowserSession(liveEntries([EMAIL, SUBMIT]), {
@@ -918,6 +997,79 @@ describe('run agentic fallback pipeline', () => {
     });
   });
 
+  it('replays TraceFill run references with each run\'s freshly captured value without mutating grounding', async () => {
+    const firstSession = createFakeBrowserSession(liveEntries([EMAIL]), {
+      captureValues: new Map([[elementRefKey(EMAIL), { text: 'TOKEN-A', value: 'unused' }]]),
+    });
+    const secondSession = createFakeBrowserSession(liveEntries([EMAIL]), {
+      captureValues: new Map([[elementRefKey(EMAIL), { text: 'TOKEN-B', value: 'unused' }]]),
+    });
+    const sessions = [firstSession, secondSession];
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => sessions.shift()!)),
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [
+        { id: 'capture-token', kind: 'capture', target: EMAIL, variable: 'token' },
+        aiStep(),
+      ],
+      {
+        ...elementGrounding(['capture-token']),
+        ...aiGrounding(trace(
+          [{ type: 'fill', target: EMAIL, value: 'token: {{run.token}}' }],
+          [passingText('Dashboard')],
+        )),
+      },
+    );
+
+    const firstRun = await run(deps, DEFAULT_OPTIONS);
+    const writesBeforeSecondRun = recordingStorage.writes.length;
+    const groundingBeforeSecondRun = await recordingStorage.storage.readText(
+      `${TEST_DIR}/login.ambercast.grounding.json`,
+    );
+    const secondRun = await run(deps, DEFAULT_OPTIONS);
+
+    expect(firstRun.results[0]?.result.status).toBe('passed');
+    expect(secondRun.results[0]?.result.status).toBe('passed');
+    expect(firstSession.operations()).toContainEqual({
+      type: 'perform',
+      action: { type: 'fill', target: EMAIL, value: 'token: TOKEN-A' },
+    });
+    expect(secondSession.operations()).toContainEqual({
+      type: 'perform',
+      action: { type: 'fill', target: EMAIL, value: 'token: TOKEN-B' },
+    });
+    expect(recordingStorage.writes.slice(writesBeforeSecondRun)).toEqual([]);
+    expect(await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`)).toBe(
+      groundingBeforeSecondRun,
+    );
+  });
+
+  it('rejects a cross-origin fresh agentic navigate before it reaches the browser', async () => {
+    const session = createFakeBrowserSession(new Map());
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'navigate', url: 'https://evil.test/phish' });
+        await request.controller.evaluateAssert(passingText('Dashboard'));
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()]);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+    expect(session.operations()).toEqual([]);
+  });
+
   it('uses exactly one agentic fallback for a behavioral trace miss and passes the unresolved prior trace', async () => {
     const priorTrace = trace(
       [{ type: 'navigate', url: '/cached-route' }],
@@ -1325,6 +1477,66 @@ describe('run path-C pre-scan', () => {
     expect(resolveAiExecutor).not.toHaveBeenCalled();
     expect(executor.agenticRequests).toEqual([]);
     expect(executor.structuredRequests).toEqual([]);
+    expect(aiCalls(events)).toEqual([]);
+  });
+
+  it('rejects a cross-origin trace navigate before an earlier same-origin action can run', async () => {
+    const session = createFakeBrowserSession(new Map());
+    const executor = createFakeAiExecutor();
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep()],
+      aiGrounding(trace(
+        [
+          { type: 'navigate', url: '/valid-first' },
+          { type: 'navigate', url: 'https://evil.test/phish' },
+        ],
+        [passingText('Verified')],
+      )),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+    expect(session.operations()).toEqual([]);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(aiCalls(events)).toEqual([]);
+  });
+
+  it('rejects an opaque-origin trace navigate before any browser action can run', async () => {
+    const session = createFakeBrowserSession(new Map());
+    const executor = createFakeAiExecutor();
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep()],
+      aiGrounding(trace(
+        [
+          { type: 'navigate', url: '/valid-first' },
+          { type: 'navigate', url: 'data:text/html,opaque-origin' },
+        ],
+        [passingText('Verified')],
+      )),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+    expect(session.operations()).toEqual([]);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
     expect(aiCalls(events)).toEqual([]);
   });
 

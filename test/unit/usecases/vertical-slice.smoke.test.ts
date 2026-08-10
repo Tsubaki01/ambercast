@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
+import { SecretRefUndeclaredError } from '#core/errors/secret-ref-undeclared-error.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computePlanDigest } from '#core/ir/digest.js';
 import {
   GroundingDocument,
   PlanDocument,
+  type ElementRef,
   type Fingerprint,
   type GeneratedPlanResponse,
   type JsonValueT,
@@ -148,5 +150,138 @@ describe('fake vertical slice', () => {
     })));
     expect(events.emitted().filter((event) => event.type === 'ai-call')).toEqual([]);
     expect(execute).toHaveBeenCalledOnce();
+  });
+
+  // A cold-start miss through path B is intentionally outside this vertical-slice test's scope.
+  it('replays a generated AI-step secret grant from pre-seeded grounding without AI calls', async () => {
+    const secretRef = '{{secrets.LOGIN_PASSWORD}}';
+    const secretTarget: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Password' };
+    const generatedResponse: GeneratedPlanResponse = {
+      steps: [{
+        id: 'complete-sign-in',
+        kind: 'ai',
+        instruction: 'Complete sign-in.',
+        secrets: [secretRef],
+      }],
+      ambiguities: [],
+    };
+    const storage = createInMemoryStorage();
+    const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
+    const execute = vi.fn(async () => ({ data: generatedResponse, raw: JSON.stringify(generatedResponse) }));
+    await storage.writeText(TEST_PATH, `${PROMPT}\n${secretRef}\n`);
+
+    const generateDeps: GenerateDeps = {
+      storage,
+      layout,
+      aiExecutor: createFakeAiExecutor({ execute }),
+      discoverTestFiles: async () => [],
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: ['**/.runs/**'],
+        targets: TARGETS,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 100 },
+      },
+    };
+
+    const generation = await generate(generateDeps, GENERATE_OPTIONS);
+
+    expect(generation.results).toMatchObject([{ status: 'generated' }]);
+    const plan = PlanDocument.parse(JSON.parse(await storage.readText(layout.planPathFor(TEST_PATH))));
+    expect(plan.steps).toEqual([expect.objectContaining({ id: 'complete-sign-in', secrets: [secretRef] })]);
+
+    const grounding = GroundingDocument.parse({
+      schemaVersion: 1,
+      planDigest: computePlanDigest(plan),
+      entries: {
+        'complete-sign-in': {
+          kind: 'ai',
+          trace: {
+            events: [{ type: 'fill-secret', target: secretTarget, secretRef }],
+            verification: [{ type: 'assert', check: 'text-visible', text: 'Dashboard' }],
+          },
+        },
+      },
+    });
+    await storage.writeText(
+      layout.groundingPathFor(TEST_PATH),
+      toCanonicalArtifactText(grounding as unknown as JsonValueT),
+    );
+
+    const session = createFakeBrowserSession(new Map());
+    const events = createRecordingEventSink();
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => {
+      throw new Error('Path-C replay must not resolve an AI executor.');
+    });
+    const runDeps: RunDeps = {
+      storage,
+      layout,
+      clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 0),
+      browserDriver: () => createFakeBrowserDriver(() => session),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, 'resolved-at-run-time']])),
+      resolveAiExecutor,
+      events: events.sink,
+      discoverTestFiles: async () => [],
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: ['**/.runs/**'],
+        targets: TARGETS,
+        defaultTarget: 'web',
+      },
+    };
+
+    const outcome = await run(runDeps, RUN_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(session.operations()).toContainEqual({
+      type: 'perform',
+      action: { type: 'fill-secret', target: secretTarget, value: 'resolved-at-run-time' },
+    });
+    expect(events.emitted().filter((event) => event.type === 'ai-call')).toEqual([]);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(JSON.stringify(outcome.results[0])).not.toContain('resolved-at-run-time');
+    expect(await storage.readText(layout.groundingPathFor(TEST_PATH))).not.toContain('resolved-at-run-time');
+  });
+
+  // A cold-start miss through path B is intentionally outside this vertical-slice test's scope.
+  it('rejects a generated AI-step secret grant that the prompt never declares', async () => {
+    const undeclaredSecretRef = '{{secrets.LOGIN_PASSWORD}}';
+    const generatedResponse: GeneratedPlanResponse = {
+      steps: [{
+        id: 'complete-sign-in',
+        kind: 'ai',
+        instruction: 'Complete sign-in.',
+        secrets: [undeclaredSecretRef],
+      }],
+      ambiguities: [],
+    };
+    const storage = createInMemoryStorage();
+    const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
+    await storage.writeText(TEST_PATH, PROMPT);
+    const generateDeps: GenerateDeps = {
+      storage,
+      layout,
+      aiExecutor: createFakeAiExecutor({
+        execute: async () => ({ data: generatedResponse, raw: JSON.stringify(generatedResponse) }),
+      }),
+      discoverTestFiles: async () => [],
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: ['**/.runs/**'],
+        targets: TARGETS,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 100 },
+      },
+    };
+
+    const generation = await generate(generateDeps, GENERATE_OPTIONS);
+
+    expect(generation.results[0]).toMatchObject({ status: 'failed' });
+    expect(generation.results[0]?.error).toBeInstanceOf(SecretRefUndeclaredError);
+    expect(await storage.exists(layout.planPathFor(TEST_PATH))).toBe(false);
+    expect(await storage.exists(layout.groundingPathFor(TEST_PATH))).toBe(false);
   });
 });
