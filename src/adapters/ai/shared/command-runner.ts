@@ -12,6 +12,18 @@ import { spawn } from 'node:child_process';
 import { abortReason, rejectOnAbort } from '#core/ai/reject-on-abort.js';
 
 /**
+ * Bounds how long abort cleanup lets a child honour `SIGTERM` before escalation.
+ *
+ * This duration is a deliberate heuristic: it trades a brief opportunity for
+ * graceful shutdown against bounded retention of a child that ignores
+ * termination, without claiming to measure typical provider shutdown time.
+ * This is deliberately a local cleanup policy rather than a configurable
+ * cancellation deadline: the caller's `AbortSignal` already owns deadline
+ * policy, and the runner rejects without waiting for this cleanup window.
+ */
+export const ABORT_GRACE_PERIOD_MS = 500;
+
+/**
  * The terminal state of one child process that was not aborted by its caller.
  *
  * A signaled outcome identifies external process termination. A caller's own
@@ -53,9 +65,11 @@ export interface CommandRunOptions {
  * @throws If spawning fails or the supplied signal aborts the call.
  * @remarks
  * The runner concatenates stdout and stderr data until the child closes. When
- * `options.signal` fires, it sends `SIGTERM` to the
- * child and rejects with the signal reason; it must never resolve a
- * self-inflicted abort as `outcome: 'signaled'`.
+ * `options.signal` fires, abort cleanup sends `SIGTERM` and rejects with the
+ * signal reason immediately. It then allows the child a bounded cleanup window
+ * before sending `SIGKILL` if the child's `close` event has not already
+ * completed cleanup; it must never resolve a self-inflicted abort as
+ * `outcome: 'signaled'`.
  */
 export type CommandRunner = (
   command: string,
@@ -126,6 +140,14 @@ export function createSpawnCommandRunner(deps: { readonly env?: NodeJS.ProcessEn
     let stdout = '';
     let stderr = '';
     let settled = false;
+    let abortKillTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const cancelAbortKillTimer = (): void => {
+      if (abortKillTimer !== undefined) {
+        clearTimeout(abortKillTimer);
+        abortKillTimer = undefined;
+      }
+    };
 
     const finish = (settle: () => void): void => {
       if (settled) {
@@ -136,8 +158,23 @@ export function createSpawnCommandRunner(deps: { readonly env?: NodeJS.ProcessEn
       signal?.removeEventListener('abort', onAbort);
       settle();
     };
+    /**
+     * The abort path begins cooperative cleanup with `SIGTERM`, then schedules
+     * `SIGKILL` only if the child has not closed within the grace period. The
+     * close listener always clears the pending escalation timer as its first
+     * action, independently of promise settlement, so a graceful exit cannot
+     * leave a later `SIGKILL` armed. Rejection remains prompt and independent of
+     * this fire-and-forget cleanup, so an unresponsive child cannot make an
+     * aborted caller wait. Delaying rejection until cleanup completes is
+     * rejected because it would make cancellation latency depend on the very
+     * signal responsiveness this escalation defends against.
+     */
     const onAbort = (): void => {
       child.kill('SIGTERM');
+      abortKillTimer = setTimeout(() => {
+        abortKillTimer = undefined;
+        child.kill('SIGKILL');
+      }, ABORT_GRACE_PERIOD_MS);
       finish(() => reject(abortReason(signal!)));
     };
 
@@ -153,6 +190,7 @@ export function createSpawnCommandRunner(deps: { readonly env?: NodeJS.ProcessEn
       finish(() => reject(error));
     });
     child.once('close', (exitCode, terminationSignal) => {
+      cancelAbortKillTimer();
       finish(() => {
         if (terminationSignal !== null) {
           resolve({ outcome: 'signaled', stdout, stderr, signal: terminationSignal });
