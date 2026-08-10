@@ -10,7 +10,9 @@
  */
 
 import { AI_EXECUTOR_FACTORIES } from '#adapters/ai/registry.js';
+import { createSpawnCommandRunner } from '#adapters/ai/shared/command-runner.js';
 import { createFsStorage } from '#adapters/storage/fs-storage.js';
+import { readCommandEnvironment } from '#adapters/system/process-command-environment.js';
 import { createSystemClock } from '#adapters/system/system-clock.js';
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { createLayoutResolver, type LayoutResolver } from '#core/layout/resolve.js';
@@ -130,7 +132,9 @@ export function createAmbercast(options: CreateAmbercastOptions): Ambercast {
   return {
     storage: createFsStorage(),
     layout: createLayoutResolver(options.config),
-    aiExecutor: AI_EXECUTOR_FACTORIES[options.aiProvider](),
+    aiExecutor: AI_EXECUTOR_FACTORIES[options.aiProvider]({
+      run: createSpawnCommandRunner({ env: readCommandEnvironment() }),
+    }),
     clock: createSystemClock(),
     discoverTestFiles: createFsTestFileDiscovery(),
     ...(options.browserDriver === undefined ? {} : { browserDriver: options.browserDriver }),

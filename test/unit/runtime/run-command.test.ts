@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { CommandRunner } from '#adapters/ai/shared/command-runner.js';
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { ConfigInvalidError } from '#core/errors/config-invalid-error.js';
 import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
@@ -23,6 +24,7 @@ const mocks = vi.hoisted(() => ({
   createFsStorage: vi.fn(),
   createAmbercast: vi.fn(),
   createNoopEventSink: vi.fn(),
+  readCommandEnvironment: vi.fn(),
   createSystemClock: vi.fn(),
   loadConfig: vi.fn(),
   resolveAiProvider: vi.fn(),
@@ -41,6 +43,9 @@ vi.mock('#adapters/system/env-secrets-provider.js', () => ({
   createEnvSecretsProvider: mocks.createEnvSecretsProvider,
 }));
 vi.mock('#adapters/system/noop-event-sink.js', () => ({ createNoopEventSink: mocks.createNoopEventSink }));
+vi.mock('#adapters/system/process-command-environment.js', () => ({
+  readCommandEnvironment: mocks.readCommandEnvironment,
+}));
 vi.mock('#adapters/system/system-clock.js', () => ({ createSystemClock: mocks.createSystemClock }));
 vi.mock('#config/load.js', () => ({ loadConfig: mocks.loadConfig }));
 vi.mock('#runtime/create-ambercast.js', () => ({ createAmbercast: mocks.createAmbercast }));
@@ -82,6 +87,27 @@ function input(overrides: Partial<RunCommandInput> = {}): RunCommandInput {
   return {
     files: [], headed: false, cacheOnly: false, stale: 'fail', cwd: '/workspace', ...overrides,
   };
+}
+
+interface FactoryCallRecorder {
+  readonly mock: { readonly calls: readonly (readonly unknown[])[] };
+}
+
+function hasCommandRunner(value: unknown): value is { readonly run: CommandRunner } {
+  return value !== null
+    && typeof value === 'object'
+    && 'run' in value
+    && typeof value.run === 'function';
+}
+
+function capturedRunner(factory: FactoryCallRecorder): CommandRunner {
+  const deps = factory.mock.calls[0]?.[0];
+
+  if (!hasCommandRunner(deps)) {
+    throw new Error('Expected the executor factory to receive a command runner.');
+  }
+
+  return deps.run;
 }
 
 afterEach(() => {
@@ -150,6 +176,10 @@ describe('runRunCommand', () => {
     const outcome = { results: [], noTestsFound: false };
     const output = reportOutput(0);
     const grep = /login/;
+    const commandEnvironment = {
+      AMBERCAST_RUNTIME_ALLOWED: 'allowed',
+      AMBERCAST_SECRET_RUNTIME_TEST: 'secret',
+    };
 
     mocks.createSystemClock.mockReturnValue(commandClock);
     mocks.createFsStorage.mockReturnValue(storage);
@@ -157,13 +187,19 @@ describe('runRunCommand', () => {
     mocks.createBrowserDriverResolver.mockReturnValue(browserDriver);
     mocks.createEnvSecretsProvider.mockReturnValue(secrets);
     mocks.createNoopEventSink.mockReturnValue(events.sink);
+    mocks.readCommandEnvironment.mockReturnValue(commandEnvironment);
     mocks.createAmbercast.mockReturnValue({
       storage,
       layout,
       clock: replayClock,
       discoverTestFiles,
     });
-    mocks.run.mockResolvedValue(outcome);
+    mocks.resolveAiProvider.mockResolvedValue('codex');
+    mocks.codexFactory.mockReturnValue({ name: 'codex-cli' });
+    mocks.run.mockImplementation(async (deps: { readonly resolveAiExecutor: () => Promise<unknown> }) => {
+      await deps.resolveAiExecutor();
+      return outcome;
+    });
     mocks.buildRunReport.mockReturnValue(output);
 
     await expect(runRunCommand(input({
@@ -205,6 +241,21 @@ describe('runRunCommand', () => {
       startedAt: '2026-08-09T00:00:00Z',
       durationMs: 250,
     }));
+    expect(mocks.readCommandEnvironment).toHaveBeenCalledExactlyOnceWith();
+    const result = await capturedRunner(mocks.codexFactory)(process.execPath, [
+      '--input-type=module',
+      '--eval',
+      'process.stdout.write(JSON.stringify(process.env));',
+    ]);
+
+    expect(result).toMatchObject({ outcome: 'exited', exitCode: 0 });
+    if (result.outcome !== 'exited') {
+      throw new Error('Expected the environment probe child to exit normally.');
+    }
+
+    const childEnvironment = JSON.parse(result.stdout) as NodeJS.ProcessEnv;
+    expect(childEnvironment.AMBERCAST_RUNTIME_ALLOWED).toBe('allowed');
+    expect(childEnvironment).not.toHaveProperty('AMBERCAST_SECRET_RUNTIME_TEST');
     expect(browserDriver).not.toHaveBeenCalled();
   });
 

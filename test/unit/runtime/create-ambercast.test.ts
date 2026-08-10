@@ -1,11 +1,25 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createBrowserDriverResolver } from '#adapters/browser/registry.js';
+import type { CommandRunner } from '#adapters/ai/shared/command-runner.js';
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { createAmbercast } from '#runtime/create-ambercast.js';
 import { createRecordingEventSink } from '../../doubles/create-recording-event-sink.js';
 import { createFakeBrowserDriver } from '../../doubles/fake-browser-driver.js';
 import { createFakeBrowserSession } from '../../doubles/fake-browser-session.js';
 import { createFakeSecretsProvider } from '../../doubles/fake-secrets-provider.js';
+
+const mocks = vi.hoisted(() => ({
+  claudeFactory: vi.fn(() => ({ name: 'claude-code-cli' })),
+  codexFactory: vi.fn(() => ({ name: 'codex-cli' })),
+  readCommandEnvironment: vi.fn(),
+}));
+
+vi.mock('#adapters/ai/registry.js', () => ({
+  AI_EXECUTOR_FACTORIES: { claude: mocks.claudeFactory, codex: mocks.codexFactory },
+}));
+vi.mock('#adapters/system/process-command-environment.js', () => ({
+  readCommandEnvironment: mocks.readCommandEnvironment,
+}));
 
 const CONFIG: ResolvedConfig = {
   testDir: '/workspace/tests',
@@ -19,6 +33,31 @@ const CONFIG: ResolvedConfig = {
   ci: { heal: false, updateGroundingCache: false },
 };
 
+afterEach(() => {
+  vi.clearAllMocks();
+});
+
+interface FactoryCallRecorder {
+  readonly mock: { readonly calls: readonly (readonly unknown[])[] };
+}
+
+function hasCommandRunner(value: unknown): value is { readonly run: CommandRunner } {
+  return value !== null
+    && typeof value === 'object'
+    && 'run' in value
+    && typeof value.run === 'function';
+}
+
+function capturedRunner(factory: FactoryCallRecorder): CommandRunner {
+  const deps = factory.mock.calls[0]?.[0];
+
+  if (!hasCommandRunner(deps)) {
+    throw new Error('Expected the executor factory to receive a command runner.');
+  }
+
+  return deps.run;
+}
+
 describe('createAmbercast', () => {
   it.each([
     ['claude', 'claude-code-cli'],
@@ -31,6 +70,35 @@ describe('createAmbercast', () => {
     expect(typeof ambercast.layout.planPathFor).toBe('function');
     expect(typeof ambercast.clock.now).toBe('function');
     expect(typeof ambercast.discoverTestFiles).toBe('function');
+  });
+
+  it.each([
+    ['claude', mocks.claudeFactory],
+    ['codex', mocks.codexFactory],
+  ] as const)('injects an environment-filtered runner into the %s executor factory', async (provider, factory) => {
+    const commandEnvironment = {
+      AMBERCAST_RUNTIME_ALLOWED: 'allowed',
+      AMBERCAST_SECRET_RUNTIME_TEST: 'secret',
+    };
+    mocks.readCommandEnvironment.mockReturnValue(commandEnvironment);
+
+    createAmbercast({ config: CONFIG, aiProvider: provider });
+
+    expect(mocks.readCommandEnvironment).toHaveBeenCalledExactlyOnceWith();
+    const result = await capturedRunner(factory)(process.execPath, [
+      '--input-type=module',
+      '--eval',
+      'process.stdout.write(JSON.stringify(process.env));',
+    ]);
+
+    expect(result).toMatchObject({ outcome: 'exited', exitCode: 0 });
+    if (result.outcome !== 'exited') {
+      throw new Error('Expected the environment probe child to exit normally.');
+    }
+
+    const childEnvironment = JSON.parse(result.stdout) as NodeJS.ProcessEnv;
+    expect(childEnvironment.AMBERCAST_RUNTIME_ALLOWED).toBe('allowed');
+    expect(childEnvironment).not.toHaveProperty('AMBERCAST_SECRET_RUNTIME_TEST');
   });
 
   it('uses resolved configuration roots for storage layout rather than creating unrelated port stand-ins', () => {

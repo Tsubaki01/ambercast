@@ -45,10 +45,12 @@ import type {
  * at the first 1,000 UTF-16 code units; the field is omitted when stderr is
  * empty. `codex --version` probes never throw.
  *
- * Its `executeAgentic` method gives an already-aborted signal precedence,
- * then rejects before spawning because this adapter has no browser session to
- * direct. The production default is `createSpawnCommandRunner()`, while
- * an injected runner leaves the protocol deterministic under test.
+     * Its `executeAgentic` method gives an already-aborted signal precedence,
+     * then rejects before spawning because this adapter has no browser session to
+     * direct. Runtime composition supplies the environment-filtered runner; the
+     * fail-closed fallback prevents an incomplete composition from inheriting
+     * ambient credentials. Injected runners leave the protocol deterministic
+     * under test.
  */
 export function createCodexCliExecutor(deps: { readonly run?: CommandRunner } = {}): AiExecutor {
   const run = deps.run ?? createSpawnCommandRunner();

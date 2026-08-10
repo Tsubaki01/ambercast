@@ -12,6 +12,18 @@ import { spawn } from 'node:child_process';
 import { abortReason, rejectOnAbort } from '#core/ai/reject-on-abort.js';
 
 /**
+ * Bounds how long abort cleanup lets a child honour `SIGTERM` before escalation.
+ *
+ * This duration is a deliberate heuristic: it trades a brief opportunity for
+ * graceful shutdown against bounded retention of a child that ignores
+ * termination, without claiming to measure typical provider shutdown time.
+ * This is deliberately a local cleanup policy rather than a configurable
+ * cancellation deadline: the caller's `AbortSignal` already owns deadline
+ * policy, and the runner rejects without waiting for this cleanup window.
+ */
+export const ABORT_GRACE_PERIOD_MS = 500;
+
+/**
  * The terminal state of one child process that was not aborted by its caller.
  *
  * A signaled outcome identifies external process termination. A caller's own
@@ -53,9 +65,11 @@ export interface CommandRunOptions {
  * @throws If spawning fails or the supplied signal aborts the call.
  * @remarks
  * The runner concatenates stdout and stderr data until the child closes. When
- * `options.signal` fires, it sends `SIGTERM` to the
- * child and rejects with the signal reason; it must never resolve a
- * self-inflicted abort as `outcome: 'signaled'`.
+ * `options.signal` fires, abort cleanup sends `SIGTERM` and rejects with the
+ * signal reason immediately. It then allows the child a bounded cleanup window
+ * before sending `SIGKILL` if the child's `close` event has not already
+ * completed cleanup; it must never resolve a self-inflicted abort as
+ * `outcome: 'signaled'`.
  */
 export type CommandRunner = (
   command: string,
@@ -64,21 +78,76 @@ export type CommandRunner = (
 ) => Promise<CommandRunResult>;
 
 /**
+ * Creates a child-process environment that excludes Ambercast secret namespaces.
+ *
+ * @param env - The environment variables that the child would otherwise inherit.
+ * @returns A shallow copy of `env` with Ambercast secret-bearing namespaces
+ * excluded.
+ *
+ * @remarks
+ * AI provider CLIs inherit their parent's environment, so the shared subprocess
+ * boundary must prevent Ambercast-managed secret values from reaching every
+ * provider. The policy is deliberately a deny-list rather than an allow-list:
+ * runtimes and provider CLIs rely on ordinary variables such as `PATH`, `HOME`,
+ * and their own authentication settings, which an allow-list could silently
+ * remove.
+ *
+ * Case-insensitive matching excludes the `AMBERCAST_SECRET_*` and
+ * `AMBERCAST_ENV_*` namespaces. Denying both namespaces prevents
+ * secret-adjacent environment variables from bypassing the shared boundary.
+ * Case-insensitive matching protects both platform-dependent environment-key
+ * behavior and manually supplied or future producer values. Returning a copy
+ * keeps this process's environment unchanged while giving each child an
+ * isolated filtered view.
+ */
+export function stripDeniedEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const filteredEnv = { ...env };
+
+  for (const key of Object.keys(filteredEnv)) {
+    if (/^AMBERCAST_(SECRET|ENV)_/i.test(key)) {
+      delete filteredEnv[key];
+    }
+  }
+
+  return filteredEnv;
+}
+
+/**
  * Creates the production runner backed by Node child processes.
  *
+ * @param deps - Optional environment source supplied by runtime composition.
  * @returns A runner that implements the subprocess and abort contract.
  * @remarks
  * This factory is the shared process-spawning implementation so the
  * two provider adapters cannot drift in stdin closure, output collection, or
  * cancellation semantics.
+ *
+ * Runtime supplies its environment through the system-adapter boundary because
+ * this AI adapter must not observe process-global state directly. The runner
+ * filters the supplied environment separately for every invocation, preserving
+ * a current child-specific view when the injected object changes. Omitting the
+ * dependency deliberately gives a child an empty environment after filtering:
+ * an unwired composition fails conspicuously instead of silently inheriting a
+ * secret-bearing ambient environment.
  */
-export function createSpawnCommandRunner(): CommandRunner {
+export function createSpawnCommandRunner(deps: { readonly env?: NodeJS.ProcessEnv } = {}): CommandRunner {
   return (command, args, options) => rejectOnAbort(options?.signal, () => new Promise<CommandRunResult>((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(command, args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: stripDeniedEnv(deps.env ?? {}),
+    });
     const signal = options?.signal;
     let stdout = '';
     let stderr = '';
     let settled = false;
+    let abortKillTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const cancelAbortKillTimer = (): void => {
+      if (abortKillTimer !== undefined) {
+        clearTimeout(abortKillTimer);
+        abortKillTimer = undefined;
+      }
+    };
 
     const finish = (settle: () => void): void => {
       if (settled) {
@@ -89,8 +158,23 @@ export function createSpawnCommandRunner(): CommandRunner {
       signal?.removeEventListener('abort', onAbort);
       settle();
     };
+    /**
+     * The abort path begins cooperative cleanup with `SIGTERM`, then schedules
+     * `SIGKILL` only if the child has not closed within the grace period. The
+     * close listener always clears the pending escalation timer as its first
+     * action, independently of promise settlement, so a graceful exit cannot
+     * leave a later `SIGKILL` armed. Rejection remains prompt and independent of
+     * this fire-and-forget cleanup, so an unresponsive child cannot make an
+     * aborted caller wait. Delaying rejection until cleanup completes is
+     * rejected because it would make cancellation latency depend on the very
+     * signal responsiveness this escalation defends against.
+     */
     const onAbort = (): void => {
       child.kill('SIGTERM');
+      abortKillTimer = setTimeout(() => {
+        abortKillTimer = undefined;
+        child.kill('SIGKILL');
+      }, ABORT_GRACE_PERIOD_MS);
       finish(() => reject(abortReason(signal!)));
     };
 
@@ -106,6 +190,7 @@ export function createSpawnCommandRunner(): CommandRunner {
       finish(() => reject(error));
     });
     child.once('close', (exitCode, terminationSignal) => {
+      cancelAbortKillTimer();
       finish(() => {
         if (terminationSignal !== null) {
           resolve({ outcome: 'signaled', stdout, stderr, signal: terminationSignal });

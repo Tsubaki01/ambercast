@@ -1,13 +1,16 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { createClaudeCodeCliExecutor } from '#adapters/ai/claude-code-cli/index.js';
+import { createSpawnCommandRunner } from '#adapters/ai/shared/command-runner.js';
 import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
 
 let available = false;
 
 describe('claude-code-cli smoke contract', () => {
   beforeAll(async () => {
-    available = await createClaudeCodeCliExecutor().isAvailable();
+    available = await createClaudeCodeCliExecutor({
+      run: createSpawnCommandRunner({ env: process.env }),
+    }).isAvailable();
   });
 
   // Availability is the only skip condition. A running provider call must
@@ -17,7 +20,9 @@ describe('claude-code-cli smoke contract', () => {
       context.skip('The Claude CLI is unavailable for the opt-in live smoke check.');
     }
 
-    const executor = createClaudeCodeCliExecutor();
+    const executor = createClaudeCodeCliExecutor({
+      run: createSpawnCommandRunner({ env: process.env }),
+    });
     await expect(executor.execute({
       prompt: 'Respond with {"ok": true}.',
       responseSchema: typedJsonSchema(z.object({ ok: z.boolean() })),
