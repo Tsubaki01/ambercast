@@ -64,17 +64,64 @@ export type CommandRunner = (
 ) => Promise<CommandRunResult>;
 
 /**
+ * Creates a child-process environment that excludes Ambercast secret namespaces.
+ *
+ * @param env - The environment variables that the child would otherwise inherit.
+ * @returns A shallow copy of `env` with Ambercast secret-bearing namespaces
+ * excluded.
+ *
+ * @remarks
+ * AI provider CLIs inherit their parent's environment, so the shared subprocess
+ * boundary must prevent Ambercast-managed secret values from reaching every
+ * provider. The policy is deliberately a deny-list rather than an allow-list:
+ * runtimes and provider CLIs rely on ordinary variables such as `PATH`, `HOME`,
+ * and their own authentication settings, which an allow-list could silently
+ * remove.
+ *
+ * Case-insensitive matching excludes the `AMBERCAST_SECRET_*` and
+ * `AMBERCAST_ENV_*` namespaces. Denying both namespaces prevents
+ * secret-adjacent environment variables from bypassing the shared boundary.
+ * Case-insensitive matching protects both platform-dependent environment-key
+ * behavior and manually supplied or future producer values. Returning a copy
+ * keeps this process's environment unchanged while giving each child an
+ * isolated filtered view.
+ */
+export function stripDeniedEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const filteredEnv = { ...env };
+
+  for (const key of Object.keys(filteredEnv)) {
+    if (/^AMBERCAST_(SECRET|ENV)_/i.test(key)) {
+      delete filteredEnv[key];
+    }
+  }
+
+  return filteredEnv;
+}
+
+/**
  * Creates the production runner backed by Node child processes.
  *
+ * @param deps - Optional environment source supplied by runtime composition.
  * @returns A runner that implements the subprocess and abort contract.
  * @remarks
  * This factory is the shared process-spawning implementation so the
  * two provider adapters cannot drift in stdin closure, output collection, or
  * cancellation semantics.
+ *
+ * Runtime supplies its environment through the system-adapter boundary because
+ * this AI adapter must not observe process-global state directly. The runner
+ * filters the supplied environment separately for every invocation, preserving
+ * a current child-specific view when the injected object changes. Omitting the
+ * dependency deliberately gives a child an empty environment after filtering:
+ * an unwired composition fails conspicuously instead of silently inheriting a
+ * secret-bearing ambient environment.
  */
-export function createSpawnCommandRunner(): CommandRunner {
+export function createSpawnCommandRunner(deps: { readonly env?: NodeJS.ProcessEnv } = {}): CommandRunner {
   return (command, args, options) => rejectOnAbort(options?.signal, () => new Promise<CommandRunResult>((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(command, args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: stripDeniedEnv(deps.env ?? {}),
+    });
     const signal = options?.signal;
     let stdout = '';
     let stderr = '';

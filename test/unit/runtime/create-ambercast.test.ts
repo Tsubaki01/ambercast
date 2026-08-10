@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createBrowserDriverResolver } from '#adapters/browser/registry.js';
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { createAmbercast } from '#runtime/create-ambercast.js';
@@ -6,6 +6,15 @@ import { createRecordingEventSink } from '../../doubles/create-recording-event-s
 import { createFakeBrowserDriver } from '../../doubles/fake-browser-driver.js';
 import { createFakeBrowserSession } from '../../doubles/fake-browser-session.js';
 import { createFakeSecretsProvider } from '../../doubles/fake-secrets-provider.js';
+
+const mocks = vi.hoisted(() => ({
+  claudeFactory: vi.fn(() => ({ name: 'claude-code-cli' })),
+  codexFactory: vi.fn(() => ({ name: 'codex-cli' })),
+}));
+
+vi.mock('#adapters/ai/registry.js', () => ({
+  AI_EXECUTOR_FACTORIES: { claude: mocks.claudeFactory, codex: mocks.codexFactory },
+}));
 
 const CONFIG: ResolvedConfig = {
   testDir: '/workspace/tests',
@@ -19,6 +28,10 @@ const CONFIG: ResolvedConfig = {
   ci: { heal: false, updateGroundingCache: false },
 };
 
+afterEach(() => {
+  vi.clearAllMocks();
+});
+
 describe('createAmbercast', () => {
   it.each([
     ['claude', 'claude-code-cli'],
@@ -31,6 +44,15 @@ describe('createAmbercast', () => {
     expect(typeof ambercast.layout.planPathFor).toBe('function');
     expect(typeof ambercast.clock.now).toBe('function');
     expect(typeof ambercast.discoverTestFiles).toBe('function');
+  });
+
+  it.each([
+    ['claude', mocks.claudeFactory],
+    ['codex', mocks.codexFactory],
+  ] as const)('injects a command runner into the %s executor factory', (provider, factory) => {
+    createAmbercast({ config: CONFIG, aiProvider: provider });
+
+    expect(factory).toHaveBeenCalledExactlyOnceWith({ run: expect.any(Function) });
   });
 
   it('uses resolved configuration roots for storage layout rather than creating unrelated port stand-ins', () => {

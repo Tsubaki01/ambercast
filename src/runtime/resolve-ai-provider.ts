@@ -3,6 +3,8 @@
  */
 
 import { AI_EXECUTOR_FACTORIES } from '#adapters/ai/registry.js';
+import { createSpawnCommandRunner } from '#adapters/ai/shared/command-runner.js';
+import { readCommandEnvironment } from '#adapters/system/process-command-environment.js';
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
 
@@ -29,7 +31,9 @@ export function resolveAiProvider(
   return (async () => {
     for (const provider of ['claude', 'codex'] as const) {
       signal?.throwIfAborted();
-      if (await AI_EXECUTOR_FACTORIES[provider]().isAvailable(signal)) {
+      if (await AI_EXECUTOR_FACTORIES[provider]({
+        run: createSpawnCommandRunner({ env: readCommandEnvironment() }),
+      }).isAvailable(signal)) {
         return provider;
       }
       signal?.throwIfAborted();

@@ -3,6 +3,7 @@
  */
 
 import type { AiExecutor } from '#ports/ai.js';
+import type { CommandRunner } from './shared/command-runner.js';
 import { createClaudeCodeCliExecutor } from './claude-code-cli/index.js';
 import { createCodexCliExecutor } from './codex-cli/index.js';
 
@@ -19,7 +20,7 @@ export type AiProviderName = 'claude' | 'codex';
  * provider resolution owns the `auto` policy and asks only for the provider
  * it needs, avoiding a startup probe or command spawn for an unused executor.
  */
-export const AI_EXECUTOR_FACTORIES: Readonly<Record<AiProviderName, () => AiExecutor>> = {
+export const AI_EXECUTOR_FACTORIES: Readonly<Record<AiProviderName, (deps?: { readonly run?: CommandRunner }) => AiExecutor>> = {
   claude: createClaudeCodeCliExecutor,
   codex: createCodexCliExecutor,
 };

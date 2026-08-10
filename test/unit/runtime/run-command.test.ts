@@ -163,7 +163,12 @@ describe('runRunCommand', () => {
       clock: replayClock,
       discoverTestFiles,
     });
-    mocks.run.mockResolvedValue(outcome);
+    mocks.resolveAiProvider.mockResolvedValue('codex');
+    mocks.codexFactory.mockReturnValue({ name: 'codex-cli' });
+    mocks.run.mockImplementation(async (deps: { readonly resolveAiExecutor: () => Promise<unknown> }) => {
+      await deps.resolveAiExecutor();
+      return outcome;
+    });
     mocks.buildRunReport.mockReturnValue(output);
 
     await expect(runRunCommand(input({
@@ -205,6 +210,7 @@ describe('runRunCommand', () => {
       startedAt: '2026-08-09T00:00:00Z',
       durationMs: 250,
     }));
+    expect(mocks.codexFactory).toHaveBeenCalledExactlyOnceWith({ run: expect.any(Function) });
     expect(browserDriver).not.toHaveBeenCalled();
   });
 

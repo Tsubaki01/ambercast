@@ -63,10 +63,11 @@ function usageFrom(value: unknown): AiUsage | undefined {
  *
  * Its `executeAgentic` method first honors an already-aborted signal, then
  * rejects with `AiExecutorUnavailableError` before building a prompt or
- * spawning a process because this adapter does not perform browser-directed
- * dispatch.
- * The production default is `createSpawnCommandRunner()` while injected
- * runners keep the command protocol testable without a live CLI.
+     * spawning a process because this adapter does not perform browser-directed
+     * dispatch. Runtime composition supplies the environment-filtered runner;
+     * the fail-closed fallback prevents an incomplete composition from
+     * inheriting ambient credentials. Injected runners keep the command protocol
+     * testable without a live CLI.
  */
 export function createClaudeCodeCliExecutor(deps: { readonly run?: CommandRunner } = {}): AiExecutor {
   const run = deps.run ?? createSpawnCommandRunner();

@@ -7,10 +7,12 @@
  * even when configuration selects `auto`.
  */
 import { AI_EXECUTOR_FACTORIES } from '#adapters/ai/registry.js';
+import { createSpawnCommandRunner } from '#adapters/ai/shared/command-runner.js';
 import { createBrowserDriverResolver } from '#adapters/browser/registry.js';
 import { createFsStorage } from '#adapters/storage/fs-storage.js';
 import { createEnvSecretsProvider } from '#adapters/system/env-secrets-provider.js';
 import { createNoopEventSink } from '#adapters/system/noop-event-sink.js';
+import { readCommandEnvironment } from '#adapters/system/process-command-environment.js';
 import { readConfigEnvironment } from '#adapters/system/process-config-environment.js';
 import { createSystemClock } from '#adapters/system/system-clock.js';
 import { loadConfig } from '#config/load.js';
@@ -172,7 +174,9 @@ export async function runRunCommand(input: RunCommandInput): Promise<RunCommandO
         config.ai.provider,
         input.aiProviderOverride,
         signal,
-      ).then((provider) => AI_EXECUTOR_FACTORIES[provider]()),
+      ).then((provider) => AI_EXECUTOR_FACTORIES[provider]({
+        run: createSpawnCommandRunner({ env: readCommandEnvironment() }),
+      })),
       ...(input.signal === undefined ? {} : { signal: input.signal }),
     }, {
       files: input.files.map((file) => (isAbsolutePath(file) ? file : joinPath(input.cwd, file))),

@@ -172,6 +172,7 @@ describe('runGenerateCommand', () => {
     await runGenerateCommand(input());
 
     expect(calls).toEqual(['claude factory', 'claude available']);
+    expect(mocks.claudeFactory).toHaveBeenCalledExactlyOnceWith({ run: expect.any(Function) });
     expect(mocks.codexFactory).not.toHaveBeenCalled();
   });
 
