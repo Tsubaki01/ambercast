@@ -68,6 +68,22 @@ describe('prompt envelope', () => {
     expect(prompt).toContain('"priorTrace"');
   });
 
+  it('renders agentic grants without optional trace or untrusted context', () => {
+    const prompt = buildAgenticPrompt({
+      instructionPrompt: 'Complete sign-in.',
+      allowedSecretRefs: ['{{secrets.LOGIN_PASSWORD}}'],
+      allowedRunRefs: ['sessionId'],
+    });
+    const renderedContext = JSON.parse(prompt.match(/```json\n([\s\S]*)\n```$/)?.[1] ?? '');
+
+    expect(renderedContext.trustedPlanMetadata).toEqual({
+      allowedSecretRefs: ['{{secrets.LOGIN_PASSWORD}}'],
+      allowedRunRefs: ['sessionId'],
+    });
+    expect(renderedContext).not.toHaveProperty('priorTrace');
+    expect(renderedContext).not.toHaveProperty('untrustedContext');
+  });
+
   it('isolates trusted grants from allow-list-shaped untrusted context', () => {
     const prompt = buildAgenticPrompt({
       instructionPrompt: 'Complete sign-in.',

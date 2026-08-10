@@ -829,6 +829,8 @@ async function executeAiStep(
     }
   }
 
+  context.signal?.throwIfAborted();
+
   if (cacheOnly) {
     throw new CaseAbort('AI trace replay missed while cache-only mode is enabled.');
   }

@@ -937,6 +937,41 @@ describe('run agentic fallback pipeline', () => {
     expect(executor.agenticRequests[0]?.priorTrace).toEqual(priorTrace);
   });
 
+  it('stops a cancelled trace replay before resolving an agentic fallback', async () => {
+    const abortController = new AbortController();
+    const abortReason = new Error('Stop trace replay.');
+    const session = createFakeBrowserSession(new Map(), {
+      onPerform() {
+        abortController.abort(abortReason);
+        throw abortReason;
+      },
+    });
+    const executor = createFakeAiExecutor();
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor,
+      signal: abortController.signal,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep()],
+      aiGrounding(trace([{ type: 'navigate', url: '/cached' }], [passingText('Cached')])),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(outcome.results[0]?.result).toMatchObject({
+      status: 'error',
+      steps: [{ id: 'recorded-ai', status: 'error', kind: 'environment' }],
+    });
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(aiCalls(events)).toEqual([]);
+  });
+
   it('suppresses a behavioral trace fallback in cache-only mode without resolving an AI executor', async () => {
     const session = createFakeBrowserSession(new Map(), {
       assertOutcome: { passed: false, message: 'The cached page changed.' },

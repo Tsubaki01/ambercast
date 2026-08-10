@@ -107,6 +107,15 @@ describe('createFakeBrowserSession', () => {
     await expect(session.evaluateAssert({ check: 'element-visible', target: REF })).resolves.toBe(outcome);
   });
 
+  it('rejects after consuming every scripted assertion outcome', async () => {
+    const outcome = { passed: false, message: 'The form is incomplete.' } as const;
+    const session = createFakeBrowserSession(entries(), { assertOutcomes: [outcome] });
+
+    await expect(session.evaluateAssert({ check: 'element-visible', target: REF })).resolves.toBe(outcome);
+    await expect(session.evaluateAssert({ check: 'element-visible', target: REF }))
+      .rejects.toThrow('No scripted assertion outcome remains.');
+  });
+
   it('records browser-facing work in order while leaving teardown outside the operation log', async () => {
     const session = createFakeBrowserSession(entries(), {
       assertOutcomes: [
