@@ -14,6 +14,7 @@ const RESULT_EVENT: RunEvent = { type: 'step-result', stepId: 'open-page', via: 
 const AI_RESOLVED_EVENT: RunEvent = { type: 'step-result', stepId: 'resolve-form', via: 'ai-resolve' };
 const TRACE_REPLAYED_EVENT: RunEvent = { type: 'step-result', stepId: 'replay-trace', via: 'trace-replay' };
 const AI_CALL_EVENT: RunEvent = { type: 'ai-call', stepId: 'resolve-form' };
+const UNSCOPED_AI_CALL_EVENT: RunEvent = { type: 'ai-call' };
 
 export function registerEventSinkContract(harness: EventSinkContractHarness): void {
   describe('EventSink contract', () => {
@@ -56,6 +57,7 @@ export function registerEventSinkContract(harness: EventSinkContractHarness): vo
         expect(() => recording.sink.emit(AI_RESOLVED_EVENT)).not.toThrow();
         expect(() => recording.sink.emit(TRACE_REPLAYED_EVENT)).not.toThrow();
         expect(() => recording.sink.emit(AI_CALL_EVENT)).not.toThrow();
+        expect(() => recording.sink.emit(UNSCOPED_AI_CALL_EVENT)).not.toThrow();
 
         expect(recording.emitted()).toEqual([
           START_EVENT,
@@ -63,6 +65,7 @@ export function registerEventSinkContract(harness: EventSinkContractHarness): vo
           AI_RESOLVED_EVENT,
           TRACE_REPLAYED_EVENT,
           AI_CALL_EVENT,
+          UNSCOPED_AI_CALL_EVENT,
         ]);
       } finally {
         await harness.dispose?.();

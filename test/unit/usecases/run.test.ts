@@ -28,7 +28,7 @@ import { createLayoutResolver } from '#core/layout/resolve.js';
 import type { AiAgenticRequest } from '#ports/ai.js';
 import type { BrowserDriver, BrowserEngine, BrowserSession, PerformableAction } from '#ports/browser.js';
 import type { StorageAdapter } from '#ports/storage.js';
-import type { Clock } from '#ports/system.js';
+import type { Clock, RunEvent } from '#ports/system.js';
 import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
 import { buildRunReport } from '#usecases/run-report.js';
 import { createFixedClock } from '../../doubles/create-fixed-clock.js';
@@ -205,8 +205,8 @@ function passingText(text: string): TraceAssert {
   return { type: 'assert', check: 'text-visible', text };
 }
 
-function aiCalls(events: ReturnType<typeof createRecordingEventSink>): readonly { readonly type: 'ai-call'; readonly stepId: string }[] {
-  return events.emitted().filter((event): event is { readonly type: 'ai-call'; readonly stepId: string } => event.type === 'ai-call');
+function aiCalls(events: ReturnType<typeof createRecordingEventSink>): readonly Extract<RunEvent, { type: 'ai-call' }>[] {
+  return events.emitted().filter((event): event is Extract<RunEvent, { type: 'ai-call' }> => event.type === 'ai-call');
 }
 
 function pathBAccessibilityTree(statusName = 'Resolution status'): JsonValueT {
