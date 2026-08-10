@@ -1,6 +1,7 @@
 import type { AmbercastError, ExitCode } from '#core/errors/types.js';
 import { reportError } from '#report/error-mapping.js';
 import type { ReportEnvelope } from '#report/schema.js';
+import { selectExitCode } from './exit-code-priority.js';
 import type { RunOutcome } from './run.js';
 
 /**
@@ -59,30 +60,23 @@ export interface RunReportOutput {
  * @remarks
  * A top-level thrown `AmbercastError` short-circuits immediately with that
  * error's own exit code, just as `buildGenerateReport()` does; it represents a
- * command failure before a case outcome exists. Otherwise this function scans
- * the whole batch, rather than using `generate-report.ts`'s first failed file,
- * because file order must not let one case hide a higher-priority error in
- * another.
+ * command failure before a case outcome exists. For a completed batch, this
+ * builder gives every applicable condition to `selectExitCode()` rather
+ * than maintain a report-specific precedence branch. The shared order is 2,
+ * then 3, 4, 1, 5, and 0, so a higher-priority outcome wins regardless of
+ * where its case appears in the batch.
  *
- * The first matching row in this priority scan determines the exit code:
- *
- * | Condition anywhere in the completed batch | Exit |
- * | --- | --- |
- * | A case error has kind `config-invalid`, `secret-unresolved`, `target-unresolved`, or `secret-literal-rejected` | 2 |
- * | A case error has kind `missing-plan`, `stale-ir`, or `integrity-violation` | 4 |
- * | A case error has kind `browser-launch-failed`, `ai-executor-unavailable`, `ai-response-invalid`, `fs-io-error`, or `unexpected-crash`, or any `RunResult.status` is `'error'` | 3 |
- * | Any `RunResult.status` is `'failed'` | 1 |
- * | No tests were found | 5 |
- * | None of the preceding conditions | 0 |
- *
- * Thus the scan deliberately checks exit 2, then exit 4, then exit 3, followed
- * by exits 1, 5, and 0: a usage failure in any case outranks an environment
- * failure in any other case, regardless of discovery order. The explicit
- * `RunResult.status === 'error'` branch is essential. The unified case-abort
- * stopgap for grounding misses, unsupported run references, and unclassified
- * browser-session errors intentionally creates no `errors[]` entry because no
- * reserved `ErrorKind` fits it. Treating that status as an exit-3 condition
- * prevents a batch containing only such aborts from falling through to exit 0.
+ * Classified case errors contribute their established exit codes. An aborted
+ * result without its own classified error contributes the generic exit-3
+ * stopgap, and a failed assertion contributes exit 1; the no-tests-found
+ * condition contributes exit 5. The abort rule is deliberately scoped to
+ * each result rather than the whole batch. A classified exit-4 error can also
+ * have an error status, and treating every error status as a batch-wide exit-3
+ * condition would manufacture a higher-priority code that misreports that
+ * classified failure. The stopgap exists because grounding misses,
+ * unsupported run references, and unclassified browser-session errors have no
+ * suitable reserved `ErrorKind`, yet a batch containing only those aborts must
+ * not appear successful.
  *
  * Summary accounting counts every result by its run status: `total` covers all
  * cases; `passed`, `failed`, `errored`, and `skipped` each describe their
@@ -109,10 +103,24 @@ export function buildRunReport(input: RunReportInput): RunReportOutput {
   const errors = outcome.results.flatMap(({ result, error }) => (
     error === undefined ? [] : [reportError(error, { scope: 'case', caseId: result.id })]
   ));
-  const errorKinds = new Set(outcome.results.flatMap(({ error }) => (
-    error === undefined ? [] : [error.kind]
-  )));
-  const statuses = new Set(outcome.results.map(({ result }) => result.status));
+  const candidates: ExitCode[] = outcome.results.flatMap<ExitCode>(({ result, error }) => {
+    const resultCandidates: ExitCode[] = [];
+
+    if (error !== undefined) {
+      resultCandidates.push(error.exitCode);
+    }
+    if (result.status === 'error' && error === undefined) {
+      resultCandidates.push(3);
+    }
+    if (result.status === 'failed') {
+      resultCandidates.push(1);
+    }
+
+    return resultCandidates;
+  });
+  if (outcome.noTestsFound) {
+    candidates.push(5);
+  }
   const summary = { total: outcome.results.length, passed: 0, failed: 0, errored: 0, skipped: 0 };
 
   for (const { result } of outcome.results) {
@@ -132,27 +140,7 @@ export function buildRunReport(input: RunReportInput): RunReportOutput {
     }
   }
 
-  const exitCode: ExitCode = errorKinds.has('config-invalid')
-    || errorKinds.has('secret-unresolved')
-    || errorKinds.has('target-unresolved')
-    || errorKinds.has('secret-literal-rejected')
-    ? 2
-    : errorKinds.has('missing-plan')
-      || errorKinds.has('stale-ir')
-      || errorKinds.has('integrity-violation')
-      ? 4
-      : errorKinds.has('browser-launch-failed')
-        || errorKinds.has('ai-executor-unavailable')
-        || errorKinds.has('ai-response-invalid')
-        || errorKinds.has('fs-io-error')
-        || errorKinds.has('unexpected-crash')
-        || statuses.has('error')
-        ? 3
-        : statuses.has('failed')
-          ? 1
-          : outcome.noTestsFound
-            ? 5
-            : 0;
+  const exitCode = selectExitCode(candidates);
 
   return {
     exitCode,

@@ -76,14 +76,14 @@ const PRIORITY_PAIRS = [
     caseOutcome('error', 'usage.test.md', new ConfigInvalidError('configuration is invalid')),
     caseOutcome('failed', 'assertion.test.md'),
   ], 2],
-  ['an exit-4 artifact error over an environment error', [
+  ['an environment error over an exit-4 artifact error', [
     caseOutcome('error', 'artifact.test.md', new StaleIrError('plan is stale')),
     caseOutcome('error', 'environment.test.md', new FsIoError('filesystem failed')),
-  ], 4],
-  ['an exit-4 artifact error over a case-abort stopgap', [
+  ], 3],
+  ['a case-abort stopgap over an exit-4 artifact error', [
     caseOutcome('error', 'artifact.test.md', new IntegrityViolationError('plan integrity failed')),
     caseOutcome('error', 'stopgap.test.md'),
-  ], 4],
+  ], 3],
   ['an exit-4 artifact error over a failed assertion', [
     caseOutcome('error', 'artifact.test.md', new MissingPlanError('plan is missing')),
     caseOutcome('failed', 'assertion.test.md'),
@@ -147,6 +147,20 @@ describe('buildRunReport', () => {
     expect(output.exitCode).toBe(3);
     expect(output.envelope.errors).toEqual([]);
     expect(output.envelope.results.map((result) => result.status)).toEqual(['error', 'error', 'error']);
+  });
+
+  it('selects exit 3 when a case-abort stopgap and failed assertion coexist', () => {
+    const output = report({
+      outcome: {
+        noTestsFound: false,
+        results: [
+          caseOutcome('failed', 'assertion.test.md'),
+          caseOutcome('error', 'stopgap.test.md'),
+        ],
+      },
+    });
+
+    expect(output.exitCode).toBe(3);
   });
 
   it('short-circuits a top-level classified error with its own exit code and a run-scoped error', () => {
