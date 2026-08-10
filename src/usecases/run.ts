@@ -839,11 +839,25 @@ class AgenticRunPipeline implements AiActionController {
    * Snapshotting is still an observation for terminal-verification purposes:
    * an agent cannot inspect new page evidence after a passing assertion and
    * then claim that the earlier assertion was its final proof of success.
+   *
+   * AI-bound snapshots never carry screenshot bytes because pixel content
+   * cannot be reliably masked by substring matching; this policy governs
+   * `AiActionController`-facing snapshot construction only. The accessibility
+   * tree preserves the parser-produced JSON structure while redacting resolved
+   * values from its string values and object keys before they cross into the
+   * AI adapter.
    */
   async snapshotForResolution() {
     this.#trailingPassedAssertRun = 0;
     this.#lastObservation = 'snapshot';
-    return this.context.session.snapshotForResolution();
+    const raw = await this.context.session.snapshotForResolution();
+    return {
+      accessibilityTree: redactJsonStrings(
+        raw.accessibilityTree,
+        this.context.resolvedSecrets,
+        this.context.runState,
+      ) as JsonValueT,
+    };
   }
 
   /**
@@ -1005,13 +1019,21 @@ async function groundedTarget(
   const response = await executor.execute({
     prompt: 'Confirm that the supplied locator still identifies the intended element and return its current stable accessibility-neighborhood fingerprint.',
     responseSchema: FINGERPRINT_RESPONSE_SCHEMA,
-    // Screenshot bytes are encoded because AI request context is JSON-only;
-    // keeping the locator unchanged confines this path to fingerprint refresh.
+    /**
+     * The structured request keeps the authored locator and the accessibility
+     * tree needed for fingerprint recovery, but not screenshot pixels, which
+     * cannot be safely redacted with string substitution. Redacting string
+     * values and object keys keeps materialized secrets and run values out of
+     * provider input without altering the tree's JSON structure.
+     */
     context: {
       target: target as unknown as JsonValueT,
       snapshot: {
-        accessibilityTree: snapshot.accessibilityTree,
-        screenshotBase64: Buffer.from(snapshot.screenshot).toString('base64'),
+        accessibilityTree: redactJsonStrings(
+          snapshot.accessibilityTree,
+          context.resolvedSecrets,
+          context.runState,
+        ) as JsonValueT,
       },
     },
     ...(context.signal === undefined ? {} : { signal: context.signal }),

@@ -6,9 +6,9 @@ import type {
   AiExecuteRequest,
   AiExecuteResult,
   AiExecutor,
+  AiResolutionSnapshot,
 } from '../../src/ports/ai.js';
 import type { TraceAction, TraceAssert, TraceRecord } from '../../src/core/ir/schema.js';
-import type { PageSnapshot } from '../../src/ports/browser.js';
 import { typedJsonSchema } from '../../src/core/ai/typed-json-schema.js';
 import { z } from 'zod';
 
@@ -42,7 +42,7 @@ const EXECUTE_RESULT: AiExecuteResult<unknown> = {
   usage: { inputTokens: 13, outputTokens: 8 },
 };
 const AGENTIC_RESULT: AiAgenticResult = { outcome: 'success' };
-const EMPTY_SNAPSHOT: PageSnapshot = { accessibilityTree: {}, screenshot: new Uint8Array() };
+const EMPTY_SNAPSHOT: AiResolutionSnapshot = { accessibilityTree: {} };
 const ACTION_A: TraceAction = { type: 'click', target: { strategy: 'accessibility', role: 'button', name: 'Submit' } };
 const ACTION_B: TraceAction = { type: 'navigate', url: 'https://example.test/second-action' };
 const CHECK: TraceAssert = { type: 'assert', check: 'element-visible', target: ACTION_A.target };

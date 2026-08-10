@@ -1,6 +1,6 @@
-import type { AiActionController } from '../../src/ports/ai.js';
+import type { AiActionController, AiResolutionSnapshot } from '../../src/ports/ai.js';
 import type { TraceAction, TraceAssert } from '../../src/core/ir/schema.js';
-import type { AssertOutcome, PageSnapshot } from '../../src/ports/browser.js';
+import type { AssertOutcome } from '../../src/ports/browser.js';
 
 /**
  * The controller contract plus immutable-by-convention operation histories.
@@ -43,7 +43,7 @@ export function createFakeAiActionController(overrides: Partial<AiActionControll
 
       return overrides.evaluateAssert(check);
     },
-    async snapshotForResolution(): Promise<PageSnapshot> {
+    async snapshotForResolution(): Promise<AiResolutionSnapshot> {
       snapshots += 1;
       if (overrides.snapshotForResolution === undefined) {
         throw new Error('No override configured for snapshotForResolution');

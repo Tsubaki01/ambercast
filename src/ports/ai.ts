@@ -12,7 +12,7 @@ import type {
   TraceRecord,
 } from '#core/ir/schema.js';
 
-import type { AssertOutcome, PageSnapshot } from './browser.js';
+import type { AssertOutcome } from './browser.js';
 
 /**
  * Optional provider-reported token accounting for one AI call.
@@ -25,6 +25,21 @@ export interface AiUsage {
 
   /** Tokens the provider counted for the generated response. */
   readonly outputTokens?: number;
+}
+
+/**
+ * Browser evidence that may cross the action-resolution AI boundary.
+ *
+ * @remarks
+ * This deliberately preserves only the accessibility tree. Keeping this
+ * contract distinct from raw browser evidence prevents callers from
+ * interpreting an omitted image as either an empty capture or a capture
+ * failure, while allowing the run pipeline to redact resolved values before
+ * the tree reaches an AI provider.
+ */
+export interface AiResolutionSnapshot {
+  /** The accessibility tree after the run pipeline applies its AI-bound redaction policy. */
+  readonly accessibilityTree: JsonValueT;
 }
 
 /**
@@ -119,12 +134,16 @@ export interface AiActionController {
   evaluateAssert(check: TraceAssert): Promise<AssertOutcome>;
 
   /**
-   * Captures the page evidence available for action resolution.
+   * Captures page evidence permitted for action resolution.
    *
-   * @returns The current accessibility tree and screenshot.
-   * @throws If either representation cannot be captured.
+   * @returns An AI-safe snapshot containing the redacted accessibility tree.
+   * @throws If page evidence cannot be captured.
+   * @remarks
+   * This intentionally has a narrower contract than raw browser evidence:
+   * callers receive no screenshot property and must not infer anything about
+   * image capture from its absence.
    */
-  snapshotForResolution(): Promise<PageSnapshot>;
+  snapshotForResolution(): Promise<AiResolutionSnapshot>;
 }
 
 /**

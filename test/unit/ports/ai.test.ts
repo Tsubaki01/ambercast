@@ -16,6 +16,7 @@ import type {
   AiExecuteRequest,
   AiExecuteResult,
   AiExecutor,
+  AiResolutionSnapshot,
   AiUsage,
 } from '../../../src/ports/ai.js';
 import type {
@@ -68,7 +69,10 @@ describe('AI port shapes', () => {
     expectTypeOf<AiActionController>().toEqualTypeOf<{
       perform(action: TraceAction): Promise<void>;
       evaluateAssert(check: TraceAssert): Promise<AssertOutcome>;
-      snapshotForResolution(): Promise<PageSnapshot>;
+      snapshotForResolution(): Promise<AiResolutionSnapshot>;
+    }>();
+    expectTypeOf<AiResolutionSnapshot>().toEqualTypeOf<{
+      readonly accessibilityTree: JsonValueT;
     }>();
     expectTypeOf<AiAgenticRequest>().toEqualTypeOf<{
       readonly instructionPrompt: string;

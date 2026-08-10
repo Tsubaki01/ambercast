@@ -1,15 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import type { ElementRef, TraceAction, TraceAssert } from '../../../src/core/ir/schema.js';
-import type { AssertOutcome, PageSnapshot } from '../../../src/ports/browser.js';
+import type { AssertOutcome } from '../../../src/ports/browser.js';
+import type { AiResolutionSnapshot } from '../../../src/ports/ai.js';
 import { createFakeAiActionController } from '../../doubles/fake-ai-action-controller.js';
 
 const REF: ElementRef = { strategy: 'accessibility', role: 'button', name: 'Submit' };
 const ACTION: TraceAction = { type: 'click', target: REF };
 const CHECK: TraceAssert = { type: 'assert', check: 'element-visible', target: REF };
 const OUTCOME: AssertOutcome = { passed: true, message: 'Visible' };
-const SNAPSHOT: PageSnapshot = {
+const SNAPSHOT: AiResolutionSnapshot = {
   accessibilityTree: { role: 'document' },
-  screenshot: new Uint8Array([1, 2, 3]),
 };
 
 describe('createFakeAiActionController', () => {
