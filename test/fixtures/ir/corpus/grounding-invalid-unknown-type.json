@@ -7,7 +7,12 @@
     "entries": {
       "step": {
         "kind": "ai",
-        "trace": [{ "type": "scroll" }]
+        "trace": {
+          "events": [{ "type": "scroll" }],
+          "verification": [
+            { "type": "assert", "check": "text-visible", "text": "Ready" }
+          ]
+        }
       }
     }
   }

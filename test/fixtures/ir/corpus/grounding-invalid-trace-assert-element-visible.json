@@ -8,9 +8,9 @@
       "step": {
         "kind": "ai",
         "trace": {
-          "events": [{ "url": "https://example.test" }],
+          "events": [],
           "verification": [
-            { "type": "assert", "check": "text-visible", "text": "Ready" }
+            { "type": "assert", "check": "element-visible" }
           ]
         }
       }

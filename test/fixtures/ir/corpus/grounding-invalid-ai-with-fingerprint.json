@@ -8,7 +8,14 @@
       "step": {
         "kind": "ai",
         "fingerprint": { "algorithm": "a11y-neighborhood-v1", "hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
-        "trace": [{ "type": "click", "target": { "strategy": "accessibility", "role": "button", "name": "Submit" } }]
+        "trace": {
+          "events": [
+            { "type": "click", "target": { "strategy": "accessibility", "role": "button", "name": "Submit" } }
+          ],
+          "verification": [
+            { "type": "assert", "check": "text-visible", "text": "Submit form is visible" }
+          ]
+        }
       }
     }
   }

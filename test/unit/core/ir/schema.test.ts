@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { toCanonicalArtifactText } from '../../../../src/core/ir/canonical-json.js';
 import {
   AccessibilityElementRef,
   ActionStep,
@@ -27,15 +28,18 @@ import {
   TargetDefinition,
   TextEqualsCheck,
   TextVisibleCheck,
-  Trace,
   TraceAction,
+  TraceAssert,
   TraceClick,
+  TraceEntry,
   TraceFill,
   TraceFillSecret,
   TraceNavigate,
   TracePress,
+  TraceRecord,
   UrlMatchesCheck,
 } from '../../../../src/core/ir/schema.js';
+import type { JsonValueT } from '../../../../src/core/ir/schema.js';
 
 interface SchemaUnderTest {
   safeParse(value: unknown): { success: boolean };
@@ -350,6 +354,17 @@ describe('AssertStep', () => {
     expectRejected(TextVisibleCheck, { id: 'multiline-secret-later', kind: 'assert', check: 'text-visible', text: 'text\n{{secrets.TOKEN}}' });
     expectAccepted(TextVisibleCheck, { id: 'multiline-split-marker', kind: 'assert', check: 'text-visible', text: 'text\n{{secrets\n.TOKEN}}' });
   });
+
+  it.each([
+    ['text-visible', { id: 'welcome-visible', kind: 'assert', check: 'text-visible', text: 'Welcome' }, { id: 'welcome-visible', kind: 'assert', check: 'text-visible' }],
+    ['element-visible', { id: 'dashboard-visible', kind: 'assert', check: 'element-visible', target: TARGET }, { id: 'dashboard-visible', kind: 'assert', check: 'element-visible' }],
+    ['text-equals', { id: 'heading-text', kind: 'assert', check: 'text-equals', target: TARGET, text: 'Welcome' }, { id: 'heading-text', kind: 'assert', check: 'text-equals', target: TARGET }],
+    ['url-matches', { id: 'dashboard-url', kind: 'assert', check: 'url-matches', pattern: '/dashboard$' }, { id: 'dashboard-url', kind: 'assert', check: 'url-matches' }],
+    ['element-count', { id: 'zero-alerts', kind: 'assert', check: 'element-count', target: TARGET, count: 0 }, { id: 'zero-alerts', kind: 'assert', check: 'element-count', target: TARGET, count: -1 }],
+  ] as const)('keeps the %s assertion branch accept/reject behavior after field-bundle extraction', (_check, accepted, rejected) => {
+    expectAccepted(AssertStep, accepted);
+    expectRejected(AssertStep, rejected);
+  });
 });
 
 describe('CaptureStep and AiStep', () => {
@@ -401,6 +416,35 @@ describe('CaptureStep and AiStep', () => {
     expectAccepted(AiStep, { id: 'ai-unicode', kind: 'ai', instruction: '設定を開く: {{run.username}}' });
   });
 
+  it('preserves omitted and explicitly empty AI secret grants as distinct serialized values', () => {
+    const omitted = AiStep.parse({ id: 'find-settings', kind: 'ai', instruction: 'Open settings' });
+    const explicitlyEmpty = AiStep.parse({ id: 'find-settings', kind: 'ai', instruction: 'Open settings', secrets: [] });
+    const omittedText = toCanonicalArtifactText(omitted as JsonValueT);
+    const explicitlyEmptyText = toCanonicalArtifactText(explicitlyEmpty as JsonValueT);
+
+    expect(AiStep.parse(JSON.parse(omittedText))).toStrictEqual(omitted);
+    expect(AiStep.parse(JSON.parse(explicitlyEmptyText))).toStrictEqual(explicitlyEmpty);
+    expect(omittedText).not.toBe(explicitlyEmptyText);
+    expect(JSON.parse(omittedText)).not.toHaveProperty('secrets');
+    expect(JSON.parse(explicitlyEmptyText)).toHaveProperty('secrets', []);
+  });
+
+  it('accepts non-empty AI secret grants and rejects invalid grant lists', () => {
+    expectAccepted(AiStep, {
+      id: 'find-settings',
+      kind: 'ai',
+      instruction: 'Open settings',
+      secrets: ['{{secrets.app.token}}', '{{secrets.app.password}}'],
+    });
+    expectRejected(AiStep, { id: 'find-settings', kind: 'ai', instruction: 'Open settings', secrets: '{{secrets.app.token}}' });
+    expectRejected(AiStep, {
+      id: 'find-settings',
+      kind: 'ai',
+      instruction: 'Open settings',
+      secrets: ['{{secrets.app.token}}', '{{secret.app.password}}'],
+    });
+  });
+
   it('rejects unknown and missing outer kind discriminants', () => {
     expectRejected(Step, { id: 'wait', kind: 'wait' });
     expectRejected(Step, { id: 'missing-kind', action: 'navigate', url: 'https://example.test' });
@@ -415,7 +459,15 @@ const traceVariants: ReadonlyArray<readonly [string, SchemaUnderTest, unknown]> 
   ['fill-secret', TraceFillSecret, { type: 'fill-secret', target: TARGET, secretRef: '{{secrets.app.password}}' }],
 ];
 
-describe('TraceAction and Trace', () => {
+const traceAssertVariants: ReadonlyArray<readonly [string, unknown]> = [
+  ['text-visible', { type: 'assert', check: 'text-visible', text: 'Welcome' }],
+  ['element-visible', { type: 'assert', check: 'element-visible', target: TARGET }],
+  ['text-equals', { type: 'assert', check: 'text-equals', target: TARGET, text: 'Welcome' }],
+  ['url-matches', { type: 'assert', check: 'url-matches', pattern: '/dashboard$' }],
+  ['element-count', { type: 'assert', check: 'element-count', target: TARGET, count: 0 }],
+];
+
+describe('TraceAction, TraceAssert, TraceEntry, and TraceRecord', () => {
   it.each(traceVariants)('accepts the %s trace action in its concrete and union schemas', (_name, schema, value) => {
     expectAccepted(schema, value);
     expectAccepted(TraceAction, value);
@@ -477,9 +529,63 @@ describe('TraceAction and Trace', () => {
     expectAccepted(TracePress, { type: 'press', target: TARGET, key });
   });
 
-  it('accepts a populated trace and an empty trace', () => {
-    expectAccepted(Trace, traceVariants.map(([, , value]) => value));
-    expectAccepted(Trace, []);
+  it.each(traceAssertVariants)('accepts the %s trace assertion branch', (_check, value) => {
+    expectAccepted(TraceAssert, value);
+  });
+
+  it('rejects invalid trace assertion discriminants and branch-level unknown properties', () => {
+    expectRejected(TraceAssert, { type: 'assert', text: 'Welcome' });
+    expectRejected(TraceAssert, { type: 'assert', check: 'page-ready', text: 'Welcome' });
+    expectRejected(TraceAssert, { check: 'text-visible', text: 'Welcome' });
+    expectRejected(TraceAssert, { type: 'click', check: 'text-visible', text: 'Welcome' });
+    expectRejected(TraceAssert, { type: 'assert', check: 'text-visible', text: 'Welcome', unexpected: true });
+  });
+
+  it.each([
+    ['text-visible', { type: 'assert', check: 'text-visible' }],
+    ['element-visible', { type: 'assert', check: 'element-visible' }],
+    ['text-equals', { type: 'assert', check: 'text-equals', target: TARGET }],
+    ['url-matches', { type: 'assert', check: 'url-matches' }],
+    ['element-count', { type: 'assert', check: 'element-count', target: TARGET, count: -1 }],
+  ] as const)('rejects an invalid %s trace assertion branch', (_check, value) => {
+    expectRejected(TraceAssert, value);
+  });
+
+  it('rejects secret markers in trace assertion text and patterns while allowing run interpolation', () => {
+    expectAccepted(TraceAssert, { type: 'assert', check: 'text-visible', text: 'Welcome, {{run.username}}' });
+    expectAccepted(TraceAssert, { type: 'assert', check: 'text-equals', target: TARGET, text: 'Hello {{run.username}}' });
+    expectAccepted(TraceAssert, { type: 'assert', check: 'url-matches', pattern: '/{{run.path}}$' });
+
+    expectRejected(TraceAssert, { type: 'assert', check: 'text-visible', text: 'Welcome {{secrets.app.password}}' });
+    expectRejected(TraceAssert, { type: 'assert', check: 'text-equals', target: TARGET, text: '{{secrets.app.password}}' });
+    expectRejected(TraceAssert, { type: 'assert', check: 'url-matches', pattern: '{{secrets.app.password}}$' });
+  });
+
+  it('rejects a trace assertion whose check and field bundle disagree', () => {
+    expectRejected(TraceAssert, { type: 'assert', check: 'text-visible', target: TARGET });
+  });
+
+  it('discriminates action and assertion trace entries while rejecting type/check mismatches', () => {
+    expectAccepted(TraceEntry, traceVariants[0]![2]);
+    expectAccepted(TraceEntry, traceAssertVariants[0]![1]);
+    expectRejected(TraceEntry, { type: 'click', check: 'text-visible', text: 'Welcome' });
+  });
+
+  it('enforces the trace-record four-quadrant rule', () => {
+    const verification = { type: 'assert', check: 'text-visible', text: 'Welcome' };
+
+    expectAccepted(TraceRecord, { events: [], verification: [verification] });
+    expectRejected(TraceRecord, { events: [{ type: 'click', target: TARGET }], verification: [] });
+    expectRejected(TraceRecord, { events: [], verification: [] });
+    expectRejected(TraceRecord, { events: [], verification: [verification], unexpected: true });
+  });
+
+  it('allows action and assertion entries in events while requiring assertions in verification', () => {
+    const action = { type: 'click', target: TARGET };
+    const assertion = { type: 'assert', check: 'text-visible', text: 'Welcome' };
+
+    expectAccepted(TraceRecord, { events: [action, assertion], verification: [assertion] });
+    expectRejected(TraceRecord, { events: [action], verification: [action] });
   });
 });
 
@@ -557,7 +663,10 @@ describe('GroundingDocument', () => {
       entries: {
         'login-flow': {
           kind: 'ai',
-          trace: traceVariants.map(([, , value]) => value),
+          trace: {
+            events: traceVariants.map(([, , value]) => value),
+            verification: [{ type: 'assert', check: 'text-visible', text: 'Login form is visible' }],
+          },
         },
       },
     });
@@ -574,7 +683,10 @@ describe('GroundingDocument', () => {
         },
         'submit-review': {
           kind: 'ai',
-          trace: [{ type: 'click', target: TARGET }],
+          trace: {
+            events: [{ type: 'click', target: TARGET }],
+            verification: [{ type: 'assert', check: 'element-visible', target: TARGET }],
+          },
         },
       },
     });
@@ -635,7 +747,10 @@ describe('GroundingDocument', () => {
         step: {
           kind: 'ai',
           fingerprint: { algorithm: 'a11y-neighborhood-v1', hash: DIGEST_A },
-          trace: [{ type: 'click', target: TARGET }],
+          trace: {
+            events: [{ type: 'click', target: TARGET }],
+            verification: [{ type: 'assert', check: 'text-visible', text: 'Ready' }],
+          },
         },
       },
     });

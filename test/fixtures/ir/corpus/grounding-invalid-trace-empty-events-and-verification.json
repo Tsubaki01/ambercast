@@ -8,10 +8,8 @@
       "step": {
         "kind": "ai",
         "trace": {
-          "events": [{ "url": "https://example.test" }],
-          "verification": [
-            { "type": "assert", "check": "text-visible", "text": "Ready" }
-          ]
+          "events": [],
+          "verification": []
         }
       }
     }
