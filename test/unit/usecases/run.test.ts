@@ -29,6 +29,7 @@ import type { BrowserDriver, BrowserEngine, BrowserSession, PerformableAction } 
 import type { StorageAdapter } from '#ports/storage.js';
 import type { Clock } from '#ports/system.js';
 import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
+import { buildRunReport } from '#usecases/run-report.js';
 import { createFixedClock } from '../../doubles/create-fixed-clock.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
 import { createRecordingEventSink } from '../../doubles/create-recording-event-sink.js';
@@ -1613,6 +1614,328 @@ describe('run agentic wrapper state machine', () => {
   });
 });
 
+describe('run deterministic redaction boundary', () => {
+  it('redacts a path-A fill-secret value from a later text-equals assertion failure', async () => {
+    const secretRef = '{{secrets.AMBERCAST_SECRET_DUMMY_PATH_A}}';
+    const secretValue = 'AMBERCAST_SECRET_DUMMY_PATH_A_VALUE';
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcome: { passed: false, message: `The visible account is ${secretValue}.` },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'fill-path-a-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef },
+      { id: 'assert-path-a-account', kind: 'assert', check: 'text-equals', target: PASSWORD, text: 'Signed in' },
+    ], elementGrounding(['fill-path-a-secret', 'assert-path-a-account']));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result).toMatchObject({
+      status: 'failed',
+      explanation: `The visible account is ${secretRef}.`,
+      steps: [
+        { id: 'fill-path-a-secret', status: 'passed' },
+        { id: 'assert-path-a-account', status: 'failed', kind: 'assertion' },
+      ],
+    });
+  });
+
+  it('redacts a deterministic IntegrityViolationError from both the case result and rendered report', async () => {
+    const secretRef = '{{secrets.AMBERCAST_SECRET_DUMMY_INTEGRITY}}';
+    const secretValue = 'AMBERCAST_SECRET_DUMMY_INTEGRITY_VALUE';
+    const rawMessage = `Deterministic action rejected ${secretValue}.`;
+    const redactedMessage = `Deterministic action rejected ${secretRef}.`;
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      onPerform(action) {
+        if (action.type === 'navigate') {
+          throw new IntegrityViolationError(rawMessage, {
+            materializedSecret: secretValue,
+            observed: [secretValue],
+          }, {
+            cause: new Error(`Underlying browser diagnostic contains ${secretValue}.`),
+          });
+        }
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'fill-integrity-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef },
+      { id: 'throw-integrity-error', kind: 'action', action: 'navigate', url: '/dashboard' },
+    ], elementGrounding(['fill-integrity-secret']));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const caseOutcome = outcome.results[0];
+    const report = buildRunReport({
+      startedAt: '2026-08-10T00:00:00Z',
+      durationMs: 0,
+      outcome,
+    });
+
+    expect({
+      explanation: caseOutcome?.result.explanation,
+      errorMessage: caseOutcome?.error?.message,
+      reportMessage: report.envelope.errors[0]?.message,
+      details: caseOutcome?.error?.details,
+      cause: caseOutcome?.error?.cause,
+    }).toStrictEqual({
+      explanation: redactedMessage,
+      errorMessage: redactedMessage,
+      reportMessage: redactedMessage,
+      details: { materializedSecret: secretRef, observed: [secretRef] },
+      cause: undefined,
+    });
+  });
+
+  it('omits a function-valued detail before its own toJSON can serialize a resolved secret', async () => {
+    const secretRef = '{{secrets.AMBERCAST_SECRET_DUMMY_UNSUPPORTED_DETAIL}}';
+    const secretValue = 'AMBERCAST_SECRET_DUMMY_UNSUPPORTED_DETAIL_VALUE';
+    const unsupportedValue = Object.assign(
+      () => undefined,
+      { toJSON: () => secretValue },
+    );
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      onPerform(action) {
+        if (action.type === 'navigate') {
+          throw new IntegrityViolationError('Deterministic action rejected an unsupported diagnostic value.', {
+            unsupportedValue,
+          });
+        }
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'fill-unsupported-detail-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef },
+      { id: 'throw-unsupported-detail-error', kind: 'action', action: 'navigate', url: '/dashboard' },
+    ], elementGrounding(['fill-unsupported-detail-secret']));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.error?.details).toStrictEqual({
+      unsupportedValue: '[unsupported-value-omitted]',
+    });
+    expect(JSON.stringify(outcome.results[0])).not.toContain(secretValue);
+  });
+
+  it('omits a cyclic detail reference without throwing while classifying the error', async () => {
+    const cyclicDetails: Record<string, unknown> = {};
+    cyclicDetails.self = cyclicDetails;
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      onPerform(action) {
+        if (action.type === 'navigate') {
+          throw new IntegrityViolationError('Deterministic action rejected cyclic diagnostics.', cyclicDetails);
+        }
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'throw-cyclic-detail-error', kind: 'action', action: 'navigate', url: '/dashboard' },
+    ], elementGrounding([]));
+
+    const runOutcome = run(deps, DEFAULT_OPTIONS);
+
+    await expect(runOutcome).resolves.toMatchObject({
+      results: [{ result: { status: 'error' } }],
+    });
+    const outcome = await runOutcome;
+    expect(outcome.results[0]?.error?.details).toStrictEqual({
+      self: '[unsupported-value-omitted]',
+    });
+  });
+
+  it('omits details beyond the defensive redaction-depth limit without throwing', async () => {
+    const deeplyNestedDetails: Record<string, unknown> = {};
+    let current: Record<string, unknown> | unknown[] = deeplyNestedDetails;
+    for (let depth = 0; depth < 25; depth += 1) {
+      const next: Record<string, unknown> | unknown[] = depth % 2 === 0 ? {} : [];
+      if (Array.isArray(current)) {
+        current.push(next);
+      } else {
+        current.child = next;
+      }
+      current = next;
+    }
+
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      onPerform(action) {
+        if (action.type === 'navigate') {
+          throw new IntegrityViolationError('Deterministic action rejected deeply nested diagnostics.', deeplyNestedDetails);
+        }
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'throw-deep-detail-error', kind: 'action', action: 'navigate', url: '/dashboard' },
+    ], elementGrounding([]));
+
+    const runOutcome = run(deps, DEFAULT_OPTIONS);
+
+    await expect(runOutcome).resolves.toMatchObject({
+      results: [{ result: { status: 'error' } }],
+    });
+    const outcome = await runOutcome;
+    let redactedDetail: unknown = outcome.results[0]?.error?.details;
+    for (let depth = 0; depth <= 20; depth += 1) {
+      expect(redactedDetail).toBeTypeOf('object');
+      redactedDetail = Array.isArray(redactedDetail)
+        ? redactedDetail[0]
+        : (redactedDetail as Record<string, unknown>).child;
+    }
+    expect(redactedDetail).toBe('[unsupported-value-omitted]');
+  });
+
+  it('retains the fixed generic explanation for a plain deterministic Error without inspecting its secret-bearing message', async () => {
+    const secretRef = '{{secrets.AMBERCAST_SECRET_DUMMY_GENERIC}}';
+    const secretValue = 'AMBERCAST_SECRET_DUMMY_GENERIC_VALUE';
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      onPerform(action) {
+        if (action.type === 'navigate') {
+          throw new Error(`Plain browser error exposed ${secretValue}.`);
+        }
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'fill-generic-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef },
+      { id: 'throw-generic-error', kind: 'action', action: 'navigate', url: '/dashboard' },
+    ], elementGrounding(['fill-generic-secret']));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]).toMatchObject({
+      result: {
+        status: 'error',
+        explanation: 'The browser session could not complete this case and no deterministic fallback is available.',
+      },
+    });
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(outcome.results[0]?.result.explanation).not.toContain(secretValue);
+  });
+
+  it('retains rotating path-A and first-pipeline secret values for a second independent AI pipeline', async () => {
+    const secretRef = '{{secrets.AMBERCAST_SECRET_DUMMY_ROTATING_ACROSS_PIPELINES}}';
+    const secretValues = [
+      'AMBERCAST_SECRET_DUMMY_ROTATING_ACROSS_PIPELINES_FIRST_VALUE',
+      'AMBERCAST_SECRET_DUMMY_ROTATING_ACROSS_PIPELINES_SECOND_VALUE',
+    ] as const;
+    let resolutionIndex = 0;
+    const resolve = vi.fn((ref: string) => {
+      expect(ref).toBe(secretRef);
+      const value = secretValues[resolutionIndex];
+      resolutionIndex += 1;
+      return value;
+    });
+    let secondPipelineDiagnostic: string | undefined;
+    let agenticInvocation = 0;
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcomes: [
+        { passed: true, message: 'The first AI pipeline completed.' },
+        {
+          passed: true,
+          message: `The second AI pipeline observed ${secretValues[0]} before ${secretValues[1]}.`,
+        },
+        {
+          passed: false,
+          message: `The final deterministic assertion observed ${secretValues[0]} before ${secretValues[1]}.`,
+        },
+      ],
+    });
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        if (agenticInvocation === 0) {
+          agenticInvocation += 1;
+          await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef });
+          await request.controller.evaluateAssert(passingText('First AI pipeline verification'));
+          return { outcome: 'success' };
+        }
+
+        if (agenticInvocation === 1) {
+          agenticInvocation += 1;
+          const outcome = await request.controller.evaluateAssert(passingText('Second AI pipeline diagnostic'));
+          secondPipelineDiagnostic = outcome.message;
+          return { outcome: 'success' };
+        }
+
+        throw new Error('The scenario permits exactly two agentic executions.');
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: { resolve },
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'fill-path-a-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef },
+      aiStep('resolve-rotated-secret', [secretRef]),
+      aiStep('observe-rotated-secrets'),
+      { id: 'assert-after-pipelines', kind: 'assert', check: 'text-equals', target: PASSWORD, text: 'Signed in' },
+    ], elementGrounding(['fill-path-a-secret', 'assert-after-pipelines']));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(resolve).toHaveBeenCalledTimes(2);
+    expect(executor.agenticRequests).toHaveLength(2);
+    expect(executor.agenticRequests[0]?.controller).not.toBe(executor.agenticRequests[1]?.controller);
+    expect(secondPipelineDiagnostic).toBe(`The second AI pipeline observed ${secretRef} before ${secretRef}.`);
+    expect(outcome.results[0]?.result.explanation).toBe(`The final deterministic assertion observed ${secretRef} before ${secretRef}.`);
+  });
+
+  it('retains a trace-replay secret for a later deterministic assertion failure', async () => {
+    const secretRef = '{{secrets.AMBERCAST_SECRET_DUMMY_TRACE_REPLAY}}';
+    const secretValue = 'AMBERCAST_SECRET_DUMMY_TRACE_REPLAY_VALUE';
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcomes: [
+        { passed: true, message: 'Cached trace verification passed.' },
+        { passed: false, message: `Later deterministic observation contains ${secretValue}.` },
+      ],
+    });
+    const { deps, recordingStorage, resolveAiExecutor } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      aiStep('replay-secret-trace', [secretRef]),
+      { id: 'assert-after-trace-replay', kind: 'assert', check: 'text-equals', target: PASSWORD, text: 'Signed in' },
+    ], {
+      'replay-secret-trace': {
+        kind: 'ai',
+        trace: trace(
+          [{ type: 'fill-secret', target: PASSWORD, secretRef }],
+          [passingText('Cached trace verification')],
+        ),
+      },
+      ...elementGrounding(['assert-after-trace-replay']),
+    });
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(outcome.results[0]?.result.explanation).toBe(`Later deterministic observation contains ${secretRef}.`);
+  });
+});
+
 describe('run agentic materialization boundary', () => {
   it('redacts overlapping secret and run values from grounding, results, errors, details, and events after proving each surface is populated', async () => {
     const secretRef = '{{secrets.auth.token}}';
@@ -1710,9 +2033,11 @@ describe('run agentic materialization boundary', () => {
 
     expect(failure).toBeInstanceOf(IntegrityViolationError);
     expect(failure?.message).toBe(`Browser rejected ${secretRef} and {{run.token}}.`);
-    expect(failure?.details).toBeUndefined();
+    expect(failure?.details).toEqual({ secret: secretRef, run: '{{run.token}}' });
+    expect(failure?.cause).toBeUndefined();
     expect(failingOutcome.results[0]?.result).toMatchObject({
       status: 'error',
+      explanation: `Browser rejected ${secretRef} and {{run.token}}.`,
       steps: [
         { id: 'capture-token', status: 'passed' },
         { id: 'recorded-ai', status: 'error', kind: 'environment' },
@@ -1896,6 +2221,49 @@ describe('run per-case grounding flush and dispatch wiring', () => {
       explanation: 'The grounding cache could not be written.',
       steps: [{ id: 'recorded-ai', status: 'passed' }],
     });
+  });
+
+  it('redacts a resolved secret and drops the cause when a grounding flush fails', async () => {
+    const secretRef = '{{secrets.AMBERCAST_SECRET_DUMMY_GROUNDING_FLUSH}}';
+    const secretValue = 'AMBERCAST_SECRET_DUMMY_GROUNDING_FLUSH_VALUE';
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]));
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef });
+        await request.controller.evaluateAssert(passingText('Dashboard'));
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep('recorded-ai', [secretRef])]);
+    const storageFailure = new Error(`The storage backend rejected ${secretValue}.`, {
+      cause: new Error(`The filesystem diagnostic contains ${secretValue}.`),
+    });
+    const writeText = vi.spyOn(recordingStorage.storage, 'writeText').mockRejectedValueOnce(storageFailure);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const caseOutcome = outcome.results[0];
+
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(session.operations()).toContainEqual({
+      type: 'perform',
+      action: { type: 'fill-secret', target: PASSWORD, value: secretValue },
+    });
+    expect({
+      errorMessage: caseOutcome?.error?.message,
+      errorCause: caseOutcome?.error?.cause,
+      explanation: caseOutcome?.result.explanation,
+    }).toStrictEqual({
+      errorMessage: 'The grounding cache could not be written.',
+      errorCause: undefined,
+      explanation: 'The grounding cache could not be written.',
+    });
+    expect(JSON.stringify(caseOutcome)).not.toContain(secretValue);
   });
 
   it('does not let a flush failure override an execution failure after a prior successful grounding mutation', async () => {
