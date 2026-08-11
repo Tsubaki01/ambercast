@@ -93,6 +93,10 @@ export type CaptureMode = 'text' | 'value';
 /**
  * The result of checking whether recorded grounding still identifies an
  * element on the current page.
+ *
+ * A miss distinguishes absence, local-neighborhood drift, and duplicate
+ * role-and-name candidates so callers can retain a safe control-flow gate
+ * while diagnostics explain the actual resolution failure.
  */
 export type GroundedResolution =
   | {
@@ -104,8 +108,11 @@ export type GroundedResolution =
   | {
       /** The recorded grounding cannot be used for the current page. */
       readonly kind: 'miss';
-      /** Why the recorded reference could not be resolved safely. */
-      readonly reason: 'fingerprint-mismatch' | 'element-not-found';
+      /**
+       * Whether the unique candidate's neighborhood changed, no candidate
+       * exists, or more than one normalized role-and-name candidate exists.
+       */
+      readonly reason: 'fingerprint-mismatch' | 'element-not-found' | 'ambiguous-match';
     };
 
 /**
@@ -146,10 +153,12 @@ export interface BrowserSession {
   /**
    * Checks whether recorded grounding still identifies a current element.
    *
-   * Nonexistence is checked first and always produces
-   * `element-not-found`, regardless of the supplied fingerprint. A
-   * `fingerprint-mismatch` is returned only when the element exists but its
-   * current fingerprint differs from `fp`.
+   * No candidate always produces `element-not-found`, regardless of the
+   * supplied fingerprint. Two or more candidates with the exact role and
+   * normalized name produce `ambiguous-match`, even if one candidate's
+   * neighborhood would hash to `fp`. A `fingerprint-mismatch` is returned
+   * only when exactly one candidate exists but its current fingerprint differs
+   * from `fp`.
    *
    * @param ref - The recorded element reference to resolve.
    * @param fp - The recorded fingerprint to verify against the live page.
@@ -157,8 +166,8 @@ export interface BrowserSession {
    * @throws If the current page cannot be inspected.
    *
    * @remarks
-   * This is a hard gate: a mismatch must remain a miss so stale grounding
-   * cannot be mistaken for a match and direct a test to the wrong element.
+   * This is a hard gate: every miss remains a miss so stale grounding or an
+   * indeterminate duplicate cannot direct a test to the wrong element.
    */
   resolveGrounded(ref: ElementRef, fp: Fingerprint): Promise<GroundedResolution>;
 

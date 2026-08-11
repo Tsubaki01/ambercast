@@ -10,9 +10,9 @@ import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { AmbercastError, type AmbercastError as AmbercastErrorType } from '#core/errors/types.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
+import { computeAccessibilityFingerprint, countAccessibilityMatches } from '#core/ir/fingerprint.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import {
-  Fingerprint,
   GroundingDocument,
   PlanDocument,
   RunRef,
@@ -62,6 +62,16 @@ type DispatchOutcome =
 
 interface DispatchContext {
   readonly session: BrowserSession;
+  /**
+   * The resolved replay target retained while actions are materialized.
+   *
+   * Navigate fields deliberately continue to accept relative URLs, whose
+   * safety depends on the target's base URL only after case values have been
+   * substituted. Keeping the target at this boundary lets the navigation
+   * guard compare the materialized destination with the replay target instead of
+   * imposing a schema restriction that would reject valid relative paths.
+   */
+  readonly target: TargetDefinition;
   readonly grounding: GroundingDocumentType;
   readonly runState: Map<RunVariableName, string>;
   readonly secrets: SecretsProvider;
@@ -100,8 +110,23 @@ const RUN_REFERENCE_START = '{{run.';
  */
 const MIN_SECRET_MATCH_LENGTH = 3;
 
-const FINGERPRINT_RESPONSE = z.strictObject({ fingerprint: Fingerprint });
-const FINGERPRINT_RESPONSE_SCHEMA = typedJsonSchema(FINGERPRINT_RESPONSE);
+/**
+ * Defines the confirmation-only response accepted from AI-assisted element
+ * re-resolution.
+ *
+ * The run pipeline derives the fingerprint from unredacted local snapshot
+ * evidence before an AI call, so the provider has no authority to supply a
+ * value that later becomes grounding. A strict binary judgment retains the
+ * provider's semantic role while allowing an explicit denial and rejecting
+ * invented response fields.
+ */
+const CONFIRMATION_RESPONSE = z.strictObject({ confirmed: z.boolean() });
+
+/**
+ * Couples the confirmation response's runtime validation to the structured AI
+ * request without exposing a second, hand-maintained wire schema.
+ */
+const CONFIRMATION_RESPONSE_SCHEMA = typedJsonSchema(CONFIRMATION_RESPONSE);
 
 /**
  * Marks an abort that has no reportable error kind while retaining a useful
@@ -224,12 +249,19 @@ function materializeText(value: string, runState: ReadonlyMap<RunVariableName, s
   });
 }
 
-function materializeStep(step: Step, runState: ReadonlyMap<RunVariableName, string>): Step {
+function materializeStep(
+  step: Step,
+  runState: ReadonlyMap<RunVariableName, string>,
+  baseUrl: string,
+): Step {
   switch (step.kind) {
     case 'action':
       switch (step.action) {
-        case 'navigate':
-          return { ...step, url: materializeText(step.url, runState) };
+        case 'navigate': {
+          const url = materializeText(step.url, runState);
+          assertSameOriginNavigation(url, baseUrl);
+          return { ...step, url };
+        }
         case 'fill':
           return { ...step, value: materializeText(step.value, runState) };
         default:
@@ -325,6 +357,59 @@ function materializeTrustedRunText(value: string, context: DispatchContext): str
 }
 
 /**
+ * Establishes the HTTP(S)-scheme and same-origin boundary for every
+ * navigation that can reach the browser port.
+ *
+ * Navigate URLs remain interpolatable rather than receiving an HTTP-only
+ * schema constraint because the browser must still resolve valid relative
+ * paths, fragments, and other target-relative forms. The resolved destination
+ * must use HTTP(S) before origin equality is compared. That order is
+ * essential: a `blob:` URL inherits its creating context's HTTP(S) origin and
+ * could otherwise appear same-origin even though its scheme is outside this
+ * browser boundary's trust. It rejects a destination that cannot be resolved,
+ * uses a non-HTTP(S) scheme, or resolves to a different origin as an
+ * `IntegrityViolationError`.
+ * Resolving against `baseUrl` is sound because `ChromiumBrowserDriver.launch()`
+ * configures its Playwright context with the identical `target.baseUrl` via
+ * `browser.newContext({ baseURL: target.baseUrl })`, so this guard and
+ * `page.goto()` resolve the same relative string against the same fixed base.
+ *
+ * Its error contract remains fully static: destination-derived text might
+ * be a captured or secret value transformed by URL normalization, so
+ * value-based redaction cannot safely justify returning it in an error. The
+ * check appears in deterministic-step materialization for path A, at the
+ * trace-action browser boundary shared by paths B and C, and in path C's
+ * whole-trace pre-scan before any action runs. Together those checkpoints
+ * preserve the invariant that every navigation URL reaching the browser port
+ * passes through this guard.
+ *
+ * @param url - The navigation destination after any permitted interpolation.
+ * @param baseUrl - The configured base URL of the resolved replay target.
+ * @throws {IntegrityViolationError} When the destination cannot be resolved,
+ *   uses a non-HTTP(S) scheme, or does not remain on the replay target's
+ *   origin.
+ */
+function assertSameOriginNavigation(url: string, baseUrl: string): void {
+  let baseOrigin: string;
+  let destination: URL;
+
+  try {
+    baseOrigin = new URL(baseUrl).origin;
+    destination = new URL(url, baseUrl);
+  } catch {
+    throw new IntegrityViolationError('A navigation URL cannot be resolved against the replay target.');
+  }
+
+  if (destination.protocol !== 'http:' && destination.protocol !== 'https:') {
+    throw new IntegrityViolationError('A navigation URL must use the replay target\'s HTTP(S) scheme.');
+  }
+
+  if (destination.origin !== baseOrigin) {
+    throw new IntegrityViolationError('A navigation URL must remain on the replay target origin.');
+  }
+}
+
+/**
  * Retains every non-empty resolved secret value for every later redaction
  * boundary in this case.
  *
@@ -364,8 +449,15 @@ function materializeTraceAction(
   switch (action.type) {
     case 'click':
       return { type: 'click', target: action.target };
-    case 'navigate':
-      return { type: 'navigate', url: materializeTrustedRunText(action.url, context) };
+    case 'navigate': {
+      const url = materializeTrustedRunText(action.url, context);
+      /*
+       * Fresh agentic control (path B) and trace replay (path C) share this
+       * browser-boundary checkpoint.
+       */
+      assertSameOriginNavigation(url, context.target.baseUrl);
+      return { type: 'navigate', url };
+    }
     case 'press':
       return { type: 'press', target: action.target, key: action.key };
     case 'fill':
@@ -443,9 +535,16 @@ function preScanTraceEntry(
   };
 
   switch (entry.type === 'assert' ? entry.check : entry.type) {
-    case 'navigate':
-      assertSafeTraceField((entry as Extract<TraceAction, { type: 'navigate' }>).url);
+    case 'navigate': {
+      const url = (entry as Extract<TraceAction, { type: 'navigate' }>).url;
+      assertSafeTraceField(url);
+      /*
+       * Pre-scanning the whole trace preserves replay atomicity: a later
+       * unsafe navigation cannot let an earlier valid action execute.
+       */
+      assertSameOriginNavigation(materializeTrustedRunText(url, context), context.target.baseUrl);
       return;
+    }
     case 'fill':
       assertSafeTraceField((entry as Extract<TraceAction, { type: 'fill' }>).value);
       return;
@@ -1161,14 +1260,22 @@ async function executeAiStep(
 }
 
 /**
- * Re-resolves an element grounding miss through a structured, fingerprint-only
- * AI request when the caller has allowed fallback.
+ * Re-resolves an element grounding miss through a structured AI confirmation
+ * request when the caller has allowed fallback.
  *
  * The authored `ElementRef` remains immutable because grounding stores no
- * alternate locator. The newly observed fingerprint is nevertheless persisted
- * before the subsequent browser work: it is a page fact that remains useful
- * even if that work fails and is intentionally accumulated for the case's
- * single final atomic flush.
+ * alternate locator. After capturing resolution evidence, this path derives
+ * the fingerprint from the unredacted accessibility tree before it resolves
+ * an AI executor or emits an `ai-call` event. An absent or ambiguous local
+ * match has no safe target for confirmation, so it raises `CaseAbort` without
+ * provider work or a grounding write.
+ *
+ * The AI receives a redacted copy of the evidence and answers only whether
+ * the existing locator identifies the intended element. A denial raises
+ * `CaseAbort`; confirmation persists only the already-derived local
+ * fingerprint before subsequent browser work. Persisting that page fact
+ * before the action remains intentional: it survives a later action failure
+ * and joins the case's single final atomic grounding flush.
  */
 async function groundedTarget(
   context: DispatchContext,
@@ -1188,17 +1295,31 @@ async function groundedTarget(
   }
 
   const snapshot = await context.session.snapshotForResolution();
+  const fingerprint = computeAccessibilityFingerprint(snapshot.accessibilityTree, target);
+  if (fingerprint === undefined) {
+    const matchCount = countAccessibilityMatches(snapshot.accessibilityTree, target);
+    if (matchCount === 0) {
+      throw new CaseAbort('The supplied locator has no matching element in the current accessibility evidence.');
+    }
+
+    if (matchCount !== undefined && matchCount > 1) {
+      throw new CaseAbort('The supplied locator matches more than one element in the current accessibility evidence and cannot be trusted.');
+    }
+
+    throw new CaseAbort('The supplied locator cannot be unambiguously identified from current accessibility evidence.');
+  }
+
   const executor = await context.resolveAiExecutor();
   context.events.emit({ type: 'ai-call', stepId: step.id });
   const response = await executor.execute({
-    prompt: 'Confirm that the supplied locator still identifies the intended element and return its current stable accessibility-neighborhood fingerprint.',
-    responseSchema: FINGERPRINT_RESPONSE_SCHEMA,
+    prompt: 'Confirm whether the supplied locator still identifies the intended element.',
+    responseSchema: CONFIRMATION_RESPONSE_SCHEMA,
     /**
-     * The structured request keeps the authored locator and the accessibility
-     * tree needed for fingerprint recovery, but not screenshot pixels, which
-     * cannot be safely redacted with string substitution. Redacting string
-     * values and object keys keeps materialized secrets and run values out of
-     * provider input without altering the tree's JSON structure.
+     * The redacted accessibility tree lets the provider make its confirm/deny
+     * semantic judgment. Screenshot pixels are excluded because string
+     * substitution cannot safely redact them; redacting string values and
+     * object keys keeps materialized secrets and run values out of provider
+     * input without altering the tree's JSON structure.
      */
     context: {
       target: target as unknown as JsonValueT,
@@ -1213,7 +1334,11 @@ async function groundedTarget(
     ...(context.signal === undefined ? {} : { signal: context.signal }),
   });
 
-  context.updateGroundingEntry(step.id, { kind: 'element', fingerprint: response.data.fingerprint });
+  if (response.data.confirmed === false) {
+    throw new CaseAbort('The AI could not confirm that the supplied locator identifies the intended element.');
+  }
+
+  context.updateGroundingEntry(step.id, { kind: 'element', fingerprint });
   context.resolvedVias.set(step.id, 'ai-resolve');
   return target;
 }
@@ -1848,6 +1973,7 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
     runState = new Map<RunVariableName, string>();
     const context: DispatchContext = {
       session,
+      target,
       grounding: loadedGrounding,
       runState,
       secrets: deps.secrets,
@@ -1875,7 +2001,9 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
 
     for (const [index, originalStep] of planSteps.entries()) {
       currentStep = originalStep;
-      const step = originalStep.kind === 'ai' ? originalStep : materializeStep(originalStep, context.runState);
+      const step = originalStep.kind === 'ai'
+        ? originalStep
+        : materializeStep(originalStep, context.runState, context.target.baseUrl);
       const outcome = step.kind === 'ai'
         ? await executeAiStep(step, context, options.cacheOnly)
         : await DISPATCH_TABLE[step.kind](step, context);
