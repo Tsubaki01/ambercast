@@ -920,11 +920,8 @@ describe('run', () => {
         { id: 'after-browser-error', status: 'skipped' },
       ],
     });
-    // Captured from inside onPerform, strictly before dispatch could throw or
-    // return: proves step-start for the second step already fired at that
-    // moment, not merely by the time the whole run resolves. It also pins the
-    // interleaving: a completed first step's start and result precede only the
-    // second step's start.
+    // Sampling events at onPerform entry proves a step-start seen there was
+    // emitted before dispatch, rather than deferred until the run settles.
     expect(eventsAtSecondPerform).toEqual([
       { type: 'step-start', stepId: 'fill-first' },
       { type: 'step-result', stepId: 'fill-first', via: 'grounding' },
