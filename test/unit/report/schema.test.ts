@@ -253,6 +253,10 @@ describe('valid nested schema fixtures', () => {
     expectAccepted(StepResult, MINIMAL_STEP_RESULT);
   });
 
+  it('accepts the sole documented screenshot omission reason', () => {
+    expectAccepted(StepResult, { ...STEP_RESULT, screenshotOmitted: 'secret-detected' });
+  });
+
   it('accepts JSON ambiguity objects and rejects non-JSON ambiguity values', () => {
     expectAccepted(GenerateResult, {
       ...GENERATE_RESULT,
@@ -349,6 +353,7 @@ describe('field boundaries', () => {
     ['expected', 1],
     ['actual', 1],
     ['screenshot', 1],
+    ['screenshotOmitted', 'capture-failed'],
     ['observed', 'not observed evidence'],
   ] as const)('rejects a present but wrong-typed optional StepResult %s field', (field, value) => {
     expectRejected(StepResult, { ...STEP_RESULT, [field]: value });

@@ -1,10 +1,9 @@
 /*
- * Defines pure companion-file layout arithmetic for paths already discovered
- * as tests. Test discovery and `testMatch`/`testIgnore` glob evaluation
- * remain outside this module: a test-discovery use case determines which
- * files are tests, then asks this resolver for their deterministic companion
- * locations. This module uses one fixed test-file format and derives its
- * generated companions from that format.
+ * Defines pure companion, run-evidence, and batch-report layout arithmetic.
+ * Test discovery and `testMatch`/`testIgnore` glob evaluation remain outside
+ * this module: a test-discovery use case determines which files are tests,
+ * then asks this resolver for their deterministic artifact locations. This
+ * module uses one fixed test-file format and one invocation-safe run segment.
  *
  * Construction validates both configured roots and probes the forward and
  * inverse transforms with a synthetic path. The probe confirms that `testDir`
@@ -19,6 +18,7 @@ import { basenamePath, dirnamePath, isAbsolutePath, joinPath, relativeWithin } f
 const TEST_SUFFIX = '.test.md';
 const PLAN_SUFFIX = '.ambercast.plan.json';
 const GROUNDING_SUFFIX = '.ambercast.grounding.json';
+const RUN_ID_PATTERN = /^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$/;
 
 /**
  * Resolves deterministic companion and run-artifact paths for discovered test
@@ -67,20 +67,44 @@ export interface LayoutResolver {
    *
    * @param testPath - A discovered test path inside the configured test tree
    *   with a non-empty name component before `.test.md`.
-   * @returns The per-test directory under the configured runs directory.
+   * @param runId - The command invocation identity, made only of one or more
+   *   alphanumeric groups separated by single hyphens.
+   * @returns The per-test directory under the configured runs directory and
+   *   invocation identity.
    * @throws {RangeError} When the path is outside the test tree or does not
-   *   end with the exact test suffix or has no name component before it.
+   *   end with the exact test suffix or has no name component before it, or
+   *   when `runId` is not a single safe path segment.
    * @remarks
-   * The test's relative directory within `testDir` is joined under `runsDir`,
-   * followed by the test's name without its terminal `.test.md` suffix. For
-   * example, a test at
-   * `/project/tests/ui/login.test.md` with `testDir` `/project/tests` and
-   * `runsDir` `/project/.runs` maps to `/project/.runs/ui/login`.
+   * The invocation segment is outside the case directory so all evidence and
+   * the matching batch report share one collision-resistant home. The test's
+   * relative directory within `testDir` then follows it, ending with the test
+   * name without its terminal `.test.md` suffix. For example, a test at
+   * `/project/tests/ui/login.test.md` with `testDir` `/project/tests`,
+   * `runsDir` `/project/.runs`, and run ID
+   * `2026-08-01T090000Z-550e8400-e29b-41d4-a716-446655440000` maps to
+   * `/project/.runs/2026-08-01T090000Z-550e8400-e29b-41d4-a716-446655440000/ui/login`.
    *
-   * A per-test directory keeps screenshots, traces, and other artifacts from
-   * distinct tests from colliding in the shared runs directory.
+   * A per-test directory inside one invocation keeps distinct cases from
+   * colliding while preserving an unambiguous batch boundary for evidence.
+   * The resolver enforces `^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$`, so a caller cannot
+   * use separators, dot segments, or an empty value to alter that boundary.
    */
-  runsDirFor(testPath: string): string;
+  runsDirFor(testPath: string, runId: string): string;
+  /**
+   * Derives the structured batch-report path for one command invocation.
+   *
+   * @param runId - The command invocation identity accepted by
+   *   {@link runsDirFor}.
+   * @returns The `report.json` path directly inside that invocation's runs
+   *   directory.
+   * @throws {RangeError} When `runId` is not a single safe path segment.
+   * @remarks
+   * A report summarizes the complete invocation rather than one particular
+   * test, so it intentionally accepts no `testPath` and has no anonymous or
+   * out-of-domain test-path rejection case. Its only caller-controlled path
+   * segment is the invocation identity shared with {@link runsDirFor}.
+   */
+  runReportPathFor(runId: string): string;
   /**
    * Recovers a test path when a file is a recognized plan companion.
    *
@@ -116,11 +140,12 @@ export interface LayoutResolver {
 }
 
 /**
- * Creates layout arithmetic for one resolved pair of test and runs paths.
+ * Creates companion, evidence, and report layout arithmetic for one resolved
+ * pair of test and runs paths.
  *
  * @param config - The normalized absolute paths that bound the layout.
  * @returns A resolver that maps known test files and recognized companions.
- * @throws {import('../errors/config-invalid-error.js').ConfigInvalidError}
+ * @throws {ConfigInvalidError}
  *   When `testDir` or `runsDir` is not a normalized absolute path, or when
  *   `testDir` cannot support the forward-to-inverse self-check. The thrown
  *   error identifies both configured paths diagnostically and retains the
@@ -135,6 +160,29 @@ export interface LayoutResolver {
  * `.test.md` file has no valid companion or run-directory mapping.
  */
 export function createLayoutResolver(config: LayoutConfig): LayoutResolver {
+  /**
+   * Rejects a caller-controlled invocation identity before it reaches path
+   * arithmetic.
+   *
+   * A report and every case's evidence share this identity, so its valid
+   * single-segment form preserves run isolation and prevents caller input
+   * from introducing an unbounded hierarchy. Invalid IDs fail with
+   * `RangeError`, matching the resolver's other caller-domain violations.
+   */
+  function assertRunId(runId: string): void {
+    if (!RUN_ID_PATTERN.test(runId)) {
+      throw new RangeError('Expected runId to be a non-empty safe path segment.');
+    }
+  }
+
+  /**
+   * Converts a known discovered test into its test-root-relative path.
+   *
+   * The forward mappings all share this check so a boundary mistake cannot
+   * produce a companion or evidence path outside the configured test domain.
+   * Unlike inverse recognition, malformed input is a caller contract breach
+   * and therefore throws `RangeError` instead of returning an ambiguous value.
+   */
   function discoveredTestPathRelativeToTestDir(testPath: string): string {
     const relativeTestPath = relativeWithin(config.testDir, testPath);
 
@@ -149,6 +197,14 @@ export function createLayoutResolver(config: LayoutConfig): LayoutResolver {
     return relativeTestPath;
   }
 
+  /**
+   * Replaces a recognized test suffix without discarding a meaningful dotted
+   * filename prefix.
+   *
+   * Companion files remain adjacent to their prompts so moving a test tree
+   * preserves both the artifact relationship and the resolver's inverse
+   * round-trip guarantee.
+   */
   function companionPathFor(testPath: string, companionSuffix: string): string {
     discoveredTestPathRelativeToTestDir(testPath);
 
@@ -156,6 +212,14 @@ export function createLayoutResolver(config: LayoutConfig): LayoutResolver {
     return joinPath(dirnamePath(testPath), `${testName.slice(0, -TEST_SUFFIX.length)}${companionSuffix}`);
   }
 
+  /**
+   * Recognizes one in-tree companion as a source test without treating an
+   * arbitrary similarly named file as a validation error.
+   *
+   * Orphan detection needs ordinary negative answers for wrong suffixes and
+   * paths outside the test root, while exact terminal replacement prevents a
+   * suffix-like substring from manufacturing a false source test.
+   */
   function testPathForCompanion(companionPath: string, companionSuffix: string): string | undefined {
     const relativeCompanionPath = relativeWithin(config.testDir, companionPath);
 
@@ -178,14 +242,19 @@ export function createLayoutResolver(config: LayoutConfig): LayoutResolver {
     groundingPathFor(testPath: string): string {
       return companionPathFor(testPath, GROUNDING_SUFFIX);
     },
-    runsDirFor(testPath: string): string {
+    runsDirFor(testPath: string, runId: string): string {
+      assertRunId(runId);
       const relativeTestPath = discoveredTestPathRelativeToTestDir(testPath);
       const relativeRunsDirectory = joinPath(
         dirnamePath(relativeTestPath),
         basenamePath(relativeTestPath).slice(0, -TEST_SUFFIX.length),
       );
 
-      return joinPath(config.runsDir, relativeRunsDirectory);
+      return joinPath(joinPath(config.runsDir, runId), relativeRunsDirectory);
+    },
+    runReportPathFor(runId: string): string {
+      assertRunId(runId);
+      return joinPath(joinPath(config.runsDir, runId), 'report.json');
     },
     testPathForPlan(planPath: string): string | undefined {
       return testPathForCompanion(planPath, PLAN_SUFFIX);

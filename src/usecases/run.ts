@@ -39,17 +39,26 @@ import type { AssertCheck, AssertOutcome, BrowserSession, PerformableAction } fr
 import type { BrowserDriverResolver } from '#ports/index.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { Clock, EventSink, SecretsProvider } from '#ports/system.js';
-import type { RunResult, StepResult } from '#report/schema.js';
+import { OBSERVED_NOTE, type Observed, type RunResult, type StepResult } from '#report/schema.js';
 import { z } from 'zod';
 import { assertSecretRefsGrounded, extractDeclaredSecretRefs } from './generator-secret-policy.js';
 
 type ResultWithoutDuration = Omit<RunResult, 'durationMs'>;
 
+/**
+ * Optional diagnostic evidence retained only for a failed dispatched step.
+ *
+ * Deriving this shape from {@link StepResult} keeps evidence capture aligned
+ * with the public report contract as that contract evolves, without a second
+ * hand-maintained copy of its field vocabulary.
+ */
+type FailureDetail = Pick<StepResult, 'expected' | 'actual' | 'screenshot' | 'screenshotOmitted' | 'observed'>;
+
 type ResolutionVia = 'grounding' | 'ai-resolve' | 'trace-replay';
 
 type DispatchOutcome =
   | { readonly kind: 'passed'; readonly via?: ResolutionVia }
-  | { readonly kind: 'assertion-failed'; readonly message: string };
+  | { readonly kind: 'assertion-failed'; readonly expected: string; readonly actual: string };
 
 interface DispatchContext {
   readonly session: BrowserSession;
@@ -1209,6 +1218,14 @@ async function groundedTarget(
   return target;
 }
 
+/**
+ * Materializes and performs one deterministic action through the live session.
+ *
+ * Element actions resolve trusted grounding immediately before browser use,
+ * and secret values are resolved only at that boundary then retained for
+ * later diagnostic redaction. This keeps plans and grounding reference-only
+ * while preserving the values required to sanitize a subsequent failure.
+ */
 async function executeAction(step: Step, context: DispatchContext): Promise<DispatchOutcome> {
   if (step.kind !== 'action') {
     throw new Error('The action dispatcher received a non-action step.');
@@ -1253,6 +1270,14 @@ async function executeAction(step: Step, context: DispatchContext): Promise<Disp
   return { kind: 'passed' };
 }
 
+/**
+ * Executes one deterministic assertion and preserves its materialized
+ * expectation when the browser reports a mismatch.
+ *
+ * The expected description is created from the browser-facing check rather
+ * than the authored plan step, so a failure explains the value the browser
+ * actually evaluated after run-value materialization.
+ */
 async function executeAssert(step: Step, context: DispatchContext): Promise<DispatchOutcome> {
   if (step.kind !== 'assert') {
     throw new Error('The assertion dispatcher received a non-assertion step.');
@@ -1289,9 +1314,40 @@ async function executeAssert(step: Step, context: DispatchContext): Promise<Disp
   }
 
   const outcome = await context.session.evaluateAssert(check);
-  return outcome.passed ? { kind: 'passed' } : { kind: 'assertion-failed', message: outcome.message };
+  return outcome.passed
+    ? { kind: 'passed' }
+    : { kind: 'assertion-failed', expected: expectedForAssert(check), actual: outcome.message };
 }
 
+/**
+ * Describes the browser check that a failed assertion expected to hold.
+ *
+ * Each assertion variant has a deliberately fixed English sentence so report
+ * consumers receive stable, actionable evidence without reconstructing a
+ * check from its internal discriminant and locator structure.
+ */
+function expectedForAssert(check: AssertCheck): string {
+  switch (check.check) {
+    case 'text-visible':
+      return `Text "${check.text}" is visible.`;
+    case 'element-visible':
+      return `Element ${check.target.role} "${check.target.name}" is visible.`;
+    case 'text-equals':
+      return `Element ${check.target.role} "${check.target.name}" has text "${check.text}".`;
+    case 'url-matches':
+      return `URL matches "${check.pattern}".`;
+    case 'element-count':
+      return `Element ${check.target.role} "${check.target.name}" has count ${check.count}.`;
+  }
+}
+
+/**
+ * Captures an allowed run value for later materialization in the same case.
+ *
+ * Captures use the text mode deliberately: this state becomes both a trusted
+ * input to later plan steps and a redaction candidate for diagnostics, so it
+ * is recorded only after grounding identifies the intended live element.
+ */
 async function executeCapture(step: Step, context: DispatchContext): Promise<DispatchOutcome> {
   if (step.kind !== 'capture') {
     throw new Error('The capture dispatcher received a non-capture step.');
@@ -1303,18 +1359,145 @@ async function executeCapture(step: Step, context: DispatchContext): Promise<Dis
   return { kind: 'passed' };
 }
 
+/**
+ * Captures and persists a screenshot for a failed live browser step.
+ *
+ * This helper runs only after the failure coordinator has established that
+ * the step's raw text evidence contains no resolved secret. Keeping the
+ * screenshot decision there makes the security guard auditable in one place,
+ * while this helper owns the independent best-effort browser and storage
+ * boundary. Evidence failures must never replace the failure being diagnosed,
+ * and layout has already established the destination's containment.
+ */
+async function captureScreenshotEvidence(
+  session: BrowserSession,
+  storage: StorageAdapter,
+  evidenceDir: string,
+  stepId: Step['id'],
+): Promise<Pick<FailureDetail, 'screenshot'>> {
+  try {
+    const path = joinPath(evidenceDir, `${stepId}.png`);
+    await storage.writeBinary(path, await session.screenshot());
+    return { screenshot: path };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Captures redacted accessibility evidence for a failed live browser step.
+ *
+ * One raw tree serves both the omission signal and persisted observed
+ * evidence: the helper checks the original tree for a
+ * resolved-secret hit, then redacts that same tree before compact
+ * serialization. Redaction must precede serialization because JSON escaping
+ * can hide a raw value from string-based replacement. Snapshot acquisition
+ * can return a false signal because no tree exists to inspect. Once a tree
+ * exists, however, detector failure is unsafe and returns a true signal: a
+ * throwing getter or other malformed evidence must not turn uncertain secret
+ * presence into permission to capture a screenshot. Rendering is separately
+ * best-effort and retains the already-established signal.
+ */
+async function captureObservedEvidence(
+  session: BrowserSession,
+  resolvedSecrets: ReadonlyMap<string, ReadonlySet<string>>,
+  runState: ReadonlyMap<RunVariableName, string>,
+): Promise<{ readonly observed?: Observed; readonly rawTreeContainsSecret: boolean }> {
+  let rawTree: JsonValueT;
+  try {
+    rawTree = await session.accessibilitySnapshot();
+  } catch {
+    return { rawTreeContainsSecret: false };
+  }
+
+  let rawTreeContainsSecret: boolean;
+  try {
+    rawTreeContainsSecret = jsonContainsResolvedSecret(rawTree, resolvedSecrets);
+  } catch {
+    return { rawTreeContainsSecret: true };
+  }
+
+  try {
+    return {
+      rawTreeContainsSecret,
+      observed: {
+        note: OBSERVED_NOTE,
+        accessibilitySnapshot: JSON.stringify(redactJsonStrings(rawTree, resolvedSecrets, runState)),
+      },
+    };
+  } catch {
+    return { rawTreeContainsSecret };
+  }
+}
+
+/**
+ * Coordinates failure evidence while keeping screenshot capture from writing
+ * a known secret disclosure to disk.
+ *
+ * The coordinator awaits accessibility capture first because its
+ * raw tree participates in the screenshot-omission decision. It combines
+ * that signal with the raw assertion pair when present through the existing
+ * `containsResolvedSecret` and `jsonContainsResolvedSecret` boundaries, so
+ * evidence capture cannot drift into a second secret detector. Any hit
+ * returns the observed detail available so far and `screenshotOmitted`
+ * without calling the browser screenshot or storage port. On a miss,
+ * screenshot capture has its own caught failure boundary, so an accessibility
+ * capture failure still permits it and a screenshot capture/write failure
+ * still preserves observed evidence. This deliberate sequencing changes only
+ * dependency order, not the independence of diagnostic failures.
+ * Assertion-specific fields stay at the caller so an environment error cannot
+ * invent them.
+ */
+async function captureFailureEvidence(
+  session: BrowserSession,
+  storage: StorageAdapter,
+  evidenceDir: string,
+  stepId: Step['id'],
+  resolvedSecrets: ReadonlyMap<string, ReadonlySet<string>>,
+  runState: ReadonlyMap<RunVariableName, string>,
+  rawAssertionText: readonly string[] = [],
+): Promise<FailureDetail> {
+  const { observed, rawTreeContainsSecret } = await captureObservedEvidence(session, resolvedSecrets, runState);
+  if (rawTreeContainsSecret || rawAssertionText.some((text) => containsResolvedSecret(text, resolvedSecrets))) {
+    return { ...(observed === undefined ? {} : { observed }), screenshotOmitted: 'secret-detected' };
+  }
+
+  return {
+    ...(observed === undefined ? {} : { observed }),
+    ...await captureScreenshotEvidence(session, storage, evidenceDir, stepId),
+  };
+}
+
 const DISPATCH_TABLE = {
   action: executeAction,
   assert: executeAssert,
   capture: executeCapture,
 } satisfies Record<Exclude<Step['kind'], 'ai'>, StepExecutor>;
 
-function stepResult(step: Step, status: StepResult['status'], kind?: StepResult['kind']): StepResult {
+/**
+ * Creates the report representation of one executed or skipped plan step.
+ *
+ * Failure evidence is an object rather than additional positional arguments
+ * so the assertion-specific and environment-specific paths can share one
+ * stable constructor while omitting diagnostics unavailable to either path.
+ * It is copied only to the currently failing step; skipped and pre-launch
+ * steps never acquire diagnostic fields they did not produce.
+ */
+function stepResult(
+  step: Step,
+  status: StepResult['status'],
+  kind?: StepResult['kind'],
+  detail?: FailureDetail,
+): StepResult {
+  const presentDetail = Object.fromEntries(
+    Object.entries(detail ?? {}).filter(([, value]) => value !== undefined),
+  ) as FailureDetail;
   return {
     id: step.id,
     type: step.kind,
     status,
     ...(kind === undefined ? {} : { kind }),
+    ...presentDetail,
   };
 }
 
@@ -1322,12 +1505,21 @@ function skippedSteps(steps: readonly Step[], after: number): StepResult[] {
   return steps.slice(after + 1).map((step) => stepResult(step, 'skipped'));
 }
 
+/**
+ * Builds the stable partial result for an error that interrupts case dispatch.
+ *
+ * The current step receives environment evidence only when it exists, while
+ * a pre-launch failure retains no synthetic step. This preserves the report's
+ * distinction between a live-session dispatch failure and work that never
+ * reached the browser.
+ */
 function resultForAbort(
   identity: Pick<RunResult, 'id' | 'file' | 'planFile'>,
   steps: readonly Step[],
   completed: readonly StepResult[],
   currentStep: Step | undefined,
   explanation: string,
+  detail?: FailureDetail,
 ): ResultWithoutDuration {
   const currentIndex = currentStep === undefined ? -1 : steps.indexOf(currentStep);
   return {
@@ -1335,7 +1527,7 @@ function resultForAbort(
     status: 'error',
     steps: currentStep === undefined
       ? [...completed]
-      : [...completed, stepResult(currentStep, 'error', 'environment'), ...skippedSteps(steps, currentIndex)],
+      : [...completed, stepResult(currentStep, 'error', 'environment', detail), ...skippedSteps(steps, currentIndex)],
     explanation,
   };
 }
@@ -1394,11 +1586,23 @@ export interface RunDeps {
   /** Reads the source prompt and generated plan/grounding artifacts. */
   readonly storage: StorageAdapter;
 
-  /** Derives the committed plan and grounding paths for a source prompt. */
+  /** Derives committed companions and invocation-scoped evidence paths. */
   readonly layout: LayoutResolver;
 
   /** Monotonic time source used to measure each case's duration. */
   readonly clock: Clock;
+
+  /**
+   * Collision-resistant identity assigned to this command invocation.
+   *
+   * It belongs with cancellation and events as invocation-scoped context,
+   * rather than with reusable services or batch replay policy, because every
+   * case uses it unchanged to place evidence beneath the same report
+   * directory. Runtime supplies a timestamp-plus-UUID value that satisfies
+   * the layout resolver's single-segment grammar; this use case neither
+   * creates nor rewrites that identity.
+   */
+  readonly runId: string;
 
   /**
    * Selects a driver after this case's target has been resolved.
@@ -1502,9 +1706,10 @@ export interface RunOutcome {
  * command report.
  * @remarks
  * Literal files retain caller order and discovered files retain the injected
- * discovery order. Cases run sequentially. A caller `AbortSignal` stops the
- * scheduler before another case starts, but returns the outcomes already
- * completed; it does not discard them.
+ * discovery order after duplicate literal paths are collapsed in first-seen
+ * order. Cases run sequentially. A caller `AbortSignal` stops the scheduler
+ * before another case starts, but returns the outcomes already completed; it
+ * does not discard them.
  *
  * Each result uses a monotonic per-case duration so elapsed time remains
  * meaningful when wall-clock time changes. Replay validates the plan before
@@ -1521,9 +1726,10 @@ export interface RunOutcome {
  * into provider-visible or persisted data.
  *
  * A failed assertion is a failed result rather than a reportable error.
- * Failures before dispatch have no step evidence, whereas a dispatched-step
- * failure preserves completed steps and skips the rest. Each case isolates its
- * own failure so later cases may continue, closes its browser session, and
+ * Dispatch-time failures with a live browser preserve best-effort screenshot
+ * and redacted accessibility evidence before the session closes, while
+ * pre-launch and post-close failures correctly have none. Each case isolates
+ * its own failure so later cases may continue, closes its browser session, and
  * flushes accumulated grounding atomically; a flush error changes only an
  * otherwise successful case. The unified case-abort result covers suppressed
  * fallback and unavailable capture or verification evidence without inventing
@@ -1537,9 +1743,10 @@ export async function run(deps: RunDeps, options: RunOptions): Promise<RunOutcom
       testIgnore: deps.config.testIgnore,
     })).map((path) => joinPath(deps.config.testDir, path))
     : [...options.files];
-  const files = options.grep === undefined
+  const filteredFiles = options.grep === undefined
     ? discovered
     : discovered.filter((path) => grepMatches(options.grep!, path, deps.config.testDir));
+  const files = [...new Set(filteredFiles)];
 
   if (files.length === 0) {
     return { results: [], noTestsFound: true };
@@ -1557,6 +1764,15 @@ export async function run(deps: RunDeps, options: RunOptions): Promise<RunOutcom
   return { results, noTestsFound: false };
 }
 
+/**
+ * Replays one prompt while its browser session is still available for failure
+ * diagnostics.
+ *
+ * Evidence is attached at the assertion and caught-dispatch boundaries rather
+ * than during teardown: both locations retain the original failure context,
+ * while post-close grounding persistence cannot safely ask the released
+ * browser for a screenshot or accessibility tree.
+ */
 async function runCase(deps: RunDeps, options: RunOptions, file: string): Promise<RunCaseOutcome> {
   const startedAt = deps.clock.monotonicMs();
   const planPath = deps.layout.planPathFor(file);
@@ -1671,19 +1887,26 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
          * as agentic diagnostics without giving browser adapters secret or
          * case-state access.
          */
+        const evidence = await captureFailureEvidence(
+          context.session,
+          deps.storage,
+          deps.layout.runsDirFor(file, deps.runId),
+          originalStep.id,
+          resolvedSecrets,
+          runState,
+          [outcome.expected, outcome.actual],
+        );
+        const expected = templateMaterializedValues(outcome.expected, resolvedSecrets, runState);
+        const actual = templateMaterializedValues(outcome.actual, resolvedSecrets, runState);
         result = {
           ...identity,
           status: 'failed',
           steps: [
             ...completed,
-            stepResult(originalStep, 'failed', 'assertion'),
+            stepResult(originalStep, 'failed', 'assertion', { ...evidence, expected, actual }),
             ...skippedSteps(planSteps, index),
           ],
-          explanation: templateMaterializedValues(
-            outcome.message,
-            resolvedSecrets ?? new Map(),
-            runState ?? new Map(),
-          ),
+          explanation: actual,
         };
         break;
       }
@@ -1718,18 +1941,28 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
      * errors retain the fixed fallback explanation without examining their
      * message, so neither branch carries materialized case data.
      */
+    const evidence = session === undefined || currentStep === undefined
+      ? undefined
+      : await captureFailureEvidence(
+        session,
+        deps.storage,
+        deps.layout.runsDirFor(file, deps.runId),
+        currentStep.id,
+        resolvedSecrets ?? new Map(),
+        runState ?? new Map(),
+      );
     if (error instanceof AmbercastError) {
       classifiedError = redactedError(
         error,
         resolvedSecrets ?? new Map(),
         runState ?? new Map(),
       ) as AmbercastErrorType;
-      result = resultForAbort(identity, planSteps, completed, currentStep, classifiedError.message);
+      result = resultForAbort(identity, planSteps, completed, currentStep, classifiedError.message, evidence);
     } else {
       const explanation = error instanceof CaseAbort
         ? error.message
         : 'The browser session could not complete this case and no deterministic fallback is available.';
-      result = resultForAbort(identity, planSteps, completed, currentStep, explanation);
+      result = resultForAbort(identity, planSteps, completed, currentStep, explanation, evidence);
     }
   } finally {
     if (session !== undefined) {

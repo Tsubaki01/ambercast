@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   createBrowserDriverResolver: vi.fn(),
   createEnvSecretsProvider: vi.fn(),
   createFsStorage: vi.fn(),
+  createCryptoRandom: vi.fn(),
   createAmbercast: vi.fn(),
   createNoopEventSink: vi.fn(),
   readCommandEnvironment: vi.fn(),
@@ -39,6 +40,7 @@ vi.mock('#adapters/browser/registry.js', () => ({
   createBrowserDriverResolver: mocks.createBrowserDriverResolver,
 }));
 vi.mock('#adapters/storage/fs-storage.js', () => ({ createFsStorage: mocks.createFsStorage }));
+vi.mock('#adapters/system/crypto-random.js', () => ({ createCryptoRandom: mocks.createCryptoRandom }));
 vi.mock('#adapters/system/env-secrets-provider.js', () => ({
   createEnvSecretsProvider: mocks.createEnvSecretsProvider,
 }));
@@ -116,20 +118,129 @@ afterEach(() => {
 
 beforeEach(() => {
   mocks.createSystemClock.mockReturnValue(createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 10));
+  mocks.createCryptoRandom.mockReturnValue({ uuid: () => '550e8400-e29b-41d4-a716-446655440000' });
 });
 
 describe('runRunCommand', () => {
+  it('persists a report-safe failing outcome under the invocation path without leaking an absolute screenshot path', async () => {
+    const storage = createInMemoryStorage();
+    const browserDriver = vi.fn(() => createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
+    const secrets = createFakeSecretsProvider(new Map());
+    const events = createRecordingEventSink();
+    const runId = '2026-08-09T000000Z-550e8400-e29b-41d4-a716-446655440000';
+    const layout = {
+      planPathFor: vi.fn(),
+      groundingPathFor: vi.fn(),
+      runReportPathFor: vi.fn(() => `${CONFIG.runsDir}/${runId}/report.json`),
+    };
+    const outcome = {
+      noTestsFound: false,
+      results: [{
+        result: {
+          id: 'login',
+          file: '/workspace/tests/login.test.md',
+          planFile: '/workspace/tests/login.ambercast.plan.json',
+          status: 'failed' as const,
+          durationMs: 12,
+          explanation: 'The page did not contain the dashboard.',
+          steps: [
+            {
+              id: 'assert-dashboard', type: 'assert' as const, status: 'failed' as const, kind: 'assertion' as const,
+              expected: 'Text "Dashboard" is visible.', actual: 'The dashboard is absent.',
+              screenshot: `${CONFIG.runsDir}/${runId}/login/assert-dashboard.png`,
+            },
+            { id: 'later', type: 'action' as const, status: 'skipped' as const },
+          ],
+        },
+      }, {
+        result: {
+          id: 'settings',
+          file: '/workspace/tests/settings.test.md',
+          planFile: '/workspace/tests/settings.ambercast.plan.json',
+          status: 'passed' as const,
+          durationMs: 4,
+          explanation: 'Replay completed successfully.',
+          steps: [{ id: 'open-settings', type: 'action' as const, status: 'passed' as const }],
+        },
+      }],
+    };
+    const persistedResults = outcome.results.map(({ result }) => ({
+      ...result,
+      steps: result.steps.map((step) => (
+        !('screenshot' in step) || step.screenshot === undefined
+          ? step
+          : { ...step, screenshot: `${runId}/login/assert-dashboard.png` }
+      )),
+    }));
+    const output: RunCommandOutput = {
+      exitCode: 1,
+      envelope: {
+        schemaVersion: '1.0', command: 'run', startedAt: '2026-08-09T00:00:00Z', durationMs: 1,
+        summary: { total: 2, passed: 1, failed: 1, errored: 0, skipped: 0 }, errors: [], results: persistedResults,
+      },
+    };
+
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.createBrowserDriverResolver.mockReturnValue(browserDriver);
+    mocks.createEnvSecretsProvider.mockReturnValue(secrets);
+    mocks.createNoopEventSink.mockReturnValue(events.sink);
+    mocks.createAmbercast.mockReturnValue({ storage, layout, clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 20), discoverTestFiles: vi.fn(async () => []) });
+    mocks.run.mockResolvedValue(outcome);
+    mocks.buildRunReport.mockReturnValue(output);
+    const writeText = vi.spyOn(storage, 'writeText');
+
+    await expect(runRunCommand(input())).resolves.toBe(output);
+
+    expect(mocks.run).toHaveBeenCalledWith(expect.objectContaining({ runId }), expect.anything());
+    expect(mocks.buildRunReport).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: expect.objectContaining({ results: expect.arrayContaining([expect.objectContaining({
+        result: expect.objectContaining({ steps: expect.arrayContaining([expect.objectContaining({ screenshot: `${runId}/login/assert-dashboard.png` })]) }),
+      })]) }),
+    }));
+    expect(layout.runReportPathFor).toHaveBeenCalledWith(runId);
+    expect(writeText).toHaveBeenCalledWith(`${CONFIG.runsDir}/${runId}/report.json`, JSON.stringify(output.envelope));
+    const persistedEnvelope = JSON.parse(await storage.readText(`${CONFIG.runsDir}/${runId}/report.json`));
+    expect(persistedEnvelope.results[0].steps[0].screenshot).toBe(`${runId}/login/assert-dashboard.png`);
+    expect(JSON.stringify(persistedEnvelope)).not.toContain(CONFIG.runsDir);
+  });
+
+  it('keeps a completed report result when its best-effort persistence write rejects', async () => {
+    const storage = createInMemoryStorage();
+    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => '/workspace/tests/.runs/report.json') };
+    const output = reportOutput(1);
+
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.createBrowserDriverResolver.mockReturnValue(createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
+    mocks.createEnvSecretsProvider.mockReturnValue(createFakeSecretsProvider(new Map()));
+    mocks.createNoopEventSink.mockReturnValue(createRecordingEventSink().sink);
+    mocks.createAmbercast.mockReturnValue({ storage, layout, clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 20), discoverTestFiles: vi.fn(async () => []) });
+    mocks.run.mockResolvedValue({ results: [], noTestsFound: false });
+    mocks.buildRunReport.mockReturnValue(output);
+    vi.spyOn(storage, 'writeText').mockRejectedValueOnce(new Error('disk full'));
+
+    await expect(runRunCommand(input())).resolves.toBe(output);
+
+    expect(mocks.buildRunReport).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ outcome: expect.any(Object) }));
+    expect(storage.writeText).toHaveBeenCalledOnce();
+  });
+
   it('propagates a configuration failure as a run-scoped report error', async () => {
+    const storage = createInMemoryStorage();
     const error = new ConfigInvalidError('Configuration is invalid.');
     const output = reportOutput(2, [{
       scope: 'run', kind: 'usage', code: 'CONFIG_INVALID', message: 'Configuration is invalid.',
     }]);
+    mocks.createFsStorage.mockReturnValue(storage);
     mocks.loadConfig.mockRejectedValue(error);
     mocks.buildRunReport.mockReturnValue(output);
+    const writeText = vi.spyOn(storage, 'writeText');
 
     await expect(runRunCommand(input())).resolves.toEqual(output);
 
     expect(mocks.buildRunReport).toHaveBeenCalledWith(expect.objectContaining({ error }));
+    expect(writeText).not.toHaveBeenCalled();
     expect(output.envelope.errors).toEqual([expect.objectContaining({
       scope: 'run', code: 'CONFIG_INVALID',
     })]);
@@ -171,7 +282,7 @@ describe('runRunCommand', () => {
     const browserDriver = vi.fn(() => createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
     const secrets = createFakeSecretsProvider(new Map([['{{secrets.auth.password}}', 'secret']]));
     const events = createRecordingEventSink();
-    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn() };
+    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => '/workspace/tests/.runs/report.json') };
     const discoverTestFiles = vi.fn(async () => []);
     const outcome = { results: [], noTestsFound: false };
     const output = reportOutput(0);
@@ -223,6 +334,7 @@ describe('runRunCommand', () => {
       storage,
       layout,
       clock: replayClock,
+      runId: '2026-08-09T000000Z-550e8400-e29b-41d4-a716-446655440000',
       browserDriver,
       secrets,
       events: events.sink,
@@ -264,7 +376,7 @@ describe('runRunCommand', () => {
     const browserDriver = vi.fn(() => createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
     const secrets = createFakeSecretsProvider(new Map());
     const events = createRecordingEventSink();
-    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn() };
+    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => '/workspace/tests/.runs/report.json') };
     const discoverTestFiles = vi.fn(async () => []);
     const controller = new AbortController();
     const outcome = { results: [], noTestsFound: false };
@@ -294,7 +406,7 @@ describe('runRunCommand', () => {
     const browserDriver = vi.fn(() => createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
     const secrets = createFakeSecretsProvider(new Map());
     const events = createRecordingEventSink();
-    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn() };
+    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => '/workspace/tests/.runs/report.json') };
     const discoverTestFiles = vi.fn(async () => []);
     const output = reportOutput(3, [{
       scope: 'run', kind: 'environment', code: 'UNEXPECTED_CRASH', message: 'The run command crashed unexpectedly.',
@@ -313,17 +425,19 @@ describe('runRunCommand', () => {
     });
     mocks.run.mockRejectedValue(new Error('unexpected test rejection'));
     mocks.buildRunReport.mockReturnValue(output);
+    const writeText = vi.spyOn(storage, 'writeText');
 
     await expect(runRunCommand(input())).resolves.toEqual(output);
 
     expect(mocks.buildRunReport).toHaveBeenCalledWith(expect.objectContaining({
       error: expect.any(UnexpectedCrashError),
     }));
+    expect(writeText).not.toHaveBeenCalled();
   });
 
   it('defers AI provider resolution and executor creation when replay needs no fallback', async () => {
     const storage = createInMemoryStorage();
-    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn() };
+    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => '/workspace/tests/.runs/report.json') };
     const discoverTestFiles = vi.fn(async () => []);
     const outcome = { results: [], noTestsFound: false };
     const output = reportOutput(0);
