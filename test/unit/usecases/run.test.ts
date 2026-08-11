@@ -11,6 +11,7 @@ import { StaleIrError } from '#core/errors/stale-ir-error.js';
 import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
+import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import {
   GroundingDocument,
@@ -206,6 +207,44 @@ function passingText(text: string): TraceAssert {
 
 function aiCalls(events: ReturnType<typeof createRecordingEventSink>): readonly { readonly type: 'ai-call'; readonly stepId: string }[] {
   return events.emitted().filter((event): event is { readonly type: 'ai-call'; readonly stepId: string } => event.type === 'ai-call');
+}
+
+function pathBAccessibilityTree(statusName = 'Resolution status'): JsonValueT {
+  return {
+    role: 'root',
+    name: '',
+    children: [{
+      role: 'main',
+      name: 'Application',
+      children: [
+        {
+          role: 'form',
+          name: 'Sign in',
+          children: [
+            { role: 'textbox', name: 'Email', children: [] },
+            { role: 'button', name: 'Submit', children: [] },
+          ],
+        },
+        { role: 'status', name: statusName, children: [] },
+      ],
+    }],
+  };
+}
+
+function pathBSnapshot(statusName?: string): { readonly accessibilityTree: JsonValueT; readonly screenshot: Uint8Array } {
+  return {
+    accessibilityTree: pathBAccessibilityTree(statusName),
+    screenshot: new Uint8Array([1, 2, 3]),
+  };
+}
+
+function pathBFingerprint(tree: JsonValueT = pathBAccessibilityTree()): Fingerprint {
+  const fingerprint = computeAccessibilityFingerprint(tree, SUBMIT);
+  if (fingerprint === undefined) {
+    throw new Error('The Path-B fixture must contain exactly one Submit button.');
+  }
+
+  return fingerprint;
 }
 
 async function readGrounding(storage: StorageAdapter, testPath: string): Promise<GroundingDocument> {
@@ -1229,7 +1268,6 @@ describe('run path-B element recovery', () => {
       [{ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }],
       elementGrounding(['click-submit']),
     );
-
     const outcome = await run(deps, DEFAULT_OPTIONS);
 
     expect(outcome.results[0]?.result.status).toBe('passed');
@@ -1243,16 +1281,14 @@ describe('run path-B element recovery', () => {
   it('re-resolves an element miss with exactly one AI call, persists the fresh fingerprint, and marks the result ai-resolve', async () => {
     const secretRef = '{{secrets.AMBERCAST_SECRET_DUMMY}}';
     const secretValue = 'AMBERCAST_SECRET_DUMMY_VALUE';
-    const snapshot = {
-      accessibilityTree: { role: 'document', name: `The password field contains ${secretValue}.` },
-      screenshot: new Uint8Array([1, 2, 3]),
-    };
+    const expectedFingerprint = pathBFingerprint();
+    const snapshot = pathBSnapshot(`The password field contains ${secretValue}.`);
     const session = createFakeBrowserSession(new Map([
       [elementRefKey(PASSWORD), { exists: true, currentFingerprint: FINGERPRINT }],
       [elementRefKey(SUBMIT), { exists: true, currentFingerprint: DIFFERENT_FINGERPRINT }],
     ]), { snapshot });
     const executor = createFakeAiExecutor({
-      execute: () => ({ data: { fingerprint: DIFFERENT_FINGERPRINT }, raw: '{"fingerprint":"fresh"}' }),
+      execute: () => ({ data: { confirmed: true }, raw: '{"confirmed":true}' }),
     });
     const { deps, events, recordingStorage } = createScenario({
       browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
@@ -1281,14 +1317,26 @@ describe('run path-B element recovery', () => {
     };
     expect(requestContext.target).toStrictEqual(SUBMIT);
     expect(requestContext.snapshot).toStrictEqual({
-      accessibilityTree: {
-        role: 'document',
-        name: `The password field contains ${secretRef}.`,
-      },
+      accessibilityTree: pathBAccessibilityTree(`The password field contains ${secretRef}.`),
     });
+    expect(executor.structuredRequests[0]?.prompt).toBe(
+      'Confirm whether the supplied locator still identifies the intended element.',
+    );
+    const responseSchema = executor.structuredRequests[0]?.responseSchema as unknown as {
+      readonly additionalProperties: boolean;
+      readonly properties: Readonly<Record<string, { readonly type: string }>>;
+      readonly required: readonly string[];
+    };
+    expect(responseSchema).toMatchObject({
+      additionalProperties: false,
+      properties: { confirmed: { type: 'boolean' } },
+      required: ['confirmed'],
+    });
+    expect(responseSchema.properties).toStrictEqual({ confirmed: { type: 'boolean' } });
+    expect(JSON.stringify(executor.structuredRequests[0]?.responseSchema)).not.toContain('fingerprint');
     expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual({
       'fill-password-secret': { kind: 'element', fingerprint: FINGERPRINT },
-      'click-submit': { kind: 'element', fingerprint: DIFFERENT_FINGERPRINT },
+      'click-submit': { kind: 'element', fingerprint: expectedFingerprint },
     });
     expect(session.operations()).toEqual([
       { type: 'resolve-grounded', target: PASSWORD, fingerprint: FINGERPRINT },
@@ -1304,13 +1352,15 @@ describe('run path-B element recovery', () => {
   });
 
   it('flushes a refreshed fingerprint even when the original action subsequently fails', async () => {
+    const expectedFingerprint = pathBFingerprint();
     const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT), {
+      snapshot: pathBSnapshot(),
       onPerform() {
         throw new Error('The refreshed target detached before click.');
       },
     });
     const executor = createFakeAiExecutor({
-      execute: () => ({ data: { fingerprint: DIFFERENT_FINGERPRINT }, raw: '{"fingerprint":"fresh"}' }),
+      execute: () => ({ data: { confirmed: true }, raw: '{"confirmed":true}' }),
     });
     const { deps, events, recordingStorage } = createScenario({
       browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
@@ -1329,15 +1379,15 @@ describe('run path-B element recovery', () => {
     expect(outcome.results[0]?.result.status).toBe('error');
     expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'click-submit' }]);
     expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual({
-      'click-submit': { kind: 'element', fingerprint: DIFFERENT_FINGERPRINT },
+      'click-submit': { kind: 'element', fingerprint: expectedFingerprint },
     });
   });
 
   it.each([
-    ['a schema-invalid re-resolution response', 'The AI response did not match the fingerprint schema.'],
+    ['a schema-invalid re-resolution response', 'The AI response did not match the confirmation schema.'],
     ['an AI refusal to confirm the authored locator', 'The AI cannot confirm the locator on this page.'],
   ] as const)('fails closed for %s without performing or replacing the previous fingerprint', async (_description, message) => {
-    const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT));
+    const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT), { snapshot: pathBSnapshot() });
     const executor = createFakeAiExecutor({
       execute: () => {
         throw new AiResponseInvalidError(message, { raw: '{"status":"unconfirmed"}', issues: [] });
@@ -1363,6 +1413,208 @@ describe('run path-B element recovery', () => {
       { type: 'snapshot-for-resolution' },
     ]);
     expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual(elementGrounding(['click-submit']));
+  });
+
+  it('computes, confirms, and persists on a genuine cold start without resolving stored grounding', async () => {
+    const expectedFingerprint = pathBFingerprint();
+    const session = createFakeBrowserSession(new Map(), { snapshot: pathBSnapshot() });
+    const resolveGrounded = vi.spyOn(session, 'resolveGrounded');
+    const executor = createFakeAiExecutor({
+      execute: () => ({ data: { confirmed: true }, raw: '{"confirmed":true}' }),
+    });
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [{ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }],
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(resolveGrounded).not.toHaveBeenCalled();
+    expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'click-submit' }]);
+    expect(executor.structuredRequests).toHaveLength(1);
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual({
+      'click-submit': { kind: 'element', fingerprint: expectedFingerprint },
+    });
+  });
+
+  it.each([
+    ['an absent target', {
+      role: 'root', name: '', children: [{ role: 'main', name: 'Application', children: [] }],
+    }, 'The supplied locator has no matching element in the current accessibility evidence.'],
+    ['ambiguous targets', {
+      role: 'root', name: '', children: [{
+        role: 'form', name: 'Sign in', children: [
+          { role: 'button', name: 'Submit', children: [] },
+          { role: 'button', name: 'Submit', children: [] },
+        ],
+      }],
+    }, 'The supplied locator matches more than one element in the current accessibility evidence and cannot be trusted.'],
+  ])('does not call AI before failing closed for %s in captured evidence', async (_description, accessibilityTree, explanation) => {
+    const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT), {
+      snapshot: { accessibilityTree, screenshot: new Uint8Array() },
+    });
+    const executor = createFakeAiExecutor();
+    const { deps, events, recordingStorage, resolveAiExecutor } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [
+        { id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT },
+        { id: 'after-click', kind: 'action', action: 'navigate', url: '/after' },
+      ],
+      elementGrounding(['click-submit']),
+    );
+    const groundingBefore = await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`);
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expectStopgapOutcome(outcome, 'click-submit', 'after-click');
+    expect(outcome.results[0]?.result.explanation).toBe(explanation);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(executor.structuredRequests).toEqual([]);
+    expect(aiCalls(events)).toEqual([]);
+    expect(recordingStorage.writes).toEqual([]);
+    expect(await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`)).toBe(groundingBefore);
+    expect(session.operations()).toEqual([
+      { type: 'resolve-grounded', target: SUBMIT, fingerprint: FINGERPRINT },
+      { type: 'snapshot-for-resolution' },
+    ]);
+  });
+
+  it('honors a confirmation denial and persists no locally recomputed fingerprint', async () => {
+    const locallyComputedFingerprint = pathBFingerprint();
+    expect(locallyComputedFingerprint).toMatchObject({ algorithm: 'a11y-neighborhood-v1' });
+    const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT), { snapshot: pathBSnapshot() });
+    const executor = createFakeAiExecutor({
+      execute: () => ({ data: { confirmed: false }, raw: '{"confirmed":false}' }),
+    });
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [{ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }],
+      elementGrounding(['click-submit']),
+    );
+    const groundingBefore = await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`);
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('error');
+    expect(outcome.results[0]?.result.explanation).toBe('The AI could not confirm that the supplied locator identifies the intended element.');
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(executor.structuredRequests).toHaveLength(1);
+    expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'click-submit' }]);
+    expect(recordingStorage.writes).toEqual([]);
+    expect(await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`)).toBe(groundingBefore);
+    expect(session.operations().filter((operation) => operation.type === 'perform')).toEqual([]);
+  });
+
+  it('persists the unredacted neighborhood fingerprint when a secret appears in the target parent', async () => {
+    const secretRef = '{{secrets.AMBERCAST_SECRET_DUMMY}}';
+    const secretValue = 'AMBERCAST_SECRET_DUMMY_VALUE';
+    const rawTree: JsonValueT = {
+      role: 'root',
+      name: '',
+      children: [{
+        role: 'form',
+        name: `Sign in ${secretValue}`,
+        children: [
+          { role: 'textbox', name: 'Email', children: [] },
+          { role: 'button', name: 'Submit', children: [] },
+        ],
+      }],
+    };
+    const redactedTree: JsonValueT = {
+      role: 'root',
+      name: '',
+      children: [{
+        role: 'form',
+        name: `Sign in ${secretRef}`,
+        children: [
+          { role: 'textbox', name: 'Email', children: [] },
+          { role: 'button', name: 'Submit', children: [] },
+        ],
+      }],
+    };
+    const rawFingerprint = pathBFingerprint(rawTree);
+    const redactedFingerprint = pathBFingerprint(redactedTree);
+    expect(rawFingerprint).not.toEqual(redactedFingerprint);
+    const session = createFakeBrowserSession(new Map([
+      [elementRefKey(PASSWORD), { exists: true, currentFingerprint: FINGERPRINT }],
+      [elementRefKey(SUBMIT), { exists: true, currentFingerprint: DIFFERENT_FINGERPRINT }],
+    ]), {
+      snapshot: { accessibilityTree: rawTree, screenshot: new Uint8Array() },
+    });
+    const executor = createFakeAiExecutor({
+      execute: () => ({ data: { confirmed: true }, raw: '{"confirmed":true}' }),
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [
+        { id: 'fill-password-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef },
+        { id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT },
+      ],
+      elementGrounding(['fill-password-secret', 'click-submit']),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect((executor.structuredRequests[0]?.context as {
+      readonly snapshot: { readonly accessibilityTree: JsonValueT };
+    }).snapshot.accessibilityTree).toStrictEqual(redactedTree);
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries['click-submit']).toEqual({
+      kind: 'element',
+      fingerprint: rawFingerprint,
+    });
+  });
+
+  it('fails closed under cache-only for a well-formed legacy-shaped fingerprint', async () => {
+    const correctedFingerprint = pathBFingerprint();
+    const session = createFakeBrowserSession(liveEntries([SUBMIT], correctedFingerprint));
+    const { deps, events, recordingStorage, resolveAiExecutor } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [{ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }],
+      { 'click-submit': { kind: 'element', fingerprint: FINGERPRINT } },
+    );
+
+    const outcome = await run(deps, { ...DEFAULT_OPTIONS, cacheOnly: true });
+
+    expect(outcome.results[0]?.result.status).toBe('error');
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(aiCalls(events)).toEqual([]);
+    expect(session.operations()).toEqual([
+      { type: 'resolve-grounded', target: SUBMIT, fingerprint: FINGERPRINT },
+    ]);
   });
 
   it('leaves the prior fingerprint untouched when the path-B snapshot fails before any AI request', async () => {
@@ -2837,6 +3089,7 @@ describe('run per-case grounding flush and dispatch wiring', () => {
       [elementRefKey(SUBMIT), { exists: true, currentFingerprint: DIFFERENT_FINGERPRINT }],
     ]), {
       captureValues: new Map([[elementRefKey(EMAIL), { text: capturedValue, value: '' }]]),
+      snapshot: pathBSnapshot(),
     });
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
@@ -2844,7 +3097,7 @@ describe('run per-case grounding flush and dispatch wiring', () => {
         await request.controller.evaluateAssert({ type: 'assert', check: 'text-visible', text: '{{run.name}}' });
         return { outcome: 'success' };
       },
-      execute: () => ({ data: { fingerprint: DIFFERENT_FINGERPRINT }, raw: '{"fingerprint":"fresh"}' }),
+      execute: () => ({ data: { confirmed: true }, raw: '{"confirmed":true}' }),
     });
     const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
     const { deps, events, recordingStorage } = createScenario({

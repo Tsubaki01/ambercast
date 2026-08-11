@@ -22,8 +22,8 @@ import type {
   PerformableAction,
 } from '#ports/browser.js';
 import {
-  computeAccessibilityFingerprint,
   parseAriaSnapshot,
+  resolveAccessibilityFingerprint,
 } from '#core/ir/fingerprint.js';
 import type { ElementRef, Fingerprint, JsonValueT, TargetDefinition } from '#core/ir/schema.js';
 
@@ -323,35 +323,31 @@ class ChromiumBrowserSession implements BrowserSession {
   /**
    * Verifies recorded grounding before an element may be used.
    *
-   * A missing element is always an `element-not-found` miss, and an existing
-   * element with a different current fingerprint is always a
-   * `fingerprint-mismatch` miss. Neither condition is a diagnostic-only
-   * pass-through: accepting it would let stale grounding direct a step to an
-   * unintended element. This method independently captures its own current
-   * body ARIA snapshot, parses it with `parseAriaSnapshot()`, and computes the
-   * live fingerprint with `computeAccessibilityFingerprint()` before comparing
-   * it with `fp`. That capture is distinct from `snapshotForResolution()`:
-   * callers may request that paired diagnostic evidence separately, but it is
-   * never reused as this method's comparison input.
+   * @remarks
+   * This method independently captures its own current body ARIA snapshot,
+   * parses it with `parseAriaSnapshot()`, and delegates the complete
+   * classification to `resolveAccessibilityFingerprint()`. No candidate is an
+   * `element-not-found` miss; one candidate whose neighborhood differs from
+   * `fp` is a `fingerprint-mismatch` miss; and two or more candidates with
+   * the exact role and normalized name are an `ambiguous-match` miss. The
+   * last outcome remains a miss even when one candidate hashes to `fp`,
+   * because this adapter's role locator cannot carry that candidate's identity
+   * to its later `.first()` browser operation.
+   *
+   * That capture is distinct from `snapshotForResolution()`: callers may
+   * request paired diagnostic evidence separately, but it is never reused as
+   * this method's comparison input.
    */
   async resolveGrounded(ref: ElementRef, fp: Fingerprint): Promise<GroundedResolution> {
-    const currentFingerprint = computeAccessibilityFingerprint(
+    const resolution = resolveAccessibilityFingerprint(
       await this.accessibilitySnapshot(),
       ref,
+      fp,
     );
 
-    if (currentFingerprint === undefined) {
-      return { kind: 'miss', reason: 'element-not-found' };
-    }
-
-    if (
-      currentFingerprint.algorithm !== fp.algorithm
-      || currentFingerprint.hash !== fp.hash
-    ) {
-      return { kind: 'miss', reason: 'fingerprint-mismatch' };
-    }
-
-    return { kind: 'hit', ref };
+    return resolution === 'hit'
+      ? { kind: 'hit', ref }
+      : { kind: 'miss', reason: resolution };
   }
 
   /**

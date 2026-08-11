@@ -48,6 +48,23 @@ const FIXTURE_WITHOUT_SUBMIT = [
   '    - textbox "Email"',
 ].join('\n');
 
+const AMBIGUOUS_SUBMIT_FIXTURE = [
+  '- main "Application":',
+  '  - form "Primary form":',
+  '    - textbox "Email"',
+  '    - button "Submit"',
+  '  - region "Secondary controls":',
+  '    - textbox "Search"',
+  '    - button "Submit"',
+].join('\n');
+
+const FIRST_AMBIGUOUS_SUBMIT_CANDIDATE_FIXTURE = [
+  '- main "Application":',
+  '  - form "Primary form":',
+  '    - textbox "Email"',
+  '    - button "Submit"',
+].join('\n');
+
 const FIXTURE_ACCESSIBILITY_TREE: JsonValueT = {
   role: 'root',
   name: '',
@@ -308,6 +325,19 @@ function fixtureFingerprint(): Fingerprint {
 
   if (fingerprint === undefined) {
     throw new Error('The fixture ARIA snapshot does not contain the submit button.');
+  }
+
+  return fingerprint;
+}
+
+function firstAmbiguousCandidateFingerprint(): Fingerprint {
+  const fingerprint = computeAccessibilityFingerprint(
+    parseAriaSnapshot(FIRST_AMBIGUOUS_SUBMIT_CANDIDATE_FIXTURE),
+    SUBMIT_BUTTON,
+  );
+
+  if (fingerprint === undefined) {
+    throw new Error('The separate ambiguous fixture does not contain its first submit candidate.');
   }
 
   return fingerprint;
@@ -692,6 +722,15 @@ describe('ChromiumBrowserSession.resolveGrounded()', () => {
     } finally {
       await session?.close();
     }
+  });
+
+  it('reports ambiguous-match when two submit candidates exist even if one has the supplied hash', async () => {
+    await withLaunchedSession({ ariaSnapshot: AMBIGUOUS_SUBMIT_FIXTURE }, async (session) => {
+      await expect(session.resolveGrounded(SUBMIT_BUTTON, firstAmbiguousCandidateFingerprint())).resolves.toEqual({
+        kind: 'miss',
+        reason: 'ambiguous-match',
+      });
+    });
   });
 });
 
