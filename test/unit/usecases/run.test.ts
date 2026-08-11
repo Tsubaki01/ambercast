@@ -724,7 +724,7 @@ describe('run', () => {
       assertOutcome: { passed: false, message: 'Submit was not visible.' },
       onClose: closed,
     });
-    const { deps, recordingStorage } = createScenario({
+    const { deps, events, recordingStorage } = createScenario({
       browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
     });
     const testPath = await writePrompt(recordingStorage.storage);
@@ -748,6 +748,9 @@ describe('run', () => {
       ],
     });
     expect(closed).toHaveBeenCalledTimes(1);
+    expect(events.emitted()).toEqual([
+      { type: 'step-start', stepId: 'assert-submit' },
+    ]);
   });
 
   it('aborts a browser-launch failure before any step has execution evidence', async () => {
@@ -884,6 +887,50 @@ describe('run', () => {
 
     expectStopgapOutcome(outcome, 'click-submit', 'after-browser-error', 'before-browser-error');
     expect(closed).toHaveBeenCalledTimes(1);
+  });
+
+  it('emits step-start for a step before its dispatch begins, not only by the time the run resolves', async () => {
+    const eventsAtSecondPerform: RunEvent[] = [];
+    const session = createFakeBrowserSession(liveEntries([EMAIL, SUBMIT]), {
+      onPerform(action) {
+        if (action.type === 'click') {
+          eventsAtSecondPerform.push(...events.emitted());
+          throw new Error('detached element');
+        }
+      },
+    });
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    const steps: Step[] = [
+      { id: 'fill-first', kind: 'action', action: 'fill', target: EMAIL, value: 'person@example.test' },
+      { id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT },
+      { id: 'after-browser-error', kind: 'action', action: 'navigate', url: '/after' },
+    ];
+    await seedFreshArtifacts(recordingStorage.storage, testPath, steps, elementGrounding(['fill-first', 'click-submit']));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result).toMatchObject({
+      status: 'error',
+      steps: [
+        { id: 'fill-first', status: 'passed' },
+        { id: 'click-submit', status: 'error', kind: 'environment' },
+        { id: 'after-browser-error', status: 'skipped' },
+      ],
+    });
+    // Captured from inside onPerform, strictly before dispatch could throw or
+    // return: proves step-start for the second step already fired at that
+    // moment, not merely by the time the whole run resolves. It also pins the
+    // interleaving: a completed first step's start and result precede only the
+    // second step's start.
+    expect(eventsAtSecondPerform).toEqual([
+      { type: 'step-start', stepId: 'fill-first' },
+      { type: 'step-result', stepId: 'fill-first', via: 'grounding' },
+      { type: 'step-start', stepId: 'click-submit' },
+    ]);
+    expect(events.emitted()).toEqual(eventsAtSecondPerform);
   });
 
   it('continues a sibling case after a browser-launch failure', async () => {
@@ -1241,6 +1288,9 @@ describe('run agentic fallback pipeline', () => {
     });
     expect(resolveAiExecutor).not.toHaveBeenCalled();
     expect(aiCalls(events)).toEqual([]);
+    expect(events.emitted()).toEqual([
+      { type: 'step-start', stepId: 'recorded-ai' },
+    ]);
   });
 
   it('suppresses a behavioral trace fallback in cache-only mode without resolving an AI executor', async () => {

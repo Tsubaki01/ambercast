@@ -177,6 +177,7 @@ describe('fake vertical slice', () => {
       storage,
       layout,
       aiExecutor: createFakeAiExecutor({ execute }),
+      events: createRecordingEventSink().sink,
       discoverTestFiles: async () => [],
       config: {
         testDir: TEST_DIR,
@@ -269,6 +270,7 @@ describe('fake vertical slice', () => {
       aiExecutor: createFakeAiExecutor({
         execute: async () => ({ data: generatedResponse, raw: JSON.stringify(generatedResponse) }),
       }),
+      events: createRecordingEventSink().sink,
       discoverTestFiles: async () => [],
       config: {
         testDir: TEST_DIR,
