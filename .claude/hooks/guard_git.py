@@ -11,10 +11,30 @@ Rejected: issues/12-, issues/12--a, issues/12-A, unicode digits.
 
 Everything else passes through (exit 0). Runs outside a work tree -> no-op.
 
-Directory resolution deliberately trusts only structured hook context, never
-shell command text. Two security-review rounds showed regex parsing cannot
-safely reproduce the combined Git and shell grammars; false-positive blocking
-is safer than a command-parsing bypass at this enforcement boundary.
+Directory resolution deliberately selects the first available trusted
+execution-context value (`data["cwd"]`, then `CLAUDE_PROJECT_DIR`, then the
+hook process's own cwd); it never derives a directory from shell command text.
+The hook still reads command text separately, elsewhere, to classify commit,
+push, and branch-switch operations -- but no command shape, a `-C <path>` flag,
+a leading `cd`, or anything else, changes which directory this resolution
+picks. Parsing command text cannot safely reproduce the combined Git and shell
+grammars, so using a command-derived path for resolution would create a bypass
+surface.
+
+This does mean resolution cannot recover once its selected value is itself
+wrong. A missing directory, or one outside a Git worktree, is still observable:
+the branch probe below fails and the hook fails open. A directory that is
+merely the *wrong* checkout -- the main checkout, or another session's
+still-existing linked worktree -- is not: it is indistinguishable from the
+intended checkout using only execution-context signals, since both are real,
+valid checkouts of this repository. In that situation the branch check below
+runs against the wrong checkout, and a command's `-C` cannot correct it: `-C`
+only changes where *git* itself acts, never which directory the guard
+evaluates. That asymmetry cuts both ways -- it can produce a false-positive
+block on a correctly-checked-out directory, and, inversely, it can let the
+guard approve a command whose `-C` (or shell cwd) actually targets a different
+checkout than the one just evaluated. The former is judged the safer failure
+mode; closing the latter would require trusting command text.
 """
 from __future__ import annotations
 
