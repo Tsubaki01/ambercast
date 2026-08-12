@@ -3319,6 +3319,58 @@ describe('run failure evidence', () => {
     expect(writeBinary).not.toHaveBeenCalled();
   });
 
+  it('omits screenshots when accessibility capture fails after an earlier fill-secret', async () => {
+    const secretRef = '{{secrets.snapshot_evidence}}';
+    const secretValue = 'AMBERCAST_SECRET_SNAPSHOT_EVIDENCE_VALUE';
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: { role: 'document' }, screenshot: new Uint8Array([1]) },
+    });
+    vi.spyOn(session, 'accessibilitySnapshot').mockRejectedValue(new Error('a11y unavailable'));
+    const screenshot = vi.spyOn(session, 'screenshot');
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+    });
+    const writeBinary = vi.spyOn(recordingStorage.storage, 'writeBinary');
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'fill-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef },
+      { id: 'assert-dashboard', kind: 'assert', check: 'text-visible', text: 'Dashboard' },
+    ], elementGrounding(['fill-secret']));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const step = outcome.results[0]?.result.steps.at(-1);
+
+    expect(step).toMatchObject({ screenshotOmitted: 'secret-detected' });
+    expect(step).not.toHaveProperty('screenshot');
+    expect(screenshot).not.toHaveBeenCalled();
+    expect(writeBinary).not.toHaveBeenCalled();
+  });
+
+  it('captures screenshots when accessibility capture fails without any resolved secret', async () => {
+    const session = createFakeBrowserSession(new Map(), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: { role: 'document' }, screenshot: new Uint8Array([1]) },
+    });
+    vi.spyOn(session, 'accessibilitySnapshot').mockRejectedValue(new Error('a11y unavailable'));
+    const screenshot = vi.spyOn(session, 'screenshot');
+    const { deps, recordingStorage } = createScenario({ browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)) });
+    const writeBinary = vi.spyOn(recordingStorage.storage, 'writeBinary');
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'assert-dashboard', kind: 'assert', check: 'text-visible', text: 'Dashboard' },
+    ]);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const step = outcome.results[0]?.result.steps[0];
+
+    expect(step).toMatchObject({ screenshot: expect.any(String) });
+    expect(step).not.toHaveProperty('screenshotOmitted');
+    expect(screenshot).toHaveBeenCalledOnce();
+    expect(writeBinary).toHaveBeenCalledOnce();
+  });
+
   it('still omits screenshots when redacted secret-bearing accessibility evidence cannot be serialized', async () => {
     const secretRef = '{{secrets.rendering_evidence}}';
     const secretValue = 'AMBERCAST_SECRET_RENDERING_EVIDENCE_VALUE';

@@ -205,6 +205,78 @@ describe('runRunCommand', () => {
     expect(JSON.stringify(persistedEnvelope)).not.toContain(CONFIG.runsDir);
   });
 
+  it('omits an uncontained screenshot without replacing the completed outcome with a crash report', async () => {
+    const storage = createInMemoryStorage();
+    const runId = '2026-08-09T000000Z-550e8400-e29b-41d4-a716-446655440000';
+    const layout = {
+      planPathFor: vi.fn(),
+      groundingPathFor: vi.fn(),
+      runReportPathFor: vi.fn(() => `${CONFIG.runsDir}/${runId}/report.json`),
+    };
+    const outcome = {
+      noTestsFound: false,
+      results: [{
+        result: {
+          id: 'login',
+          file: '/workspace/tests/login.test.md',
+          planFile: '/workspace/tests/login.ambercast.plan.json',
+          status: 'failed' as const,
+          durationMs: 12,
+          explanation: 'The page did not contain the dashboard.',
+          steps: [{
+            id: 'assert-dashboard', type: 'assert' as const, status: 'failed' as const, kind: 'assertion' as const,
+            expected: 'Text "Dashboard" is visible.', actual: 'The dashboard is absent.',
+            screenshot: '/host/diagnostics/assert-dashboard.png',
+          }],
+        },
+      }],
+    };
+    const output: RunCommandOutput = {
+      exitCode: 1,
+      envelope: {
+        schemaVersion: '1.0', command: 'run', startedAt: '2026-08-09T00:00:00Z', durationMs: 1,
+        summary: { total: 1, passed: 0, failed: 1, errored: 0, skipped: 0 }, errors: [],
+        results: [{
+          id: 'login',
+          file: '/workspace/tests/login.test.md',
+          planFile: '/workspace/tests/login.ambercast.plan.json',
+          status: 'failed',
+          durationMs: 12,
+          explanation: 'The page did not contain the dashboard.',
+          steps: [{
+            id: 'assert-dashboard', type: 'assert', status: 'failed', kind: 'assertion',
+            expected: 'Text "Dashboard" is visible.', actual: 'The dashboard is absent.',
+          }],
+        }],
+      },
+    };
+
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.createBrowserDriverResolver.mockReturnValue(createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
+    mocks.createEnvSecretsProvider.mockReturnValue(createFakeSecretsProvider(new Map()));
+    mocks.createNoopEventSink.mockReturnValue(createRecordingEventSink().sink);
+    mocks.createAmbercast.mockReturnValue({ storage, layout, clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 20), discoverTestFiles: vi.fn(async () => []) });
+    mocks.run.mockResolvedValue(outcome);
+    mocks.buildRunReport.mockReturnValue(output);
+
+    await expect(runRunCommand(input())).resolves.toBe(output);
+
+    expect(output).toMatchObject({ exitCode: 1, envelope: { summary: { total: 1, failed: 1, errored: 0 } } });
+    expect(mocks.buildRunReport).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ outcome: expect.any(Object) }));
+    const reportInput = mocks.buildRunReport.mock.calls[0]?.[0];
+    const reportStep = reportInput?.outcome?.results[0]?.result.steps[0];
+    expect(reportStep).toMatchObject({
+      id: 'assert-dashboard', status: 'failed', kind: 'assertion',
+      expected: 'Text "Dashboard" is visible.', actual: 'The dashboard is absent.',
+    });
+    expect(reportStep).not.toHaveProperty('screenshot');
+    expect(mocks.buildRunReport).not.toHaveBeenCalledWith(expect.objectContaining({ error: expect.any(Error) }));
+    const persistedEnvelope = JSON.parse(await storage.readText(`${CONFIG.runsDir}/${runId}/report.json`));
+    expect(persistedEnvelope.results[0].steps[0]).not.toHaveProperty('screenshot');
+    expect(JSON.stringify(persistedEnvelope)).not.toContain('/host/diagnostics');
+  });
+
   it('keeps a completed report result when its best-effort persistence write rejects', async () => {
     const storage = createInMemoryStorage();
     const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => '/workspace/tests/.runs/report.json') };

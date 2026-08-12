@@ -1517,10 +1517,11 @@ async function captureScreenshotEvidence(
  * resolved-secret hit, then redacts that same tree before compact
  * serialization. Redaction must precede serialization because JSON escaping
  * can hide a raw value from string-based replacement. Snapshot acquisition
- * can return a false signal because no tree exists to inspect. Once a tree
- * exists, however, detector failure is unsafe and returns a true signal: a
- * throwing getter or other malformed evidence must not turn uncertain secret
- * presence into permission to capture a screenshot. Rendering is separately
+ * must fail closed after any case secret resolves: an uninspectable page can
+ * still display a value filled by an earlier step. Once a tree exists,
+ * detector failure is likewise unsafe and returns a true signal: a throwing
+ * getter or other malformed evidence must not turn uncertain secret presence
+ * into permission to capture a screenshot. Rendering is separately
  * best-effort and retains the already-established signal.
  */
 async function captureObservedEvidence(
@@ -1532,7 +1533,8 @@ async function captureObservedEvidence(
   try {
     rawTree = await session.accessibilitySnapshot();
   } catch {
-    return { rawTreeContainsSecret: false };
+    // An uninspectable page cannot authorize a screenshot once this case knows a secret exists.
+    return { rawTreeContainsSecret: resolvedSecrets.size > 0 };
   }
 
   let rawTreeContainsSecret: boolean;
@@ -1567,9 +1569,10 @@ async function captureObservedEvidence(
  * returns the observed detail available so far and `screenshotOmitted`
  * without calling the browser screenshot or storage port. On a miss,
  * screenshot capture has its own caught failure boundary, so an accessibility
- * capture failure still permits it and a screenshot capture/write failure
- * still preserves observed evidence. This deliberate sequencing changes only
- * dependency order, not the independence of diagnostic failures.
+ * capture failure permits it only while the case has resolved no secret; a
+ * screenshot capture/write failure still preserves observed evidence. This
+ * deliberate sequencing changes only dependency order, not the independence
+ * of diagnostic failures.
  * Assertion-specific fields stay at the caller so an environment error cannot
  * invent them.
  */

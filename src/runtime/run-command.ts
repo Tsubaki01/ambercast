@@ -63,14 +63,16 @@ function runIdFor(startedAt: string, uuid: string): string {
  * report-boundary view, preserving the use case's measurement while ensuring
  * CLI JSON always satisfies its published schema. Screenshot paths are also
  * made relative to the configured runs root here, where a report consumer can
- * resolve them without exposing a host filesystem prefix.
+ * resolve them without exposing a host filesystem prefix. An uncontained path
+ * is omitted from only its diagnostic step: it must never reach the report,
+ * but one bad evidence field must not replace a completed replay outcome with
+ * a crash report.
  *
  * @param outcome - The completed replay outcome with absolute internal paths.
- * @param runsDir - The resolved absolute root that contains every screenshot.
- * @returns A copy suitable for the public report contract.
- * @throws {Error} When a screenshot does not remain contained by `runsDir`.
- *   That would violate layout composition and must not silently expose an
- *   absolute host path in a structured report.
+ * @param runsDir - The resolved absolute root used to determine reportable
+ *   screenshot paths.
+ * @returns A copy suitable for the public report contract, with any
+ *   uncontained screenshot field omitted.
  */
 function reportableOutcome(outcome: RunOutcome, runsDir: string): RunOutcome {
   return {
@@ -89,7 +91,10 @@ function reportableOutcome(outcome: RunOutcome, runsDir: string): RunOutcome {
 
           const screenshot = relativeWithin(runsDir, step.screenshot);
           if (screenshot === undefined) {
-            throw new Error('A screenshot path escaped the configured runs directory.');
+            // Do not leak a host path or let one diagnostic field crash a completed replay.
+            const withoutScreenshot = { ...step };
+            delete withoutScreenshot.screenshot;
+            return withoutScreenshot;
           }
 
           return { ...step, screenshot };
