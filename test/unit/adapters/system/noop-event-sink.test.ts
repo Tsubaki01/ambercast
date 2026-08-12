@@ -30,6 +30,7 @@ const RUN_EVENT_CASES: readonly { readonly description: string; readonly event: 
   { description: 'an AI-resolved step-result event', event: { type: 'step-result', stepId: 'resolve-form', via: 'ai-resolve' } },
   { description: 'a trace-replayed step-result event', event: { type: 'step-result', stepId: 'replay-trace', via: 'trace-replay' } },
   { description: 'an ai-call event', event: { type: 'ai-call', stepId: 'resolve-form' } },
+  { description: 'an unscoped ai-call event', event: { type: 'ai-call' } },
 ];
 
 describe('createNoopEventSink()', () => {

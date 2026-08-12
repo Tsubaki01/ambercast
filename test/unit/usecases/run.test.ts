@@ -28,7 +28,7 @@ import { createLayoutResolver } from '#core/layout/resolve.js';
 import type { AiAgenticRequest } from '#ports/ai.js';
 import type { BrowserDriver, BrowserEngine, BrowserSession, PerformableAction } from '#ports/browser.js';
 import type { StorageAdapter } from '#ports/storage.js';
-import type { Clock } from '#ports/system.js';
+import type { Clock, RunEvent } from '#ports/system.js';
 import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
 import { buildRunReport } from '#usecases/run-report.js';
 import { createFixedClock } from '../../doubles/create-fixed-clock.js';
@@ -205,8 +205,8 @@ function passingText(text: string): TraceAssert {
   return { type: 'assert', check: 'text-visible', text };
 }
 
-function aiCalls(events: ReturnType<typeof createRecordingEventSink>): readonly { readonly type: 'ai-call'; readonly stepId: string }[] {
-  return events.emitted().filter((event): event is { readonly type: 'ai-call'; readonly stepId: string } => event.type === 'ai-call');
+function aiCalls(events: ReturnType<typeof createRecordingEventSink>): readonly Extract<RunEvent, { type: 'ai-call' }>[] {
+  return events.emitted().filter((event): event is Extract<RunEvent, { type: 'ai-call' }> => event.type === 'ai-call');
 }
 
 function pathBAccessibilityTree(statusName = 'Resolution status'): JsonValueT {
@@ -724,7 +724,7 @@ describe('run', () => {
       assertOutcome: { passed: false, message: 'Submit was not visible.' },
       onClose: closed,
     });
-    const { deps, recordingStorage } = createScenario({
+    const { deps, events, recordingStorage } = createScenario({
       browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
     });
     const testPath = await writePrompt(recordingStorage.storage);
@@ -748,6 +748,9 @@ describe('run', () => {
       ],
     });
     expect(closed).toHaveBeenCalledTimes(1);
+    expect(events.emitted()).toEqual([
+      { type: 'step-start', stepId: 'assert-submit' },
+    ]);
   });
 
   it('aborts a browser-launch failure before any step has execution evidence', async () => {
@@ -884,6 +887,47 @@ describe('run', () => {
 
     expectStopgapOutcome(outcome, 'click-submit', 'after-browser-error', 'before-browser-error');
     expect(closed).toHaveBeenCalledTimes(1);
+  });
+
+  it('emits step-start for a step before its dispatch begins, not only by the time the run resolves', async () => {
+    const eventsAtSecondPerform: RunEvent[] = [];
+    const session = createFakeBrowserSession(liveEntries([EMAIL, SUBMIT]), {
+      onPerform(action) {
+        if (action.type === 'click') {
+          eventsAtSecondPerform.push(...events.emitted());
+          throw new Error('detached element');
+        }
+      },
+    });
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    const steps: Step[] = [
+      { id: 'fill-first', kind: 'action', action: 'fill', target: EMAIL, value: 'person@example.test' },
+      { id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT },
+      { id: 'after-browser-error', kind: 'action', action: 'navigate', url: '/after' },
+    ];
+    await seedFreshArtifacts(recordingStorage.storage, testPath, steps, elementGrounding(['fill-first', 'click-submit']));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result).toMatchObject({
+      status: 'error',
+      steps: [
+        { id: 'fill-first', status: 'passed' },
+        { id: 'click-submit', status: 'error', kind: 'environment' },
+        { id: 'after-browser-error', status: 'skipped' },
+      ],
+    });
+    // Sampling events at onPerform entry proves a step-start seen there was
+    // emitted before dispatch, rather than deferred until the run settles.
+    expect(eventsAtSecondPerform).toEqual([
+      { type: 'step-start', stepId: 'fill-first' },
+      { type: 'step-result', stepId: 'fill-first', via: 'grounding' },
+      { type: 'step-start', stepId: 'click-submit' },
+    ]);
+    expect(events.emitted()).toEqual(eventsAtSecondPerform);
   });
 
   it('continues a sibling case after a browser-launch failure', async () => {
@@ -1241,6 +1285,9 @@ describe('run agentic fallback pipeline', () => {
     });
     expect(resolveAiExecutor).not.toHaveBeenCalled();
     expect(aiCalls(events)).toEqual([]);
+    expect(events.emitted()).toEqual([
+      { type: 'step-start', stepId: 'recorded-ai' },
+    ]);
   });
 
   it('suppresses a behavioral trace fallback in cache-only mode without resolving an AI executor', async () => {

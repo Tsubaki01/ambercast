@@ -27,6 +27,7 @@ import type { LayoutResolver } from '#core/layout/resolve.js';
 import { joinPath } from '#core/paths.js';
 import type { AiExecutor } from '#ports/ai.js';
 import type { StorageAdapter } from '#ports/storage.js';
+import type { EventSink } from '#ports/system.js';
 import {
   assertNoLiteralSecrets,
   assertSecretRefsGrounded,
@@ -170,6 +171,14 @@ export interface GenerateDeps {
   readonly aiExecutor: AiExecutor;
 
   /**
+   * Receives lifecycle accounting for structured provider invocations.
+   *
+   * Every attempted `aiExecutor.execute` call emits one `ai-call`; paths that
+   * avoid the provider emit none.
+   */
+  readonly events: EventSink;
+
+  /**
    * Configured prompt discovery injected from runtime.
    *
    * This structural callback mirrors runtime's `TestFileDiscovery` without a
@@ -231,8 +240,8 @@ export interface GenerateOutcome {
 /**
  * Generates or previews deterministic plan artifacts for resolved prompt files.
  *
- * @param deps - I/O, layout, provider, discovery, configuration, and optional
- * cancellation dependencies.
+ * @param deps - I/O, layout, provider, event delivery, discovery,
+ * configuration, and optional cancellation dependencies.
  * @param options - Batch selection and generation policy.
  * @returns Ordered file outcomes and the zero-match fact needed by the command
  * layer's exit policy.
@@ -240,9 +249,11 @@ export interface GenerateOutcome {
  * Literal paths retain caller order; discovered paths retain the order supplied
  * by the injected discovery seam, which owns sorting and deduplication. List
  * mode performs that filesystem discovery but does not read prompt files,
- * invoke AI, or write artifacts. Other files run sequentially, so a caller
- * cancellation prevents new work without discarding earlier outcomes, while
- * an individual file failure does not block later files.
+ * invoke AI, emit lifecycle events, or write artifacts. Every attempted
+ * provider invocation emits one `ai-call` event; paths that avoid the
+ * provider emit none. Other files run sequentially, so a caller cancellation
+ * prevents new work without discarding earlier outcomes, while an individual
+ * file failure does not block later files.
  *
  * Freshness requires both semantic validity and canonical artifact bytes,
  * preventing malformed or reformatted plans from skipping generation. A
@@ -334,6 +345,7 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
     const signal = AbortSignal.any(deps.signal === undefined ? [timeout] : [deps.signal, timeout]);
     let response;
     try {
+      deps.events.emit({ type: 'ai-call' });
       response = await deps.aiExecutor.execute({
         prompt: 'Generate a deterministic ambercast execution plan for the supplied Markdown test.',
         responseSchema: GENERATED_PLAN_RESPONSE_SCHEMA,

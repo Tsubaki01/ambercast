@@ -82,12 +82,14 @@ export interface EnvironmentInfo {
 }
 
 /**
- * A lifecycle event emitted while a run is executing.
+ * A lifecycle event emitted while a use case generates or replays a plan.
  *
  * @remarks
- * The variants intentionally carry only step identity and, for results, the
- * resolution path. The discriminated union can gain richer payloads later
- * without making an early reporting boundary needlessly broad.
+ * Replay events always identify the affected step. A generation-wide provider
+ * invocation happens before a plan supplies any step identity, so its
+ * `ai-call` event may omit `stepId`. The variants intentionally carry only
+ * that available identity and, for results, the resolution path, keeping the
+ * reporting boundary narrow while allowing richer payloads when needed.
  */
 export type RunEvent =
   | { readonly type: 'step-start'; readonly stepId: StepId }
@@ -96,15 +98,15 @@ export type RunEvent =
       readonly stepId: StepId;
       readonly via: 'grounding' | 'ai-resolve' | 'trace-replay';
     }
-  | { readonly type: 'ai-call'; readonly stepId: StepId };
+  | { readonly type: 'ai-call'; readonly stepId?: StepId };
 
 /**
- * Receives run lifecycle events without coupling execution to a reporting
- * transport.
+ * Receives use-case lifecycle events without coupling generation or replay to
+ * a reporting transport.
  */
 export interface EventSink {
   /**
-   * Delivers one well-formed lifecycle event to this sink.
+   * Delivers one well-formed use-case lifecycle event to this sink.
    *
    * Events are delivered in emission order. Repeated or identical events are
    * retained as separate deliveries, and this method never throws for a
@@ -114,7 +116,7 @@ export interface EventSink {
    *
    * @remarks
    * A sink that might fail must swallow the failure or queue work internally;
-   * reporting must not interrupt the run loop that emits these events.
+   * reporting must not interrupt the use case that emits these events.
    */
   emit(event: RunEvent): void;
 }

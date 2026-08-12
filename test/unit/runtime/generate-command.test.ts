@@ -9,6 +9,7 @@ import {
   type GenerateCommandInput,
   type GenerateCommandOutput,
 } from '#runtime/generate-command.js';
+import { createRecordingEventSink } from '../../doubles/create-recording-event-sink.js';
 
 const mocks = vi.hoisted(() => ({
   loadConfig: vi.fn(),
@@ -17,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   buildGenerateReport: vi.fn(),
   claudeFactory: vi.fn(),
   codexFactory: vi.fn(),
+  createNoopEventSink: vi.fn(),
   createSystemClock: vi.fn(),
 }));
 
@@ -27,6 +29,7 @@ vi.mock('#usecases/generate-report.js', () => ({ buildGenerateReport: mocks.buil
 vi.mock('#adapters/ai/registry.js', () => ({
   AI_EXECUTOR_FACTORIES: { claude: mocks.claudeFactory, codex: mocks.codexFactory },
 }));
+vi.mock('#adapters/system/noop-event-sink.js', () => ({ createNoopEventSink: mocks.createNoopEventSink }));
 vi.mock('#adapters/system/system-clock.js', () => ({ createSystemClock: mocks.createSystemClock }));
 
 const CONFIG: ResolvedConfig = {
@@ -80,12 +83,14 @@ function arrangeSuccessfulCommand(
   selectedProvider: 'claude' | 'codex',
 ) {
   const selected = executor(selectedProvider, true);
+  const events = createRecordingEventSink();
   mocks.loadConfig.mockResolvedValue({ ...CONFIG, ai: { ...CONFIG.ai, provider: configuredProvider } });
   if (selectedProvider === 'claude') {
     mocks.claudeFactory.mockReturnValue(selected);
   } else {
     mocks.codexFactory.mockReturnValue(selected);
   }
+  mocks.createNoopEventSink.mockReturnValue(events.sink);
   mocks.createAmbercast.mockReturnValue({
     aiExecutor: selected,
     clock: { now: () => new Date('2026-08-08T00:00:00Z'), monotonicMs: () => 10 },
@@ -93,7 +98,7 @@ function arrangeSuccessfulCommand(
   mocks.generate.mockResolvedValue({ results: [], noTestsFound: false });
   const output = reportOutput(0);
   mocks.buildGenerateReport.mockReturnValue(output);
-  return { selected, output };
+  return { selected, events, output };
 }
 
 afterEach(() => {
@@ -110,12 +115,12 @@ beforeEach(() => {
 
 describe('runGenerateCommand', () => {
   it('loads config, lets an explicit provider override win, composes, and generates', async () => {
-    const { selected, output } = arrangeSuccessfulCommand('auto', 'codex');
+    const { events, selected, output } = arrangeSuccessfulCommand('auto', 'codex');
 
     await expect(runGenerateCommand(input({ aiProviderOverride: 'codex' }))).resolves.toEqual(output);
     expect(mocks.loadConfig).toHaveBeenCalledWith(expect.objectContaining({ cwd: '/workspace' }));
-    expect(mocks.createAmbercast).toHaveBeenCalledWith(expect.objectContaining({ aiProvider: 'codex' }));
-    expect(mocks.generate).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ files: [] }));
+    expect(mocks.createAmbercast).toHaveBeenCalledWith(expect.objectContaining({ aiProvider: 'codex', events: events.sink }));
+    expect(mocks.generate).toHaveBeenCalledWith(expect.objectContaining({ events: events.sink }), expect.objectContaining({ files: [] }));
     expect(selected.isAvailable).not.toHaveBeenCalled();
     expect(mocks.claudeFactory).not.toHaveBeenCalled();
   });

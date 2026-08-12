@@ -5,6 +5,7 @@
 
 import { createFsStorage } from '#adapters/storage/fs-storage.js';
 import { readConfigEnvironment } from '#adapters/system/process-config-environment.js';
+import { createNoopEventSink } from '#adapters/system/noop-event-sink.js';
 import { createSystemClock } from '#adapters/system/system-clock.js';
 import { loadConfig } from '#config/load.js';
 import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
@@ -100,11 +101,13 @@ export async function runGenerateCommand(input: GenerateCommandInput): Promise<G
       ...(input.configPathOverride === undefined ? {} : { configPathOverride: input.configPathOverride }),
     });
     const aiProvider = await resolveAiProvider(config.ai.provider, input.aiProviderOverride, input.signal);
-    const ambercast = createAmbercast({ config, aiProvider });
+    const events = createNoopEventSink();
+    const ambercast = createAmbercast({ config, aiProvider, events });
     const outcome = await generate({
       storage: ambercast.storage,
       layout: ambercast.layout,
       aiExecutor: ambercast.aiExecutor,
+      events,
       discoverTestFiles: ambercast.discoverTestFiles,
       config,
       ...(input.signal === undefined ? {} : { signal: input.signal }),

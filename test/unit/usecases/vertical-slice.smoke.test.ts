@@ -59,6 +59,7 @@ describe('fake vertical slice', () => {
   it('replays a generated plan from pre-seeded grounding without AI calls', async () => {
     const storage = createInMemoryStorage();
     const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
+    const generateEvents = createRecordingEventSink();
     const execute = vi.fn(async () => ({ data: GENERATED_RESPONSE, raw: JSON.stringify(GENERATED_RESPONSE) }));
     await storage.writeText(TEST_PATH, PROMPT);
 
@@ -66,6 +67,7 @@ describe('fake vertical slice', () => {
       storage,
       layout,
       aiExecutor: createFakeAiExecutor({ execute }),
+      events: generateEvents.sink,
       discoverTestFiles: async () => [],
       config: {
         testDir: TEST_DIR,
@@ -82,6 +84,7 @@ describe('fake vertical slice', () => {
       results: [{ file: TEST_PATH, status: 'generated', planFile: layout.planPathFor(TEST_PATH) }],
     });
     expect(execute).toHaveBeenCalledOnce();
+    expect(generateEvents.emitted()).toEqual([{ type: 'ai-call' }]);
 
     const plan = PlanDocument.parse(JSON.parse(await storage.readText(layout.planPathFor(TEST_PATH))));
     expect(GroundingDocument.parse(JSON.parse(await storage.readText(layout.groundingPathFor(TEST_PATH))))).toEqual({
@@ -101,7 +104,7 @@ describe('fake vertical slice', () => {
       };
       return { stepId: step.id, target: step.target, fingerprint };
     });
-    // A cold-start miss (fresh generate() grounding without this pre-seed) is deferred to path B; this test cannot and does not exercise that path.
+    // Path B covers a cold-start grounding miss; this test exercises only pre-seeded grounding.
     const seededGrounding: GroundingDocument = {
       schemaVersion: 1,
       planDigest: computePlanDigest(plan),
@@ -174,6 +177,7 @@ describe('fake vertical slice', () => {
       storage,
       layout,
       aiExecutor: createFakeAiExecutor({ execute }),
+      events: createRecordingEventSink().sink,
       discoverTestFiles: async () => [],
       config: {
         testDir: TEST_DIR,
@@ -266,6 +270,7 @@ describe('fake vertical slice', () => {
       aiExecutor: createFakeAiExecutor({
         execute: async () => ({ data: generatedResponse, raw: JSON.stringify(generatedResponse) }),
       }),
+      events: createRecordingEventSink().sink,
       discoverTestFiles: async () => [],
       config: {
         testDir: TEST_DIR,
