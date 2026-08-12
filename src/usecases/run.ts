@@ -2004,6 +2004,13 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
 
     for (const [index, originalStep] of planSteps.entries()) {
       currentStep = originalStep;
+      /*
+       * `step-start` emits here, unconditionally, because it records each step
+       * attempt rather than completion, including when its assertion fails or
+       * its dispatch throws, while `step-result` stays gated on a completed
+       * resolution path because it reports the step's `via` field.
+       */
+      deps.events.emit({ type: 'step-start', stepId: originalStep.id });
       const step = originalStep.kind === 'ai'
         ? originalStep
         : materializeStep(originalStep, context.runState, context.target.baseUrl);
@@ -2046,7 +2053,6 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
       if (originalStep.kind === 'capture') {
         allowedRunRefs.add(originalStep.variable);
       }
-      deps.events.emit({ type: 'step-start', stepId: originalStep.id });
       deps.events.emit({
         type: 'step-result',
         stepId: originalStep.id,

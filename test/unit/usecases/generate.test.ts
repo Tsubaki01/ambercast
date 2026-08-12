@@ -17,6 +17,7 @@ import type { StorageAdapter } from '#ports/storage.js';
 import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/generate.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
 import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
+import { createRecordingEventSink } from '../../doubles/create-recording-event-sink.js';
 
 const TEST_DIR = '/workspace/tests';
 const RUNS_DIR = '/workspace/tests/.runs';
@@ -106,11 +107,13 @@ function createRecordingStorage(
 
 function createScenario(overrides: Partial<GenerateDeps> = {}) {
   const recordingStorage = createRecordingStorage();
+  const events = createRecordingEventSink();
   const execute = vi.fn(async () => ({ data: RESPONSE, raw: JSON.stringify(RESPONSE) }));
   const deps: GenerateDeps = {
     storage: recordingStorage.storage,
     layout: createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR }),
     aiExecutor: createFakeAiExecutor({ execute }),
+    events: events.sink,
     discoverTestFiles: vi.fn(async () => ['login.test.md']),
     config: {
       testDir: TEST_DIR,
@@ -123,7 +126,7 @@ function createScenario(overrides: Partial<GenerateDeps> = {}) {
     ...overrides,
   };
 
-  return { deps, execute, recordingStorage };
+  return { deps, events, execute, recordingStorage };
 }
 
 async function writePrompt(storage: StorageAdapter, relativePath = 'login.test.md', contents = PROMPT): Promise<string> {
@@ -188,17 +191,18 @@ describe('generate', () => {
   });
 
   it('gives list precedence over dry-run, force, and strict without reading prompts or writing artifacts', async () => {
-    const { deps, execute, recordingStorage } = createScenario({ discoverTestFiles: async () => ['login.test.md'] });
+    const { deps, events, execute, recordingStorage } = createScenario({ discoverTestFiles: async () => ['login.test.md'] });
 
     await expect(generate(deps, { ...DEFAULT_OPTIONS, list: true, dryRun: true, force: true, strict: true }))
       .resolves.toEqual({ results: [{ file: `${TEST_DIR}/login.test.md`, status: 'listed' }], noTestsFound: false });
     expect(execute).not.toHaveBeenCalled();
+    expect(events.emitted()).toEqual([]);
     expect(recordingStorage.reads).toEqual([]);
     expect(recordingStorage.writes).toEqual([]);
   });
 
   it('skips a valid canonical fresh plan without calling AI or rewriting artifacts', async () => {
-    const { deps, execute, recordingStorage } = createScenario();
+    const { deps, events, execute, recordingStorage } = createScenario();
     const testPath = await writePrompt(recordingStorage.storage);
     await seedFreshArtifacts(recordingStorage.storage, testPath);
     recordingStorage.reset();
@@ -207,6 +211,7 @@ describe('generate', () => {
       results: [{ file: testPath, status: 'skipped-fresh', planFile: `${TEST_DIR}/login.ambercast.plan.json` }],
     });
     expect(execute).not.toHaveBeenCalled();
+    expect(events.emitted()).toEqual([]);
     expect(recordingStorage.writes).toEqual([]);
   });
 
@@ -216,7 +221,7 @@ describe('generate', () => {
     ['a stale plan in dry-run', { force: false, dryRun: true }, 'would-generate'],
     ['a fresh plan forced in dry-run', { force: true, dryRun: true }, 'would-generate'],
   ] as const)('generates or previews %s according to force and dry-run policy', async (_description, policy, status) => {
-    const { deps, execute, recordingStorage } = createScenario();
+    const { deps, events, execute, recordingStorage } = createScenario();
     const testPath = await writePrompt(recordingStorage.storage);
     if (policy.force) {
       await seedFreshArtifacts(recordingStorage.storage, testPath);
@@ -229,6 +234,7 @@ describe('generate', () => {
       results: [{ file: testPath, status }],
     });
     expect(execute).toHaveBeenCalledTimes(1);
+    expect(events.emitted()).toEqual([{ type: 'ai-call' }]);
     expect(recordingStorage.writes.length).toBe(policy.dryRun ? 0 : 2);
   });
 
@@ -304,7 +310,7 @@ describe('generate', () => {
     ['provider rejection', new AiExecutorUnavailableError('provider unavailable'), 'ai-executor-unavailable'],
     ['invalid response rejection', new AiResponseInvalidError('invalid response'), 'ai-response-invalid'],
   ] as const)('keeps %s as a failed file and continues to later files', async (_description, error, kind) => {
-    const { deps, recordingStorage } = createScenario({
+    const { deps, events, recordingStorage } = createScenario({
       aiExecutor: createFakeAiExecutor({
         execute: async (request) => {
           if (request.context !== null && typeof request.context === 'object' && 'testMd' in request.context && String(request.context.testMd).includes('first')) {
@@ -324,6 +330,7 @@ describe('generate', () => {
         { file: `${TEST_DIR}/second.test.md`, status: 'generated' },
       ],
     });
+    expect(events.emitted()).toEqual([{ type: 'ai-call' }, { type: 'ai-call' }]);
   });
 
   it('wraps a per-call timeout as an unavailable executor failure and continues the batch', async () => {

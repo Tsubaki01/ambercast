@@ -23,6 +23,27 @@ import type {
   AiUsage,
 } from '#ports/ai.js';
 
+/**
+ * Produces the Claude transport schema without its top-level schema
+ * declaration.
+ *
+ * @param schema - The response schema selected by the caller.
+ * @returns A shallow copy that omits only the top-level `$schema` keyword.
+ *
+ * @remarks
+ * Destructuring creates a shallow copy instead of deleting a property in
+ * place because `request.responseSchema` may be the shared module-level
+ * `GENERATED_PLAN_RESPONSE_SCHEMA` constant reused by every call in the
+ * process. Only the top-level transport keyword is removed: a deep strip
+ * could alter nested schemas whose declarations remain part of their meaning.
+ */
+function withoutDollarSchema(
+  schema: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  const { $schema: _schemaDeclaration, ...schemaWithoutDeclaration } = schema;
+  return schemaWithoutDeclaration;
+}
+
 function responseInvalid(raw: string, message: string, cause?: unknown): AiResponseInvalidError {
   return new AiResponseInvalidError(message, { raw, issues: [{ path: '', message }] }, { cause });
 }
@@ -76,7 +97,7 @@ export function createClaudeCodeCliExecutor(deps: { readonly run?: CommandRunner
     name: 'claude-code-cli',
     execute<T>(request: AiExecuteRequest<T>): Promise<AiExecuteResult<T>> {
       return rejectOnAbort(request.signal, async () => {
-        const responseSchema = JSON.stringify(request.responseSchema);
+        const responseSchema = JSON.stringify(withoutDollarSchema(request.responseSchema));
         if (responseSchema.length > 200_000) {
           throw new AiExecutorUnavailableError(
             'The Claude Code CLI response schema is too large to pass as an argument.',

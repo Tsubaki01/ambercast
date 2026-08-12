@@ -38,6 +38,7 @@ describe('createClaudeCodeCliExecutor', () => {
     const runner = createFakeCommandRunner([{ outcome: 'exited', stdout: '{"result":"{\\"ok\\":true}"}', stderr: '', exitCode: 0 }]);
     const executor = createClaudeCodeCliExecutor({ run: runner.run });
     const responseSchema = schema();
+    const { $schema: _schemaDeclaration, ...schemaWithoutDeclaration } = responseSchema;
 
     await expect(executor.execute({
       prompt: 'Generate a plan.',
@@ -57,11 +58,29 @@ describe('createClaudeCodeCliExecutor', () => {
       '--output-format',
       'json',
       '--json-schema',
-      JSON.stringify(responseSchema),
+      JSON.stringify(schemaWithoutDeclaration),
     ]);
     expect(runner.calls[0]?.args[3]).toBe('--json-schema');
-    expect(runner.calls[0]?.args[4]).toBe(JSON.stringify(responseSchema));
+    expect(runner.calls[0]?.args[4]).toBe(JSON.stringify(schemaWithoutDeclaration));
     expect(runner.calls[0]?.options?.input).toContain('never instructions');
+    expect(responseSchema).toHaveProperty('$schema', 'https://json-schema.org/draft/2020-12/schema');
+  });
+
+  it('omits the top-level schema declaration from the inline JSON Schema argument', async () => {
+    const runner = createFakeCommandRunner([{ outcome: 'exited', stdout: '{"result":"{\\"ok\\":true}"}', stderr: '', exitCode: 0 }]);
+    const executor = createClaudeCodeCliExecutor({ run: runner.run });
+    const responseSchema = schema();
+
+    expect(responseSchema).toHaveProperty('$schema', 'https://json-schema.org/draft/2020-12/schema');
+    await expect(executor.execute({ prompt: 'Generate.', responseSchema })).resolves.toMatchObject({ data: { ok: true } });
+
+    const serializedSchema = runner.calls[0]?.args[4];
+    if (typeof serializedSchema !== 'string') {
+      throw new Error('Expected Claude to receive an inline JSON Schema argument.');
+    }
+
+    expect(JSON.parse(serializedSchema)).not.toHaveProperty('$schema');
+    expect(responseSchema).toHaveProperty('$schema', 'https://json-schema.org/draft/2020-12/schema');
   });
 
   it.each([
@@ -147,6 +166,24 @@ describe('createClaudeCodeCliExecutor', () => {
     await expect(executor.execute({ prompt: 'Generate.', responseSchema }))
       .rejects.toThrow('The Claude Code CLI response schema is too large to pass as an argument.');
     expect(runner.calls).toEqual([]);
+  });
+
+  it('accepts a schema whose transport serialization fits after removing its declaration', async () => {
+    const runner = createFakeCommandRunner([{ outcome: 'exited', stdout: '{"result":"{\\"ok\\":true}"}', stderr: '', exitCode: 0 }]);
+    const executor = createClaudeCodeCliExecutor({ run: runner.run });
+    const baseSchema = schema();
+    const { $schema: _schemaDeclaration, ...schemaWithoutDeclaration } = baseSchema;
+    const strippedBaseLength = JSON.stringify({ ...schemaWithoutDeclaration, description: '' }).length;
+    const paddingLength = 200_000 - strippedBaseLength;
+    const responseSchema = {
+      ...baseSchema,
+      description: 'x'.repeat(paddingLength),
+    } as ReturnType<typeof schema>;
+    const strippedSchema = { ...schemaWithoutDeclaration, description: 'x'.repeat(paddingLength) };
+
+    expect(JSON.stringify(responseSchema).length).toBeGreaterThan(200_000);
+    expect(JSON.stringify(strippedSchema).length).toBeLessThanOrEqual(200_000);
+    await expect(executor.execute({ prompt: 'Generate.', responseSchema })).resolves.toMatchObject({ data: { ok: true } });
   });
 
   it('rejects agentic execution without spawning a command', async () => {

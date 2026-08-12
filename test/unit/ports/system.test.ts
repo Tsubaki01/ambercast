@@ -23,7 +23,7 @@ describe('system port shapes', () => {
     expectTypeOf<RunEvent>().toEqualTypeOf<
       | { readonly type: 'step-start'; readonly stepId: StepId }
       | { readonly type: 'step-result'; readonly stepId: StepId; readonly via: 'grounding' | 'ai-resolve' | 'trace-replay' }
-      | { readonly type: 'ai-call'; readonly stepId: StepId }
+      | { readonly type: 'ai-call'; readonly stepId?: StepId }
     >();
     expectTypeOf<EventSink['emit']>().toEqualTypeOf<(event: RunEvent) => void>();
   });

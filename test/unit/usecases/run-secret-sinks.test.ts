@@ -192,6 +192,7 @@ function createGenerateScenario(
       storage: recordingStorage.storage,
       layout: createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR }),
       aiExecutor,
+      events: createRecordingEventSink().sink,
       discoverTestFiles: async () => ['login.test.md'],
       config: {
         testDir: TEST_DIR,

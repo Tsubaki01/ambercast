@@ -56,6 +56,6 @@ export interface Ports {
   /** Supplies execution-environment facts that influence runtime policy. */
   readonly environment: EnvironmentInfo;
 
-  /** Receives ordered lifecycle reporting without affecting run execution. */
+  /** Receives use-case lifecycle events without coupling generation or replay to a reporting transport. */
   readonly events: EventSink;
 }

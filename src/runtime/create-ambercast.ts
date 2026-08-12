@@ -2,11 +2,12 @@
  * Composes the concrete services shared by the `generate` and `run` command
  * paths.
  *
- * Replay needs browser-driver resolution, secret lookup, and event delivery;
- * generation needs an AI executor; and both commands share filesystem storage,
- * layout, clock, and discovery. One composer holds that real dependency set so
- * command paths converge on the same Ports-aligned application boundary
- * instead of duplicating composition policy in a parallel run-specific helper.
+ * Generation needs an AI executor and event delivery; replay needs browser
+ * driver resolution, secret lookup, and the same event delivery; and both
+ * commands share filesystem storage, layout, clock, and discovery. One
+ * composer holds that real dependency set so command paths converge on the
+ * same Ports-aligned application boundary instead of duplicating composition
+ * policy in a parallel run-specific helper.
  */
 
 import { AI_EXECUTOR_FACTORIES } from '#adapters/ai/registry.js';
@@ -52,10 +53,11 @@ export interface CreateAmbercastOptions {
   readonly secrets?: SecretsProvider;
 
   /**
-   * Replay event delivery. The `events` name exactly matches `Ports`,
-   * rather than creating a parallel `eventSink` vocabulary here.
+   * Lifecycle event delivery for generation and replay. The `events` name
+   * exactly matches `Ports`, rather than creating a parallel `eventSink`
+   * vocabulary here.
    */
-  readonly events?: EventSink;
+  readonly events: EventSink;
 }
 
 /**
@@ -90,10 +92,10 @@ export interface Ambercast {
   readonly secrets?: SecretsProvider;
 
   /**
-   * Replay event delivery, retaining Ports' `events` name rather than a
-   * second `eventSink` name for the same port.
+   * Lifecycle event delivery for generation and replay, retaining Ports'
+   * `events` name rather than a second `eventSink` name for the same port.
    */
-  readonly events?: EventSink;
+  readonly events: EventSink;
 }
 
 /**
@@ -104,9 +106,9 @@ export interface Ambercast {
  * @remarks
  * This is intentionally not a general ports factory. It serves the two real
  * callers, `generate` and `run`, and grows only with dependencies one of them
- * actually uses. Replay makes `browserDriver`, `secrets`, and `events` real
- * dependencies; random and environment ports remain outside this composer
- * because neither composed command depends on them. Keeping one composer instead of a speculative
+ * actually uses. Generation and replay both make `events` a real dependency;
+ * random and environment ports remain outside this composer because neither
+ * composed command depends on them. Keeping one composer instead of a speculative
  * `createRunAmbercast()` split preserves a single, visibly Ports-aligned
  * application boundary.
  *
@@ -120,13 +122,13 @@ export interface Ambercast {
  * executor is not read and is not passed to `run()`—`RunDeps` has no
  * `aiExecutor` field—so a grounded replay still requires no AI CLI.
  *
- * `browserDriver`, `secrets`, and `events` remain optional in both input and
- * result because generation supplies none of them. Replay keeps local,
- * non-optional references to the same values it passes here and gives those
- * references directly to `run()`'s non-optional `RunDeps` fields; it does not
- * read them back from the optional `Ambercast` properties and therefore needs
- * no unsound assertion. The returned optional fields still make the composed
- * shape visibly converge toward `Ports` for consumers that do need them.
+ * `browserDriver` and `secrets` remain optional in both input and result
+ * because generation supplies neither. Replay keeps local, non-optional
+ * references to the same values it passes here and gives those references
+ * directly to `run()`'s non-optional `RunDeps` fields; it does not read them
+ * back from the optional `Ambercast` properties and therefore needs no unsound
+ * assertion. The returned optional fields still make the composed shape
+ * visibly converge toward `Ports` for consumers that do need them.
  */
 export function createAmbercast(options: CreateAmbercastOptions): Ambercast {
   return {
@@ -139,6 +141,6 @@ export function createAmbercast(options: CreateAmbercastOptions): Ambercast {
     discoverTestFiles: createFsTestFileDiscovery(),
     ...(options.browserDriver === undefined ? {} : { browserDriver: options.browserDriver }),
     ...(options.secrets === undefined ? {} : { secrets: options.secrets }),
-    ...(options.events === undefined ? {} : { events: options.events }),
+    events: options.events,
   };
 }

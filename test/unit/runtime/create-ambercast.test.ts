@@ -63,7 +63,7 @@ describe('createAmbercast', () => {
     ['claude', 'claude-code-cli'],
     ['codex', 'codex-cli'],
   ] as const)('composes the narrow generation service set for %s', (provider, executorName) => {
-    const ambercast = createAmbercast({ config: CONFIG, aiProvider: provider });
+    const ambercast = createAmbercast({ config: CONFIG, aiProvider: provider, events: createRecordingEventSink().sink });
 
     expect(ambercast.aiExecutor.name).toBe(executorName);
     expect(typeof ambercast.storage.readText).toBe('function');
@@ -82,7 +82,7 @@ describe('createAmbercast', () => {
     };
     mocks.readCommandEnvironment.mockReturnValue(commandEnvironment);
 
-    createAmbercast({ config: CONFIG, aiProvider: provider });
+    createAmbercast({ config: CONFIG, aiProvider: provider, events: createRecordingEventSink().sink });
 
     expect(mocks.readCommandEnvironment).toHaveBeenCalledExactlyOnceWith();
     const result = await capturedRunner(factory)(process.execPath, [
@@ -102,7 +102,7 @@ describe('createAmbercast', () => {
   });
 
   it('uses resolved configuration roots for storage layout rather than creating unrelated port stand-ins', () => {
-    const ambercast = createAmbercast({ config: CONFIG, aiProvider: 'codex' });
+    const ambercast = createAmbercast({ config: CONFIG, aiProvider: 'codex', events: createRecordingEventSink().sink });
 
     expect(ambercast.layout.planPathFor('/workspace/tests/nested/login.test.md'))
       .toBe('/workspace/tests/nested/login.ambercast.plan.json');
@@ -110,28 +110,32 @@ describe('createAmbercast', () => {
 
   it('keeps a headed Chromium resolver intact so replay resolves through the driver registry', () => {
     const browserDriver = createBrowserDriverResolver({ headed: true });
-    const ambercast = createAmbercast({ config: CONFIG, aiProvider: 'codex', browserDriver });
+    const ambercast = createAmbercast({
+      config: CONFIG,
+      aiProvider: 'codex',
+      browserDriver,
+      events: createRecordingEventSink().sink,
+    });
 
     expect(ambercast.browserDriver).toBe(browserDriver);
     expect(ambercast.browserDriver?.('chromium').engine).toBe('chromium');
   });
 
   it('omits browser driver when generation has none', () => {
-    expect(createAmbercast({ config: CONFIG, aiProvider: 'codex' }).browserDriver).toBeUndefined();
+    expect(createAmbercast({ config: CONFIG, aiProvider: 'codex', events: createRecordingEventSink().sink }).browserDriver).toBeUndefined();
   });
 
   it('retains supplied secrets and omits them when generation has none', () => {
     const secrets = createFakeSecretsProvider(new Map([['{{secrets.auth.password}}', 'secret']]));
 
-    expect(createAmbercast({ config: CONFIG, aiProvider: 'codex', secrets }).secrets).toBe(secrets);
-    expect(createAmbercast({ config: CONFIG, aiProvider: 'codex' }).secrets).toBeUndefined();
+    expect(createAmbercast({ config: CONFIG, aiProvider: 'codex', secrets, events: createRecordingEventSink().sink }).secrets).toBe(secrets);
+    expect(createAmbercast({ config: CONFIG, aiProvider: 'codex', events: createRecordingEventSink().sink }).secrets).toBeUndefined();
   });
 
-  it('retains supplied events and omits them when generation has none', () => {
+  it('passes the supplied events sink through unchanged', () => {
     const events = createRecordingEventSink();
 
     expect(createAmbercast({ config: CONFIG, aiProvider: 'codex', events: events.sink }).events).toBe(events.sink);
-    expect(createAmbercast({ config: CONFIG, aiProvider: 'codex' }).events).toBeUndefined();
   });
 
   it('constructs its AI executor even when every replay-specific port is supplied', () => {
