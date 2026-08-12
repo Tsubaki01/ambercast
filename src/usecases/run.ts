@@ -1,5 +1,6 @@
 import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
 import type { ResolvedConfig } from '#core/config/schema.js';
+import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
 import { BrowserLaunchFailedError } from '#core/errors/browser-launch-failed-error.js';
 import { FsIoError } from '#core/errors/fs-io-error.js';
 import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
@@ -91,6 +92,7 @@ interface DispatchContext {
   readonly updateGroundingEntry: (stepId: Step['id'], entry: GroundingEntry) => void;
   readonly deleteGroundingEntry: (stepId: Step['id']) => void;
   readonly resolvedVias: Map<Step['id'], ResolutionVia>;
+  readonly aiTimeoutMs: number;
   readonly signal?: AbortSignal;
 }
 
@@ -127,6 +129,45 @@ const CONFIRMATION_RESPONSE = z.strictObject({ confirmed: z.boolean() });
  * request without exposing a second, hand-maintained wire schema.
  */
 const CONFIRMATION_RESPONSE_SCHEMA = typedJsonSchema(CONFIRMATION_RESPONSE);
+
+/**
+ * Invokes one AI request with an independent timeout while preserving the
+ * caller's cancellation semantics.
+ *
+ * Each provider request receives its own timeout because browser work and
+ * earlier fallback calls must not consume a later request's configured
+ * budget. Keeping signal composition, invocation, and failure attribution
+ * together also keeps both run paths on one cancellation contract while the
+ * locally created timeout reason remains available for trustworthy
+ * attribution. `AbortSignal.any()` forwards the winning source's exact
+ * reason, and the AI boundary's `rejectOnAbort()` rejects with that composed
+ * reason. Every `AbortSignal.timeout()` call creates a fresh reason object,
+ * so comparing it by identity distinguishes this call's timeout from a
+ * caller-provided error that merely has a timeout-like name. Only a rejection
+ * equal to the freshly created timeout's reason after that timeout aborts
+ * becomes an `AiExecutorUnavailableError`; caller cancellation and every
+ * other provider failure retain their original error.
+ */
+async function callAiExecutor<T>(
+  context: DispatchContext,
+  invoke: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const timeout = AbortSignal.timeout(context.aiTimeoutMs);
+  const signal = AbortSignal.any(context.signal === undefined ? [timeout] : [context.signal, timeout]);
+  try {
+    return await invoke(signal);
+  } catch (error) {
+    if (timeout.aborted && error === timeout.reason) {
+      throw new AiExecutorUnavailableError(
+        'The AI provider did not respond within the configured timeout.',
+        undefined,
+        { cause: error },
+      );
+    }
+
+    throw error;
+  }
+}
 
 /**
  * Marks an abort that has no reportable error kind while retaining a useful
@@ -1202,14 +1243,14 @@ async function executeAgentic(
   const executor = await context.resolveAiExecutor();
   const pipeline = new AgenticRunPipeline(context, secretRefs, step, fallbackFromReplay);
   context.events.emit({ type: 'ai-call', stepId: step.id });
-  const result = await executor.executeAgentic({
+  const result = await callAiExecutor(context, (signal) => executor.executeAgentic({
     instructionPrompt: step.instruction,
     allowedSecretRefs: secretRefs,
     allowedRunRefs: [...context.allowedRunRefs],
     controller: pipeline,
     ...(priorTrace === undefined ? {} : { priorTrace }),
-    ...(context.signal === undefined ? {} : { signal: context.signal }),
-  });
+    signal,
+  }));
 
   return pipeline.finalize(result.outcome);
 }
@@ -1311,7 +1352,7 @@ async function groundedTarget(
 
   const executor = await context.resolveAiExecutor();
   context.events.emit({ type: 'ai-call', stepId: step.id });
-  const response = await executor.execute({
+  const response = await callAiExecutor(context, (signal) => executor.execute({
     prompt: 'Confirm whether the supplied locator still identifies the intended element.',
     responseSchema: CONFIRMATION_RESPONSE_SCHEMA,
     /**
@@ -1331,8 +1372,8 @@ async function groundedTarget(
         ) as JsonValueT,
       },
     },
-    ...(context.signal === undefined ? {} : { signal: context.signal }),
-  });
+    signal,
+  }));
 
   if (response.data.confirmed === false) {
     throw new CaseAbort('The AI could not confirm that the supplied locator identifies the intended element.');
@@ -1776,10 +1817,10 @@ export interface RunDeps {
     readonly testIgnore: readonly string[];
   }) => Promise<readonly string[]>;
 
-  /** The configuration subset used for discovery and target/digest resolution. */
+  /** The configuration subset used for discovery, target/digest resolution, and per-call AI timeout policy. */
   readonly config: Pick<
     ResolvedConfig,
-    'testDir' | 'testMatch' | 'testIgnore' | 'targets' | 'defaultTarget'
+    'testDir' | 'testMatch' | 'testIgnore' | 'targets' | 'defaultTarget' | 'ai'
   >;
 
   /**
@@ -1999,6 +2040,7 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
         }
       },
       resolvedVias,
+      aiTimeoutMs: deps.config.ai.timeoutMs,
       ...(deps.signal === undefined ? {} : { signal: deps.signal }),
     };
 

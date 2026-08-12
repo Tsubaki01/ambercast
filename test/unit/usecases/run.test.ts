@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { createFsStorage } from '#adapters/storage/fs-storage.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { BrowserLaunchFailedError } from '#core/errors/browser-launch-failed-error.js';
+import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
 import { FsIoError } from '#core/errors/fs-io-error.js';
 import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
@@ -62,6 +63,8 @@ const EMAIL: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'E
 const PASSWORD: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Password' };
 const SUBMIT: ElementRef = { strategy: 'accessibility', role: 'button', name: 'Submit' };
 const DEFAULT_OPTIONS: RunOptions = { files: [], cacheOnly: false, stale: 'fail' };
+const AI_TIMEOUT_MESSAGE = 'The AI provider did not respond within the configured timeout.';
+const GENERIC_ABORT_EXPLANATION = 'The browser session could not complete this case and no deterministic fallback is available.';
 
 interface RecordingStorage {
   readonly storage: StorageAdapter;
@@ -132,6 +135,7 @@ function createScenario(overrides: Partial<RunDeps> = {}): Scenario {
       testIgnore: ['**/.runs/**'],
       targets: TARGETS,
       defaultTarget: 'web',
+      ai: { provider: 'codex', timeoutMs: 120_000 },
     },
     ...overrides,
   };
@@ -268,6 +272,57 @@ function aiStep(
     instruction: 'Complete the sign-in flow and verify the dashboard.',
     ...(secrets === undefined ? {} : { secrets: [...secrets] }),
   };
+}
+
+function configWithAiTimeout(timeoutMs: number): RunDeps['config'] {
+  return {
+    testDir: TEST_DIR,
+    testMatch: ['**/*.test.md'],
+    testIgnore: ['**/.runs/**'],
+    targets: TARGETS,
+    defaultTarget: 'web',
+    ai: { provider: 'codex', timeoutMs },
+  };
+}
+
+function expectAiTimeoutOutcome(outcome: Awaited<ReturnType<typeof run>>, stepId: string): void {
+  expect(outcome.results[0]?.error).toBeInstanceOf(AiExecutorUnavailableError);
+  expect(outcome.results[0]?.error).toMatchObject({
+    kind: 'ai-executor-unavailable',
+    message: AI_TIMEOUT_MESSAGE,
+  });
+  expect(outcome.results[0]?.result).toMatchObject({
+    status: 'error',
+    steps: [{ id: stepId, status: 'error', kind: 'environment' }],
+    explanation: AI_TIMEOUT_MESSAGE,
+  });
+}
+
+function expectUnclassifiedAbortOutcome(outcome: Awaited<ReturnType<typeof run>>, stepId: string): void {
+  expect(outcome.results[0]?.error).toBeUndefined();
+  expect(outcome.results[0]?.result).toMatchObject({
+    status: 'error',
+    steps: [{ id: stepId, status: 'error', kind: 'environment' }],
+    explanation: GENERIC_ABORT_EXPLANATION,
+  });
+}
+
+function runWithinAiTimeoutTestWindow(deps: RunDeps): Promise<Awaited<ReturnType<typeof run>>> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error('The run did not settle after the configured AI timeout elapsed.'));
+    }, 1_000);
+    void run(deps, DEFAULT_OPTIONS).then(
+      (outcome) => {
+        clearTimeout(timer);
+        resolve(outcome);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 function expectStopgapOutcome(
@@ -409,6 +464,7 @@ describe('run', () => {
         testIgnore: ['**/.runs/**'],
         targets: MULTI_TARGETS,
         defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 120_000 },
       },
     });
     const testPath = await writePrompt(recordingStorage.storage);
@@ -439,7 +495,13 @@ describe('run', () => {
 
   it('resolves the target before attempting plan work that follows digest computation', async () => {
     const { deps, browserDriver, recordingStorage } = createScenario({
-      config: { testDir: TEST_DIR, testMatch: ['**/*.test.md'], testIgnore: [], targets: TARGETS },
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets: TARGETS,
+        ai: { provider: 'codex', timeoutMs: 120_000 },
+      },
     });
     const testPath = await writePrompt(recordingStorage.storage);
 
@@ -1733,6 +1795,193 @@ describe('run path-B element recovery', () => {
     expect(resolveAiExecutor).not.toHaveBeenCalled();
     expect(aiCalls(events)).toEqual([]);
     expect(session.operations()).toEqual([]);
+  });
+});
+
+describe('run AI call timeout composition', () => {
+  it('classifies a never-resolving path-C executor as a provider timeout', async () => {
+    const executor = createFakeAiExecutor({
+      executeAgentic: () => new Promise<never>(() => undefined),
+    });
+    const { deps, recordingStorage } = createScenario({
+      config: configWithAiTimeout(1),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()]);
+
+    const outcome = await runWithinAiTimeoutTestWindow(deps);
+
+    expect(executor.agenticRequests).toHaveLength(1);
+    expectAiTimeoutOutcome(outcome, 'recorded-ai');
+  });
+
+  it('classifies a never-resolving path-B executor as a provider timeout', async () => {
+    const executor = createFakeAiExecutor({
+      execute: () => new Promise<never>(() => undefined),
+    });
+    const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT));
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      config: configWithAiTimeout(1),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [{ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }],
+      elementGrounding(['click-submit']),
+    );
+
+    const outcome = await runWithinAiTimeoutTestWindow(deps);
+
+    expect(executor.structuredRequests).toHaveLength(1);
+    expectAiTimeoutOutcome(outcome, 'click-submit');
+  });
+
+  it('keeps a caller abort during a pending path-C call unclassified and forwards its exact reason', async () => {
+    const controller = new AbortController();
+    const reason = new Error('caller stopped the agentic call');
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const executor = createFakeAiExecutor({
+      executeAgentic: () => {
+        markStarted?.();
+        return new Promise<never>(() => undefined);
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      config: configWithAiTimeout(60_000),
+      resolveAiExecutor: async () => executor,
+      signal: controller.signal,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()]);
+
+    const running = run(deps, DEFAULT_OPTIONS);
+    await started;
+    controller.abort(reason);
+    const outcome = await running;
+
+    expectUnclassifiedAbortOutcome(outcome, 'recorded-ai');
+    expect(executor.agenticRequests[0]?.signal).not.toBe(controller.signal);
+    expect(executor.agenticRequests[0]?.signal?.reason).toBe(reason);
+  });
+
+  it('keeps a caller abort during a pending path-B call unclassified and forwards its exact reason', async () => {
+    const controller = new AbortController();
+    const reason = new Error('caller stopped the structured call');
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const executor = createFakeAiExecutor({
+      execute: () => {
+        markStarted?.();
+        return new Promise<never>(() => undefined);
+      },
+    });
+    const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT));
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      config: configWithAiTimeout(60_000),
+      resolveAiExecutor: async () => executor,
+      signal: controller.signal,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [{ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }],
+      elementGrounding(['click-submit']),
+    );
+
+    const running = run(deps, DEFAULT_OPTIONS);
+    await started;
+    controller.abort(reason);
+    const outcome = await running;
+
+    expectUnclassifiedAbortOutcome(outcome, 'click-submit');
+    expect(executor.structuredRequests[0]?.signal).not.toBe(controller.signal);
+    expect(executor.structuredRequests[0]?.signal?.reason).toBe(reason);
+  });
+
+  it('does not mistake a caller TimeoutError for a local timeout after both signals abort', async () => {
+    const controller = new AbortController();
+    const timeoutController = new AbortController();
+    const callerReason = new DOMException('caller cancelled', 'TimeoutError');
+    const fabricatedTimeoutReason = new DOMException('local timeout fabricated', 'TimeoutError');
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeoutController.signal);
+
+    try {
+      let markStarted: (() => void) | undefined;
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      const executor = createFakeAiExecutor({
+        executeAgentic: () => {
+          markStarted?.();
+          return new Promise<never>(() => undefined);
+        },
+      });
+      const { deps, recordingStorage } = createScenario({
+        config: configWithAiTimeout(60_000),
+        resolveAiExecutor: async () => executor,
+        signal: controller.signal,
+      });
+      const testPath = await writePrompt(recordingStorage.storage);
+      await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()]);
+
+      const running = run(deps, DEFAULT_OPTIONS);
+      await started;
+      controller.abort(callerReason);
+      timeoutController.abort(fabricatedTimeoutReason);
+      const outcome = await running;
+
+      expect(timeoutSpy).toHaveBeenCalledWith(60_000);
+      expectUnclassifiedAbortOutcome(outcome, 'recorded-ai');
+      expect(executor.agenticRequests[0]?.signal).not.toBe(controller.signal);
+      expect(executor.agenticRequests[0]?.signal?.reason).toBe(callerReason);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+
+  it('creates distinct timeout composites for two sequential path-B re-resolution calls', async () => {
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout');
+
+    try {
+      const executor = createFakeAiExecutor({
+        execute: () => ({ data: { fingerprint: DIFFERENT_FINGERPRINT }, raw: '{"fingerprint":"fresh"}' }),
+      });
+      const session = createFakeBrowserSession(liveEntries([PASSWORD, SUBMIT], DIFFERENT_FINGERPRINT));
+      const { deps, recordingStorage } = createScenario({
+        browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+        resolveAiExecutor: async () => executor,
+      });
+      const testPath = await writePrompt(recordingStorage.storage);
+      await seedFreshArtifacts(
+        recordingStorage.storage,
+        testPath,
+        [
+          { id: 'fill-password', kind: 'action', action: 'fill', target: PASSWORD, value: 'correct horse battery staple' },
+          { id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT },
+        ],
+        elementGrounding(['fill-password', 'click-submit']),
+      );
+
+      const outcome = await run(deps, DEFAULT_OPTIONS);
+
+      expect(outcome.results[0]?.result.status).toBe('passed');
+      expect(timeoutSpy).toHaveBeenCalledTimes(2);
+      expect(executor.structuredRequests).toHaveLength(2);
+      expect(executor.structuredRequests[0]?.signal).not.toBe(executor.structuredRequests[1]?.signal);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
   });
 });
 
