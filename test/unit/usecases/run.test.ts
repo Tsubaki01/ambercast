@@ -3526,7 +3526,7 @@ describe('run failure evidence', () => {
         browserDriver: () => createFakeBrowserDriver(() => session), secrets: createFakeSecretsProvider(new Map()),
         resolveAiExecutor: async () => createFakeAiExecutor(), events: createRecordingEventSink().sink,
         discoverTestFiles: async () => [],
-        config: { testDir, testMatch: ['**/*.test.md'], testIgnore: ['**/.runs/**'], targets: TARGETS, defaultTarget: 'web' },
+        config: { testDir, testMatch: ['**/*.test.md'], testIgnore: ['**/.runs/**'], targets: TARGETS, defaultTarget: 'web', ai: { provider: 'codex', timeoutMs: 120_000 } },
       }, { files: [testPath], cacheOnly: false, stale: 'fail' });
       const result = outcome.results[0]?.result;
       const step = result?.steps[0];
