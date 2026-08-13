@@ -1,4 +1,8 @@
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
+import { createFsStorage } from '#adapters/storage/fs-storage.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { BrowserLaunchFailedError } from '#core/errors/browser-launch-failed-error.js';
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
@@ -31,6 +35,7 @@ import type { StorageAdapter } from '#ports/storage.js';
 import type { Clock, RunEvent } from '#ports/system.js';
 import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
 import { buildRunReport } from '#usecases/run-report.js';
+import { OBSERVED_NOTE, RunResult } from '#report/schema.js';
 import { createFixedClock } from '../../doubles/create-fixed-clock.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
 import { createRecordingEventSink } from '../../doubles/create-recording-event-sink.js';
@@ -115,6 +120,7 @@ function createScenario(overrides: Partial<RunDeps> = {}): Scenario {
     storage: recordingStorage.storage,
     layout: createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR }),
     clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 0),
+    runId: '2026-08-09T000000Z-550e8400-e29b-41d4-a716-446655440000',
     browserDriver,
     secrets: createFakeSecretsProvider(new Map()),
     resolveAiExecutor,
@@ -3064,6 +3070,9 @@ describe('run per-case grounding flush and dispatch wiring', () => {
       explanation: 'The grounding cache could not be written.',
       steps: [{ id: 'recorded-ai', status: 'passed' }],
     });
+    expect(outcome.results[0]?.result.steps[0]).not.toHaveProperty('screenshot');
+    expect(outcome.results[0]?.result.steps[0]).not.toHaveProperty('screenshotOmitted');
+    expect(outcome.results[0]?.result.steps[0]).not.toHaveProperty('observed');
   });
 
   it('redacts a resolved secret and drops the cause when a grounding flush fails', async () => {
@@ -3225,5 +3234,463 @@ describe('run per-case grounding flush and dispatch wiring', () => {
       { type: 'step-result', stepId: 'recorded-ai', via: 'ai-resolve' },
       { type: 'step-result', stepId: 'click-submit', via: 'ai-resolve' },
     ]);
+  });
+});
+
+describe('run failure evidence', () => {
+  it('persists a normal assertion screenshot with real filesystem storage and a schema-valid result', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ambercast-run-evidence-'));
+    const testDir = join(root, 'tests');
+    const runsDir = join(root, '.runs');
+    const testPath = join(testDir, 'login.test.md');
+    const runId = '2026-08-10T000000Z-550e8400-e29b-41d4-a716-446655440000';
+    const screenshotBytes = new Uint8Array([7, 8, 9]);
+    const storage = createFsStorage();
+    const layout = createLayoutResolver({ testDir, runsDir });
+
+    try {
+      await storage.writeText(testPath, PROMPT);
+      const plan: PlanDocument = {
+        schemaVersion: 1,
+        source: {
+          inputsDigest: computeInputsDigest({
+            normalizedTestMd: normalizeTestMd(PROMPT), schemaVersion: 1,
+            generatorPromptTemplateFingerprint: promptTemplateFingerprint(), targetDefinitions: TARGETS,
+          }),
+        },
+        targets: TARGETS,
+        steps: [
+          { id: 'assert-dashboard', kind: 'assert', check: 'text-visible', text: 'Dashboard' },
+          { id: 'later-step', kind: 'action', action: 'navigate', url: '/later' },
+        ],
+      };
+      await storage.writeText(layout.planPathFor(testPath), toCanonicalArtifactText(plan as unknown as JsonValueT));
+      await storage.writeText(layout.groundingPathFor(testPath), toCanonicalArtifactText({
+        schemaVersion: 1, planDigest: computePlanDigest(plan), entries: {},
+      } as unknown as JsonValueT));
+      const session = createFakeBrowserSession(new Map(), {
+        assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+        snapshot: { accessibilityTree: { role: 'document', name: 'Sign in' }, screenshot: screenshotBytes },
+      });
+      const outcome = await run({
+        storage, layout, clock: createFixedClock(new Date('2026-08-10T00:00:00.000Z'), 0), runId,
+        browserDriver: () => createFakeBrowserDriver(() => session), secrets: createFakeSecretsProvider(new Map()),
+        resolveAiExecutor: async () => createFakeAiExecutor(), events: createRecordingEventSink().sink,
+        discoverTestFiles: async () => [],
+        config: { testDir, testMatch: ['**/*.test.md'], testIgnore: ['**/.runs/**'], targets: TARGETS, defaultTarget: 'web' },
+      }, { files: [testPath], cacheOnly: false, stale: 'fail' });
+      const result = outcome.results[0]?.result;
+      const step = result?.steps[0];
+      const screenshotPath = join(runsDir, runId, 'login', 'assert-dashboard.png');
+
+      expect(RunResult.safeParse(result).success).toBe(true);
+      expect(step).toMatchObject({
+        expected: 'Text "Dashboard" is visible.', actual: 'The dashboard is absent.', screenshot: screenshotPath,
+        observed: { note: OBSERVED_NOTE, accessibilitySnapshot: '{"role":"document","name":"Sign in"}' },
+      });
+      expect(step).not.toHaveProperty('screenshotOmitted');
+      expect(result?.steps[1]).not.toHaveProperty('screenshot');
+      expect(result?.steps[1]).not.toHaveProperty('screenshotOmitted');
+      expect(result?.steps[1]).not.toHaveProperty('observed');
+      expect(new Uint8Array(await readFile(screenshotPath))).toEqual(screenshotBytes);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    [{ id: 'text-visible', kind: 'assert', check: 'text-visible', text: 'Welcome' }, {}, 'Text "Welcome" is visible.'],
+    [{ id: 'element-visible', kind: 'assert', check: 'element-visible', target: SUBMIT }, elementGrounding(['element-visible']), 'Element button "Submit" is visible.'],
+    [{ id: 'text-equals', kind: 'assert', check: 'text-equals', target: SUBMIT, text: 'Continue' }, elementGrounding(['text-equals']), 'Element button "Submit" has text "Continue".'],
+    [{ id: 'url-matches', kind: 'assert', check: 'url-matches', pattern: '/dashboard/.*' }, {}, 'URL matches "/dashboard/.*".'],
+    [{ id: 'element-count', kind: 'assert', check: 'element-count', target: SUBMIT, count: 2 }, elementGrounding(['element-count']), 'Element button "Submit" has count 2.'],
+  ] as const)('renders the materialized expected description for %s', async (step, entries, expected) => {
+    const session = createFakeBrowserSession(liveEntries([SUBMIT]), {
+      assertOutcome: { passed: false, message: 'The browser reported a mismatch.' },
+    });
+    const { deps, recordingStorage } = createScenario({ browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)) });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [step], entries);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.steps[0]).toMatchObject({ expected, actual: 'The browser reported a mismatch.' });
+  });
+
+  it('restores a captured run reference in an expected assertion description exactly once', async () => {
+    const session = createFakeBrowserSession(liveEntries([EMAIL]), {
+      captureValues: new Map([[elementRefKey(EMAIL), { text: 'Ari', value: '' }]]),
+      assertOutcome: { passed: false, message: 'Welcome, Ari was not visible.' },
+    });
+    const { deps, recordingStorage } = createScenario({ browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)) });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'capture-name', kind: 'capture', target: EMAIL, variable: 'name' },
+      { id: 'assert-welcome', kind: 'assert', check: 'text-visible', text: 'Welcome, {{run.name}}' },
+    ], elementGrounding(['capture-name']));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result).toMatchObject({
+      explanation: 'Welcome, {{run.name}} was not visible.',
+      steps: [{ status: 'passed' }, {
+        expected: 'Text "Welcome, {{run.name}}" is visible.', actual: 'Welcome, {{run.name}} was not visible.',
+      }],
+    });
+  });
+
+  it('omits screenshots without touching browser or storage when raw accessibility evidence contains a resolved secret', async () => {
+    const secretRef = '{{secrets.evidence}}';
+    const secretValue = 'AMBERCAST_SECRET_EVIDENCE_VALUE';
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: { text: `token=${secretValue}` }, screenshot: new Uint8Array([1]) },
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+    });
+    const writeBinary = vi.spyOn(recordingStorage.storage, 'writeBinary');
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'fill-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef },
+      { id: 'assert-dashboard', kind: 'assert', check: 'text-visible', text: 'Dashboard' },
+    ], elementGrounding(['fill-secret']));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({ screenshotOmitted: 'secret-detected' });
+    expect(outcome.results[0]?.result.steps.at(-1)).not.toHaveProperty('screenshot');
+    expect(screenshot).not.toHaveBeenCalled();
+    expect(writeBinary).not.toHaveBeenCalled();
+  });
+
+  it('omits screenshots when accessibility capture fails after an earlier fill-secret', async () => {
+    const secretRef = '{{secrets.snapshot_evidence}}';
+    const secretValue = 'AMBERCAST_SECRET_SNAPSHOT_EVIDENCE_VALUE';
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: { role: 'document' }, screenshot: new Uint8Array([1]) },
+    });
+    vi.spyOn(session, 'accessibilitySnapshot').mockRejectedValue(new Error('a11y unavailable'));
+    const screenshot = vi.spyOn(session, 'screenshot');
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+    });
+    const writeBinary = vi.spyOn(recordingStorage.storage, 'writeBinary');
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'fill-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef },
+      { id: 'assert-dashboard', kind: 'assert', check: 'text-visible', text: 'Dashboard' },
+    ], elementGrounding(['fill-secret']));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const step = outcome.results[0]?.result.steps.at(-1);
+
+    expect(step).toMatchObject({ screenshotOmitted: 'secret-detected' });
+    expect(step).not.toHaveProperty('screenshot');
+    expect(screenshot).not.toHaveBeenCalled();
+    expect(writeBinary).not.toHaveBeenCalled();
+  });
+
+  it('captures screenshots when accessibility capture fails without any resolved secret', async () => {
+    const session = createFakeBrowserSession(new Map(), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: { role: 'document' }, screenshot: new Uint8Array([1]) },
+    });
+    vi.spyOn(session, 'accessibilitySnapshot').mockRejectedValue(new Error('a11y unavailable'));
+    const screenshot = vi.spyOn(session, 'screenshot');
+    const { deps, recordingStorage } = createScenario({ browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)) });
+    const writeBinary = vi.spyOn(recordingStorage.storage, 'writeBinary');
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'assert-dashboard', kind: 'assert', check: 'text-visible', text: 'Dashboard' },
+    ]);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const step = outcome.results[0]?.result.steps[0];
+
+    expect(step).toMatchObject({ screenshot: expect.any(String) });
+    expect(step).not.toHaveProperty('screenshotOmitted');
+    expect(screenshot).toHaveBeenCalledOnce();
+    expect(writeBinary).toHaveBeenCalledOnce();
+  });
+
+  it('still omits screenshots when redacted secret-bearing accessibility evidence cannot be serialized', async () => {
+    const secretRef = '{{secrets.rendering_evidence}}';
+    const secretValue = 'AMBERCAST_SECRET_RENDERING_EVIDENCE_VALUE';
+    let textReads = 0;
+    const accessibilityTree: { readonly text: string } = {} as { readonly text: string };
+    Object.defineProperty(accessibilityTree, 'text', {
+      enumerable: true,
+      get() {
+        textReads += 1;
+        if (textReads === 1) {
+          return `token=${secretValue}`;
+        }
+
+        throw new Error('observed evidence rendering failed');
+      },
+    });
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: {
+        accessibilityTree,
+        screenshot: new Uint8Array([1]),
+      },
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+    });
+    const writeBinary = vi.spyOn(recordingStorage.storage, 'writeBinary');
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'fill-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef },
+      { id: 'assert-dashboard', kind: 'assert', check: 'text-visible', text: 'Dashboard' },
+    ], elementGrounding(['fill-secret']));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({ screenshotOmitted: 'secret-detected' });
+    expect(outcome.results[0]?.result.steps.at(-1)).not.toHaveProperty('screenshot');
+    expect(screenshot).not.toHaveBeenCalled();
+    expect(writeBinary).not.toHaveBeenCalled();
+  });
+
+  it('omits an assertion screenshot when its raw diagnostic contains a resolved secret despite a clean tree', async () => {
+    const secretRef = '{{secrets.evidence}}';
+    const secretValue = 'AMBERCAST_SECRET_EVIDENCE_VALUE';
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcome: { passed: false, message: `The page exposed ${secretValue}.` },
+      snapshot: { accessibilityTree: { text: 'Clean accessibility evidence' }, screenshot: new Uint8Array([1]) },
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+    });
+    const writeBinary = vi.spyOn(recordingStorage.storage, 'writeBinary');
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'fill-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef },
+      { id: 'assert-dashboard', kind: 'assert', check: 'text-visible', text: 'Dashboard' },
+    ], elementGrounding(['fill-secret']));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({
+      actual: `The page exposed ${secretRef}.`, screenshotOmitted: 'secret-detected',
+    });
+    expect(screenshot).not.toHaveBeenCalled();
+    expect(writeBinary).not.toHaveBeenCalled();
+  });
+
+  it('omits an assertion screenshot when only its raw expected text contains a resolved secret', async () => {
+    const secretRef = '{{secrets.expected_evidence}}';
+    const secretValue = 'AMBERCAST_SECRET_EXPECTED_EVIDENCE_VALUE';
+    const session = createFakeBrowserSession(liveEntries([EMAIL, PASSWORD]), {
+      captureValues: new Map([[elementRefKey(EMAIL), { text: secretValue, value: '' }]]),
+      assertOutcome: { passed: false, message: 'The ordinary diagnostic is clean.' },
+      snapshot: { accessibilityTree: { text: 'Clean accessibility evidence' }, screenshot: new Uint8Array([2]) },
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+    });
+    const writeBinary = vi.spyOn(recordingStorage.storage, 'writeBinary');
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'fill-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef },
+      { id: 'capture-token', kind: 'capture', target: EMAIL, variable: 'token' },
+      { id: 'assert-token', kind: 'assert', check: 'text-visible', text: 'Token {{run.token}}' },
+    ], elementGrounding(['fill-secret', 'capture-token']));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({ screenshotOmitted: 'secret-detected' });
+    expect(screenshot).not.toHaveBeenCalled();
+    expect(writeBinary).not.toHaveBeenCalled();
+  });
+
+  it('attaches best-effort evidence to a caught dispatch error without assertion-only fields', async () => {
+    const session = createFakeBrowserSession(new Map(), {
+      snapshot: { accessibilityTree: { role: 'document', name: 'Broken page' }, screenshot: new Uint8Array([3]) },
+      onPerform(action) {
+        if (action.type === 'navigate') {
+          throw new Error('socket disconnected');
+        }
+      },
+    });
+    const { deps, recordingStorage } = createScenario({ browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)) });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [{ id: 'open-dashboard', kind: 'action', action: 'navigate', url: '/dashboard' }]);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const step = outcome.results[0]?.result.steps[0];
+
+    expect(outcome.results[0]?.result.explanation).toBe('The browser session could not complete this case and no deterministic fallback is available.');
+    expect(step).toMatchObject({ id: 'open-dashboard', status: 'error', kind: 'environment', screenshot: expect.any(String), observed: expect.any(Object) });
+    expect(step).not.toHaveProperty('expected');
+    expect(step).not.toHaveProperty('actual');
+  });
+
+  it('sequences accessibility capture before screenshot and keeps their failure modes independent', async () => {
+    const order: string[] = [];
+    const session = createFakeBrowserSession(new Map(), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: { role: 'document' }, screenshot: new Uint8Array([4]) },
+    });
+    vi.spyOn(session, 'accessibilitySnapshot').mockImplementation(async () => {
+      order.push('accessibility-start');
+      await Promise.resolve();
+      order.push('accessibility-end');
+      throw new Error('a11y unavailable');
+    });
+    vi.spyOn(session, 'screenshot').mockImplementation(async () => {
+      order.push('screenshot');
+      return new Uint8Array([4]);
+    });
+    const { deps, recordingStorage } = createScenario({ browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)) });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [{ id: 'assert-dashboard', kind: 'assert', check: 'text-visible', text: 'Dashboard' }]);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(order).toEqual(['accessibility-start', 'accessibility-end', 'screenshot']);
+    expect(outcome.results[0]?.result.steps[0]).toMatchObject({ screenshot: expect.any(String) });
+    expect(outcome.results[0]?.result.steps[0]).not.toHaveProperty('observed');
+    expect(outcome.results[0]?.result.steps[0]).not.toHaveProperty('screenshotOmitted');
+  });
+
+  it('absorbs screenshot capture or write failures without changing the original assertion result', async () => {
+    for (const failure of ['capture', 'write'] as const) {
+      const session = createFakeBrowserSession(new Map(), {
+        assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+        snapshot: { accessibilityTree: { role: 'document' }, screenshot: new Uint8Array([5]) },
+      });
+      const { deps, recordingStorage } = createScenario({ browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)) });
+      if (failure === 'capture') {
+        vi.spyOn(session, 'screenshot').mockImplementation(() => { throw new Error('synchronous screenshot failure'); });
+      } else {
+        vi.spyOn(recordingStorage.storage, 'writeBinary').mockRejectedValue(new Error('disk full'));
+      }
+      const testPath = await writePrompt(recordingStorage.storage, `${failure}.test.md`);
+      await seedFreshArtifacts(recordingStorage.storage, testPath, [{ id: 'assert-dashboard', kind: 'assert', check: 'text-visible', text: 'Dashboard' }]);
+
+      const outcome = await run(deps, { ...DEFAULT_OPTIONS, files: [testPath] });
+      const step = outcome.results[0]?.result.steps[0];
+
+      expect(outcome.results[0]?.result).toMatchObject({ status: 'failed', explanation: 'The dashboard is absent.' });
+      expect(step).not.toHaveProperty('screenshot');
+      expect(step).toHaveProperty('observed');
+    }
+  });
+
+  it('omits a caught-error screenshot when only its raw accessibility tree contains a resolved secret', async () => {
+    const secretRef = '{{secrets.catch_evidence}}';
+    const secretValue = 'AMBERCAST_SECRET_CATCH_EVIDENCE_VALUE';
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      snapshot: { accessibilityTree: { text: `token=${secretValue}` }, screenshot: new Uint8Array([6]) },
+      onPerform(action) {
+        if (action.type === 'navigate') {
+          throw new Error('detached page');
+        }
+      },
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+    });
+    const writeBinary = vi.spyOn(recordingStorage.storage, 'writeBinary');
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'fill-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef },
+      { id: 'open-dashboard', kind: 'action', action: 'navigate', url: '/dashboard' },
+    ], elementGrounding(['fill-secret']));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const step = outcome.results[0]?.result.steps.at(-1);
+
+    expect(step).toMatchObject({ kind: 'environment', screenshotOmitted: 'secret-detected' });
+    expect(step).not.toHaveProperty('screenshot');
+    expect(step).not.toHaveProperty('expected');
+    expect(step).not.toHaveProperty('actual');
+    expect(screenshot).not.toHaveBeenCalled();
+    expect(writeBinary).not.toHaveBeenCalled();
+  });
+
+  it('redacts raw assertion and accessibility evidence before it reaches the result', async () => {
+    const secretRef = '{{secrets.redaction_evidence}}';
+    const secretValue = 'secret-"quoted\\value';
+    const capturedValue = 'captured-value';
+    const session = createFakeBrowserSession(liveEntries([EMAIL, PASSWORD]), {
+      captureValues: new Map([[elementRefKey(EMAIL), { text: capturedValue, value: '' }]]),
+      assertOutcome: { passed: false, message: `actual ${secretValue} ${capturedValue}` },
+      snapshot: {
+        accessibilityTree: { [`key ${secretValue}`]: `value ${capturedValue} ${secretValue}` },
+        screenshot: new Uint8Array([7]),
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'fill-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef },
+      { id: 'capture-token', kind: 'capture', target: EMAIL, variable: 'token' },
+      { id: 'assert-token', kind: 'assert', check: 'text-visible', text: 'Token {{run.token}}' },
+    ], elementGrounding(['fill-secret', 'capture-token']));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const result = outcome.results[0]?.result;
+    const step = result?.steps.at(-1);
+
+    expect(step).toMatchObject({
+      expected: 'Text "Token {{run.token}}" is visible.',
+      actual: `actual ${secretRef} {{run.token}}`,
+      screenshotOmitted: 'secret-detected',
+      observed: { accessibilitySnapshot: expect.any(String) },
+    });
+    expect(step?.observed?.accessibilitySnapshot).toContain(secretRef);
+    expect(step?.observed?.accessibilitySnapshot).toContain('{{run.token}}');
+    expect(JSON.stringify(result)).not.toContain(secretValue);
+    expect(JSON.stringify(result)).not.toContain(capturedValue);
+    expect(RunResult.safeParse(result).success).toBe(true);
+  });
+
+  it('returns a pre-launch error without attempting to attach browser evidence', async () => {
+    const driver = createFakeBrowserDriver(() => createFakeBrowserSession(new Map()));
+    vi.spyOn(driver, 'launch').mockRejectedValue(new BrowserLaunchFailedError('launch failed'));
+    const { deps, recordingStorage } = createScenario({ browserDriver: vi.fn(() => driver) });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [{ id: 'open-dashboard', kind: 'action', action: 'navigate', url: '/dashboard' }]);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result).toMatchObject({ status: 'error', steps: [] });
+  });
+
+  it('does not capture failure evidence for passing or duplicate literal cases', async () => {
+    const passingSession = createFakeBrowserSession(new Map());
+    const screenshot = vi.spyOn(passingSession, 'screenshot');
+    const accessibilitySnapshot = vi.spyOn(passingSession, 'accessibilitySnapshot');
+    const { deps, recordingStorage } = createScenario({ browserDriver: vi.fn(() => createFakeBrowserDriver(() => passingSession)) });
+    const writeBinary = vi.spyOn(recordingStorage.storage, 'writeBinary');
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [{ id: 'open-dashboard', kind: 'action', action: 'navigate', url: '/dashboard' }]);
+
+    const outcome = await run(deps, { ...DEFAULT_OPTIONS, files: [testPath, testPath] });
+
+    expect(outcome.results).toHaveLength(1);
+    expect(screenshot).not.toHaveBeenCalled();
+    expect(accessibilitySnapshot).not.toHaveBeenCalled();
+    expect(writeBinary).not.toHaveBeenCalled();
   });
 });

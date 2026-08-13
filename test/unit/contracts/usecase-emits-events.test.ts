@@ -96,6 +96,7 @@ registerUsecaseEmitsEventsContract([
         storage,
         layout,
         clock: createFixedClock(new Date('2026-08-11T00:00:00.000Z'), 0),
+        runId: '2026-08-11T000000Z-550e8400-e29b-41d4-a716-446655440000',
         browserDriver: () => createFakeBrowserDriver(() => createFakeBrowserSession(new Map())),
         secrets: createFakeSecretsProvider(new Map()),
         resolveAiExecutor: async () => {

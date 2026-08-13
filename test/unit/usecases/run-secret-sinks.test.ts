@@ -164,6 +164,7 @@ function createRunScenario(
       storage: recordingStorage.storage,
       layout: createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR }),
       clock: createFixedClock(new Date('2026-08-10T00:00:00.000Z'), 0),
+      runId: '2026-08-10T000000Z-550e8400-e29b-41d4-a716-446655440000',
       browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
       secrets: createFakeSecretsProvider(secrets),
       resolveAiExecutor: async () => executor,
