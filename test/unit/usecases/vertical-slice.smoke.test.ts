@@ -53,7 +53,7 @@ const GENERATE_OPTIONS: GenerateOptions = {
   allowEmpty: false,
   list: false,
 };
-const RUN_OPTIONS: RunOptions = { files: [TEST_PATH], cacheOnly: false, stale: 'fail' };
+const RUN_OPTIONS: RunOptions = { files: [TEST_PATH], cacheOnly: false, allowEmpty: false, list: false, stale: 'fail' };
 
 describe('fake vertical slice', () => {
   it('replays a generated plan from pre-seeded grounding without AI calls', async () => {

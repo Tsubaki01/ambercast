@@ -47,6 +47,11 @@ const RUN_RESULT = {
   steps: [STEP_RESULT],
   explanation: 'The login flow completed successfully.',
 };
+const LISTED_RUN_RESULT = {
+  id: 'login-succeeds',
+  file: 'tests/login.test.md',
+  status: 'listed',
+};
 const HEAL_RESULT = {
   id: 'login-succeeds',
   file: 'tests/login.test.md',
@@ -300,6 +305,39 @@ describe('valid nested schema fixtures', () => {
     [{ id: 'login-succeeds', file: 'tests/login.test.md', status: 'failed', dryRun: false }],
   ] as const)('accepts each exact generate-result status branch', (result) => {
     expectAccepted(GenerateResult, result);
+  });
+});
+
+describe('run result status branches', () => {
+  it.each([
+    ['passed', { ...RUN_RESULT, status: 'passed' }],
+    ['failed', { ...RUN_RESULT, status: 'failed' }],
+    ['error', { ...RUN_RESULT, status: 'error' }],
+    ['skipped', { ...RUN_RESULT, status: 'skipped' }],
+    ['listed', LISTED_RUN_RESULT],
+  ] as const)('accepts the %s branch through the public ReportEnvelope', (_status, result) => {
+    expectAccepted(ReportEnvelope, reportEnvelope('run', [result], {
+      summary: { total: 1, passed: result.status === 'listed' || result.status === 'passed' ? 1 : 0, failed: 0, errored: 0, skipped: 0 },
+    }));
+  });
+
+  it('rejects values that mix discovery-only and execution-backed result fields', () => {
+    expectRejected(ReportEnvelope, reportEnvelope('run', [{ ...LISTED_RUN_RESULT, durationMs: 42 }]));
+    expectRejected(ReportEnvelope, reportEnvelope('run', [without(RUN_RESULT, 'durationMs')]));
+  });
+
+  it('rejects an unrecognized run status through the public ReportEnvelope', () => {
+    expectRejected(ReportEnvelope, reportEnvelope('run', [{ ...RUN_RESULT, status: 'not-run' }]));
+  });
+
+  it('round-trips executed and listed branches through ordinary JSON serialization', () => {
+    const envelope = ReportEnvelope.parse(reportEnvelope('run', [RUN_RESULT, LISTED_RUN_RESULT], {
+      summary: { total: 2, passed: 2, failed: 0, errored: 0, skipped: 0 },
+    }));
+
+    const roundTripped = ReportEnvelope.parse(JSON.parse(JSON.stringify(envelope)));
+
+    expect(roundTripped).toEqual(envelope);
   });
 });
 

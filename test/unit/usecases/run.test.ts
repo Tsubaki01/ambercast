@@ -62,7 +62,13 @@ const DIFFERENT_FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v1', 
 const EMAIL: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Email' };
 const PASSWORD: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Password' };
 const SUBMIT: ElementRef = { strategy: 'accessibility', role: 'button', name: 'Submit' };
-const DEFAULT_OPTIONS: RunOptions = { files: [], cacheOnly: false, stale: 'fail' };
+const DEFAULT_OPTIONS: RunOptions = {
+  files: [],
+  cacheOnly: false,
+  allowEmpty: false,
+  list: false,
+  stale: 'fail',
+};
 const AI_TIMEOUT_MESSAGE = 'The AI provider did not respond within the configured timeout.';
 const GENERIC_ABORT_EXPLANATION = 'The browser session could not complete this case and no deterministic fallback is available.';
 
@@ -1098,6 +1104,110 @@ describe('run', () => {
 
     expect(outcome.noTestsFound).toBe(true);
     expect(outcome.results).toEqual([]);
+  });
+
+  it.each([
+    [false, false, true, 5, 'zero-match replay'],
+    [false, true, true, 0, 'zero-match listing'],
+    [true, false, true, 0, 'allowed zero-match replay'],
+    [true, true, true, 0, 'allowed zero-match listing'],
+    [false, false, false, 0, 'matched replay'],
+    [false, true, false, 0, 'matched listing'],
+    [true, false, false, 0, 'matched allowed replay'],
+    [true, true, false, 0, 'matched allowed listing'],
+  ] as const)(
+    'applies allow-empty/list policy for %s/%s with noTestsFound=%s (%s)',
+    async (allowEmpty, list, noTestsFound, exitCode, _description) => {
+      const { deps, recordingStorage } = createScenario({ discoverTestFiles: async () => (
+        noTestsFound ? [] : ['login.test.md']
+      ) });
+      let testPath: string | undefined;
+      if (!noTestsFound) {
+        testPath = await writePrompt(recordingStorage.storage);
+        await createFreshPlan(recordingStorage.storage, testPath);
+      }
+
+      const outcome = await run(deps, { ...DEFAULT_OPTIONS, allowEmpty, list });
+      const report = buildRunReport({
+        startedAt: '2026-08-09T00:00:00Z',
+        durationMs: 0,
+        options: { allowEmpty, list },
+        outcome,
+      });
+
+      expect(report.exitCode).toBe(exitCode);
+      if (noTestsFound) {
+        expect(outcome).toEqual({ results: [], noTestsFound: true, listed: [] });
+        return;
+      }
+      if (list) {
+        expect(outcome).toEqual({
+          results: [],
+          noTestsFound: false,
+          listed: [{ file: testPath }],
+        });
+        return;
+      }
+      expect(outcome).toMatchObject({
+        noTestsFound: false,
+        listed: [],
+        results: [{ result: { file: testPath, status: 'passed' } }],
+      });
+    },
+  );
+
+  it('lists matched paths without resolving AI, launching a browser, emitting events, or reading artifacts', async () => {
+    const discoverTestFiles = vi.fn(async () => ['login.test.md']);
+    const { deps, browserDriver, events, recordingStorage, resolveAiExecutor } = createScenario({ discoverTestFiles });
+
+    const outcome = await run(deps, { ...DEFAULT_OPTIONS, list: true });
+
+    expect(outcome).toEqual({
+      results: [],
+      noTestsFound: false,
+      listed: [{ file: `${TEST_DIR}/login.test.md` }],
+    });
+    expect(discoverTestFiles).toHaveBeenCalledTimes(1);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(browserDriver).not.toHaveBeenCalled();
+    expect(events.emitted()).toEqual([]);
+    expect(recordingStorage.reads).toEqual([]);
+    expect(recordingStorage.exists).toEqual([]);
+    expect(recordingStorage.writes).toEqual([]);
+  });
+
+  it('lists a first-seen, grep-filtered deterministic selection from duplicated literal paths', async () => {
+    const { deps, recordingStorage } = createScenario();
+    const alpha = `${TEST_DIR}/suite/alpha.test.md`;
+    const beta = `${TEST_DIR}/other/beta.test.md`;
+    const gamma = `${TEST_DIR}/suite/gamma.test.md`;
+
+    const outcome = await run(deps, {
+      ...DEFAULT_OPTIONS,
+      files: [gamma, beta, alpha, gamma, beta, alpha],
+      grep: /^suite\//,
+      list: true,
+    });
+
+    expect(outcome).toEqual({
+      results: [],
+      noTestsFound: false,
+      listed: [{ file: gamma }, { file: alpha }],
+    });
+    expect(recordingStorage.reads).toEqual([]);
+    expect(recordingStorage.exists).toEqual([]);
+  });
+
+  it('keeps a grep-filtered empty list on the ordinary zero-match path', async () => {
+    const { deps, recordingStorage } = createScenario({
+      discoverTestFiles: async () => ['suite/alpha.test.md', 'suite/beta.test.md'],
+    });
+
+    const outcome = await run(deps, { ...DEFAULT_OPTIONS, grep: /^other\//, list: true });
+
+    expect(outcome).toEqual({ results: [], noTestsFound: true, listed: [] });
+    expect(recordingStorage.reads).toEqual([]);
+    expect(recordingStorage.exists).toEqual([]);
   });
 });
 
@@ -2618,6 +2728,7 @@ describe('run deterministic redaction boundary', () => {
     const report = buildRunReport({
       startedAt: '2026-08-10T00:00:00Z',
       durationMs: 0,
+      options: { allowEmpty: false, list: false },
       outcome,
     });
 
@@ -3527,7 +3638,7 @@ describe('run failure evidence', () => {
         resolveAiExecutor: async () => createFakeAiExecutor(), events: createRecordingEventSink().sink,
         discoverTestFiles: async () => [],
         config: { testDir, testMatch: ['**/*.test.md'], testIgnore: ['**/.runs/**'], targets: TARGETS, defaultTarget: 'web', ai: { provider: 'codex', timeoutMs: 120_000 } },
-      }, { files: [testPath], cacheOnly: false, stale: 'fail' });
+      }, { files: [testPath], cacheOnly: false, allowEmpty: false, list: false, stale: 'fail' });
       const result = outcome.results[0]?.result;
       const step = result?.steps[0];
       const screenshotPath = join(runsDir, runId, 'login', 'assert-dashboard.png');

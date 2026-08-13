@@ -210,27 +210,66 @@ const ExecutedResultFields = {
 };
 
 /**
- * Zod schema for one result produced by the `run` command.
+ * Zod schema for an execution-backed result produced by the `run` command.
  *
- * It preserves one test case's identity alongside its execution evidence,
- * including {@link StepResult} items, so consumers can diagnose outcomes
- * without reconstructing them from unstructured logs.
+ * This branch preserves one test case's identity alongside its execution
+ * evidence, including {@link StepResult} items, so consumers can diagnose an
+ * outcome without reconstructing it from unstructured logs. Its separate
+ * branch keeps execution-backed cases distinct from discovery-only rows in the
+ * public run-result union, so consumers can rely on the presence of execution
+ * evidence here.
  */
-export const RunResult = z.strictObject({
+export const ExecutedRunResult = z.strictObject({
   ...ResultIdentityFields,
   status: z.enum(['passed', 'failed', 'error', 'skipped']),
   ...ExecutedResultFields,
 });
 
 /**
- * A per-case result emitted by a `run` report.
+ * An execution-backed per-case result emitted by a `run` report.
+ *
+ * Consumers that need duration and step evidence can use this branch without
+ * accepting discovery-only list results.
+ */
+export type ExecutedRunResult = z.infer<typeof ExecutedRunResult>;
+
+/**
+ * Zod schema for a prompt path reported by `run --list`.
+ *
+ * Listing confirms deterministic file selection but deliberately supplies no
+ * plan or execution evidence. Keeping that distinction explicit prevents a
+ * discovery result from being mistaken for a replayed case.
+ */
+export const ListedRunResult = z.strictObject({
+  id: NonWhitespaceString,
+  file: NonWhitespaceString,
+  status: z.literal('listed'),
+});
+
+/**
+ * A discovery-only result emitted by a `run --list` report.
+ */
+export type ListedRunResult = z.infer<typeof ListedRunResult>;
+
+/**
+ * Zod schema for one result produced by the `run` command.
+ *
+ * The status discriminant separates execution-backed results from `--list`
+ * discovery rows, mirroring the public generation-report pattern. This gives
+ * report consumers one result array without implying that listed files carry
+ * execution duration or step evidence.
+ */
+export const RunResult = z.discriminatedUnion('status', [ExecutedRunResult, ListedRunResult]);
+
+/**
+ * A per-case execution result or a discovery-only result emitted by a `run` report.
  */
 export type RunResult = z.infer<typeof RunResult>;
 
 /**
  * Zod schema for one result produced by the `heal` command.
  *
- * It shares {@link RunResult}'s identity and execution evidence so consumers
+ * It shares {@link ExecutedRunResult}'s identity and execution evidence so consumers
  * can process per-case outcomes consistently. Its healing-specific status
  * vocabulary distinguishes a repair outcome from an ordinary execution.
  */

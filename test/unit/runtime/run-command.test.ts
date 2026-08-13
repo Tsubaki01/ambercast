@@ -87,7 +87,7 @@ function reportOutput(exitCode: RunCommandOutput['exitCode'], errors: ReportErro
 
 function input(overrides: Partial<RunCommandInput> = {}): RunCommandInput {
   return {
-    files: [], headed: false, cacheOnly: false, stale: 'fail', cwd: '/workspace', ...overrides,
+    files: [], headed: false, cacheOnly: false, allowEmpty: false, list: false, stale: 'fail', cwd: '/workspace', ...overrides,
   };
 }
 
@@ -135,6 +135,7 @@ describe('runRunCommand', () => {
     };
     const outcome = {
       noTestsFound: false,
+      listed: [],
       results: [{
         result: {
           id: 'login',
@@ -215,6 +216,7 @@ describe('runRunCommand', () => {
     };
     const outcome = {
       noTestsFound: false,
+      listed: [],
       results: [{
         result: {
           id: 'login',
@@ -288,7 +290,7 @@ describe('runRunCommand', () => {
     mocks.createEnvSecretsProvider.mockReturnValue(createFakeSecretsProvider(new Map()));
     mocks.createNoopEventSink.mockReturnValue(createRecordingEventSink().sink);
     mocks.createAmbercast.mockReturnValue({ storage, layout, clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 20), discoverTestFiles: vi.fn(async () => []) });
-    mocks.run.mockResolvedValue({ results: [], noTestsFound: false });
+    mocks.run.mockResolvedValue({ results: [], noTestsFound: false, listed: [] });
     mocks.buildRunReport.mockReturnValue(output);
     vi.spyOn(storage, 'writeText').mockRejectedValueOnce(new Error('disk full'));
 
@@ -316,6 +318,57 @@ describe('runRunCommand', () => {
     expect(output.envelope.errors).toEqual([expect.objectContaining({
       scope: 'run', code: 'CONFIG_INVALID',
     })]);
+  });
+
+  it('threads allow-empty and list to replay and report construction after a successful run', async () => {
+    const storage = createInMemoryStorage();
+    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => '/workspace/tests/.runs/report.json') };
+    const outcome = { results: [], noTestsFound: true, listed: [] };
+    const output = reportOutput(0);
+
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.createBrowserDriverResolver.mockReturnValue(createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
+    mocks.createEnvSecretsProvider.mockReturnValue(createFakeSecretsProvider(new Map()));
+    mocks.createNoopEventSink.mockReturnValue(createRecordingEventSink().sink);
+    mocks.createAmbercast.mockReturnValue({
+      storage,
+      layout,
+      clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 20),
+      discoverTestFiles: vi.fn(async () => []),
+    });
+    mocks.run.mockResolvedValue(outcome);
+    mocks.buildRunReport.mockReturnValue(output);
+
+    await expect(runRunCommand(input({ allowEmpty: true, list: true }))).resolves.toBe(output);
+
+    expect(mocks.run).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      allowEmpty: true,
+      list: true,
+    }));
+    expect(mocks.buildRunReport).toHaveBeenCalledWith(expect.objectContaining({
+      options: { allowEmpty: true, list: true },
+      outcome,
+    }));
+  });
+
+  it('threads allow-empty and list into the report context on the command-error path', async () => {
+    const storage = createInMemoryStorage();
+    const error = new ConfigInvalidError('Configuration is invalid.');
+    const output = reportOutput(2, [{
+      scope: 'run', kind: 'usage', code: 'CONFIG_INVALID', message: error.message,
+    }]);
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockRejectedValue(error);
+    mocks.buildRunReport.mockReturnValue(output);
+
+    await expect(runRunCommand(input({ allowEmpty: true, list: true }))).resolves.toBe(output);
+
+    expect(mocks.run).not.toHaveBeenCalled();
+    expect(mocks.buildRunReport).toHaveBeenCalledWith(expect.objectContaining({
+      options: { allowEmpty: true, list: true },
+      error,
+    }));
   });
 
   it('rejects stale regeneration before configuration or prompt and plan storage can be read', async () => {
@@ -356,7 +409,7 @@ describe('runRunCommand', () => {
     const events = createRecordingEventSink();
     const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => '/workspace/tests/.runs/report.json') };
     const discoverTestFiles = vi.fn(async () => []);
-    const outcome = { results: [], noTestsFound: false };
+    const outcome = { results: [], noTestsFound: false, listed: [] };
     const output = reportOutput(0);
     const grep = /login/;
     const commandEnvironment = {
@@ -418,6 +471,8 @@ describe('runRunCommand', () => {
       grep,
       target: 'web',
       cacheOnly: true,
+      allowEmpty: false,
+      list: false,
       stale: 'fail',
     });
     expect(mocks.buildRunReport).toHaveBeenCalledWith(expect.objectContaining({
@@ -451,7 +506,7 @@ describe('runRunCommand', () => {
     const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => '/workspace/tests/.runs/report.json') };
     const discoverTestFiles = vi.fn(async () => []);
     const controller = new AbortController();
-    const outcome = { results: [], noTestsFound: false };
+    const outcome = { results: [], noTestsFound: false, listed: [] };
     const output = reportOutput(0);
 
     mocks.createFsStorage.mockReturnValue(storage);
@@ -511,7 +566,7 @@ describe('runRunCommand', () => {
     const storage = createInMemoryStorage();
     const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => '/workspace/tests/.runs/report.json') };
     const discoverTestFiles = vi.fn(async () => []);
-    const outcome = { results: [], noTestsFound: false };
+    const outcome = { results: [], noTestsFound: false, listed: [] };
     const output = reportOutput(0);
 
     mocks.createFsStorage.mockReturnValue(storage);

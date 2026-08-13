@@ -28,6 +28,8 @@ const PROMPT = '# Replay a hand-authored trace\n\nVerify the fixture is ready.\n
 const RUN_OPTIONS: RunOptions = {
   files: [TEST_PATH],
   cacheOnly: false,
+  allowEmpty: false,
+  list: false,
   stale: 'fail',
 };
 

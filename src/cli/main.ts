@@ -62,6 +62,20 @@ interface ParsedRunCommand {
     readonly target?: string;
     readonly headed: boolean;
     readonly cacheOnly: boolean;
+    /**
+     * Whether a zero-match replay selection is an allowed empty outcome.
+     *
+     * This stays explicit in parsed input so report policy is independent of
+     * command rendering and cannot suppress a matched case's real failure.
+     */
+    readonly allowEmpty: boolean;
+    /**
+     * Whether the command reports resolved paths without replaying cases.
+     *
+     * Runtime forwards the parsed choice to both selection and report
+     * construction so list mode has the same contract in text and JSON output.
+     */
+    readonly list: boolean;
     readonly stale: 'fail' | 'regenerate';
     readonly aiProviderOverride?: 'claude' | 'codex';
     readonly cwd: string;
@@ -71,7 +85,7 @@ interface ParsedRunCommand {
   readonly color: boolean;
 }
 
-const USAGE = `Usage: ambercast <command> [options]\n\nCommands:\n  generate [files...]  Generate deterministic plans\n  run [files...]       Replay deterministic plans\n\nGenerate options:\n  --strict  --force  --dry-run  --target <name>  --ai <claude|codex>\n  --allow-empty  --list  --json  --config <path>  --no-color\n\nRun options:\n  --grep <pattern>  --target <name>  --headed  --json  --cache-only  --no-color\n  --stale <fail>\n`;
+const USAGE = `Usage: ambercast <command> [options]\n\nCommands:\n  generate [files...]  Generate deterministic plans\n  run [files...]       Replay deterministic plans\n\nGenerate options:\n  --strict  --force  --dry-run  --target <name>  --ai <claude|codex>\n  --allow-empty  --list  --json  --config <path>  --no-color\n\nRun options:\n  --grep <pattern>  --target <name>  --headed  --cache-only  --allow-empty  --list\n  --stale <fail>  --json  --no-color\n`;
 
 function writeUsage(stream: NodeJS.WritableStream): void {
   stream.write(USAGE);
@@ -195,11 +209,13 @@ function parseGenerate(argv: readonly string[], signal: AbortSignal): ParsedGene
  * discovery. `--grep` filters those paths, `--target` selects a configured
  * target, `--headed` requests visible browser execution, `--json` selects the
  * report rendering, and `--no-color` disables its ANSI styling. `--cache-only`
- * is accepted for forward compatibility but has no effect because replay never
- * falls back to AI resolution. `--stale` accepts `fail` and `regenerate` as enum
+ * forces a replay miss to fail immediately instead of falling back to the AI
+ * executor. `--stale` accepts `fail` and `regenerate` as enum
  * values, while runtime rejects `regenerate` as an unavailable option before
  * touching files. `--ai` retains the shared CLI provider-override syntax without
  * making replay resolve a provider.
+ * `--allow-empty` makes an empty selection successful at report time, while
+ * `--list` stops after deterministic selection and reports the matched paths.
  *
  * `--grep` constructs its regular expression here rather than deferring it to
  * runtime. A malformed pattern is argument-shape validation, like the
@@ -219,6 +235,8 @@ function parseRun(argv: readonly string[], signal: AbortSignal): ParsedRunComman
   let headed = false;
   let json = false;
   let cacheOnly = false;
+  let allowEmpty = false;
+  let list = false;
   let stale: 'fail' | 'regenerate' = 'fail';
   let aiProviderOverride: 'claude' | 'codex' | undefined;
   let color = true;
@@ -236,6 +254,10 @@ function parseRun(argv: readonly string[], signal: AbortSignal): ParsedRunComman
 
     if (argument === '--headed') {
       headed = true;
+    } else if (argument === '--allow-empty') {
+      allowEmpty = true;
+    } else if (argument === '--list') {
+      list = true;
     } else if (argument === '--json') {
       json = true;
     } else if (argument === '--cache-only') {
@@ -280,6 +302,8 @@ function parseRun(argv: readonly string[], signal: AbortSignal): ParsedRunComman
       ...(target === undefined ? {} : { target }),
       headed,
       cacheOnly,
+      allowEmpty,
+      list,
       stale,
       ...(aiProviderOverride === undefined ? {} : { aiProviderOverride }),
       cwd: process.cwd(),

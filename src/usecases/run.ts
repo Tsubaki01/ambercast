@@ -40,11 +40,18 @@ import type { AssertCheck, AssertOutcome, BrowserSession, PerformableAction } fr
 import type { BrowserDriverResolver } from '#ports/index.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { Clock, EventSink, SecretsProvider } from '#ports/system.js';
-import { OBSERVED_NOTE, type Observed, type RunResult, type StepResult } from '#report/schema.js';
+import { OBSERVED_NOTE, type ExecutedRunResult, type Observed, type StepResult } from '#report/schema.js';
 import { z } from 'zod';
 import { assertSecretRefsGrounded, extractDeclaredSecretRefs } from './generator-secret-policy.js';
 
-type ResultWithoutDuration = Omit<RunResult, 'durationMs'>;
+/**
+ * Execution evidence while a case is still in progress.
+ *
+ * Duration is attached only after teardown, so this intermediary keeps every
+ * executed-result field except the clock-derived value. It intentionally does
+ * not use the public union because a listed file never enters case execution.
+ */
+type ResultWithoutDuration = Omit<ExecutedRunResult, 'durationMs'>;
 
 /**
  * Optional diagnostic evidence retained only for a failed dispatched step.
@@ -1680,10 +1687,12 @@ function skippedSteps(steps: readonly Step[], after: number): StepResult[] {
  * The current step receives environment evidence only when it exists, while
  * a pre-launch failure retains no synthetic step. This preserves the report's
  * distinction between a live-session dispatch failure and work that never
- * reached the browser.
+ * reached the browser. Its identity is deliberately restricted to
+ * {@link ExecutedRunResult}, because only an interrupted replay can produce
+ * the partial step evidence this helper assembles.
  */
 function resultForAbort(
-  identity: Pick<RunResult, 'id' | 'file' | 'planFile'>,
+  identity: Pick<ExecutedRunResult, 'id' | 'file' | 'planFile'>,
   steps: readonly Step[],
   completed: readonly StepResult[],
   currentStep: Step | undefined,
@@ -1710,14 +1719,15 @@ function grepMatches(grep: RegExp, path: string, testDir: string): boolean {
 }
 
 /**
- * Declares replay selection and AI-fallback policy for one run batch.
+ * Declares replay selection, reporting, and AI-fallback policy for one run batch.
  *
  * @remarks
  * A caller may give literal prompt paths or let the use case ask the injected
  * discovery seam for them. Target selection is also batch-wide because it
  * participates in the plan's input digest: selecting a different configured
  * target must fail as stale rather than replaying a plan against a silently
- * different browser target.
+ * different browser target. Empty-selection acceptance remains report policy,
+ * while list mode is the sole selection policy that prevents case execution.
  */
 export interface RunOptions {
   /** Literal prompt paths, or an empty list to use configured discovery. */
@@ -1737,6 +1747,23 @@ export interface RunOptions {
 
   /** Whether grounding misses and trace misses must fail without an AI fallback. */
   readonly cacheOnly: boolean;
+
+  /**
+   * Lets reporting accept an empty resolved selection without changing replay.
+   *
+   * The use case carries this command policy unchanged so the report boundary
+   * can choose exit status; only discovery and list selection belong here.
+   */
+  readonly allowEmpty: boolean;
+
+  /**
+   * Reports the resolved file selection without starting any case execution.
+   *
+   * The short-circuit runs after grep filtering and first-seen deduplication,
+   * preserving the exact selection a normal replay would schedule while
+   * avoiding browser, artifact, event, and AI-fallback work.
+   */
+  readonly list: boolean;
 
   /** Parsed stale-artifact policy; regeneration is rejected before replay begins. */
   readonly stale: 'fail' | 'regenerate';
@@ -1843,15 +1870,21 @@ export interface RunDeps {
  * `status: 'error'` so the report's priority scan selects a nonzero exit.
  */
 export interface RunCaseOutcome {
-  /** The complete per-case execution evidence and status. */
-  readonly result: RunResult;
+  /**
+   * The complete execution evidence and status for this replayed case.
+   *
+   * Keeping this execution-only ensures downstream code can safely consume
+   * duration and steps without first narrowing a discovery-only result.
+   */
+  readonly result: ExecutedRunResult;
 
   /** The first classified failure that aborted this case, when one exists. */
   readonly error?: AmbercastError;
 }
 
 /**
- * Ordered replay outcomes plus the structural zero-match fact.
+ * Ordered replay outcomes, discovery-only listed files, and the structural
+ * zero-match fact.
  *
  * The separate flag distinguishes an empty discovery result from a batch that
  * ran and happened to produce no passing cases, which matters to report exit
@@ -1863,7 +1896,25 @@ export interface RunOutcome {
 
   /** Whether discovery resolved no prompt files before case work began. */
   readonly noTestsFound: boolean;
+
+  /**
+   * Files selected for discovery-only reporting.
+   *
+   * This field is always present and is empty outside list mode. It remains
+   * separate from {@link results} because each case outcome promises executed
+   * duration and step evidence, while a listed file has intentionally not
+   * entered replay.
+   */
+  readonly listed: readonly RunListedFile[];
 }
+
+/**
+ * A prompt file selected by `run --list`.
+ *
+ * The report boundary derives the public result identity from this path so the
+ * use case does not duplicate report-only identifiers alongside selection.
+ */
+export type RunListedFile = { readonly file: string };
 
 /**
  * Replays canonical, fresh plan artifacts against their configured browser targets.
@@ -1871,14 +1922,19 @@ export interface RunOutcome {
  * @param deps - Replay I/O, target, clock, browser, secret, event, discovery,
  * and cancellation dependencies.
  * @param options - Batch selection and replay policy.
- * @returns Completed per-case outcomes and the zero-match fact needed by the
- * command report.
+ * @returns Completed per-case outcomes, discovery-only listed files, and the
+ * zero-match fact needed by the command report.
  * @remarks
  * Literal files retain caller order and discovered files retain the injected
  * discovery order after duplicate literal paths are collapsed in first-seen
  * order. Cases run sequentially. A caller `AbortSignal` stops the scheduler
  * before another case starts, but returns the outcomes already completed; it
  * does not discard them.
+ *
+ * List mode stops after the same discovery, grep, and deduplication phase.
+ * Its separate listed-file collection guarantees that this inspection path
+ * cannot be treated as execution evidence by callers that consume case
+ * outcomes.
  *
  * Each result uses a monotonic per-case duration so elapsed time remains
  * meaningful when wall-clock time changes. Replay validates the plan before
@@ -1917,9 +1973,8 @@ export async function run(deps: RunDeps, options: RunOptions): Promise<RunOutcom
     : discovered.filter((path) => grepMatches(options.grep!, path, deps.config.testDir));
   const files = [...new Set(filteredFiles)];
 
-  if (files.length === 0) {
-    return { results: [], noTestsFound: true };
-  }
+  if (files.length === 0) { return { results: [], noTestsFound: true, listed: [] }; }
+  if (options.list) { return { results: [], noTestsFound: false, listed: files.map((file) => ({ file })) }; }
 
   const results: RunCaseOutcome[] = [];
   for (const file of files) {
@@ -1930,7 +1985,7 @@ export async function run(deps: RunDeps, options: RunOptions): Promise<RunOutcom
     results.push(await runCase(deps, options, file));
   }
 
-  return { results, noTestsFound: false };
+  return { results, noTestsFound: false, listed: [] };
 }
 
 /**
