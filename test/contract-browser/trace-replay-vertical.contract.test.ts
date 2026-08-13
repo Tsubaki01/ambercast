@@ -150,6 +150,7 @@ describe('hand-authored trace replay against real Chromium', () => {
           testIgnore: ['**/.runs/**'],
           targets,
           defaultTarget: 'fixture',
+          ai: { provider: 'codex', timeoutMs: 120_000 },
         },
       };
 
