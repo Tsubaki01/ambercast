@@ -50,7 +50,7 @@ const DIFFERENT_FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v1', 
 const EMAIL: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Email' };
 const PASSWORD: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Password' };
 const SUBMIT: ElementRef = { strategy: 'accessibility', role: 'button', name: 'Submit' };
-const RUN_OPTIONS: RunOptions = { files: [], cacheOnly: false, stale: 'fail' };
+const RUN_OPTIONS: RunOptions = { files: [], cacheOnly: false, allowEmpty: false, list: false, stale: 'fail' };
 const GENERATE_OPTIONS: GenerateOptions = {
   files: [],
   strict: false,
@@ -477,6 +477,7 @@ describe('run secret sinks', () => {
       const report = buildRunReport({
         startedAt: '2026-08-10T00:00:00.000Z',
         durationMs: 0,
+        options: { allowEmpty: false, list: false },
         outcome,
       });
       expect(JSON.stringify(report)).not.toContain(SECRET_VALUE);

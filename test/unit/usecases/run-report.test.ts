@@ -12,21 +12,24 @@ import { StaleIrError } from '#core/errors/stale-ir-error.js';
 import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import type { AmbercastError } from '#core/errors/types.js';
 import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
-import type { RunResult } from '#report/schema.js';
+import type { ExecutedRunResult } from '#report/schema.js';
 import { buildRunReport, type RunReportInput } from '#usecases/run-report.js';
 import type { RunCaseOutcome } from '#usecases/run.js';
 
 const BASE = {
   startedAt: '2026-08-08T00:00:00Z',
   durationMs: 42,
+  options: { allowEmpty: false, list: false },
 } as const;
 
-function report(input: Omit<RunReportInput, keyof typeof BASE>): ReturnType<typeof buildRunReport> {
+function report(
+  input: Omit<RunReportInput, keyof typeof BASE> & { readonly options?: RunReportInput['options'] },
+): ReturnType<typeof buildRunReport> {
   return buildRunReport({ ...BASE, ...input } as RunReportInput);
 }
 
 function caseOutcome(
-  status: RunResult['status'],
+  status: ExecutedRunResult['status'],
   id: string,
   error?: AmbercastError,
 ): RunCaseOutcome {
@@ -107,7 +110,7 @@ describe('buildRunReport', () => {
     'serializes a case-scoped %s error',
     (_errorKind, error, code, kind, exitCode) => {
       const outcome = caseOutcome('error', 'login.test.md', error);
-      const output = report({ outcome: { noTestsFound: false, results: [outcome] } });
+      const output = report({ outcome: { noTestsFound: false, results: [outcome], listed: [] } });
 
       expect(output.exitCode).toBe(exitCode);
       expect(output.envelope.results).toEqual([outcome.result]);
@@ -124,8 +127,8 @@ describe('buildRunReport', () => {
   it.each(PRIORITY_PAIRS)(
     'selects the declared priority for %s regardless of result order',
     (description, results, exitCode) => {
-      const output = report({ outcome: { noTestsFound: false, results } });
-      const reversedOutput = report({ outcome: { noTestsFound: false, results: [...results].reverse() } });
+      const output = report({ outcome: { noTestsFound: false, results, listed: [] } });
+      const reversedOutput = report({ outcome: { noTestsFound: false, results: [...results].reverse(), listed: [] } });
 
       expect(output.exitCode, description).toBe(exitCode);
       expect(reversedOutput.exitCode, description).toBe(exitCode);
@@ -141,6 +144,7 @@ describe('buildRunReport', () => {
           caseOutcome('error', 'unsupported-reference.test.md'),
           caseOutcome('error', 'browser-session-stopgap.test.md'),
         ],
+        listed: [],
       },
     });
 
@@ -157,6 +161,7 @@ describe('buildRunReport', () => {
           caseOutcome('failed', 'assertion.test.md'),
           caseOutcome('error', 'stopgap.test.md'),
         ],
+        listed: [],
       },
     });
 
@@ -170,6 +175,7 @@ describe('buildRunReport', () => {
       outcome: {
         noTestsFound: false,
         results: [caseOutcome('error', 'environment.test.md', new BrowserLaunchFailedError('would otherwise select exit 3'))],
+        listed: [],
       },
     } as unknown as RunReportInput);
 
@@ -191,6 +197,7 @@ describe('buildRunReport', () => {
           caseOutcome('passed', 'login.test.md'),
           caseOutcome('passed', 'checkout.test.md'),
         ],
+        listed: [],
       },
     });
 
@@ -199,11 +206,80 @@ describe('buildRunReport', () => {
   });
 
   it('selects exit 5 for a no-tests-found outcome without another condition', () => {
-    const output = report({ outcome: { noTestsFound: true, results: [] } });
+    const output = report({ outcome: { noTestsFound: true, results: [], listed: [] } });
 
     expect(output.exitCode).toBe(5);
     expect(output.envelope.summary).toEqual({ total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 });
     expect(output.envelope.errors).toEqual([]);
+  });
+
+  it.each([
+    [false, false, true, 5],
+    [false, true, true, 0],
+    [true, false, true, 0],
+    [true, true, true, 0],
+    [false, false, false, 0],
+    [false, true, false, 0],
+    [true, false, false, 0],
+    [true, true, false, 0],
+  ] as const)(
+    'selects the exit gate for allowEmpty=%s, list=%s, and noTestsFound=%s (exit %s)',
+    (allowEmpty, list, noTestsFound, exitCode) => {
+      const output = report({
+        options: { allowEmpty, list },
+        outcome: { noTestsFound, results: [], listed: [] },
+      });
+
+      expect(output.exitCode).toBe(exitCode);
+    },
+  );
+
+  it('maps discovery-only files into listed report rows with report-boundary identities', () => {
+    const output = report({
+      outcome: {
+        noTestsFound: false,
+        results: [],
+        listed: [{ file: 'tests/login.test.md' }, { file: 'tests/checkout.test.md' }],
+      },
+    });
+
+    expect(output.exitCode).toBe(0);
+    expect(output.envelope.results).toEqual([
+      { id: 'tests/login.test.md', file: 'tests/login.test.md', status: 'listed' },
+      { id: 'tests/checkout.test.md', file: 'tests/checkout.test.md', status: 'listed' },
+    ]);
+  });
+
+  it('counts listed rows as passed without changing execution-only summary categories', () => {
+    const output = report({
+      outcome: {
+        noTestsFound: false,
+        results: [
+          caseOutcome('passed', 'passed.test.md'),
+          caseOutcome('failed', 'failed.test.md'),
+          caseOutcome('error', 'errored.test.md'),
+          caseOutcome('skipped', 'skipped.test.md'),
+        ],
+        listed: [{ file: 'listed-a.test.md' }, { file: 'listed-b.test.md' }],
+      },
+    });
+
+    expect(output.envelope.summary).toEqual({ total: 6, passed: 3, failed: 1, errored: 1, skipped: 1 });
+  });
+
+  it('does not let allow-empty suppress a classified error from a matched case', () => {
+    const error = new MissingPlanError('plan is missing');
+    const output = report({
+      options: { allowEmpty: true, list: false },
+      outcome: {
+        noTestsFound: false,
+        results: [caseOutcome('error', 'login.test.md', error)],
+        listed: [],
+      },
+    });
+
+    expect(output.exitCode).toBe(4);
+    expect(output.envelope.errors).toEqual([expect.objectContaining({ code: 'MISSING_PLAN' })]);
   });
 
   it('counts every run status in the summary, including non-zero errored cases', () => {
@@ -216,6 +292,7 @@ describe('buildRunReport', () => {
           caseOutcome('error', 'errored.test.md', new BrowserLaunchFailedError('browser did not launch')),
           caseOutcome('skipped', 'skipped.test.md'),
         ],
+        listed: [],
       },
     });
 

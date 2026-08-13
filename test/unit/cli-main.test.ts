@@ -259,6 +259,18 @@ describe('main()', () => {
     expect(runRunCommand).toHaveBeenCalledWith(expect.objectContaining({ stale: 'fail' }));
   });
 
+  it.each([
+    ['allow-empty', ['run', '--allow-empty'], { allowEmpty: true, list: false }],
+    ['list', ['run', '--list'], { allowEmpty: false, list: true }],
+    ['allow-empty and list', ['run', '--allow-empty', '--list'], { allowEmpty: true, list: true }],
+  ] as const)('parses the run %s flag combination', async (_description, argv, expectedInput) => {
+    runRunCommand.mockResolvedValue({ exitCode: 0, envelope: RUN_ENVELOPE });
+
+    await run(argv);
+
+    expect(runRunCommand).toHaveBeenCalledWith(expect.objectContaining(expectedInput));
+  });
+
   it('disables ANSI styling for human run output with --no-color', async () => {
     runRunCommand.mockResolvedValue({
       exitCode: 1,
@@ -329,5 +341,13 @@ describe('main()', () => {
     expect(result.stderr).toBe('');
     expect(result.exitCode).toBe(0);
     expect(runRunCommand).not.toHaveBeenCalled();
+  });
+
+  it('documents --allow-empty and --list in run usage text', async () => {
+    const result = await run(['run', '--help']);
+    const runOptions = result.stdout.slice(result.stdout.indexOf('Run options:'));
+
+    expect(runOptions).toContain('--allow-empty');
+    expect(runOptions).toContain('--list');
   });
 });

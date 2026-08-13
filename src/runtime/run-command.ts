@@ -126,6 +126,22 @@ export interface RunCommandInput {
   readonly cacheOnly: boolean;
 
   /**
+   * Allows a resolved empty selection to report success.
+   *
+   * This is reporting policy rather than replay policy, so runtime threads it
+   * unchanged to the report builder without allowing it to mask case errors.
+   */
+  readonly allowEmpty: boolean;
+
+  /**
+   * Resolves and reports matching prompt paths without executing cases.
+   *
+   * Runtime passes this to replay for its early selection boundary and to
+   * report construction so an intentional empty list remains successful.
+   */
+  readonly list: boolean;
+
+  /**
    * Freshness policy accepted by the parser. `regenerate` is a valid enum
    * value but is rejected as `ConfigInvalidError` before file I/O. Replay
    * never eagerly resolves or probes an AI provider and never regenerates a
@@ -185,9 +201,16 @@ export async function runRunCommand(input: RunCommandInput): Promise<RunCommandO
   const startedAt = reportTimestamp(clock.now());
   const runId = runIdFor(startedAt, createCryptoRandom().uuid());
   const startedMs = clock.monotonicMs();
+  /**
+   * Supplies both report paths with one consistent timing and options shape.
+   *
+   * Both completed and command-error paths use this factory, avoiding
+   * independently constructed report-context object literals.
+   */
   const reportContext = () => ({
     startedAt,
     durationMs: Math.max(0, Math.round(clock.monotonicMs() - startedMs)),
+    options: { allowEmpty: input.allowEmpty, list: input.list },
   });
 
   try {
@@ -235,6 +258,8 @@ export async function runRunCommand(input: RunCommandInput): Promise<RunCommandO
       ...(input.grep === undefined ? {} : { grep: input.grep }),
       ...(input.target === undefined ? {} : { target: input.target }),
       cacheOnly: input.cacheOnly,
+      allowEmpty: input.allowEmpty,
+      list: input.list,
       stale: input.stale,
     });
 

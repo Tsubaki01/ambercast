@@ -98,6 +98,46 @@ describe('bin/ambercast.js (e2e)', () => {
     expect(envelope.results).toEqual([expect.objectContaining({ file: expect.stringContaining('test.test.md'), status: 'listed' })]);
   });
 
+  it('lists a matched run file as a JSON report row without replaying its missing plan', async () => {
+    const project = await fixtureProject();
+    const result = await runCli(['run', '--list', '--json'], project);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe('');
+    const envelope = JSON.parse(result.stdout);
+    expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
+    expect(envelope).toMatchObject({
+      command: 'run',
+      summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 },
+      results: [expect.objectContaining({ file: expect.stringContaining('test.test.md'), status: 'listed' })],
+    });
+  });
+
+  it('renders matched run listings in human text', async () => {
+    const project = await fixtureProject();
+    const result = await runCli(['run', '--list', '--no-color'], project);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe('');
+    expect(result.stdout).toMatch(/listed.*test\.test\.md/i);
+  });
+
+  it('allows a grep-filtered empty run selection to exit successfully', async () => {
+    const project = await fixtureProject();
+    const result = await runCli(['run', '--allow-empty', '--grep', '^no-match$', '--json'], project);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe('');
+    const envelope = JSON.parse(result.stdout);
+    expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
+    expect(envelope).toMatchObject({
+      command: 'run',
+      summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 },
+      results: [],
+      errors: [],
+    });
+  });
+
   it('reports a missing run plan through the built CLI with exit 4', async () => {
     const project = await fixtureProject();
     const result = await runCli(['run', '--json'], project);
