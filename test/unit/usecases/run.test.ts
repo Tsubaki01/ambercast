@@ -1820,7 +1820,7 @@ describe('run AI call timeout composition', () => {
     const executor = createFakeAiExecutor({
       execute: () => new Promise<never>(() => undefined),
     });
-    const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT));
+    const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT), { snapshot: pathBSnapshot() });
     const { deps, recordingStorage } = createScenario({
       browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
       config: configWithAiTimeout(1),
@@ -1884,7 +1884,7 @@ describe('run AI call timeout composition', () => {
         return new Promise<never>(() => undefined);
       },
     });
-    const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT));
+    const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT), { snapshot: pathBSnapshot() });
     const { deps, recordingStorage } = createScenario({
       browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
       config: configWithAiTimeout(60_000),
@@ -1955,9 +1955,9 @@ describe('run AI call timeout composition', () => {
 
     try {
       const executor = createFakeAiExecutor({
-        execute: () => ({ data: { fingerprint: DIFFERENT_FINGERPRINT }, raw: '{"fingerprint":"fresh"}' }),
+        execute: () => ({ data: { confirmed: true }, raw: '{"confirmed":true}' }),
       });
-      const session = createFakeBrowserSession(liveEntries([PASSWORD, SUBMIT], DIFFERENT_FINGERPRINT));
+      const session = createFakeBrowserSession(liveEntries([EMAIL, SUBMIT], DIFFERENT_FINGERPRINT), { snapshot: pathBSnapshot() });
       const { deps, recordingStorage } = createScenario({
         browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
         resolveAiExecutor: async () => executor,
@@ -1967,10 +1967,10 @@ describe('run AI call timeout composition', () => {
         recordingStorage.storage,
         testPath,
         [
-          { id: 'fill-password', kind: 'action', action: 'fill', target: PASSWORD, value: 'correct horse battery staple' },
+          { id: 'fill-email', kind: 'action', action: 'fill', target: EMAIL, value: 'correct horse battery staple' },
           { id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT },
         ],
-        elementGrounding(['fill-password', 'click-submit']),
+        elementGrounding(['fill-email', 'click-submit']),
       );
 
       const outcome = await run(deps, DEFAULT_OPTIONS);

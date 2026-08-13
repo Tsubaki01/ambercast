@@ -236,6 +236,7 @@ describe('fake vertical slice', () => {
         testIgnore: ['**/.runs/**'],
         targets: TARGETS,
         defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 120_000 },
       },
     };
 
