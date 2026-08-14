@@ -151,24 +151,25 @@ describe('parseAriaSnapshot', () => {
   });
 
   it.each([
-    ['an embedded C0 control byte', '- but\u0001ton', '- \'but\u0001ton\''],
-    ['an embedded C1 control byte', '- but\u0085ton', '- \'but\u0085ton\''],
-    ['a leading hyphen', '- -button', '- \'-button\''],
-    ['a colon followed by a space', '- button [ref=e1: detail]', '- \'button [ref=e1: detail]\''],
-    ['a space followed by a hash', '- button [ref=e1 #detail]', '- \'button [ref=e1 #detail]\''],
-    ['a leading YAML indicator', '- !button', '- \'!button\''],
-    ['an embedded curly brace', '- but{ton', '- \'but{ton\''],
-    ['an embedded backtick', '- but`ton', '- \'but`ton\''],
-    ['a leading square bracket', '- [button', '- \'[button\''],
-    ['a numeric YAML scalar collision', '- 123', '- \'123\''],
-    ['a boolean YAML scalar collision', '- true', '- \'true\''],
+    ['an embedded C0 control byte', '- but\u0001ton', '- \'but\u0001ton\'', 'but\u0001ton'],
+    ['an embedded C1 control byte', '- but\u0085ton', '- \'but\u0085ton\'', 'but\u0085ton'],
+    ['a leading hyphen', '- -button', '- \'-button\'', '-button'],
+    ['a colon followed by a space', '- button [ref=e1: detail]', '- \'button [ref=e1: detail]\'', 'button'],
+    ['a space followed by a hash', '- button [ref=e1 #detail]', '- \'button [ref=e1 #detail]\'', 'button'],
+    ['a leading YAML indicator', '- !button', '- \'!button\'', '!button'],
+    ['an embedded curly brace', '- but{ton', '- \'but{ton\'', 'but{ton'],
+    ['an embedded backtick', '- but`ton', '- \'but`ton\'', 'but`ton'],
+    ['a leading square bracket', '- [button', '- \'[button\'', '[button'],
+    ['a numeric YAML scalar collision', '- 123', '- \'123\'', '123'],
+    ['a boolean YAML scalar collision', '- true', '- \'true\'', 'true'],
   ] as const)('rejects an unquoted key that needs renderer quoting for %s, but accepts the outer-quoted form', (
     _description,
     unquoted,
     quoted,
+    expectedRole,
   ) => {
     expect(parseAriaSnapshot(unquoted)).toBe(SNAPSHOT_INVALID);
-    expect(parseAriaSnapshot(quoted)).not.toBe(SNAPSHOT_INVALID);
+    expect(parseAriaSnapshot(quoted)).toEqual(root([node(expectedRole)]));
   });
 
   it.each([
@@ -180,29 +181,30 @@ describe('parseAriaSnapshot', () => {
   });
 
   it.each([
-    ['leading whitespace', '- text:  value', '- text: " value"'],
-    ['trailing whitespace', '- text: value ', '- text: "value "'],
-    ['an embedded C0 control byte', '- text: va\u0001lue', '- text: "va\\x01lue"'],
-    ['an embedded C1 control byte', '- text: va\u0085lue', '- text: "va\\x85lue"'],
-    ['a leading hyphen', '- text: -value', '- text: "-value"'],
-    ['a colon followed by a space', '- text: value: detail', '- text: "value: detail"'],
-    ['a colon at the end of the value', '- text: value:', '- text: "value:"'],
-    ['a space followed by a hash', '- text: value #detail', '- text: "value #detail"'],
-    ['an embedded line feed', '- text: value\ncontinued', '- text: "value\\ncontinued"'],
-    ['an embedded carriage return', '- text: value\rcontinued', '- text: "value\\rcontinued"'],
-    ['a leading YAML indicator', '- text: !value', '- text: "!value"'],
-    ['an embedded curly brace', '- text: va{lue', '- text: "va{lue"'],
-    ['an embedded backtick', '- text: va`lue', '- text: "va`lue"'],
-    ['a leading square bracket', '- text: [value', '- text: "[value"'],
-    ['a numeric YAML scalar collision', '- text: 123', '- text: "123"'],
-    ['a boolean YAML scalar collision', '- text: true', '- text: "true"'],
+    ['leading whitespace', '- text:  value', '- text: " value"', ' value'],
+    ['trailing whitespace', '- text: value ', '- text: "value "', 'value '],
+    ['an embedded C0 control byte', '- text: va\u0001lue', '- text: "va\\x01lue"', 'va\u0001lue'],
+    ['an embedded C1 control byte', '- text: va\u0085lue', '- text: "va\\x85lue"', 'va\u0085lue'],
+    ['a leading hyphen', '- text: -value', '- text: "-value"', '-value'],
+    ['a colon followed by a space', '- text: value: detail', '- text: "value: detail"', 'value: detail'],
+    ['a colon at the end of the value', '- text: value:', '- text: "value:"', 'value:'],
+    ['a space followed by a hash', '- text: value #detail', '- text: "value #detail"', 'value #detail'],
+    ['an embedded line feed', '- text: value\ncontinued', '- text: "value\\ncontinued"', 'value\ncontinued'],
+    ['an embedded carriage return', '- text: value\rcontinued', '- text: "value\\rcontinued"', 'value\rcontinued'],
+    ['a leading YAML indicator', '- text: !value', '- text: "!value"', '!value'],
+    ['an embedded curly brace', '- text: va{lue', '- text: "va{lue"', 'va{lue'],
+    ['an embedded backtick', '- text: va`lue', '- text: "va`lue"', 'va`lue'],
+    ['a leading square bracket', '- text: [value', '- text: "[value"', '[value'],
+    ['a numeric YAML scalar collision', '- text: 123', '- text: "123"', '123'],
+    ['a boolean YAML scalar collision', '- text: true', '- text: "true"', 'true'],
   ] as const)('rejects an unquoted value that needs renderer quoting for %s, but accepts the quoted form', (
     _description,
     unquoted,
     quoted,
+    expectedName,
   ) => {
     expect(parseAriaSnapshot(unquoted)).toBe(SNAPSHOT_INVALID);
-    expect(parseAriaSnapshot(quoted)).not.toBe(SNAPSHOT_INVALID);
+    expect(parseAriaSnapshot(quoted)).toEqual(root([node('text', expectedName)]));
   });
 
   it.each([
@@ -308,5 +310,18 @@ describe('parseAriaSnapshot', () => {
 
     expect(clonedMarker).not.toBe(SNAPSHOT_INVALID);
     expect(isSnapshotInvalid(clonedMarker)).toBe(true);
+  });
+
+  it.each<[string, JsonValueT]>([
+    ['a normally parsed root tree', parseAriaSnapshot('- button "Save"')],
+    ['null', null],
+    ['an array', []],
+    ['a plain string', 'snapshotInvalid'],
+    ['a number', 1],
+    ['an empty object', {}],
+    ['an object with a false marker field', { snapshotInvalid: false }],
+    ['an object with a string marker field', { snapshotInvalid: 'true' }],
+  ])('does not over-match %s as an invalid marker', (_description, value) => {
+    expect(isSnapshotInvalid(value)).toBe(false);
   });
 });
