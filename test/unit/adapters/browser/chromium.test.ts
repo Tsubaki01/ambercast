@@ -673,18 +673,32 @@ describe('ChromiumBrowserSession.perform()', () => {
   });
 });
 
-interface AssertionScenario {
+interface AssertionScenarioBase {
   readonly description: string;
   readonly failureMessage?: string;
-  readonly requiresBoundTarget?: boolean;
-  check(target: BoundElement | undefined): AssertCheck;
   configure(launcher: FakePlaywrightLauncher, expectedPassed: boolean): void;
   assertPlaywright(launcher: FakePlaywrightLauncher): void;
 }
 
+type BoundAssertCheck = Extract<AssertCheck, { readonly target: BoundElement }>;
+type UnboundAssertCheck = Exclude<AssertCheck, BoundAssertCheck>;
+
+interface BoundAssertionScenario extends AssertionScenarioBase {
+  readonly binding: 'bound';
+  check(target: BoundElement): BoundAssertCheck;
+}
+
+interface UnboundAssertionScenario extends AssertionScenarioBase {
+  readonly binding: 'unbound';
+  check(): UnboundAssertCheck;
+}
+
+type AssertionScenario = BoundAssertionScenario | UnboundAssertionScenario;
+
 const ASSERTION_SCENARIOS: readonly AssertionScenario[] = [
   {
     description: 'text-visible',
+    binding: 'unbound',
     check: () => ({ check: 'text-visible', text: 'Welcome' }),
     configure(launcher, expectedPassed): void {
       launcher.page.textLocator.visible = expectedPassed;
@@ -698,13 +712,8 @@ const ASSERTION_SCENARIOS: readonly AssertionScenario[] = [
   },
   {
     description: 'element-visible',
-    requiresBoundTarget: true,
-    check: (target) => {
-      if (target === undefined) {
-        throw new Error('element-visible requires a bound submit target.');
-      }
-      return { check: 'element-visible', target };
-    },
+    binding: 'bound',
+    check: (target) => ({ check: 'element-visible', target }),
     configure(launcher, expectedPassed): void {
       launcher.page.roleLocator.visible = expectedPassed;
     },
@@ -715,13 +724,8 @@ const ASSERTION_SCENARIOS: readonly AssertionScenario[] = [
   },
   {
     description: 'text-equals',
-    requiresBoundTarget: true,
-    check: (target) => {
-      if (target === undefined) {
-        throw new Error('text-equals requires a bound submit target.');
-      }
-      return { check: 'text-equals', target, text: 'Send form' };
-    },
+    binding: 'bound',
+    check: (target) => ({ check: 'text-equals', target, text: 'Send form' }),
     failureMessage: 'Element text does not equal: Submit; expected "Send form", received "Send later".',
     configure(launcher, expectedPassed): void {
       launcher.page.roleLocator.text = expectedPassed ? 'Send form' : 'Send later';
@@ -733,6 +737,7 @@ const ASSERTION_SCENARIOS: readonly AssertionScenario[] = [
   },
   {
     description: 'element-count',
+    binding: 'unbound',
     check: () => ({ check: 'element-count', target: SUBMIT_BUTTON, count: 2 }),
     failureMessage: 'Element count does not equal: Submit; expected 2, received 1.',
     configure(launcher, expectedPassed): void {
@@ -749,6 +754,7 @@ const ASSERTION_SCENARIOS: readonly AssertionScenario[] = [
   },
   {
     description: 'url-matches',
+    binding: 'unbound',
     check: () => ({ check: 'url-matches', pattern: '^https://example\\.test/account$' }),
     configure(launcher, expectedPassed): void {
       launcher.page.currentUrl = expectedPassed
@@ -769,9 +775,10 @@ describe('ChromiumBrowserSession.evaluateAssert()', () => {
       it(`returns ${expectedPassed ? 'a pass' : 'a failure'} for ${scenario.description}`, async () => {
         await withLaunchedSession({}, async (session, launcher) => {
           scenario.configure(launcher, expectedPassed);
-          const target = scenario.requiresBoundTarget ? await bindSubmit(session) : undefined;
-
-          const outcome = await session.evaluateAssert(scenario.check(target));
+          const check = scenario.binding === 'bound'
+            ? scenario.check(await bindSubmit(session))
+            : scenario.check();
+          const outcome = await session.evaluateAssert(check);
 
           expect(outcome.passed).toBe(expectedPassed);
           if (!outcome.passed) {

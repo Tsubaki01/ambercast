@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ElementRef, Fingerprint } from '../../src/core/ir/schema.js';
-import type { BoundElement, BrowserSession, GroundedResolution } from '../../src/ports/browser.js';
+import type { BoundElement, BrowserSession, GroundingMissReason } from '../../src/ports/browser.js';
 
 export type BrowserSessionContractScenario =
   | 'normal'
@@ -15,8 +15,6 @@ export interface BrowserSessionContractSetup {
   readonly exists: boolean;
   readonly scenario?: BrowserSessionContractScenario;
 }
-
-type GroundingMissReason = Extract<GroundedResolution, { readonly kind: 'miss' }>['reason'];
 
 export interface BrowserSessionOperationObservation {
   readonly ariaSnapshotCalls: number;
@@ -100,7 +98,7 @@ async function actualFingerprintFor(
   return harness.actualFingerprintFor(session, setup);
 }
 
-function fingerprintWithFlippedLeadingHexCharacter(fingerprint: Fingerprint): Fingerprint {
+export function fingerprintWithFlippedLeadingHexCharacter(fingerprint: Fingerprint): Fingerprint {
   const replacement = fingerprint.hash[0] === '0' ? '1' : '0';
 
   return { ...fingerprint, hash: `${replacement}${fingerprint.hash.slice(1)}` };
@@ -176,7 +174,12 @@ async function expectRejectedWithoutBrowserWork(
   reason: 'provenance' | 'navigation' | 'fingerprint',
 ): Promise<void> {
   const before = harness.operationObservation(session);
-  await expect(operation.invoke(session, element)).rejects.toThrow(reason);
+  const messageMatcher = {
+    provenance: /provenance.*browser session/i,
+    navigation: /navigation generation is stale/i,
+    fingerprint: /fingerprint (?:verification failed|no longer matches)/i,
+  }[reason];
+  await expect(operation.invoke(session, element)).rejects.toThrow(messageMatcher);
   const after = harness.operationObservation(session);
   expect(after.roleLocatorCalls).toBe(before.roleLocatorCalls);
   expect(after.finalOperationCalls).toBe(before.finalOperationCalls);

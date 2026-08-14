@@ -37,7 +37,14 @@ import type { LayoutResolver } from '#core/layout/resolve.js';
 import { joinPath, relativeWithin } from '#core/paths.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import type { AiActionController, AiExecutor } from '#ports/ai.js';
-import type { AssertCheck, AssertOutcome, BoundElement, BrowserSession, PerformableAction } from '#ports/browser.js';
+import type {
+  AssertCheck,
+  AssertOutcome,
+  BoundElement,
+  BrowserSession,
+  GroundingMissReason,
+  PerformableAction,
+} from '#ports/browser.js';
 import type { BrowserDriverResolver } from '#ports/index.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { Clock, EventSink, SecretsProvider } from '#ports/system.js';
@@ -1437,9 +1444,7 @@ async function groundedTarget(
   return resolved.element;
 }
 
-function groundingAbort(
-  reason: 'fingerprint-mismatch' | 'element-not-found' | 'ambiguous-match' | 'snapshot-invalid' | 'secret-contaminated',
-): CaseAbort {
+function groundingAbort(reason: GroundingMissReason): CaseAbort {
   switch (reason) {
     case 'fingerprint-mismatch':
       return new CaseAbort('The supplied locator changed shape after AI confirmation and cannot be safely bound.');

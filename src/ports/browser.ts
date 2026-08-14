@@ -206,6 +206,20 @@ export type GroundingQuery =
     };
 
 /**
+ * Reasons a current page cannot safely satisfy a grounding query.
+ *
+ * This is shared by the browser port's resolution result and every caller
+ * that turns a miss into user-facing control flow, so adding a new reason
+ * remains a single contract change.
+ */
+export type GroundingMissReason =
+  | 'fingerprint-mismatch'
+  | 'element-not-found'
+  | 'ambiguous-match'
+  | 'snapshot-invalid'
+  | 'secret-contaminated';
+
+/**
  * The result of binding an {@link ElementRef} against the current page.
  *
  * A miss distinguishes absent, invalid, changed, tainted, and duplicate
@@ -239,12 +253,7 @@ export type GroundedResolution =
        * snapshot, or a resolved secret value contaminated the derived
        * descriptor.
        */
-      readonly reason:
-        | 'fingerprint-mismatch'
-        | 'element-not-found'
-        | 'ambiguous-match'
-        | 'snapshot-invalid'
-        | 'secret-contaminated';
+      readonly reason: GroundingMissReason;
     };
 
 /**

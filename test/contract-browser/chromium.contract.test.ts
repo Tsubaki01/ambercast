@@ -53,6 +53,16 @@ const MISSING_ELEMENT_PAGE = `data:text/html,${encodeURIComponent(`<!doctype htm
   </body>
 </html>`)}`;
 
+const DUPLICATE_TEXT_PAGE = `data:text/html,${encodeURIComponent(`<!doctype html>
+<html lang="en">
+  <body>
+    <main aria-label="Application">
+      <p>Repeated status</p>
+      <p>Repeated status</p>
+    </main>
+  </body>
+</html>`)}`;
+
 const FIRST_AMBIGUOUS_SUBMIT_CANDIDATE_PAGE = `data:text/html,${encodeURIComponent(`<!doctype html>
 <html lang="en">
   <body>
@@ -335,6 +345,21 @@ describe('Chromium real-browser contract', () => {
       }
       return { ...observation };
     },
+  });
+
+  it('evaluates text-visible against repeated visible text without a strict-mode violation', async () => {
+    const session = await createChromiumBrowserDriver().launch(TARGET);
+
+    try {
+      await session.perform({ type: 'navigate', url: DUPLICATE_TEXT_PAGE });
+
+      await expect(session.evaluateAssert({
+        check: 'text-visible',
+        text: 'Repeated status',
+      })).resolves.toEqual({ passed: true });
+    } finally {
+      await session.close();
+    }
   });
 
   it('reports ambiguous-match for a separate duplicate fixture even when one candidate has the stored hash', async () => {

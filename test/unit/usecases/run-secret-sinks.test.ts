@@ -22,12 +22,13 @@ import {
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
 import type { AiExecutor } from '#ports/ai.js';
-import type { BoundElement, BrowserSession } from '#ports/browser.js';
+import type { BrowserSession } from '#ports/browser.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { SecretsProvider } from '#ports/system.js';
 import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/generate.js';
 import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
 import { buildRunReport } from '#usecases/run-report.js';
+import { boundTarget } from '../../doubles/bound-target.js';
 import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
 import { createFakeBrowserDriver } from '../../doubles/fake-browser-driver.js';
 import {
@@ -60,10 +61,6 @@ const GENERATE_OPTIONS: GenerateOptions = {
   allowEmpty: false,
   list: false,
 };
-
-function boundTarget(ref: ElementRef, fingerprint: Fingerprint = FINGERPRINT): BoundElement {
-  return { ref, fingerprint };
-}
 
 interface RecordingStorage {
   readonly storage: StorageAdapter;
@@ -343,7 +340,7 @@ describe('run secret sinks', () => {
         target: PASSWORD,
         query: expect.objectContaining({ mode: 'compute' }),
       }),
-      { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD), value: SECRET_VALUE } },
+      { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: SECRET_VALUE } },
     ]);
   });
 
@@ -386,9 +383,14 @@ describe('run secret sinks', () => {
     expect(outcome.results[0]?.result.status).toBe('passed');
     expect(executor.agenticRequests).toHaveLength(1);
     expect(resolveGrounded).toHaveBeenCalledWith(secretTaintedTarget, expect.objectContaining({ mode: 'compute' }));
-    expect([...((resolveGrounded.mock.calls[0]?.[1] as { readonly resolvedSecrets: Iterable<ReadonlySet<string>> }).resolvedSecrets)]).toEqual([
-      new Set([preScanValue, materializationValue]),
-    ]);
+    const computeQuery = resolveGrounded.mock.calls
+      .map(([, query]) => query)
+      .find((query) => query.mode === 'compute');
+
+    expect(computeQuery?.mode).toBe('compute');
+    if (computeQuery?.mode === 'compute') {
+      expect([...computeQuery.resolvedSecrets]).toEqual([new Set([preScanValue, materializationValue])]);
+    }
     expect(session.operations().filter((operation) => operation.type === 'perform')).toEqual([]);
     expect(JSON.stringify(outcome)).not.toContain(materializationValue);
   });
@@ -420,9 +422,14 @@ describe('run secret sinks', () => {
       steps: [{ id: 'recorded-ai', status: 'error', kind: 'environment' }],
     });
     expect(resolveGrounded).toHaveBeenCalledWith(secretTaintedTarget, expect.objectContaining({ mode: 'compute' }));
-    expect([...((resolveGrounded.mock.calls[0]?.[1] as { readonly resolvedSecrets: Iterable<ReadonlySet<string>> }).resolvedSecrets)]).toEqual([
-      new Set([SECRET_VALUE]),
-    ]);
+    const computeQuery = resolveGrounded.mock.calls
+      .map(([, query]) => query)
+      .find((query) => query.mode === 'compute');
+
+    expect(computeQuery?.mode).toBe('compute');
+    if (computeQuery?.mode === 'compute') {
+      expect([...computeQuery.resolvedSecrets]).toEqual([new Set([SECRET_VALUE])]);
+    }
     expect(session.operations().filter((operation) => operation.type === 'perform')).toEqual([]);
     expect(recordingStorage.writes).toEqual([]);
     expect(JSON.stringify(outcome)).not.toContain(SECRET_VALUE);
@@ -459,11 +466,11 @@ describe('run secret sinks', () => {
     expect(recordingStorage.writes).toEqual([]);
     expect(session.operations()).toEqual([
       expect.objectContaining({ type: 'resolve-grounded', target: PASSWORD, query: expect.objectContaining({ mode: 'compute' }) }),
-      { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD), value: firstSecretValue } },
+      { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: firstSecretValue } },
       expect.objectContaining({ type: 'resolve-grounded', target: unsafeTarget, query: expect.objectContaining({ mode: 'compute' }) }),
-      { type: 'perform', action: { type: 'click', target: boundTarget(unsafeTarget) } },
+      { type: 'perform', action: { type: 'click', target: boundTarget(unsafeTarget, FINGERPRINT) } },
       expect.objectContaining({ type: 'resolve-grounded', target: PASSWORD, query: expect.objectContaining({ mode: 'compute' }) }),
-      { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD), value: persistenceOnlySecret } },
+      { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: persistenceOnlySecret } },
       { type: 'evaluate-assert', check: { check: 'text-visible', text: 'Dashboard' } },
     ]);
   });

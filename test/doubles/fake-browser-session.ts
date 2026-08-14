@@ -85,7 +85,7 @@ export interface FakeBrowserSession extends BrowserSession {
 }
 
 /**
- * The browser-boundary work observed by the fake after successful validation.
+ * The browser-boundary work observed by the fake after provenance validation.
  *
  * These counters model the three calls that a real targeted operation must
  * keep behind provenance validation. Contract tests use them to prove that a
@@ -188,6 +188,14 @@ function mintBoundElement(
   return element;
 }
 
+/*
+ * This fixture-level taint check deliberately compares only the requested
+ * descriptor fields as literal, case-sensitive, whitespace-preserving text.
+ * Production normalizes accessible names and also examines the target's
+ * neighborhood, so tests that depend on either richer behavior must script a
+ * `secret-contaminated` miss instead of treating this approximation as browser
+ * evidence.
+ */
 function computeDescriptorContainsResolvedSecret(ref: ElementRef, query: GroundingQuery): boolean {
   if (query.mode !== 'compute') {
     return false;
@@ -252,6 +260,8 @@ function requireCurrentBinding(state: FakeBrowserSessionState, element: BoundEle
   if (record === undefined) {
     throw new Error('Bound element provenance is invalid for this browser session.');
   }
+
+  state.ariaSnapshotCalls += 1;
 
   if (record.generation !== state.generation) {
     throw new Error('Bound element navigation generation is stale.');

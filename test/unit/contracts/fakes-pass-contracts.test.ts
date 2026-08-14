@@ -1,8 +1,12 @@
+import type { ElementRef } from '../../../src/core/ir/schema.js';
 import type { BrowserSession } from '../../../src/ports/browser.js';
 import type { AiExecuteRequest, AiExecuteResult } from '../../../src/ports/ai.js';
 import { registerAiExecutorContract } from '../../contracts/ai-executor.contract.js';
 import { registerBrowserDriverContract } from '../../contracts/browser-driver.contract.js';
-import { registerBrowserSessionContract } from '../../contracts/browser-session.contract.js';
+import {
+  fingerprintWithFlippedLeadingHexCharacter,
+  registerBrowserSessionContract,
+} from '../../contracts/browser-session.contract.js';
 import { registerClockContract } from '../../contracts/clock.contract.js';
 import { registerEnvironmentInfoContract } from '../../contracts/environment-info.contract.js';
 import { registerEventSinkContract } from '../../contracts/event-sink.contract.js';
@@ -26,7 +30,7 @@ import {
 import { createFakeEnvironmentInfo } from '../../doubles/fake-environment-info.js';
 import { createFakeSecretsProvider } from '../../doubles/fake-secrets-provider.js';
 
-function sessionKey(ref: { readonly strategy: 'accessibility'; readonly role: string; readonly name: string }): string {
+function sessionKey(ref: ElementRef): string {
   return elementRefKey(ref);
 }
 
@@ -70,10 +74,7 @@ registerBrowserSessionContract({
       throw new Error('The fake contract fixture must retain the descriptor entry to invalidate it.');
     }
 
-    entry.currentFingerprint = {
-      ...entry.currentFingerprint,
-      hash: `${entry.currentFingerprint.hash[0] === '0' ? '1' : '0'}${entry.currentFingerprint.hash.slice(1)}`,
-    };
+    entry.currentFingerprint = fingerprintWithFlippedLeadingHexCharacter(entry.currentFingerprint);
   },
   operationObservation: (session) => operationObservation(session as FakeBrowserSession),
 });

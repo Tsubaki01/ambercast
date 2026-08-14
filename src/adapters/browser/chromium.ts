@@ -173,6 +173,14 @@ function adaptLocator(locator: PlaywrightLocator): PlaywrightLocatorHandle {
  * The IR validates accessibility roles independently of Playwright's closed
  * role union. The cast is therefore contained here, where the real API is
  * invoked, rather than widening the adapter's public structural interface.
+ *
+ * Page-scoped text visibility deliberately selects the first text match at
+ * this production boundary. Unlike bound role/name targets, text assertions
+ * may legitimately match repeated presentation text; Playwright requires an
+ * explicit single candidate before `isVisible()` can inspect it. Keeping that
+ * narrowing here preserves the smaller structural locator seam for all other
+ * adapter users and still bases the assertion on visibility, not merely a
+ * nonzero match count that could include hidden text.
  */
 function adaptPage(page: PlaywrightPage): PlaywrightPageHandle {
   let generation = 0;
@@ -185,7 +193,7 @@ function adaptPage(page: PlaywrightPage): PlaywrightPageHandle {
   return {
     goto: (url) => page.goto(url),
     getByRole: (role, options) => adaptLocator(page.getByRole(role as PlaywrightRole, options)),
-    getByText: (text) => adaptLocator(page.getByText(text)),
+    getByText: (text) => adaptLocator(page.getByText(text).first()),
     locator: (selector) => adaptLocator(page.locator(selector)),
     navigationGeneration: () => generation,
     url: () => page.url(),

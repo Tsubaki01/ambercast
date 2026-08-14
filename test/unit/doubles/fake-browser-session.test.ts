@@ -6,6 +6,7 @@ import {
   createFakeBrowserSession,
   elementRefKey,
   fingerprintsEqual,
+  operationObservation,
   type FakeBrowserSession,
   type FakeBrowserSessionEntry,
 } from '../../doubles/fake-browser-session.js';
@@ -180,6 +181,33 @@ describe('createFakeBrowserSession', () => {
     const foreign = bindForTest(first, REF, FINGERPRINT);
 
     await expectTargetedOperationsToReject(second, foreign);
+  });
+
+  it('starts operation-immediate revalidation only after provenance succeeds', async () => {
+    const liveEntries = entries();
+    const session = createFakeBrowserSession(liveEntries);
+    const fabricated: BoundElement = { ref: REF, fingerprint: FINGERPRINT };
+
+    await expect(session.perform({ type: 'click', target: fabricated })).rejects.toThrow('provenance');
+    expect(operationObservation(session)).toEqual({
+      ariaSnapshotCalls: 0,
+      roleLocatorCalls: 0,
+      finalOperationCalls: 0,
+    });
+
+    const bound = bindForTest(session, REF, FINGERPRINT);
+    const entry = liveEntries.get(REF_KEY);
+    if (entry === undefined) {
+      throw new Error('The revalidation fixture must contain the bound entry.');
+    }
+    entry.currentFingerprint = OTHER_FINGERPRINT;
+
+    await expect(session.perform({ type: 'click', target: bound })).rejects.toThrow('fingerprint');
+    expect(operationObservation(session)).toEqual({
+      ariaSnapshotCalls: 1,
+      roleLocatorCalls: 0,
+      finalOperationCalls: 0,
+    });
   });
 
   it('invalidates every targeted operation after its own navigate action advances generation', async () => {

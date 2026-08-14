@@ -32,12 +32,13 @@ import {
 } from '#core/ir/schema.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
 import type { AiAgenticRequest } from '#ports/ai.js';
-import type { BoundElement, BrowserDriver, BrowserEngine, BrowserSession, PerformableAction } from '#ports/browser.js';
+import type { BrowserDriver, BrowserEngine, BrowserSession, PerformableAction } from '#ports/browser.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { Clock, RunEvent } from '#ports/system.js';
 import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
 import { buildRunReport } from '#usecases/run-report.js';
 import { OBSERVED_NOTE, RunResult } from '#report/schema.js';
+import { boundTarget } from '../../doubles/bound-target.js';
 import { createFixedClock } from '../../doubles/create-fixed-clock.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
 import { createRecordingEventSink } from '../../doubles/create-recording-event-sink.js';
@@ -72,10 +73,6 @@ const DEFAULT_OPTIONS: RunOptions = {
 };
 const AI_TIMEOUT_MESSAGE = 'The AI provider did not respond within the configured timeout.';
 const GENERIC_ABORT_EXPLANATION = 'The browser session could not complete this case and no deterministic fallback is available.';
-
-function boundTarget(ref: ElementRef, fingerprint: Fingerprint = FINGERPRINT): BoundElement {
-  return { ref, fingerprint };
-}
 
 interface RecordingStorage {
   readonly storage: StorageAdapter;
@@ -582,11 +579,11 @@ describe('run', () => {
 
     expect(outcome.results[0]?.result.status).toBe('passed');
     expect(performed).toEqual([
-      { type: 'click', target: boundTarget(SUBMIT) },
+      { type: 'click', target: boundTarget(SUBMIT, FINGERPRINT) },
       { type: 'navigate', url: '/dashboard' },
-      { type: 'press', target: boundTarget(EMAIL), key: 'Enter' },
-      { type: 'fill', target: boundTarget(EMAIL), value: 'person@example.test' },
-      { type: 'fill-secret', target: boundTarget(PASSWORD), value: 'not-in-the-plan' },
+      { type: 'press', target: boundTarget(EMAIL, FINGERPRINT), key: 'Enter' },
+      { type: 'fill', target: boundTarget(EMAIL, FINGERPRINT), value: 'person@example.test' },
+      { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: 'not-in-the-plan' },
     ]);
   });
 
@@ -709,8 +706,8 @@ describe('run', () => {
     const outcome = await run(deps, DEFAULT_OPTIONS);
 
     expect(outcome.results[0]?.result.status).toBe('passed');
-    expect(captureValue).toHaveBeenCalledWith(boundTarget(EMAIL), 'text');
-    expect(performed).toEqual([{ type: 'fill', target: boundTarget(SUBMIT), value: 'Hello, Ari!' }]);
+    expect(captureValue).toHaveBeenCalledWith(boundTarget(EMAIL, FINGERPRINT), 'text');
+    expect(performed).toEqual([{ type: 'fill', target: boundTarget(SUBMIT, FINGERPRINT), value: 'Hello, Ari!' }]);
   });
 
   it.each([
@@ -1320,11 +1317,11 @@ describe('run agentic fallback pipeline', () => {
     expect(secondRun.results[0]?.result.status).toBe('passed');
     expect(firstSession.operations()).toContainEqual({
       type: 'perform',
-      action: { type: 'fill', target: boundTarget(EMAIL), value: 'token: TOKEN-A' },
+      action: { type: 'fill', target: boundTarget(EMAIL, FINGERPRINT), value: 'token: TOKEN-A' },
     });
     expect(secondSession.operations()).toContainEqual({
       type: 'perform',
-      action: { type: 'fill', target: boundTarget(EMAIL), value: 'token: TOKEN-B' },
+      action: { type: 'fill', target: boundTarget(EMAIL, FINGERPRINT), value: 'token: TOKEN-B' },
     });
     expect(recordingStorage.writes.slice(writesBeforeSecondRun)).toEqual([]);
     expect(await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`)).toBe(
@@ -1391,7 +1388,7 @@ describe('run agentic fallback pipeline', () => {
         target: SUBMIT,
         query: expect.objectContaining({ mode: 'compute' }),
       }),
-      { type: 'perform', action: { type: 'press', target: boundTarget(SUBMIT), key: 'Enter' } },
+      { type: 'perform', action: { type: 'press', target: boundTarget(SUBMIT, FINGERPRINT), key: 'Enter' } },
       { type: 'evaluate-assert', check: { check: 'text-visible', text: 'Refreshed dashboard' } },
     ]);
     expect(events.emitted().filter((event) => event.type === 'step-result')).toEqual([
@@ -1806,7 +1803,7 @@ describe('run path-B element recovery', () => {
     });
     expect(session.operations()).toEqual([
       { type: 'resolve-grounded', target: PASSWORD, query: { mode: 'verify', fingerprint: FINGERPRINT } },
-      { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD), value: secretValue } },
+      { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: secretValue } },
       { type: 'resolve-grounded', target: SUBMIT, query: { mode: 'verify', fingerprint: FINGERPRINT } },
       { type: 'snapshot-for-resolution' },
       { type: 'resolve-grounded', target: SUBMIT, query: { mode: 'verify', fingerprint: expectedFingerprint } },
@@ -2071,7 +2068,7 @@ describe('run path-B element recovery', () => {
     expect(await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`)).toBe(groundingBefore);
     expect(session.operations()).toEqual([
       { type: 'resolve-grounded', target: PASSWORD, query: { mode: 'verify', fingerprint: FINGERPRINT } },
-      { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD), value: secretValue } },
+      { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: secretValue } },
       { type: 'resolve-grounded', target: SUBMIT, query: { mode: 'verify', fingerprint: FINGERPRINT } },
       { type: 'snapshot-for-resolution' },
     ]);
@@ -3619,7 +3616,7 @@ describe('run agentic materialization boundary', () => {
     expect(session.operations().filter((operation) => operation.type === 'perform')).toEqual(
       _description === 'a captured run value'
         ? []
-        : [{ type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD), value: 'SECRET-LITERAL-SENTINEL' } }],
+        : [{ type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: 'SECRET-LITERAL-SENTINEL' } }],
     );
   });
 
@@ -3662,7 +3659,7 @@ describe('run agentic materialization boundary', () => {
           target: PASSWORD,
           query: expect.objectContaining({ mode: 'compute' }),
         }),
-        { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD), value: secretValue } },
+        { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: secretValue } },
       ]);
       return;
     }
@@ -3871,7 +3868,7 @@ describe('run per-case grounding flush and dispatch wiring', () => {
     expect(writeText).toHaveBeenCalledTimes(1);
     expect(session.operations()).toContainEqual({
       type: 'perform',
-      action: { type: 'fill-secret', target: boundTarget(PASSWORD), value: secretValue },
+      action: { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: secretValue },
     });
     expect({
       errorMessage: caseOutcome?.error?.message,
