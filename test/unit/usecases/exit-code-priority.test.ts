@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { ExitCode } from '#core/errors/types.js';
-import { selectExitCode } from '#usecases/exit-code-priority.js';
+import {
+  assertContiguousRankSequence,
+  selectExitCode,
+} from '#usecases/exit-code-priority.js';
 
 const PRIORITY_PAIRS: readonly (readonly [ExitCode, ExitCode])[] = [
   [2, 3],
@@ -42,5 +45,33 @@ describe('selectExitCode', () => {
 
   it('deduplicates repeated candidates without changing the selected exit code', () => {
     expect(selectExitCode([3, 3, 2])).toBe(2);
+  });
+});
+
+describe('assertContiguousRankSequence', () => {
+  it('does not throw for a contiguous six-entry rank sequence', () => {
+    expect(() =>
+      assertContiguousRankSequence({ a: 0, b: 1, c: 2, d: 3, e: 4, f: 5 }),
+    ).not.toThrow();
+  });
+
+  it('does not throw for a single-entry rank sequence', () => {
+    expect(() => assertContiguousRankSequence({ a: 0 })).not.toThrow();
+  });
+
+  it('does not throw for an empty rank sequence', () => {
+    expect(() => assertContiguousRankSequence({})).not.toThrow();
+  });
+
+  it('throws for duplicate ranks', () => {
+    expect(() => assertContiguousRankSequence({ a: 0, b: 0 })).toThrow();
+  });
+
+  it('throws for a rank sequence with a gap', () => {
+    expect(() => assertContiguousRankSequence({ a: 0, b: 2 })).toThrow();
+  });
+
+  it('throws for a rank sequence that does not start at 0', () => {
+    expect(() => assertContiguousRankSequence({ a: -1, b: 1 })).toThrow();
   });
 });
