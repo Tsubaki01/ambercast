@@ -1,4 +1,5 @@
 import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
+import { composeAiDeadline, isAiDeadlineTimeout } from '#core/ai/ai-deadline.js';
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
 import { BrowserLaunchFailedError } from '#core/errors/browser-launch-failed-error.js';
@@ -138,33 +139,21 @@ const CONFIRMATION_RESPONSE = z.strictObject({ confirmed: z.boolean() });
 const CONFIRMATION_RESPONSE_SCHEMA = typedJsonSchema(CONFIRMATION_RESPONSE);
 
 /**
- * Invokes one AI request with an independent timeout while preserving the
- * caller's cancellation semantics.
+ * Invokes one AI request under this dispatch context's deadline policy.
  *
- * Each provider request receives its own timeout because browser work and
- * earlier fallback calls must not consume a later request's configured
- * budget. Keeping signal composition, invocation, and failure attribution
- * together also keeps both run paths on one cancellation contract while the
- * locally created timeout reason remains available for trustworthy
- * attribution. `AbortSignal.any()` forwards the winning source's exact
- * reason, and the AI boundary's `rejectOnAbort()` rejects with that composed
- * reason. Every `AbortSignal.timeout()` call creates a fresh reason object,
- * so comparing it by identity distinguishes this call's timeout from a
- * caller-provided error that merely has a timeout-like name. Only a rejection
- * equal to the freshly created timeout's reason after that timeout aborts
- * becomes an `AiExecutorUnavailableError`; caller cancellation and every
- * other provider failure retain their original error.
+ * A confirmed local expiry becomes an `AiExecutorUnavailableError` with the
+ * configured-timeout message. Every other provider failure retains its
+ * original error for the caller's existing handling path.
  */
 async function callAiExecutor<T>(
   context: DispatchContext,
   invoke: (signal: AbortSignal) => Promise<T>,
 ): Promise<T> {
-  const timeout = AbortSignal.timeout(context.aiTimeoutMs);
-  const signal = AbortSignal.any(context.signal === undefined ? [timeout] : [context.signal, timeout]);
+  const deadline = composeAiDeadline(context.signal, context.aiTimeoutMs);
   try {
-    return await invoke(signal);
+    return await invoke(deadline.signal);
   } catch (error) {
-    if (timeout.aborted && error === timeout.reason) {
+    if (isAiDeadlineTimeout(deadline, error)) {
       throw new AiExecutorUnavailableError(
         'The AI provider did not respond within the configured timeout.',
         undefined,

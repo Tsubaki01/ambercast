@@ -6,6 +6,37 @@
 import { AmbercastError } from './types.js';
 
 /**
+ * Explains why an automatic provider-availability probe did not select a
+ * provider.
+ *
+ * `not-found` means the probe's own deadline did not expire before
+ * `isAvailable` resolved `false`; it does not verify that an executable is
+ * missing. Providers also use that result for other unavailable conditions,
+ * such as a non-zero version command or a spawn failure.
+ */
+export type AiProviderAvailabilityFailureReason = 'timeout' | 'not-found';
+
+/**
+ * Names a concrete AI provider supported by executor selection.
+ */
+export type AiProviderName = 'claude' | 'codex';
+
+/**
+ * Records one provider considered while resolving the automatic policy.
+ *
+ * The readonly shape gives resolver callers a stable diagnostic vocabulary
+ * without narrowing the general-purpose details contract shared by all
+ * Ambercast errors.
+ */
+export interface AiProviderAvailabilityAttempt {
+  /** Provider whose availability probe completed without selecting it. */
+  readonly provider: AiProviderName;
+
+  /** Classification derived from that probe's individual deadline. */
+  readonly reason: AiProviderAvailabilityFailureReason;
+}
+
+/**
  * Reports an AI executor that is unavailable for the requested operation.
  *
  * @remarks

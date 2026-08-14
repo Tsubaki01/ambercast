@@ -4,6 +4,7 @@
  */
 
 import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
+import { composeAiDeadline, isAiDeadlineTimeout } from '#core/ai/ai-deadline.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
@@ -119,12 +120,23 @@ async function repairGroundingIfNeeded(
   }
 }
 
-function aiFailure(error: unknown): AmbercastErrorType {
+/**
+ * Converts a rejected AI request into its reportable failure classification.
+ *
+ * The caller supplies the already-established local-deadline classification
+ * so this presentation boundary does not repeat a name-based timeout guess or
+ * diverge from the cancellation contract used by other AI call sites.
+ *
+ * @param error - Rejection value from the provider request.
+ * @param isTimeout - Whether the error is this request's own timeout reason.
+ * @returns The existing Ambercast error or a classified unavailable-provider error.
+ */
+function aiFailure(error: unknown, isTimeout: boolean): AmbercastErrorType {
   if (error instanceof AmbercastError) {
     return error;
   }
 
-  if (error instanceof DOMException && error.name === 'TimeoutError') {
+  if (isTimeout) {
     return new AiExecutorUnavailableError('The AI provider did not respond within the configured timeout.', undefined, { cause: error });
   }
 
@@ -341,8 +353,7 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
       continue;
     }
 
-    const timeout = AbortSignal.timeout(deps.config.ai.timeoutMs);
-    const signal = AbortSignal.any(deps.signal === undefined ? [timeout] : [deps.signal, timeout]);
+    const deadline = composeAiDeadline(deps.signal, deps.config.ai.timeoutMs);
     let response;
     try {
       deps.events.emit({ type: 'ai-call' });
@@ -350,19 +361,16 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
         prompt: 'Generate a deterministic ambercast execution plan for the supplied Markdown test.',
         responseSchema: GENERATED_PLAN_RESPONSE_SCHEMA,
         context: { testMd: normalizedTestMd, targets: resolvedTargets },
-        signal,
+        signal: deadline.signal,
       });
     } catch (error) {
-      if (error instanceof DOMException && error.name === 'TimeoutError') {
-        results.push({ file, status: 'failed', error: aiFailure(error) });
-        continue;
-      }
+      const isTimeout = isAiDeadlineTimeout(deadline, error);
 
-      if (deps.signal?.aborted) {
+      if (!isTimeout && deps.signal?.aborted) {
         break;
       }
 
-      results.push({ file, status: 'failed', error: aiFailure(error) });
+      results.push({ file, status: 'failed', error: aiFailure(error, isTimeout) });
       continue;
     }
 

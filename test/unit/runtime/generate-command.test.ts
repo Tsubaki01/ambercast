@@ -227,9 +227,12 @@ describe('runGenerateCommand', () => {
 
   it('passes cancellation into auto probing and classifies an unexpected probe rejection', async () => {
     const controller = new AbortController();
+    const timeoutController = new AbortController();
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeoutController.signal);
     const reason = new Error('stop probing');
+    let observedSignal: AbortSignal | undefined;
     const isAvailable = vi.fn(async (signal?: AbortSignal) => {
-      expect(signal).toBe(controller.signal);
+      observedSignal = signal;
       controller.abort(reason);
       return false;
     });
@@ -240,11 +243,18 @@ describe('runGenerateCommand', () => {
     }]);
     mocks.buildGenerateReport.mockReturnValue(output);
 
-    await expect(runGenerateCommand(input({ signal: controller.signal }))).resolves.toEqual(output);
-    expect(mocks.codexFactory).not.toHaveBeenCalled();
-    expect(mocks.buildGenerateReport).toHaveBeenCalledWith(expect.objectContaining({
-      error: expect.any(UnexpectedCrashError),
-    }));
+    try {
+      await expect(runGenerateCommand(input({ signal: controller.signal }))).resolves.toEqual(output);
+      expect(observedSignal).not.toBe(controller.signal);
+      expect(observedSignal?.aborted).toBe(true);
+      expect(observedSignal?.reason).toBe(reason);
+      expect(mocks.codexFactory).not.toHaveBeenCalled();
+      expect(mocks.buildGenerateReport).toHaveBeenCalledWith(expect.objectContaining({
+        error: expect.any(UnexpectedCrashError),
+      }));
+    } finally {
+      timeoutSpy.mockRestore();
+    }
   });
 
   it('measures a successful command from before configuration loading through report construction', async () => {

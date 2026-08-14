@@ -3,14 +3,10 @@
  */
 
 import type { AiExecutor } from '#ports/ai.js';
+import type { AiProviderName } from '#core/errors/ai-executor-unavailable-error.js';
 import type { CommandRunner } from './shared/command-runner.js';
 import { createClaudeCodeCliExecutor } from './claude-code-cli/index.js';
 import { createCodexCliExecutor } from './codex-cli/index.js';
-
-/**
- * A concrete configured provider name accepted by the executor registry.
- */
-export type AiProviderName = 'claude' | 'codex';
 
 /**
  * Lazily creates each supported AI executor.
