@@ -129,6 +129,47 @@ function createScenario(overrides: Partial<GenerateDeps> = {}) {
   return { deps, events, execute, recordingStorage };
 }
 
+function interceptTimeouts(controllersByTimeoutMs: ReadonlyMap<number, AbortController>) {
+  return vi.spyOn(AbortSignal, 'timeout').mockImplementation((timeoutMs) => {
+    const controller = controllersByTimeoutMs.get(timeoutMs);
+    if (controller === undefined) {
+      throw new Error(`Unexpected deadline timeout: ${timeoutMs}`);
+    }
+    return controller.signal;
+  });
+}
+
+function captureComposedTimeoutSignals(timeoutSignals: readonly AbortSignal[]): AbortSignal[] {
+  const originalAny = AbortSignal.any;
+  const composedTimeoutSignals: AbortSignal[] = [];
+
+  vi.spyOn(AbortSignal, 'any').mockImplementation((signals) => {
+    const timeoutSignal = signals.find((signal) => timeoutSignals.includes(signal));
+    if (timeoutSignal !== undefined) {
+      composedTimeoutSignals.push(timeoutSignal);
+    }
+    return originalAny.call(AbortSignal, signals);
+  });
+
+  return composedTimeoutSignals;
+}
+
+function sequentialTimeoutConfig(timeoutMsValues: readonly number[]) {
+  let timeoutMsIndex = 0;
+
+  return {
+    provider: 'codex' as const,
+    get timeoutMs() {
+      const timeoutMs = timeoutMsValues[timeoutMsIndex];
+      timeoutMsIndex += 1;
+      if (timeoutMs === undefined) {
+        throw new Error('Unexpected deadline creation.');
+      }
+      return timeoutMs;
+    },
+  };
+}
+
 async function writePrompt(storage: StorageAdapter, relativePath = 'login.test.md', contents = PROMPT): Promise<string> {
   const path = `${TEST_DIR}/${relativePath}`;
   await storage.writeText(path, contents);
@@ -338,9 +379,14 @@ describe('generate', () => {
     const timeoutController = new AbortController();
     const secondTimeoutController = new AbortController();
     const timeoutReason = new Error('controlled local timeout');
-    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout')
-      .mockReturnValueOnce(timeoutController.signal)
-      .mockReturnValueOnce(secondTimeoutController.signal);
+    const timeoutSpy = interceptTimeouts(new Map([
+      [101, timeoutController],
+      [102, secondTimeoutController],
+    ]));
+    const composedTimeoutSignals = captureComposedTimeoutSignals([
+      timeoutController.signal,
+      secondTimeoutController.signal,
+    ]);
     let markStarted: (() => void) | undefined;
     const started = new Promise<void>((resolve) => {
       markStarted = resolve;
@@ -348,7 +394,7 @@ describe('generate', () => {
     let observedSignal: AbortSignal | undefined;
     const { deps, recordingStorage } = createScenario({
       signal: caller.signal,
-      config: { testDir: TEST_DIR, testMatch: ['**/*.test.md'], testIgnore: [], targets: TARGETS, defaultTarget: 'web', ai: { provider: 'codex', timeoutMs: 100 } },
+      config: { testDir: TEST_DIR, testMatch: ['**/*.test.md'], testIgnore: [], targets: TARGETS, defaultTarget: 'web', ai: sequentialTimeoutConfig([101, 102]) },
       aiExecutor: createFakeAiExecutor({
         execute: (request) => {
           if (request.context !== null && typeof request.context === 'object' && 'testMd' in request.context && request.context.testMd === 'first') {
@@ -367,6 +413,8 @@ describe('generate', () => {
     try {
       const running = generate(deps, DEFAULT_OPTIONS);
       await started;
+      expect(timeoutSpy).toHaveBeenNthCalledWith(1, 101);
+      expect(composedTimeoutSignals[0]).toBe(timeoutController.signal);
       expect(observedSignal).not.toBe(caller.signal);
       expect(observedSignal).not.toBe(timeoutController.signal);
       timeoutController.abort(timeoutReason);
@@ -383,8 +431,10 @@ describe('generate', () => {
           { status: 'generated' },
         ],
       });
+      expect(timeoutSpy).toHaveBeenNthCalledWith(2, 102);
+      expect(composedTimeoutSignals[1]).toBe(secondTimeoutController.signal);
     } finally {
-      timeoutSpy.mockRestore();
+      vi.restoreAllMocks();
     }
   });
 
