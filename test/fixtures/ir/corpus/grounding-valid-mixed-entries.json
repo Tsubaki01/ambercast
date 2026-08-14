@@ -7,7 +7,7 @@
     "entries": {
       "login-flow": {
         "kind": "element",
-        "fingerprint": { "algorithm": "a11y-neighborhood-v1", "hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
+        "fingerprint": { "algorithm": "a11y-neighborhood-v2", "hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
       },
       "submit-review": {
         "kind": "ai",

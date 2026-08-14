@@ -14,7 +14,7 @@ import type {
 /**
  * A browser engine that a target can select for a run.
  *
- * @remarks
+   * @remarks
  * Deriving this union from the target contract keeps target validation and
  * driver selection aligned as browser support grows.
  */
@@ -94,9 +94,15 @@ export type CaptureMode = 'text' | 'value';
  * The result of checking whether recorded grounding still identifies an
  * element on the current page.
  *
- * A miss distinguishes absence, local-neighborhood drift, and duplicate
- * role-and-name candidates so callers can retain a safe control-flow gate
- * while diagnostics explain the actual resolution failure.
+ * A miss distinguishes absent, invalid, changed, and duplicate accessibility
+ * evidence so callers can retain a safe control-flow gate while diagnostics
+ * explain the actual resolution failure.
+ *
+ * @remarks
+ * This result carries no resolved-secret values because secret taint guards
+ * fingerprint generation before a value can enter the cache. Algorithm
+ * versioning rejects incompatible grounding documents before resolution, so
+ * this check receives fingerprints produced under the same cache policy.
  */
 export type GroundedResolution =
   | {
@@ -109,10 +115,15 @@ export type GroundedResolution =
       /** The recorded grounding cannot be used for the current page. */
       readonly kind: 'miss';
       /**
-       * Whether the unique candidate's neighborhood changed, no candidate
-       * exists, or more than one normalized role-and-name candidate exists.
+       * Whether the parser rejected the snapshot, the unique candidate's
+       * neighborhood changed, no candidate exists, or more than one normalized
+       * role-and-name candidate exists.
        */
-      readonly reason: 'fingerprint-mismatch' | 'element-not-found' | 'ambiguous-match';
+      readonly reason:
+        | 'fingerprint-mismatch'
+        | 'element-not-found'
+        | 'ambiguous-match'
+        | 'snapshot-invalid';
     };
 
 /**
@@ -153,12 +164,10 @@ export interface BrowserSession {
   /**
    * Checks whether recorded grounding still identifies a current element.
    *
-   * No candidate always produces `element-not-found`, regardless of the
-   * supplied fingerprint. Two or more candidates with the exact role and
-   * normalized name produce `ambiguous-match`, even if one candidate's
-   * neighborhood would hash to `fp`. A `fingerprint-mismatch` is returned
-   * only when exactly one candidate exists but its current fingerprint differs
-   * from `fp`.
+   * The result preserves why the reference cannot be used. Duplicate
+   * candidates remain unusable even when one has the expected neighborhood,
+   * because a role locator cannot preserve that candidate's identity for its
+   * later browser operation.
    *
    * @param ref - The recorded element reference to resolve.
    * @param fp - The recorded fingerprint to verify against the live page.
@@ -168,6 +177,10 @@ export interface BrowserSession {
    * @remarks
    * This is a hard gate: every miss remains a miss so stale grounding or an
    * indeterminate duplicate cannot direct a test to the wrong element.
+   * Resolution deliberately has no resolved-secret parameter. Secret taint
+   * guards fingerprint generation before a value can enter the cache, while
+   * algorithm versioning rejects incompatible grounding documents before this
+   * verification.
    */
   resolveGrounded(ref: ElementRef, fp: Fingerprint): Promise<GroundedResolution>;
 

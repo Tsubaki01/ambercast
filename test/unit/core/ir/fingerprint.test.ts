@@ -2,14 +2,19 @@ import { describe, expect, it } from 'vitest';
 import { createHash } from 'node:crypto';
 import {
   computeAccessibilityFingerprint,
-  parseAriaSnapshot,
   resolveAccessibilityFingerprint,
 } from '#core/ir/fingerprint.js';
+import { parseAriaSnapshot, SNAPSHOT_INVALID } from '#core/ir/aria-snapshot.js';
 import { toCanonicalDigestBytes } from '#core/ir/canonical-json.js';
 import type { ElementRef, Fingerprint, JsonValueT } from '#core/ir/schema.js';
 
 const TARGET: ElementRef = { strategy: 'accessibility', role: 'button', name: 'Submit' };
-const FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v1', hash: 'a'.repeat(64) };
+const FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v2', hash: 'a'.repeat(64) };
+const NO_RESOLVED_SECRETS: readonly ReadonlySet<string>[] = [];
+
+function textTree(name: string): JsonValueT {
+  return { role: 'root', name: '', children: [{ role: 'text', name, children: [] }] };
+}
 
 function createAccessibilityTree({
   parentRole = 'form',
@@ -45,10 +50,13 @@ function createAccessibilityTree({
 }
 
 function fingerprint(tree: JsonValueT, ref: ElementRef = TARGET): Fingerprint {
-  const result = computeAccessibilityFingerprint(tree, ref);
+  const result = computeAccessibilityFingerprint(tree, ref, NO_RESOLVED_SECRETS);
 
-  expect(result).toBeDefined();
-  return result as Fingerprint;
+  if (result.kind !== 'ok') {
+    throw new Error(`Expected an accessibility fingerprint, received ${result.kind}.`);
+  }
+
+  return result.fingerprint;
 }
 
 function handHash(descriptor: JsonValueT): string {
@@ -91,140 +99,26 @@ function createTargetNeighborhood({
   };
 }
 
-describe('parseAriaSnapshot', () => {
-  it('parses a single flat item', () => {
-    expect(parseAriaSnapshot('- button "Save"')).toEqual({
-      role: 'root',
-      name: '',
-      children: [{ role: 'button', name: 'Save', children: [] }],
-    });
-  });
+type DescriptorNamePosition = 'target' | 'parent' | 'siblingBefore' | 'siblingAfter';
 
-  it('builds parent-child edges across increasing and decreasing indentation depths', () => {
-    expect(parseAriaSnapshot([
-      '- navigation "Main":',
-      '  - list:',
-      '    - listitem:',
-      '      - link "Home"',
-      '  - link "Support"',
-      '- contentinfo "Footer"',
-    ].join('\n'))).toEqual({
-      role: 'root',
-      name: '',
-      children: [
-        {
-          role: 'navigation',
-          name: 'Main',
-          children: [
-            {
-              role: 'list',
-              name: '',
-              children: [{
-                role: 'listitem',
-                name: '',
-                children: [{ role: 'link', name: 'Home', children: [] }],
-              }],
-            },
-            { role: 'link', name: 'Support', children: [] },
-          ],
-        },
-        { role: 'contentinfo', name: 'Footer', children: [] },
-      ],
-    });
-  });
-
-  it('assigns an empty name to a bareword role', () => {
-    expect(parseAriaSnapshot('- separator')).toEqual({
-      role: 'root',
-      name: '',
-      children: [{ role: 'separator', name: '', children: [] }],
-    });
-  });
-
-  it('removes a structural colon from an unnamed role', () => {
-    expect(parseAriaSnapshot('- listitem:')).toEqual({
-      role: 'root',
-      name: '',
-      children: [{ role: 'listitem', name: '', children: [] }],
-    });
-  });
-
-  it('unescapes a quoted name containing an escaped quote', () => {
-    expect(parseAriaSnapshot('- button "Save \\"draft\\""')).toEqual({
-      role: 'root',
-      name: '',
-      children: [{ role: 'button', name: 'Save "draft"', children: [] }],
-    });
-  });
-
-  it.each([
-    ['C:\\Temp\\file', '- button "C:\\\\Temp\\\\file"'],
-    ['C:\\Temp\\file "quoted" here', '- button "C:\\\\Temp\\\\file \\"quoted\\" here"'],
-  ] as const)('unescapes literal backslashes in a quoted name', (name, snapshot) => {
-    expect(parseAriaSnapshot(snapshot)).toEqual({
-      role: 'root',
-      name: '',
-      children: [{ role: 'button', name, children: [] }],
-    });
-  });
-
-  it('skips slash-prefixed metadata without making it a genuine child or sibling', () => {
-    const snapshot = [
-      '- link "Download":',
-      '  - /url: /downloads/ambercast',
-      '  - text: Download the release',
-    ].join('\n');
-    const expectedTree: JsonValueT = {
-      role: 'root',
-      name: '',
-      children: [{
-        role: 'link',
-        name: 'Download',
-        children: [{ role: 'text', name: '', children: [] }],
-      }],
-    };
-    const textRef: ElementRef = { strategy: 'accessibility', role: 'text', name: '' };
-
-    expect(parseAriaSnapshot(snapshot)).toEqual(expectedTree);
-    expect(fingerprint(parseAriaSnapshot(snapshot), textRef).hash)
-      .toBe(fingerprint(expectedTree, textRef).hash);
-  });
-
-  it('discards an attribute suffix without preventing later lines from parsing', () => {
-    expect(parseAriaSnapshot('- heading "Sign in" [level=1]\n- button "Continue"')).toEqual({
-      role: 'root',
-      name: '',
-      children: [
-        { role: 'heading', name: 'Sign in', children: [] },
-        { role: 'button', name: 'Continue', children: [] },
-      ],
-    });
-  });
-
-  it('places multiple top-level items beneath the one exact synthetic root shape', () => {
-    expect(parseAriaSnapshot('- banner\n- main "Content"\n- contentinfo "Footer"')).toEqual({
-      role: 'root',
-      name: '',
-      children: [
-        { role: 'banner', name: '', children: [] },
-        { role: 'main', name: 'Content', children: [] },
-        { role: 'contentinfo', name: 'Footer', children: [] },
-      ],
-    });
-  });
-
-  it('returns the synthetic root with no children for empty input', () => {
-    expect(parseAriaSnapshot('')).toEqual({ role: 'root', name: '', children: [] });
-  });
-
-  it('skips malformed unindented lines and continues parsing later valid outline lines', () => {
-    expect(parseAriaSnapshot('heading "This is not an outline"\n- button "Continue"\ntrailing malformed text')).toEqual({
-      role: 'root',
-      name: '',
-      children: [{ role: 'button', name: 'Continue', children: [] }],
-    });
-  });
-});
+function neighborhoodWithNameAt(
+  position: DescriptorNamePosition,
+  name: string,
+): { readonly tree: JsonValueT; readonly ref: ElementRef } {
+  switch (position) {
+    case 'target':
+      return {
+        tree: createTargetNeighborhood({ targetName: name }),
+        ref: { strategy: 'accessibility', role: 'button', name },
+      };
+    case 'parent':
+      return { tree: createTargetNeighborhood({ parentName: name }), ref: TARGET };
+    case 'siblingBefore':
+      return { tree: createTargetNeighborhood({ siblingBeforeName: name }), ref: TARGET };
+    case 'siblingAfter':
+      return { tree: createTargetNeighborhood({ siblingAfterName: name }), ref: TARGET };
+  }
+}
 
 describe('computeAccessibilityFingerprint', () => {
   it('returns the same hash for exact matching trees', () => {
@@ -373,10 +267,11 @@ describe('computeAccessibilityFingerprint', () => {
     expect(fingerprint(changedTree).hash).not.toBe(fingerprint(createAccessibilityTree()).hash);
   });
 
-  it('returns undefined when the target reference is absent from the tree', () => {
+  it('returns no-match when the target reference is absent from the tree', () => {
     const absentTarget: ElementRef = { strategy: 'accessibility', role: 'link', name: 'Forgot password?' };
 
-    expect(computeAccessibilityFingerprint(createAccessibilityTree(), absentTarget)).toBeUndefined();
+    expect(computeAccessibilityFingerprint(createAccessibilityTree(), absentTarget, NO_RESOLVED_SECRETS))
+      .toEqual({ kind: 'no-match' });
   });
 
   it('is deterministic when called repeatedly with the same tree and target', () => {
@@ -385,11 +280,11 @@ describe('computeAccessibilityFingerprint', () => {
     expect(fingerprint(tree)).toEqual(fingerprint(tree));
   });
 
-  it('tags the returned fingerprint with the a11y-neighborhood-v1 algorithm identifier', () => {
-    expect(fingerprint(createAccessibilityTree()).algorithm).toBe('a11y-neighborhood-v1');
+  it('tags the returned fingerprint with the a11y-neighborhood-v2 algorithm identifier', () => {
+    expect(fingerprint(createAccessibilityTree()).algorithm).toBe('a11y-neighborhood-v2');
   });
 
-  it('returns undefined when role-and-name matching finds more than one physical node', () => {
+  it('returns ambiguous-match when role-and-name matching finds more than one physical node', () => {
     const createDuplicateMatches = ({
       earlySiblingRole = 'link',
       lateMatchRole = 'button',
@@ -424,7 +319,8 @@ describe('computeAccessibilityFingerprint', () => {
     });
 
     const duplicateMatches = createDuplicateMatches();
-    expect(computeAccessibilityFingerprint(duplicateMatches, TARGET)).toBeUndefined();
+    expect(computeAccessibilityFingerprint(duplicateMatches, TARGET, NO_RESOLVED_SECRETS))
+      .toEqual({ kind: 'ambiguous-match' });
   });
 
   it('changes the hash when unchanged sibling roles are reordered', () => {
@@ -544,7 +440,7 @@ describe('computeAccessibilityFingerprint', () => {
     };
     const ref: ElementRef = { strategy: 'accessibility', role: 'button', name: 'Café' };
 
-    expect(computeAccessibilityFingerprint(tree, ref)).toBeUndefined();
+    expect(computeAccessibilityFingerprint(tree, ref, NO_RESOLVED_SECRETS)).toEqual({ kind: 'ambiguous-match' });
   });
 
   it('treats whitespace-equivalent duplicate names as ambiguous', () => {
@@ -561,22 +457,24 @@ describe('computeAccessibilityFingerprint', () => {
       }],
     };
 
-    expect(computeAccessibilityFingerprint(tree, TARGET)).toBeUndefined();
+    expect(computeAccessibilityFingerprint(tree, TARGET, NO_RESOLVED_SECRETS)).toEqual({ kind: 'ambiguous-match' });
   });
 
   it('never treats the synthetic root as a candidate, including after whitespace collapses to empty', () => {
     const syntheticRootOnly: JsonValueT = { role: 'root', name: '', children: [] };
     const rootReference: ElementRef = { strategy: 'accessibility', role: 'root', name: ' \t ' };
 
-    expect(computeAccessibilityFingerprint(syntheticRootOnly, rootReference)).toBeUndefined();
+    expect(computeAccessibilityFingerprint(syntheticRootOnly, rootReference, NO_RESOLVED_SECRETS))
+      .toEqual({ kind: 'no-match' });
   });
 
-  it('returns undefined for a well-formed empty accessibility tree', () => {
-    expect(computeAccessibilityFingerprint({ role: 'root', name: '', children: [] }, TARGET)).toBeUndefined();
+  it('returns no-match for a well-formed empty accessibility tree', () => {
+    expect(computeAccessibilityFingerprint({ role: 'root', name: '', children: [] }, TARGET, NO_RESOLVED_SECRETS))
+      .toEqual({ kind: 'no-match' });
   });
 
-  it('returns undefined for malformed JSON rather than treating it as an empty tree', () => {
-    expect(computeAccessibilityFingerprint({}, TARGET)).toBeUndefined();
+  it('returns no-match for malformed JSON rather than treating it as an empty tree', () => {
+    expect(computeAccessibilityFingerprint({}, TARGET, NO_RESOLVED_SECRETS)).toEqual({ kind: 'no-match' });
   });
 
   it('finds a target in a deep but ordinary tree without changing the result', () => {
@@ -605,8 +503,205 @@ describe('computeAccessibilityFingerprint', () => {
     ['parent', createAccessibilityTree({ parentName: '\ud800' }), TARGET],
     ['sibling', createAccessibilityTree({ siblingName: '\ud800' }), TARGET],
   ] as const)('treats an unpaired UTF-16 surrogate in the %s name as a non-match', (_position, tree, ref) => {
-    expect(computeAccessibilityFingerprint(tree, ref)).toBeUndefined();
+    expect(computeAccessibilityFingerprint(tree, ref, NO_RESOLVED_SECRETS)).toEqual({ kind: 'no-match' });
     expect(resolveAccessibilityFingerprint(tree, ref, FINGERPRINT)).toBe('element-not-found');
+  });
+
+  it('classifies the parser invalid-snapshot marker before malformed-tree matching', () => {
+    expect(computeAccessibilityFingerprint(SNAPSHOT_INVALID, TARGET, NO_RESOLVED_SECRETS))
+      .toEqual({ kind: 'snapshot-invalid' });
+  });
+
+  it('classifies a JSON-round-tripped invalid-snapshot marker structurally', () => {
+    const clonedMarker = JSON.parse(JSON.stringify(SNAPSHOT_INVALID)) as JsonValueT;
+
+    expect(clonedMarker).not.toBe(SNAPSHOT_INVALID);
+    expect(computeAccessibilityFingerprint(clonedMarker, TARGET, NO_RESOLVED_SECRETS))
+      .toEqual({ kind: 'snapshot-invalid' });
+  });
+
+  it.each([
+    ['target role', createTargetNeighborhood(), TARGET, 'button'],
+    ['target name', createTargetNeighborhood(), TARGET, 'Submit'],
+    ['parent role', createTargetNeighborhood({ parentRole: 'secret-form' }), TARGET, 'secret-form'],
+    ['parent name', createTargetNeighborhood({ parentName: 'Secret parent' }), TARGET, 'Secret parent'],
+    ['sibling-before role', createTargetNeighborhood({ siblingBeforeRole: 'secret-before' }), TARGET, 'secret-before'],
+    ['sibling-before name', createTargetNeighborhood({ siblingBeforeName: 'Secret before' }), TARGET, 'Secret before'],
+    ['sibling-after role', createTargetNeighborhood({ siblingAfterRole: 'secret-after' }), TARGET, 'secret-after'],
+    ['sibling-after name', createTargetNeighborhood({ siblingAfterName: 'Secret after' }), TARGET, 'Secret after'],
+  ] as const)('rejects a resolved secret found in the descriptor %s', (_field, tree, ref, secret) => {
+    expect(computeAccessibilityFingerprint(tree, ref, [new Set([secret])]))
+      .toEqual({ kind: 'secret-contaminated' });
+  });
+
+  it('materializes a genuine single-use secret iterator before checking every descriptor field', () => {
+    let iterations = 0;
+    function* resolvedSecretSets(): Generator<ReadonlySet<string>> {
+      iterations += 1;
+      yield new Set(['Secret after']);
+    }
+    const secretValues = resolvedSecretSets();
+
+    expect(computeAccessibilityFingerprint(createTargetNeighborhood({ siblingAfterName: 'Secret after' }), TARGET, secretValues))
+      .toEqual({ kind: 'secret-contaminated' });
+    expect(iterations).toBe(1);
+  });
+
+  it.each([
+    [
+      'an exact two-code-unit value',
+      createTargetNeighborhood({ targetName: 'xy' }),
+      { strategy: 'accessibility', role: 'button', name: 'xy' } as const,
+      new Set(['xy']),
+      { kind: 'secret-contaminated' },
+    ],
+    [
+      'a three-code-unit substring',
+      createTargetNeighborhood({ targetName: 'contains abc value' }),
+      { strategy: 'accessibility', role: 'button', name: 'contains abc value' } as const,
+      new Set(['abc']),
+      { kind: 'secret-contaminated' },
+    ],
+    [
+      'a two-code-unit substring',
+      createTargetNeighborhood({ targetName: 'contains ab value' }),
+      { strategy: 'accessibility', role: 'button', name: 'contains ab value' } as const,
+      new Set(['ab']),
+      { kind: 'ok' },
+    ],
+    [
+      'an empty resolved value',
+      createTargetNeighborhood(),
+      TARGET,
+      new Set(['']),
+      { kind: 'ok' },
+    ],
+  ] as const)('applies the secret matching threshold for %s', (_description, tree, ref, secrets, expected) => {
+    expect(computeAccessibilityFingerprint(tree, ref, [secrets])).toMatchObject(expected);
+  });
+
+  it.each([
+    [
+      'does not use the raw secret length when whitespace normalization leaves a two-code-unit substring',
+      'contains ab value',
+      'ab  ',
+      { kind: 'ok' },
+    ],
+    [
+      'uses the normalized secret length when whitespace normalization leaves a three-code-unit substring',
+      'contains abc value',
+      'abc  ',
+      { kind: 'secret-contaminated' },
+    ],
+  ] as const)('measures the secret substring threshold on the normalized comparison string when it %s', (
+    _description,
+    targetName,
+    secret,
+    expected,
+  ) => {
+    const { tree, ref } = neighborhoodWithNameAt('target', targetName);
+
+    expect(computeAccessibilityFingerprint(tree, ref, [new Set([secret])])).toMatchObject(expected);
+  });
+
+  it.each(['target', 'parent', 'siblingBefore', 'siblingAfter'] as const)(
+    'normalizes a decomposed %s name against a composed resolved secret before checking taint',
+    (position) => {
+      const { tree, ref } = neighborhoodWithNameAt(position, 'Cafe\u0301 settings');
+
+      expect(computeAccessibilityFingerprint(tree, ref, [new Set(['Café settings'])]))
+        .toEqual({ kind: 'secret-contaminated' });
+    },
+  );
+
+  it.each(['target', 'parent', 'siblingBefore', 'siblingAfter'] as const)(
+    'normalizes a composed %s name against a decomposed resolved secret before checking taint',
+    (position) => {
+      const { tree, ref } = neighborhoodWithNameAt(position, 'Café settings');
+
+      expect(computeAccessibilityFingerprint(tree, ref, [new Set(['Cafe\u0301 settings'])]))
+        .toEqual({ kind: 'secret-contaminated' });
+    },
+  );
+
+  it.each(['target', 'parent', 'siblingBefore', 'siblingAfter'] as const)(
+    'normalizes an irregular-whitespace %s name against a collapsed resolved secret before checking taint',
+    (position) => {
+      const { tree, ref } = neighborhoodWithNameAt(position, '  account\t\n settings  ');
+
+      expect(computeAccessibilityFingerprint(tree, ref, [new Set(['account settings'])]))
+        .toEqual({ kind: 'secret-contaminated' });
+    },
+  );
+
+  it.each(['target', 'parent', 'siblingBefore', 'siblingAfter'] as const)(
+    'normalizes a collapsed %s name against an irregular-whitespace resolved secret before checking taint',
+    (position) => {
+      const { tree, ref } = neighborhoodWithNameAt(position, 'account settings');
+
+      expect(computeAccessibilityFingerprint(tree, ref, [new Set(['  account\t\n settings  '])]))
+        .toEqual({ kind: 'secret-contaminated' });
+    },
+  );
+
+  it('taints a role that contains a raw resolved secret value', () => {
+    const targetRole = 'button-secret-field';
+    const target: ElementRef = { strategy: 'accessibility', role: targetRole, name: 'Submit' };
+
+    expect(computeAccessibilityFingerprint(
+      createTargetNeighborhood({ targetRole }),
+      target,
+      [new Set(['secret'])],
+    )).toEqual({ kind: 'secret-contaminated' });
+  });
+
+  it.each([
+    ['Unicode composition', 'button Cafe\u0301 field', 'button Café field'],
+    ['whitespace collapsing', 'button   submit field', 'button submit field'],
+  ] as const)('does not apply name normalization to roles for %s-only matches', (_description, targetRole, secret) => {
+    const target: ElementRef = { strategy: 'accessibility', role: targetRole, name: 'Submit' };
+
+    expect(computeAccessibilityFingerprint(
+      createTargetNeighborhood({ targetRole }),
+      target,
+      [new Set([secret])],
+    )).toMatchObject({ kind: 'ok' });
+  });
+
+  it('does not inspect a non-adjacent descendant for secret contamination', () => {
+    const tree: JsonValueT = {
+      role: 'root',
+      name: '',
+      children: [{
+        role: 'form',
+        name: 'Sign in',
+        children: [
+          { role: 'group', name: 'Safe group', children: [{ role: 'text', name: 'LEAKED_SECRET', children: [] }] },
+          { role: 'button', name: 'Submit', children: [] },
+        ],
+      }],
+    };
+
+    expect(computeAccessibilityFingerprint(tree, TARGET, [new Set(['LEAKED_SECRET'])]))
+      .toMatchObject({ kind: 'ok' });
+  });
+
+  it.each([
+    [
+      'a decomposed colon-value text name',
+      '- text: Cafe\u0301',
+      { strategy: 'accessibility', role: 'text', name: 'Café' } as const,
+      textTree('Café'),
+    ],
+    [
+      'a whitespace-irregular colon-value text name',
+      '- text: "  Release\\t notes  "',
+      { strategy: 'accessibility', role: 'text', name: 'Release notes' } as const,
+      textTree('Release notes'),
+    ],
+  ] as const)('normalizes %s after parser name promotion', (_description, snapshot, ref, normalizedTree) => {
+    expect(computeAccessibilityFingerprint(parseAriaSnapshot(snapshot), ref, NO_RESOLVED_SECRETS))
+      .toEqual(computeAccessibilityFingerprint(normalizedTree, ref, NO_RESOLVED_SECRETS));
   });
 });
 
@@ -619,6 +714,17 @@ describe('resolveAccessibilityFingerprint', () => {
 
   it('maps malformed evidence to element-not-found', () => {
     expect(resolveAccessibilityFingerprint({}, TARGET, FINGERPRINT)).toBe('element-not-found');
+  });
+
+  it('maps the parser invalid-snapshot marker to snapshot-invalid', () => {
+    expect(resolveAccessibilityFingerprint(SNAPSHOT_INVALID, TARGET, FINGERPRINT)).toBe('snapshot-invalid');
+  });
+
+  it('maps a JSON-round-tripped invalid-snapshot marker to snapshot-invalid', () => {
+    const clonedMarker = JSON.parse(JSON.stringify(SNAPSHOT_INVALID)) as JsonValueT;
+
+    expect(clonedMarker).not.toBe(SNAPSHOT_INVALID);
+    expect(resolveAccessibilityFingerprint(clonedMarker, TARGET, FINGERPRINT)).toBe('snapshot-invalid');
   });
 
   it('reports fingerprint-mismatch for one matching candidate whose neighborhood changed', () => {
@@ -710,7 +816,8 @@ describe('resolveAccessibilityFingerprint', () => {
       }],
     };
 
-    expect(computeAccessibilityFingerprint(duplicateCandidatesWithUnhashableParent, TARGET)).toBeUndefined();
+    expect(computeAccessibilityFingerprint(duplicateCandidatesWithUnhashableParent, TARGET, NO_RESOLVED_SECRETS))
+      .toEqual({ kind: 'ambiguous-match' });
     expect(resolveAccessibilityFingerprint(duplicateCandidatesWithUnhashableParent, TARGET, FINGERPRINT)).toBe('ambiguous-match');
   });
 });

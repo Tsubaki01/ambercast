@@ -68,9 +68,28 @@ const AMBIGUOUS_SUBMIT_PAGE = `data:text/html,${encodeURIComponent(`<!doctype ht
 </html>`)}`;
 
 const SUBMIT: ElementRef = { strategy: 'accessibility', role: 'button', name: 'Submit' };
+const UNIQUE_TARGET: ElementRef = { strategy: 'accessibility', role: 'button', name: 'Unique target' };
 
 let chromiumAvailable = false;
 let activeSession: BrowserSession | undefined;
+
+function adjacentTextPage(text: string): string {
+  return `data:text/html,${encodeURIComponent(`<!doctype html>
+<html lang="en">
+  <body>
+    <main aria-label="Application"><button aria-label="Unique target">Act</button>${text}</main>
+  </body>
+</html>`)}`;
+}
+
+function fingerprintFor(tree: JsonValueT, ref: ElementRef): Fingerprint {
+  const result = computeAccessibilityFingerprint(tree, ref, []);
+  if (result.kind !== 'ok') {
+    throw new Error(`The fixture page does not contain exactly one ${ref.role} "${ref.name}" (${result.kind}).`);
+  }
+
+  return result.fingerprint;
+}
 
 function treeContainingFirstCandidate(tree: JsonValueT, target: ElementRef): JsonValueT | undefined {
   if (typeof tree !== 'object' || tree === null || Array.isArray(tree)) {
@@ -125,12 +144,7 @@ async function actualFingerprintFor(setup: BrowserSessionContractSetup): Promise
   }
 
   const snapshot = await activeSession.snapshotForResolution();
-  const fingerprint = computeAccessibilityFingerprint(snapshot.accessibilityTree, setup.ref);
-  if (fingerprint === undefined) {
-    throw new Error(`The fixture page does not contain ${setup.ref.role} "${setup.ref.name}".`);
-  }
-
-  return fingerprint;
+  return fingerprintFor(snapshot.accessibilityTree, setup.ref);
 }
 
 describe('Chromium real-browser contract', () => {
@@ -164,10 +178,7 @@ describe('Chromium real-browser contract', () => {
     try {
       await session.perform({ type: 'navigate', url: FIRST_AMBIGUOUS_SUBMIT_CANDIDATE_PAGE });
       const firstCandidateSnapshot = await session.snapshotForResolution();
-      const firstCandidateFingerprint = computeAccessibilityFingerprint(firstCandidateSnapshot.accessibilityTree, SUBMIT);
-      if (firstCandidateFingerprint === undefined) {
-        throw new Error('The single-candidate duplicate fixture must yield a Submit fingerprint.');
-      }
+      const firstCandidateFingerprint = fingerprintFor(firstCandidateSnapshot.accessibilityTree, SUBMIT);
 
       await session.perform({ type: 'navigate', url: AMBIGUOUS_SUBMIT_PAGE });
       const ambiguousSnapshot = await session.snapshotForResolution();
@@ -176,12 +187,28 @@ describe('Chromium real-browser contract', () => {
         throw new Error('The ambiguous fixture must retain its first Submit candidate.');
       }
 
-      expect(computeAccessibilityFingerprint(firstCandidateTree, SUBMIT)).toEqual(firstCandidateFingerprint);
+      expect(fingerprintFor(firstCandidateTree, SUBMIT)).toEqual(firstCandidateFingerprint);
 
       await expect(session.resolveGrounded(SUBMIT, firstCandidateFingerprint)).resolves.toEqual({
         kind: 'miss',
         reason: 'ambiguous-match',
       });
+    } finally {
+      await session.close();
+    }
+  });
+
+  it('changes the fingerprint when a direct adjacent text sibling changes from Alpha to Beta', async () => {
+    const session = await createChromiumBrowserDriver().launch(TARGET);
+
+    try {
+      await session.perform({ type: 'navigate', url: adjacentTextPage('Alpha') });
+      const alphaFingerprint = fingerprintFor((await session.snapshotForResolution()).accessibilityTree, UNIQUE_TARGET);
+
+      await session.perform({ type: 'navigate', url: adjacentTextPage('Beta') });
+      const betaFingerprint = fingerprintFor((await session.snapshotForResolution()).accessibilityTree, UNIQUE_TARGET);
+
+      expect(betaFingerprint).not.toEqual(alphaFingerprint);
     } finally {
       await session.close();
     }

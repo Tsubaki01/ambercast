@@ -11,7 +11,7 @@ import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { AmbercastError, type AmbercastError as AmbercastErrorType } from '#core/errors/types.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
-import { computeAccessibilityFingerprint, countAccessibilityMatches } from '#core/ir/fingerprint.js';
+import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import {
   GroundingDocument,
@@ -1314,9 +1314,14 @@ async function executeAiStep(
  * The authored `ElementRef` remains immutable because grounding stores no
  * alternate locator. After capturing resolution evidence, this path derives
  * the fingerprint from the unredacted accessibility tree before it resolves
- * an AI executor or emits an `ai-call` event. An absent or ambiguous local
- * match has no safe target for confirmation, so it raises `CaseAbort` without
- * provider work or a grounding write.
+ * an AI executor or emits an `ai-call` event. An absent, ambiguous,
+ * parser-invalid, or secret-contaminated local result has no safe target for
+ * confirmation, so it raises `CaseAbort` without provider work or a grounding
+ * write. The messages guide recovery: duplicate candidates need a
+ * distinguishing accessible name, invalid evidence warrants a retry and
+ * parser-compatibility check, and secret-tainted evidence needs an accessible
+ * name that does not echo the secret. The secret value itself never appears in
+ * the diagnostic.
  *
  * The AI receives a redacted copy of the evidence and answers only whether
  * the existing locator identifies the intended element. A denial raises
@@ -1343,19 +1348,25 @@ async function groundedTarget(
   }
 
   const snapshot = await context.session.snapshotForResolution();
-  const fingerprint = computeAccessibilityFingerprint(snapshot.accessibilityTree, target);
-  if (fingerprint === undefined) {
-    const matchCount = countAccessibilityMatches(snapshot.accessibilityTree, target);
-    if (matchCount === 0) {
+  const classification = computeAccessibilityFingerprint(
+    snapshot.accessibilityTree,
+    target,
+    context.resolvedSecrets.values(),
+  );
+  switch (classification.kind) {
+    case 'ok':
+      break;
+    case 'no-match':
       throw new CaseAbort('The supplied locator has no matching element in the current accessibility evidence.');
-    }
-
-    if (matchCount !== undefined && matchCount > 1) {
-      throw new CaseAbort('The supplied locator matches more than one element in the current accessibility evidence and cannot be trusted.');
-    }
-
-    throw new CaseAbort('The supplied locator cannot be unambiguously identified from current accessibility evidence.');
+    case 'ambiguous-match':
+      throw new CaseAbort('The supplied locator matches more than one element in the current accessibility evidence. Add a distinguishing aria-label (or other accessible-name difference) to one of the matching elements so the locator can identify a single element.');
+    case 'snapshot-invalid':
+      throw new CaseAbort('The current accessibility evidence could not be parsed and cannot be trusted for this locator. Retry the run; if this persists, the page structure may use a form this parser does not recognize.');
+    case 'secret-contaminated':
+      throw new CaseAbort("The supplied locator's accessibility evidence contains a resolved secret value and cannot be fingerprinted or cached. Add an aria-label that does not echo the secret value to the affected element.");
   }
+
+  const fingerprint = classification.fingerprint;
 
   const executor = await context.resolveAiExecutor();
   context.events.emit({ type: 'ai-call', stepId: step.id });

@@ -1,8 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import {
-  computeAccessibilityFingerprint,
-  parseAriaSnapshot,
-} from '#core/ir/fingerprint.js';
+import { parseAriaSnapshot } from '#core/ir/aria-snapshot.js';
+import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
 import type {
   ElementRef,
   Fingerprint,
@@ -321,26 +319,28 @@ function fixtureFingerprint(): Fingerprint {
   const fingerprint = computeAccessibilityFingerprint(
     parseAriaSnapshot(FIXTURE_ARIA_SNAPSHOT),
     SUBMIT_BUTTON,
+    [],
   );
 
-  if (fingerprint === undefined) {
+  if (fingerprint.kind !== 'ok') {
     throw new Error('The fixture ARIA snapshot does not contain the submit button.');
   }
 
-  return fingerprint;
+  return fingerprint.fingerprint;
 }
 
 function firstAmbiguousCandidateFingerprint(): Fingerprint {
   const fingerprint = computeAccessibilityFingerprint(
     parseAriaSnapshot(FIRST_AMBIGUOUS_SUBMIT_CANDIDATE_FIXTURE),
     SUBMIT_BUTTON,
+    [],
   );
 
-  if (fingerprint === undefined) {
+  if (fingerprint.kind !== 'ok') {
     throw new Error('The separate ambiguous fixture does not contain its first submit candidate.');
   }
 
-  return fingerprint;
+  return fingerprint.fingerprint;
 }
 
 async function launchSession(
@@ -700,6 +700,18 @@ describe('ChromiumBrowserSession.captureValue()', () => {
 });
 
 describe('ChromiumBrowserSession.resolveGrounded()', () => {
+  it('maps parser-invalid evidence to the snapshot-invalid grounding miss reason', async () => {
+    await withLaunchedSession({ ariaSnapshot: 'not an ARIA outline' }, async (session) => {
+      await expect(session.resolveGrounded(SUBMIT_BUTTON, {
+        algorithm: 'a11y-neighborhood-v2',
+        hash: 'a'.repeat(64),
+      })).resolves.toEqual({
+        kind: 'miss',
+        reason: 'snapshot-invalid',
+      });
+    });
+  });
+
   it('captures fresh ARIA state instead of reusing snapshot-for-resolution evidence', async () => {
     const launcher = new FakePlaywrightLauncher({ ariaSnapshot: FIXTURE_ARIA_SNAPSHOT });
     let session: BrowserSession | undefined;

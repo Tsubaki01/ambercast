@@ -17,6 +17,7 @@ import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
+import { SNAPSHOT_INVALID } from '#core/ir/aria-snapshot.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import {
   GroundingDocument,
@@ -57,8 +58,8 @@ const MULTI_TARGETS = {
   staging: { baseUrl: 'https://staging.example.test', browser: 'chromium' },
 } as const;
 const PROMPT = '# Sign in\n\nWhen I submit valid credentials, I reach the dashboard.\n';
-const FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v1', hash: 'a'.repeat(64) };
-const DIFFERENT_FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v1', hash: 'b'.repeat(64) };
+const FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v2', hash: 'a'.repeat(64) };
+const DIFFERENT_FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v2', hash: 'b'.repeat(64) };
 const EMAIL: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Email' };
 const PASSWORD: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Password' };
 const SUBMIT: ElementRef = { strategy: 'accessibility', role: 'button', name: 'Submit' };
@@ -255,12 +256,12 @@ function pathBSnapshot(statusName?: string): { readonly accessibilityTree: JsonV
 }
 
 function pathBFingerprint(tree: JsonValueT = pathBAccessibilityTree()): Fingerprint {
-  const fingerprint = computeAccessibilityFingerprint(tree, SUBMIT);
-  if (fingerprint === undefined) {
+  const result = computeAccessibilityFingerprint(tree, SUBMIT, []);
+  if (result.kind !== 'ok') {
     throw new Error('The Path-B fixture must contain exactly one Submit button.');
   }
 
-  return fingerprint;
+  return result.fingerprint;
 }
 
 async function readGrounding(storage: StorageAdapter, testPath: string): Promise<GroundingDocument> {
@@ -437,7 +438,7 @@ describe('run', () => {
     const secretRef = '{{secrets.LOGIN_PASSWORD}}';
     const session = createFakeBrowserSession(liveEntries([PASSWORD]));
     const browserDriver = vi.fn(() => createFakeBrowserDriver(() => session));
-    const { deps, recordingStorage } = createScenario({
+    const { deps, events: _events, recordingStorage, resolveAiExecutor: _resolveAiExecutor } = createScenario({
       browserDriver,
       secrets: createFakeSecretsProvider(new Map([[secretRef, 'resolved-at-run-time']])),
     });
@@ -1698,7 +1699,12 @@ describe('run path-B element recovery', () => {
           { role: 'button', name: 'Submit', children: [] },
         ],
       }],
-    }, 'The supplied locator matches more than one element in the current accessibility evidence and cannot be trusted.'],
+    }, 'The supplied locator matches more than one element in the current accessibility evidence. Add a distinguishing aria-label (or other accessible-name difference) to one of the matching elements so the locator can identify a single element.'],
+    [
+      'parser-invalid evidence',
+      SNAPSHOT_INVALID,
+      'The current accessibility evidence could not be parsed and cannot be trusted for this locator. Retry the run; if this persists, the page structure may use a form this parser does not recognize.',
+    ],
   ])('does not call AI before failing closed for %s in captured evidence', async (_description, accessibilityTree, explanation) => {
     const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT), {
       snapshot: { accessibilityTree, screenshot: new Uint8Array() },
@@ -1738,7 +1744,7 @@ describe('run path-B element recovery', () => {
 
   it('honors a confirmation denial and persists no locally recomputed fingerprint', async () => {
     const locallyComputedFingerprint = pathBFingerprint();
-    expect(locallyComputedFingerprint).toMatchObject({ algorithm: 'a11y-neighborhood-v1' });
+    expect(locallyComputedFingerprint).toMatchObject({ algorithm: 'a11y-neighborhood-v2' });
     const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT), { snapshot: pathBSnapshot() });
     const executor = createFakeAiExecutor({
       execute: () => ({ data: { confirmed: false }, raw: '{"confirmed":false}' }),
@@ -1769,7 +1775,7 @@ describe('run path-B element recovery', () => {
     expect(session.operations().filter((operation) => operation.type === 'perform')).toEqual([]);
   });
 
-  it('persists the unredacted neighborhood fingerprint when a secret appears in the target parent', async () => {
+  it('aborts secret-contaminated evidence without echoing or persisting the resolved secret', async () => {
     const secretRef = '{{secrets.AMBERCAST_SECRET_DUMMY}}';
     const secretValue = 'AMBERCAST_SECRET_DUMMY_VALUE';
     const rawTree: JsonValueT = {
@@ -1784,21 +1790,6 @@ describe('run path-B element recovery', () => {
         ],
       }],
     };
-    const redactedTree: JsonValueT = {
-      role: 'root',
-      name: '',
-      children: [{
-        role: 'form',
-        name: `Sign in ${secretRef}`,
-        children: [
-          { role: 'textbox', name: 'Email', children: [] },
-          { role: 'button', name: 'Submit', children: [] },
-        ],
-      }],
-    };
-    const rawFingerprint = pathBFingerprint(rawTree);
-    const redactedFingerprint = pathBFingerprint(redactedTree);
-    expect(rawFingerprint).not.toEqual(redactedFingerprint);
     const session = createFakeBrowserSession(new Map([
       [elementRefKey(PASSWORD), { exists: true, currentFingerprint: FINGERPRINT }],
       [elementRefKey(SUBMIT), { exists: true, currentFingerprint: DIFFERENT_FINGERPRINT }],
@@ -1808,7 +1799,7 @@ describe('run path-B element recovery', () => {
     const executor = createFakeAiExecutor({
       execute: () => ({ data: { confirmed: true }, raw: '{"confirmed":true}' }),
     });
-    const { deps, recordingStorage } = createScenario({
+    const { deps, events, recordingStorage, resolveAiExecutor } = createScenario({
       browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
       secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
       resolveAiExecutor: async () => executor,
@@ -1820,20 +1811,76 @@ describe('run path-B element recovery', () => {
       [
         { id: 'fill-password-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef },
         { id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT },
+        { id: 'after-click', kind: 'action', action: 'navigate', url: '/after' },
       ],
       elementGrounding(['fill-password-secret', 'click-submit']),
     );
+    const groundingBefore = await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`);
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expectStopgapOutcome(outcome, 'click-submit', 'after-click', 'fill-password-secret');
+    expect(outcome.results[0]?.result.explanation).toBe(
+      'The supplied locator\'s accessibility evidence contains a resolved secret value and cannot be fingerprinted or cached. Add an aria-label that does not echo the secret value to the affected element.',
+    );
+    expect(outcome.results[0]?.result.explanation).not.toContain(secretValue);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(executor.structuredRequests).toEqual([]);
+    expect(aiCalls(events)).toEqual([]);
+    expect(recordingStorage.writes).toEqual([]);
+    expect(await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`)).toBe(groundingBefore);
+    expect(session.operations()).toEqual([
+      { type: 'resolve-grounded', target: PASSWORD, fingerprint: FINGERPRINT },
+      { type: 'perform', action: { type: 'fill-secret', target: PASSWORD, value: secretValue } },
+      { type: 'resolve-grounded', target: SUBMIT, fingerprint: FINGERPRINT },
+      { type: 'snapshot-for-resolution' },
+    ]);
+  });
+
+  it('evicts a whole grounding document with one v1 entry, including its valid v2 sibling, before fresh resolution', async () => {
+    const session = createFakeBrowserSession(new Map(), { snapshot: pathBSnapshot() });
+    const executor = createFakeAiExecutor({
+      execute: () => ({ data: { confirmed: true }, raw: '{"confirmed":true}' }),
+    });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    const plan = await createFreshPlan(recordingStorage.storage, testPath, [
+      { id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT },
+    ]);
+    const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
+    await recordingStorage.storage.writeText(layout.groundingPathFor(testPath), toCanonicalArtifactText({
+      schemaVersion: 1,
+      planDigest: computePlanDigest(plan),
+      entries: {
+        'click-submit': {
+          kind: 'element',
+          fingerprint: { algorithm: 'a11y-neighborhood-v1', hash: 'c'.repeat(64) },
+        },
+        'still-valid-v2': {
+          kind: 'element',
+          fingerprint: { algorithm: 'a11y-neighborhood-v2', hash: 'd'.repeat(64) },
+        },
+      },
+    } as unknown as JsonValueT));
 
     const outcome = await run(deps, DEFAULT_OPTIONS);
 
     expect(outcome.results[0]?.result.status).toBe('passed');
-    expect((executor.structuredRequests[0]?.context as {
-      readonly snapshot: { readonly accessibilityTree: JsonValueT };
-    }).snapshot.accessibilityTree).toStrictEqual(redactedTree);
-    expect((await readGrounding(recordingStorage.storage, testPath)).entries['click-submit']).toEqual({
-      kind: 'element',
-      fingerprint: rawFingerprint,
+    expect(resolveAiExecutor).toHaveBeenCalledTimes(1);
+    expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'click-submit' }]);
+    expect(executor.structuredRequests).toHaveLength(1);
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toStrictEqual({
+      'click-submit': { kind: 'element', fingerprint: pathBFingerprint() },
     });
+    expect(session.operations()).toEqual([
+      { type: 'snapshot-for-resolution' },
+      { type: 'perform', action: { type: 'click', target: SUBMIT } },
+    ]);
   });
 
   it('fails closed under cache-only for a well-formed legacy-shaped fingerprint', async () => {
