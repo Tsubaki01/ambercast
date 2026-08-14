@@ -375,6 +375,27 @@ class OrchestratorWatchTest(unittest.TestCase):
 
         self.assertEqual(self.watch(discovery, DualClock()), (0, ""))
 
+    def test_transient_target_disappearance_preserves_accumulated_idle_time(self):
+        # A remains idle but is absent for one successful enumeration while B
+        # stays live. Its in-memory clock must resume at the next poll so A
+        # wakes with B at the original stale deadline, rather than after a
+        # fresh stale window.
+        calls = 0
+
+        def discovery():
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                return [self.other]
+            return [self.one, self.other]
+
+        clock = DualClock()
+        code, message = self.watch(discovery, clock, stale=180)
+        self.assertEqual(code, 2)
+        self.assertEqual(clock.sleeps, 3)
+        self.assertIn(self.one["branch"], message)
+        self.assertIn(self.other["branch"], message)
+
     def test_wall_clock_suspend_wakes_when_monotonic_clock_stops(self):
         code, _ = self.watch(
             lambda: [self.one], DualClock(wall_step=120, monotonic_step=0), stale=120
@@ -429,11 +450,16 @@ class OrchestratorWatchTest(unittest.TestCase):
 
     def test_backoff_schedule_caps_and_digest_progress_resets_it(self):
         self.assertEqual(watch_progress.orchestrator_stale_after(900, 0), 900)
-        self.assertEqual(watch_progress.orchestrator_stale_after(900, 1), 12 * 60)
+        self.assertEqual(watch_progress.orchestrator_stale_after(900, 1), 900)
         self.assertEqual(watch_progress.orchestrator_stale_after(900, 2), 24 * 60)
         self.assertEqual(watch_progress.orchestrator_stale_after(900, 3), 48 * 60)
         self.assertEqual(watch_progress.orchestrator_stale_after(900, 4), 60 * 60)
         self.assertEqual(watch_progress.orchestrator_stale_after(900, 99), 60 * 60)
+        self.assertEqual(watch_progress.orchestrator_stale_after(3600, 1), 3600)
+        self.assertEqual(watch_progress.orchestrator_stale_after(3600, 99), 3600)
+        self.assertEqual(
+            watch_progress.orchestrator_stale_after(720, 1), 12 * 60
+        )
 
         sidecar = self.proj / ".claude" / "impl" / ".watchdog-orchestrator.json"
         sidecar.write_text(json.dumps({

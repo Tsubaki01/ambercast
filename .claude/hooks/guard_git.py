@@ -56,7 +56,6 @@ import sys
 
 
 ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
-OPERATORS = {";", "&&", "||", "|", "&", "\n"}
 STRUCTURAL_SHELL_TOKENS = {
     "(", ")", "{", "}", "if", "then", "elif", "else", "fi", "while",
     "for", "until", "case", "do", "done", "esac", "select", "function",
@@ -106,18 +105,28 @@ def _shell_tokens(command):
 
 
 def _is_git_executable(token):
-    return token == "git" or token.endswith("/git")
+    return _executable_basename(token) == "git"
+
+
+def _executable_basename(token):
+    """Normalize a command-path token without granting it path authority."""
+    return token.rsplit("/", 1)[-1]
+
+
+def _is_operator(token):
+    """Recognize every shlex punctuation run that starts a new command."""
+    return bool(token) and all(character in ";|&\n" for character in token)
 
 
 def _is_shell_executable(token):
     """Recognize an interpreter token without assuming it lacks a path."""
-    return os.path.basename(token) in {"sh", "bash", "zsh"}
+    return _executable_basename(token) in {"sh", "bash", "zsh"}
 
 
 def _has_combined_shell_c_flag(tokens, index):
     """Whether this shell invocation executes a nested command string."""
     for token in tokens[index + 1:]:
-        if token in OPERATORS:
+        if _is_operator(token):
             break
         if token == "--":
             break
@@ -131,13 +140,19 @@ def _skip_env(tokens, index):
     index += 1
     while index < len(tokens):
         token = tokens[index]
+        if _is_operator(token):
+            return index
         if token == "--":
             return index + 1
         if ASSIGNMENT_RE.fullmatch(token):
             index += 1
             continue
         if token.startswith("-"):
-            if token in ENV_OPTIONS_WITH_VALUE and index + 1 < len(tokens):
+            if (
+                token in ENV_OPTIONS_WITH_VALUE
+                and index + 1 < len(tokens)
+                and not _is_operator(tokens[index + 1])
+            ):
                 index += 2
             else:
                 index += 1
@@ -148,16 +163,22 @@ def _skip_env(tokens, index):
 
 def _skip_wrapper(tokens, index):
     """Skip a shell wrapper and its setup options before its executable."""
-    wrapper = tokens[index]
+    wrapper = _executable_basename(tokens[index])
     options_with_value = WRAPPER_OPTIONS_WITH_VALUE.get(wrapper, set())
     index += 1
     while index < len(tokens):
         token = tokens[index]
+        if _is_operator(token):
+            return index
         if token == "--":
             return index + 1
         if not token.startswith("-"):
             return index
-        if token in options_with_value and index + 1 < len(tokens):
+        if (
+            token in options_with_value
+            and index + 1 < len(tokens)
+            and not _is_operator(tokens[index + 1])
+        ):
             index += 2
         else:
             index += 1
@@ -169,10 +190,17 @@ def _git_subcommand(tokens, index):
     index += 1
     while index < len(tokens):
         token = tokens[index]
+        if _is_operator(token):
+            return None
         if token == "--":
-            return tokens[index + 1] if index + 1 < len(tokens) else None
+            if index + 1 < len(tokens) and not _is_operator(tokens[index + 1]):
+                return tokens[index + 1]
+            return None
         if token in GIT_OPTIONS_WITH_VALUE:
-            index += 2
+            if index + 1 < len(tokens) and not _is_operator(tokens[index + 1]):
+                index += 2
+            else:
+                return None
             continue
         if token.startswith(("-c", "-C")) and token not in {"-c", "-C"}:
             index += 1
@@ -220,7 +248,7 @@ def classify(command):
     command_position = True
     while index < len(tokens):
         token = tokens[index]
-        if token in OPERATORS:
+        if _is_operator(token):
             command_position = True
             index += 1
             continue
@@ -229,17 +257,25 @@ def classify(command):
             continue
         while index < len(tokens) and ASSIGNMENT_RE.fullmatch(tokens[index]):
             index += 1
-        if index >= len(tokens) or tokens[index] in OPERATORS:
+        if index >= len(tokens):
+            break
+        if _is_operator(tokens[index]):
             command_position = True
             continue
         while index < len(tokens):
-            if tokens[index] == "env":
+            if _is_operator(tokens[index]):
+                break
+            executable = _executable_basename(tokens[index])
+            if executable == "env":
                 index = _skip_env(tokens, index)
                 continue
-            if tokens[index] in WRAPPER_COMMANDS:
+            if executable in WRAPPER_COMMANDS:
                 index = _skip_wrapper(tokens, index)
                 continue
             break
+        if index < len(tokens) and _is_operator(tokens[index]):
+            command_position = True
+            continue
         if index < len(tokens) and _is_git_executable(tokens[index]):
             subcommand = _git_subcommand(tokens, index)
             commit = commit or subcommand == "commit"

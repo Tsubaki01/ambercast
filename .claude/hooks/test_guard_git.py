@@ -162,6 +162,36 @@ class EvaluateTest(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIsNotNone(self.evaluate(command))
 
+    def test_path_qualified_prefixes_cannot_bypass_branch_enforcement(self):
+        # Prefix recognition must follow executable basename semantics, just as
+        # the Git executable recognizer does. Each of these previously reached
+        # main as an unclassified non-Git command.
+        for command in (
+            "/usr/bin/env X=1 git commit -m x",
+            "/usr/bin/sudo git commit -m x",
+            "/usr/bin/time git push",
+            '/bin/bash -lc "git commit -m x"',
+        ):
+            with self.subTest(command=command):
+                result = self.evaluate(command)
+                self.assertIsNotNone(result)
+                self.assertEqual(result[0], 2)
+
+    def test_prefixes_and_operator_runs_reset_command_position(self):
+        # Prefix parsers can stop at a separator. That separator must return
+        # classification to command position even when shlex groups it as a
+        # punctuation run rather than a canonical shell operator token.
+        for command in (
+            "env ; git commit -m x",
+            "true |& git commit -m x",
+            "case x in y) ;; esac; git commit -m x",
+            "X=1 ; /usr/bin/env git push",
+        ):
+            with self.subTest(command=command):
+                result = self.evaluate(command)
+                self.assertIsNotNone(result)
+                self.assertEqual(result[0], 2)
+
     def test_command_separators_and_git_global_options_are_lexed(self):
         for separator in (";", "&&", "||", "|", "&", "\n"):
             with self.subTest(separator=separator):

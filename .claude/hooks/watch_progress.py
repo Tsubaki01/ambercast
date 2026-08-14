@@ -44,11 +44,13 @@ issue. The primary checkout uses its own `.watchdog-orchestrator.pid` lock and
 a best-effort `.watchdog-orchestrator.json` sidecar. That sidecar remembers the
 latest successful active-target snapshot separately from per-digest wake
 backoff, atomically prunes targets no longer active, and resets a target's
-backoff when its digest changes. An interrupted worktree listing therefore
-cannot silently erase known work: a known snapshot makes an initial listing
-failure wake immediately, while a running watcher tolerates only three
-consecutive failures before it wakes. A successful empty listing clears the
-snapshot and ends the watcher quietly.
+backoff when its digest changes. Within one watcher process, a target omitted
+by a successful list remains in memory until it returns or the watcher ends,
+so a transient enumeration gap cannot reset its accumulated idle clock. An
+interrupted worktree listing therefore cannot silently erase known work: a
+known snapshot makes an initial listing failure wake immediately, while a
+running watcher tolerates only three consecutive failures before it wakes. A
+successful empty listing clears the snapshot and ends the watcher quietly.
 """
 import errno
 import fcntl
@@ -81,9 +83,10 @@ LOCK_ERROR = "error"
 _HELD_LOCKS = {}
 
 # Orchestrator retry intervals start at the normal stale window, then apply the
-# fixed 12/24/48/60-minute schedule after same-digest wakes. The v2 sidecar
-# keeps only wall-readable observations and accumulated time: monotonic values
-# are process-local and therefore reset when a fresh hook process is armed.
+# larger of that setting and the fixed 12/24/48/60-minute schedule after
+# same-digest wakes. The v2 sidecar keeps only wall-readable observations and
+# accumulated time: monotonic values are process-local and therefore reset when
+# a fresh hook process is armed.
 
 
 def lock_path(proj, issue):
@@ -372,7 +375,10 @@ def orchestrator_stale_after(stale_after, unchanged_wake_count):
     """Return the current per-target deadline after unchanged stale wakes."""
     if unchanged_wake_count <= 0:
         return stale_after
-    return ORCHESTRATOR_BACKOFF_SEC[min(unchanged_wake_count - 1, len(ORCHESTRATOR_BACKOFF_SEC) - 1)]
+    schedule = ORCHESTRATOR_BACKOFF_SEC[
+        min(unchanged_wake_count - 1, len(ORCHESTRATOR_BACKOFF_SEC) - 1)
+    ]
+    return max(stale_after, schedule)
 
 
 def _clock_delta(now_monotonic, previous_monotonic, now_wall, previous_wall):
@@ -625,6 +631,11 @@ def watch_orchestrator(proj, interval, stale_after, max_runtime,
     states = _initial_orchestrator_states(
         targets, start_monotonic, start_wall, hash_fn, previous
     )
+    # The persisted snapshot intentionally contains only currently active
+    # targets. Retaining omitted states in this process bridges a successful
+    # but transient enumeration gap without resurrecting removed work after a
+    # later re-arm.
+    missing_states = {}
     _persist_orchestrator_sidecar_or_warn(proj, _snapshot_payload(targets, states))
     discovery_failures = 0
     while True:
@@ -648,11 +659,17 @@ def watch_orchestrator(proj, interval, stale_after, max_runtime,
             _persist_orchestrator_sidecar_or_warn(proj, _empty_orchestrator_sidecar())
             return 0, ""
 
+        active_keys = {_target_key(target) for target in targets}
+        for key, state in states.items():
+            if key not in active_keys:
+                missing_states[key] = state
         next_states = {}
         for target in targets:
             key = _target_key(target)
             digest = hash_fn(target["path"], target["issue"])
             state = states.get(key)
+            if state is None:
+                state = missing_states.pop(key, None)
             if state is None:
                 prior = _initial_orchestrator_states(
                     [target], now_monotonic, now_wall, hash_fn, previous
