@@ -334,30 +334,129 @@ describe('generate', () => {
   });
 
   it('wraps a per-call timeout as an unavailable executor failure and continues the batch', async () => {
+    const caller = new AbortController();
+    const timeoutController = new AbortController();
+    const secondTimeoutController = new AbortController();
+    const timeoutReason = new Error('controlled local timeout');
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout')
+      .mockReturnValueOnce(timeoutController.signal)
+      .mockReturnValueOnce(secondTimeoutController.signal);
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let observedSignal: AbortSignal | undefined;
     const { deps, recordingStorage } = createScenario({
-      config: { testDir: TEST_DIR, testMatch: ['**/*.test.md'], testIgnore: [], targets: TARGETS, defaultTarget: 'web', ai: { provider: 'codex', timeoutMs: 1 } },
+      signal: caller.signal,
+      config: { testDir: TEST_DIR, testMatch: ['**/*.test.md'], testIgnore: [], targets: TARGETS, defaultTarget: 'web', ai: { provider: 'codex', timeoutMs: 100 } },
       aiExecutor: createFakeAiExecutor({
-        execute: (request) => request.context !== null && typeof request.context === 'object' && 'testMd' in request.context && request.context.testMd === 'first'
-          ? new Promise(() => undefined)
-          : { data: RESPONSE, raw: JSON.stringify(RESPONSE) },
+        execute: (request) => {
+          if (request.context !== null && typeof request.context === 'object' && 'testMd' in request.context && request.context.testMd === 'first') {
+            observedSignal = request.signal;
+            markStarted?.();
+            return new Promise<never>(() => undefined);
+          }
+          return { data: RESPONSE, raw: JSON.stringify(RESPONSE) };
+        },
       }),
       discoverTestFiles: async () => ['first.test.md', 'second.test.md'],
     });
     await writePrompt(recordingStorage.storage, 'first.test.md', 'first');
     await writePrompt(recordingStorage.storage, 'second.test.md', 'second');
 
-    await expect(generate(deps, DEFAULT_OPTIONS)).resolves.toMatchObject({
-      results: [
-        {
-          status: 'failed',
-          error: {
-            kind: 'ai-executor-unavailable',
-            message: 'The AI provider did not respond within the configured timeout.',
+    try {
+      const running = generate(deps, DEFAULT_OPTIONS);
+      await started;
+      expect(observedSignal).not.toBe(caller.signal);
+      expect(observedSignal).not.toBe(timeoutController.signal);
+      timeoutController.abort(timeoutReason);
+
+      await expect(running).resolves.toMatchObject({
+        results: [
+          {
+            status: 'failed',
+            error: {
+              kind: 'ai-executor-unavailable',
+              message: 'The AI provider did not respond within the configured timeout.',
+            },
           },
-        },
-        { status: 'generated' },
-      ],
+          { status: 'generated' },
+        ],
+      });
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+
+  it('does not mistake a caller TimeoutError for its local timeout after both signals abort', async () => {
+    const caller = new AbortController();
+    const timeoutController = new AbortController();
+    const callerReason = new DOMException('caller cancelled', 'TimeoutError');
+    const localReason = new DOMException('fabricated local timeout', 'TimeoutError');
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeoutController.signal);
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
     });
+    let observedSignal: AbortSignal | undefined;
+    const execute = vi.fn((request: { readonly signal?: AbortSignal }) => {
+      observedSignal = request.signal;
+      markStarted?.();
+      return new Promise<never>(() => undefined);
+    });
+    const { deps, recordingStorage } = createScenario({
+      signal: caller.signal,
+      aiExecutor: createFakeAiExecutor({ execute }),
+      discoverTestFiles: async () => ['first.test.md', 'second.test.md'],
+    });
+    await writePrompt(recordingStorage.storage, 'first.test.md', 'first');
+    await writePrompt(recordingStorage.storage, 'second.test.md', 'second');
+
+    try {
+      const running = generate(deps, DEFAULT_OPTIONS);
+      await started;
+      caller.abort(callerReason);
+      timeoutController.abort(localReason);
+
+      await expect(running).resolves.toEqual({ results: [], noTestsFound: false });
+      expect(execute).toHaveBeenCalledOnce();
+      expect(observedSignal).not.toBe(caller.signal);
+      expect(observedSignal).not.toBe(timeoutController.signal);
+      expect(observedSignal?.reason).toBe(callerReason);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+
+  it('keeps an unrelated TimeoutError-named provider rejection generic', async () => {
+    const timeoutController = new AbortController();
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeoutController.signal);
+    const providerError = new DOMException('provider returned a timeout-shaped failure', 'TimeoutError');
+    const { deps, recordingStorage } = createScenario({
+      aiExecutor: createFakeAiExecutor({
+        execute: async (request) => {
+          if (request.context !== null && typeof request.context === 'object' && 'testMd' in request.context && request.context.testMd === 'first') {
+            throw providerError;
+          }
+          return { data: RESPONSE, raw: JSON.stringify(RESPONSE) };
+        },
+      }),
+      discoverTestFiles: async () => ['first.test.md', 'second.test.md'],
+    });
+    await writePrompt(recordingStorage.storage, 'first.test.md', 'first');
+    await writePrompt(recordingStorage.storage, 'second.test.md', 'second');
+
+    try {
+      await expect(generate(deps, DEFAULT_OPTIONS)).resolves.toMatchObject({
+        results: [
+          { status: 'failed', error: { kind: 'ai-executor-unavailable', message: 'The AI provider call failed.' } },
+          { status: 'generated' },
+        ],
+      });
+      expect(timeoutController.signal.aborted).toBe(false);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
   });
 
   it('classifies a non-abort adapter failure as unavailable without claiming that the call timed out', async () => {
