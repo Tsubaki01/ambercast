@@ -41,19 +41,21 @@ class ResolveTargetDirTest(unittest.TestCase):
         with patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": "/project"}, clear=False):
             self.assertEqual(
                 guard_git.resolve_target_dir({"cwd": "/cwd"}),
-                "/cwd",
+                ("/cwd", "data.cwd"),
             )
 
     def test_project_dir_and_process_cwd_remain_fallbacks(self):
         with patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": "/project"}, clear=False):
             self.assertEqual(
-                guard_git.resolve_target_dir({}), "/project"
+                guard_git.resolve_target_dir({}),
+                ("/project", "CLAUDE_PROJECT_DIR"),
             )
         with patch.dict(os.environ, {}, clear=True), patch(
             "guard_git.os.getcwd", return_value="/process-cwd"
         ):
             self.assertEqual(
-                guard_git.resolve_target_dir({}), "/process-cwd"
+                guard_git.resolve_target_dir({}),
+                ("/process-cwd", "process cwd"),
             )
 
 
@@ -79,6 +81,10 @@ class EvaluateTest(unittest.TestCase):
         result = self.evaluate("git commit -m message")
         self.assertIsNotNone(result)
         self.assertIn("commits/pushes on main", result[1])
+        self.assertIn("Resolved directory", result[1])
+        self.assertIn("data.cwd", result[1])
+        self.assertIn("Observed branch: main", result[1])
+        self.assertIn("Do not retry", result[1])
 
     def test_compound_branch_switch_and_commit_is_still_blocked(self):
         result = self.evaluate("git switch issues/58 && git commit -m message")
@@ -124,6 +130,90 @@ class EvaluateTest(unittest.TestCase):
         ) as run:
             self.assertIsNone(self.evaluate("git commit -m message"))
         self.assertEqual(run.call_args.kwargs["timeout"], 5)
+
+    def test_quoted_prompt_prose_is_not_a_git_invocation(self):
+        self.assertIsNone(
+            self.evaluate('codex exec "git commit should be reviewed"')
+        )
+        self.assertIsNone(self.evaluate("echo 'git commit'"))
+
+    def test_quoted_git_binary_and_absolute_path_are_real_invocations(self):
+        self.assertIsNotNone(self.evaluate('"git" commit -m x'))
+        self.assertIsNotNone(self.evaluate("/usr/bin/git push"))
+
+    def test_environment_prefixes_do_not_hide_git_commit(self):
+        self.assertIsNotNone(self.evaluate("env X=1 git commit -m x"))
+        self.assertIsNotNone(self.evaluate("X=1 git commit -m x"))
+        self.assertIsNotNone(self.evaluate("env -i X=1 git commit -m x"))
+
+    def test_common_shell_wrappers_do_not_hide_git_operations(self):
+        for command in (
+            "command git commit -m x",
+            "sudo git commit -m x",
+            "sudo -n git commit -m x",
+            "command -p git commit -m x",
+            "nice git commit -m x",
+            "time git push",
+            "time -p git push",
+            "command env X=1 git commit -m x",
+            "sudo env X=1 git commit -m x",
+            "env X=1 command git commit -m x",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.evaluate(command))
+
+    def test_command_separators_and_git_global_options_are_lexed(self):
+        for separator in (";", "&&", "||", "|", "&", "\n"):
+            with self.subTest(separator=separator):
+                self.assertIsNotNone(
+                    self.evaluate(f"echo ready {separator} git -C /tmp commit -m x")
+                )
+        self.assertIsNotNone(self.evaluate("git --git-dir=/tmp commit -m x"))
+        self.assertIsNotNone(self.evaluate("git -c core.editor=true commit -m x"))
+
+    def test_exec_and_complex_shell_forms_cannot_hide_git_operations(self):
+        for command in (
+            "exec git commit -m x",
+            "exec -a disguised-git git commit -m x",
+            '/bin/sh -c "git commit -m x"',
+            'bash -lc "git commit -m x"',
+            '(git commit -m x)',
+            'if git commit -m x; then :; fi',
+            'while git commit -m x; do break; done',
+        ):
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.evaluate(command))
+
+    def test_ambiguous_shell_evaluation_with_git_is_blocked_on_main(self):
+        self.assertIsNotNone(self.evaluate("sh -c 'git commit -m x'"))
+        self.assertIsNotNone(self.evaluate('echo "$(git commit -m x)"'))
+        self.assertIsNotNone(self.evaluate("echo `git commit -m x`"))
+        self.assertIsNotNone(self.evaluate("eval 'git commit -m x'"))
+        self.assertIsNotNone(self.evaluate("git commit '"))
+
+    def test_ambiguous_shell_evaluation_is_blocked_on_issue_branches_too(self):
+        for command in (
+            "sh -c 'git commit -m x'",
+            "bash -xec 'git switch main && git commit -m x'",
+            "git commit -m 'message $(date)'",
+            "if git status; then echo git; fi",
+        ):
+            with self.subTest(command=command):
+                result = self.evaluate(command, self.worktree)
+                self.assertIsNotNone(result)
+                self.assertIn("too complex to statically classify", result[1])
+                self.assertIn("simple, single-command form", result[1])
+
+    def test_non_git_branch_name_text_is_not_an_operation(self):
+        self.assertIsNone(self.evaluate("echo issues/6-fix-commit-msg"))
+
+    def test_trusted_data_cwd_pins_the_known_false_negative_direction(self):
+        # Resolution is deliberately based on hook input, not the `-C` target.
+        # This linked worktree is valid, so its issue branch permits a command
+        # that Git itself would direct back at main.
+        self.assertIsNone(
+            self.evaluate(f"git -C {self.main} commit -m message", self.worktree)
+        )
 
 
 class MainTest(unittest.TestCase):
