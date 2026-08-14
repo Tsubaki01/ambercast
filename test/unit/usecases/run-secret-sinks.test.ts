@@ -8,6 +8,7 @@ import { createSpawnCommandRunner } from '#adapters/ai/shared/command-runner.js'
 import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
+import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import {
@@ -23,9 +24,11 @@ import { createLayoutResolver } from '#core/layout/resolve.js';
 import type { AiExecutor } from '#ports/ai.js';
 import type { BrowserSession } from '#ports/browser.js';
 import type { StorageAdapter } from '#ports/storage.js';
+import type { SecretsProvider } from '#ports/system.js';
 import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/generate.js';
 import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
 import { buildRunReport } from '#usecases/run-report.js';
+import { boundTarget } from '../../doubles/bound-target.js';
 import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
 import { createFakeBrowserDriver } from '../../doubles/fake-browser-driver.js';
 import {
@@ -46,7 +49,6 @@ const PROMPT = '# Sign in\n\nWhen I submit valid credentials, I reach the dashbo
 const SECRET_REF = '{{secrets.AMBERCAST_SECRET_DUMMY}}';
 const SECRET_VALUE = 'sk-AMBERCAST_SECRET_DUMMY';
 const FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v2', hash: 'a'.repeat(64) };
-const DIFFERENT_FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v2', hash: 'b'.repeat(64) };
 const EMAIL: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Email' };
 const PASSWORD: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Password' };
 const SUBMIT: ElementRef = { strategy: 'accessibility', role: 'button', name: 'Submit' };
@@ -182,6 +184,26 @@ function createRunScenario(
   };
 }
 
+function createRotatingSecretsProvider(ref: string, values: readonly string[]): SecretsProvider {
+  let next = 0;
+
+  return {
+    resolve(requestedRef: string): string | undefined {
+      if (requestedRef !== ref) {
+        return undefined;
+      }
+
+      const value = values[next];
+      next += 1;
+      if (value === undefined) {
+        throw new Error('The rotating secret fixture received an unexpected extra resolution.');
+      }
+
+      return value;
+    },
+  };
+}
+
 function createGenerateScenario(
   aiExecutor: AiExecutor,
   aiTimeoutMs = 100,
@@ -313,22 +335,77 @@ describe('run secret sinks', () => {
     expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
     expect(recordingStorage.writes).toEqual([]);
     expect(session.operations()).toEqual([
-      { type: 'perform', action: { type: 'fill-secret', target: PASSWORD, value: SECRET_VALUE } },
+      expect.objectContaining({
+        type: 'resolve-grounded',
+        target: PASSWORD,
+        query: expect.objectContaining({ mode: 'compute' }),
+      }),
+      { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: SECRET_VALUE } },
     ]);
   });
 
-  it('refuses the grounding write for an AI target name that bypasses the in-flow switch', async () => {
-    const unsafeTarget: ElementRef = {
+  it('rejects a secret-tainted fill-secret target during trace replay before the fill can reach the browser', async () => {
+    const preScanValue = 'AMBERCAST_SECRET_PRE_SCAN_VALUE';
+    const materializationValue = 'AMBERCAST_SECRET_MATERIALIZATION_VALUE';
+    const secretTaintedTarget: ElementRef = {
       strategy: 'accessibility',
-      role: 'button',
-      name: `Continue with ${SECRET_VALUE}`,
+      role: 'textbox',
+      name: `Password for ${materializationValue}`,
     };
-    const session = createFakeBrowserSession(liveEntries([PASSWORD, unsafeTarget]));
+    const session = createFakeBrowserSession(liveEntries([secretTaintedTarget]));
+    const resolveGrounded = vi.spyOn(session, 'resolveGrounded');
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
-        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: SECRET_REF });
-        await request.controller.perform({ type: 'click', target: unsafeTarget });
         await request.controller.evaluateAssert({ type: 'assert', check: 'text-visible', text: 'Dashboard' });
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createRunScenario(session, executor);
+    const rotatingSecrets = createRotatingSecretsProvider(SECRET_REF, [preScanValue, materializationValue]);
+    const testPath = await writePrompt(recordingStorage.storage, `${PROMPT}\n${SECRET_REF}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep()],
+      {
+        'recorded-ai': {
+          kind: 'ai',
+          trace: {
+            events: [{ type: 'fill-secret', target: secretTaintedTarget, secretRef: SECRET_REF }],
+            verification: [{ type: 'assert', check: 'text-visible', text: 'Cached dashboard' }],
+          },
+        },
+      },
+    );
+
+    const outcome = await run({ ...deps, secrets: rotatingSecrets }, RUN_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(executor.agenticRequests).toHaveLength(1);
+    expect(resolveGrounded).toHaveBeenCalledWith(secretTaintedTarget, expect.objectContaining({ mode: 'compute' }));
+    const computeQuery = resolveGrounded.mock.calls
+      .map(([, query]) => query)
+      .find((query) => query.mode === 'compute');
+
+    expect(computeQuery?.mode).toBe('compute');
+    if (computeQuery?.mode === 'compute') {
+      expect([...computeQuery.resolvedSecrets]).toEqual([new Set([preScanValue, materializationValue])]);
+    }
+    expect(session.operations().filter((operation) => operation.type === 'perform')).toEqual([]);
+    expect(JSON.stringify(outcome)).not.toContain(materializationValue);
+  });
+
+  it('rejects a fresh agentic fill-secret target after recording its own secret for compute-mode binding', async () => {
+    const secretTaintedTarget: ElementRef = {
+      strategy: 'accessibility',
+      role: 'textbox',
+      name: `Password for ${SECRET_VALUE}`,
+    };
+    const session = createFakeBrowserSession(liveEntries([secretTaintedTarget]));
+    const resolveGrounded = vi.spyOn(session, 'resolveGrounded');
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'fill-secret', target: secretTaintedTarget, secretRef: SECRET_REF });
         return { outcome: 'success' };
       },
     });
@@ -339,21 +416,72 @@ describe('run secret sinks', () => {
 
     const outcome = await run(deps, RUN_OPTIONS);
 
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(outcome.results[0]?.result).toMatchObject({
+      status: 'error',
+      steps: [{ id: 'recorded-ai', status: 'error', kind: 'environment' }],
+    });
+    expect(resolveGrounded).toHaveBeenCalledWith(secretTaintedTarget, expect.objectContaining({ mode: 'compute' }));
+    const computeQuery = resolveGrounded.mock.calls
+      .map(([, query]) => query)
+      .find((query) => query.mode === 'compute');
+
+    expect(computeQuery?.mode).toBe('compute');
+    if (computeQuery?.mode === 'compute') {
+      expect([...computeQuery.resolvedSecrets]).toEqual([new Set([SECRET_VALUE])]);
+    }
+    expect(session.operations().filter((operation) => operation.type === 'perform')).toEqual([]);
+    expect(recordingStorage.writes).toEqual([]);
+    expect(JSON.stringify(outcome)).not.toContain(SECRET_VALUE);
+  });
+
+  it('refuses the grounding write for a trace tainted only after its safe compute binds', async () => {
+    const firstSecretValue = 'AMBERCAST_SECRET_EARLIER_VALUE';
+    const persistenceOnlySecret = 'AMBERCAST_SECRET_PERSISTENCE_VALUE';
+    const unsafeTarget: ElementRef = {
+      strategy: 'accessibility',
+      role: 'button',
+      name: `Continue with ${persistenceOnlySecret}`,
+    };
+    const session = createFakeBrowserSession(liveEntries([PASSWORD, unsafeTarget]));
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: SECRET_REF });
+        await request.controller.perform({ type: 'click', target: unsafeTarget });
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: SECRET_REF });
+        await request.controller.evaluateAssert({ type: 'assert', check: 'text-visible', text: 'Dashboard' });
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createRunScenario(session, executor);
+    const rotatingSecrets = createRotatingSecretsProvider(SECRET_REF, [firstSecretValue, persistenceOnlySecret]);
+    const testPath = await writePrompt(recordingStorage.storage, `${PROMPT}\n${SECRET_REF}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()]);
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run({ ...deps, secrets: rotatingSecrets }, RUN_OPTIONS);
+
     expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
     expect(outcome.results[0]?.result.status).toBe('error');
     expect(recordingStorage.writes).toEqual([]);
     expect(session.operations()).toEqual([
-      { type: 'perform', action: { type: 'fill-secret', target: PASSWORD, value: SECRET_VALUE } },
-      { type: 'perform', action: { type: 'click', target: unsafeTarget } },
+      expect.objectContaining({ type: 'resolve-grounded', target: PASSWORD, query: expect.objectContaining({ mode: 'compute' }) }),
+      { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: firstSecretValue } },
+      expect.objectContaining({ type: 'resolve-grounded', target: unsafeTarget, query: expect.objectContaining({ mode: 'compute' }) }),
+      { type: 'perform', action: { type: 'click', target: boundTarget(unsafeTarget, FINGERPRINT) } },
+      expect.objectContaining({ type: 'resolve-grounded', target: PASSWORD, query: expect.objectContaining({ mode: 'compute' }) }),
+      { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: persistenceOnlySecret } },
       { type: 'evaluate-assert', check: { check: 'text-visible', text: 'Dashboard' } },
     ]);
   });
 
-  it('surfaces a dirty grounding integrity violation over a later deterministic assertion failure', async () => {
+  it('surfaces a persistence-only dirty grounding integrity violation over a later deterministic assertion failure', async () => {
+    const firstSecretValue = 'AMBERCAST_SECRET_EARLIER_VALUE';
+    const persistenceOnlySecret = 'AMBERCAST_SECRET_PERSISTENCE_VALUE';
     const unsafeTarget: ElementRef = {
       strategy: 'accessibility',
       role: 'button',
-      name: `Continue with ${SECRET_VALUE}`,
+      name: `Continue with ${persistenceOnlySecret}`,
     };
     const session = createFakeBrowserSession(liveEntries([PASSWORD, SUBMIT, unsafeTarget]), {
       assertOutcomes: [
@@ -365,11 +493,13 @@ describe('run secret sinks', () => {
       async executeAgentic(request) {
         await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: SECRET_REF });
         await request.controller.perform({ type: 'click', target: unsafeTarget });
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: SECRET_REF });
         await request.controller.evaluateAssert({ type: 'assert', check: 'text-visible', text: 'Dashboard' });
         return { outcome: 'success' };
       },
     });
-    const { deps, recordingStorage } = createRunScenario(session, executor, new Map([[SECRET_REF, SECRET_VALUE]]));
+    const { deps, recordingStorage } = createRunScenario(session, executor);
+    const rotatingSecrets = createRotatingSecretsProvider(SECRET_REF, [firstSecretValue, persistenceOnlySecret]);
     const testPath = await writePrompt(recordingStorage.storage, `${PROMPT}\n${SECRET_REF}\n`);
     await seedFreshArtifacts(recordingStorage.storage, testPath, [
       aiStep(),
@@ -377,7 +507,7 @@ describe('run secret sinks', () => {
     ], elementGrounding(['later-ordinary-assertion']));
     recordingStorage.writes.length = 0;
 
-    const outcome = await run(deps, RUN_OPTIONS);
+    const outcome = await run({ ...deps, secrets: rotatingSecrets }, RUN_OPTIONS);
 
     expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
     expect(outcome.results[0]?.result).toMatchObject({
@@ -542,23 +672,26 @@ describe('run secret sinks', () => {
       return { outcome: 'exited', stdout: '', stderr: '', exitCode: 0 };
     }]);
     const runExecutor = createCodexCliExecutor({ run: runRunner.run });
-    const session = createFakeBrowserSession(liveEntries([SUBMIT], DIFFERENT_FINGERPRINT), {
-      snapshot: {
-        accessibilityTree: {
-          role: 'root',
-          name: '',
-          children: [{
-            role: 'form',
-            name: 'Sign in',
-            children: [
-              { role: 'textbox', name: 'Email', children: [] },
-              { role: 'button', name: 'Submit', children: [] },
-            ],
-          }],
-        },
-        screenshot: new Uint8Array(),
+    const snapshot: { readonly accessibilityTree: JsonValueT; readonly screenshot: Uint8Array } = {
+      accessibilityTree: {
+        role: 'root',
+        name: '',
+        children: [{
+          role: 'form',
+          name: 'Sign in',
+          children: [
+            { role: 'textbox', name: 'Email', children: [] },
+            { role: 'button', name: 'Submit', children: [] },
+          ],
+        }],
       },
-    });
+      screenshot: new Uint8Array(),
+    };
+    const fingerprint = computeAccessibilityFingerprint(snapshot.accessibilityTree, SUBMIT, []);
+    if (fingerprint.kind !== 'ok') {
+      throw new Error('The post-confirmation fixture must contain exactly one Submit button.');
+    }
+    const session = createFakeBrowserSession(liveEntries([SUBMIT], fingerprint.fingerprint), { snapshot });
     const runScenario = createRunScenario(session, runExecutor);
     const testPath = await writePrompt(runScenario.recordingStorage.storage);
     await seedFreshArtifacts(

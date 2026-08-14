@@ -3,11 +3,13 @@ import type { ElementRef, Fingerprint, JsonValueT, TargetDefinition } from '../.
 import type {
   AssertCheck,
   AssertOutcome,
+  BoundElement,
   BrowserDriver,
   BrowserEngine,
   BrowserSession,
   CaptureMode,
   GroundedResolution,
+  GroundingQuery,
   PageSnapshot,
   PerformableAction,
 } from '../../../src/ports/browser.js';
@@ -24,16 +26,16 @@ describe('browser port shapes', () => {
       readonly screenshot: Uint8Array;
     }>();
     expectTypeOf<PerformableAction>().toEqualTypeOf<
-      | { readonly type: 'click'; readonly target: ElementRef }
+      | { readonly type: 'click'; readonly target: BoundElement }
       | { readonly type: 'navigate'; readonly url: string }
-      | { readonly type: 'press'; readonly target: ElementRef; readonly key: 'Enter' | 'Tab' | 'Escape' | 'ArrowDown' | 'ArrowUp' }
-      | { readonly type: 'fill'; readonly target: ElementRef; readonly value: string }
-      | { readonly type: 'fill-secret'; readonly target: ElementRef; readonly value: string }
+      | { readonly type: 'press'; readonly target: BoundElement; readonly key: 'Enter' | 'Tab' | 'Escape' | 'ArrowDown' | 'ArrowUp' }
+      | { readonly type: 'fill'; readonly target: BoundElement; readonly value: string }
+      | { readonly type: 'fill-secret'; readonly target: BoundElement; readonly value: string }
     >();
     expectTypeOf<AssertCheck>().toEqualTypeOf<
       | { readonly check: 'text-visible'; readonly text: string }
-      | { readonly check: 'element-visible'; readonly target: ElementRef }
-      | { readonly check: 'text-equals'; readonly target: ElementRef; readonly text: string }
+      | { readonly check: 'element-visible'; readonly target: BoundElement }
+      | { readonly check: 'text-equals'; readonly target: BoundElement; readonly text: string }
       | { readonly check: 'url-matches'; readonly pattern: string }
       | { readonly check: 'element-count'; readonly target: ElementRef; readonly count: number }
     >();
@@ -43,20 +45,28 @@ describe('browser port shapes', () => {
     >();
     expectTypeOf<CaptureMode>().toEqualTypeOf<'text' | 'value'>();
     expectTypeOf<GroundedResolution>().toEqualTypeOf<
-      | { readonly kind: 'hit'; readonly ref: ElementRef }
+      | { readonly kind: 'hit'; readonly element: BoundElement }
       | {
           readonly kind: 'miss';
-          readonly reason: 'fingerprint-mismatch' | 'element-not-found' | 'ambiguous-match' | 'snapshot-invalid';
+          readonly reason: 'fingerprint-mismatch' | 'element-not-found' | 'ambiguous-match' | 'snapshot-invalid' | 'secret-contaminated';
         }
+    >();
+    expectTypeOf<BoundElement>().toEqualTypeOf<{
+      readonly ref: ElementRef;
+      readonly fingerprint: Fingerprint;
+    }>();
+    expectTypeOf<GroundingQuery>().toEqualTypeOf<
+      | { readonly mode: 'verify'; readonly fingerprint: Fingerprint }
+      | { readonly mode: 'compute'; readonly resolvedSecrets: Iterable<ReadonlySet<string>> }
     >();
   });
 
   it('defines every browser session operation with its exact arguments', () => {
     expectTypeOf<BrowserSession['perform']>().toEqualTypeOf<(action: PerformableAction) => Promise<void>>();
     expectTypeOf<BrowserSession['evaluateAssert']>().toEqualTypeOf<(check: AssertCheck) => Promise<AssertOutcome>>();
-    expectTypeOf<BrowserSession['captureValue']>().toEqualTypeOf<(target: ElementRef, mode: CaptureMode) => Promise<string>>();
+    expectTypeOf<BrowserSession['captureValue']>().toEqualTypeOf<(target: BoundElement, mode: CaptureMode) => Promise<string>>();
     expectTypeOf<BrowserSession['resolveGrounded']>().toEqualTypeOf<
-      (ref: ElementRef, fp: Fingerprint) => Promise<GroundedResolution>
+      (ref: ElementRef, query: GroundingQuery) => Promise<GroundedResolution>
     >();
     expectTypeOf<BrowserSession['snapshotForResolution']>().toEqualTypeOf<() => Promise<PageSnapshot>>();
     expectTypeOf<BrowserSession['screenshot']>().toEqualTypeOf<() => Promise<Uint8Array>>();

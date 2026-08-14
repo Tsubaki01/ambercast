@@ -215,7 +215,12 @@ describe('fake vertical slice', () => {
       toCanonicalArtifactText(grounding as unknown as JsonValueT),
     );
 
-    const session = createFakeBrowserSession(new Map());
+    const session = createFakeBrowserSession(new Map([
+      [elementRefKey(secretTarget), { exists: true, currentFingerprint: {
+        algorithm: 'a11y-neighborhood-v2',
+        hash: 'a'.repeat(64),
+      } }],
+    ]));
     const events = createRecordingEventSink();
     const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => {
       throw new Error('Path-C replay must not resolve an AI executor.');
@@ -245,7 +250,11 @@ describe('fake vertical slice', () => {
     expect(outcome.results[0]?.result.status).toBe('passed');
     expect(session.operations()).toContainEqual({
       type: 'perform',
-      action: { type: 'fill-secret', target: secretTarget, value: 'resolved-at-run-time' },
+      action: {
+        type: 'fill-secret',
+        target: expect.objectContaining({ ref: secretTarget }),
+        value: 'resolved-at-run-time',
+      },
     });
     expect(events.emitted().filter((event) => event.type === 'ai-call')).toEqual([]);
     expect(resolveAiExecutor).not.toHaveBeenCalled();
