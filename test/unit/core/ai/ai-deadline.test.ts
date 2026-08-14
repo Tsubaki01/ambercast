@@ -44,8 +44,9 @@ describe('composeAiDeadline', () => {
 
   it('preserves the exact reason from the source that aborts first', () => {
     const localTimeout = new AbortController();
-    const caller = new AbortController();
+    const localCaller = new AbortController();
     const callerTimeout = new AbortController();
+    const callerFirstCaller = new AbortController();
     const preAbortedCaller = new AbortController();
     const preAbortedTimeout = new AbortController();
     const timeoutSpy = interceptTimeouts(new Map([
@@ -57,13 +58,13 @@ describe('composeAiDeadline', () => {
     const callerReason = new Error('caller stopped the request');
     const preAbortedReason = new Error('caller was already stopped');
 
-    const localDeadline = composeAiDeadline(caller.signal, 1);
+    const localDeadline = composeAiDeadline(localCaller.signal, 1);
     expect(localDeadline.timeoutSignal).toBe(localTimeout.signal);
     localTimeout.abort(localReason);
 
-    const callerDeadline = composeAiDeadline(caller.signal, 2);
+    const callerDeadline = composeAiDeadline(callerFirstCaller.signal, 2);
     expect(callerDeadline.timeoutSignal).toBe(callerTimeout.signal);
-    caller.abort(callerReason);
+    callerFirstCaller.abort(callerReason);
 
     preAbortedCaller.abort(preAbortedReason);
     const preAbortedDeadline = composeAiDeadline(preAbortedCaller.signal, 3);
