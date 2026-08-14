@@ -13,9 +13,11 @@ Scope and escape hatches:
   AND .claude/impl/issue-<N>.state exists (grammar shared with guard_git.py
   and guard_phase.py); any other branch or a detached HEAD passes through
 - a session with live background work (teammate, subagent, background shell;
-  Stop input `background_tasks`, v2.1.145+) may stop — the completion
-  notification re-wakes it. This keeps orchestrator sessions that share the
-  branch with an implementing teammate from being blocked into implementing
+  Stop input `background_tasks`, v2.1.145+) may stop. Completion notifications
+  can be lost while the host is suspended, so `watch_progress.py` is the
+  independent watchdog backstop that eventually re-wakes an idle lead. This
+  still keeps orchestrator sessions that share the branch with an implementing
+  teammate from being blocked into implementing that teammate's job itself.
 - `paused=true` in the state file -> allow the stop and reset the stall
   counter (intentional pause; remove the line to resume with a fresh budget)
 - stall protection: .claude/impl/.guard-stop-issue-<N>.json records a
@@ -98,10 +100,11 @@ def has_live_background(tasks):
     precisely so hooks can distinguish "session is done" from "session is
     paused waiting for background work to wake it back up". A session with
     live delegated work (teammate, subagent, workflow, background shell)
-    may stop: the completion notification re-wakes it, and the guard
-    re-engages then. Without this, an orchestrator sharing the branch with
-    an implementing teammate would be blocked into doing the teammate's
-    job itself.
+    may stop. A completion notification normally re-wakes it, but suspension
+    can lose that notification; watch_progress.py independently detects the
+    resulting lack of progress. Without this allowance, an orchestrator
+    sharing the branch with an implementing teammate would be blocked into
+    doing the teammate's job itself.
     """
     if not isinstance(tasks, list):
         return False
