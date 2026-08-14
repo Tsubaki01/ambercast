@@ -4,7 +4,7 @@
  * preset with
  * eslint-plugin-boundaries and production-only `no-restricted-syntax` rules.
  * The determinism and digest restrictions apply only to `src/**`, while
- * deliberately invalid module-graph fixtures below
+ * generated build output and deliberately invalid module-graph fixtures below
  * `test/fixtures/architecture/**` are excluded from the ordinary lint run and
  * exercised explicitly by their rule tests. The flat form makes those scopes
  * and ordering visible in one ESM module.
@@ -165,7 +165,7 @@ const digestInputRestrictions = [
 ];
 
 export default [
-  { ignores: ['test/fixtures/architecture/**'] },
+  { ignores: ['dist/**', 'test/fixtures/architecture/**'] },
   ...tseslint.configs.recommended,
   {
     files: ['**/*.ts'],

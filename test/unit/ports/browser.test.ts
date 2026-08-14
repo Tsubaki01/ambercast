@@ -44,7 +44,10 @@ describe('browser port shapes', () => {
     expectTypeOf<CaptureMode>().toEqualTypeOf<'text' | 'value'>();
     expectTypeOf<GroundedResolution>().toEqualTypeOf<
       | { readonly kind: 'hit'; readonly ref: ElementRef }
-      | { readonly kind: 'miss'; readonly reason: 'fingerprint-mismatch' | 'element-not-found' | 'ambiguous-match' }
+      | {
+          readonly kind: 'miss';
+          readonly reason: 'fingerprint-mismatch' | 'element-not-found' | 'ambiguous-match' | 'snapshot-invalid';
+        }
     >();
   });
 

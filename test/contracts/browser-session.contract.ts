@@ -16,7 +16,7 @@ export interface BrowserSessionContractHarness {
 
 const REF: ElementRef = { strategy: 'accessibility', role: 'button', name: 'Submit' };
 const MATCHING_FINGERPRINT: Fingerprint = {
-  algorithm: 'a11y-neighborhood-v1',
+  algorithm: 'a11y-neighborhood-v2',
   hash: 'a'.repeat(64),
 };
 

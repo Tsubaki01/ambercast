@@ -65,6 +65,11 @@ Implementation tasks run in a **linked worktree per issue** by default; working 
 - `npm test` — build (via `pretest`) then run the Vitest suite
 - `npm run test:contract:ai` — run opt-in provider smoke tests; requires local
   `claude`/`codex` CLIs installed and authenticated, and is not run in CI
+- `npm run test:contract:browser` — run the browser-driven contract suite against a
+  real Chromium binary; excluded from the default `npm test` run (see
+  `vitest.config.ts`'s `test.exclude`) because it needs that binary, but unlike
+  `test:contract:ai` it does run in CI, in its own dedicated `contract-browser` job
+  (`.github/workflows/ci.yml`) that installs Chromium first
 - `node bin/ambercast.js` — run the CLI (requires `npm run build` first)
 - `node scripts/verify-pack.mjs` — authoritative, automated check that the
   packed tarball contains `dist/`, `bin/ambercast.js`, and that the bin file

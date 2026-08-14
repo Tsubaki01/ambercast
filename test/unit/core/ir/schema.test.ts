@@ -172,14 +172,18 @@ describe('ElementRef', () => {
 
 describe('Fingerprint', () => {
   it('accepts a versioned accessibility-neighborhood SHA-256 fingerprint', () => {
-    expectAccepted(Fingerprint, { algorithm: 'a11y-neighborhood-v1', hash: DIGEST_A });
+    expectAccepted(Fingerprint, { algorithm: 'a11y-neighborhood-v2', hash: DIGEST_A });
+  });
+
+  it('rejects the retired a11y-neighborhood-v1 algorithm', () => {
+    expectRejected(Fingerprint, { algorithm: 'a11y-neighborhood-v1', hash: DIGEST_A });
   });
 
   it('rejects an unknown algorithm, invalid hash, wrong field type, and unknown property', () => {
     expectRejected(Fingerprint, { algorithm: 'dom-v1', hash: DIGEST_A });
-    expectRejected(Fingerprint, { algorithm: 'a11y-neighborhood-v1', hash: 'a'.repeat(63) });
-    expectRejected(Fingerprint, { algorithm: 'a11y-neighborhood-v1', hash: 1 });
-    expectRejected(Fingerprint, { algorithm: 'a11y-neighborhood-v1', hash: DIGEST_A, unexpected: true });
+    expectRejected(Fingerprint, { algorithm: 'a11y-neighborhood-v2', hash: 'a'.repeat(63) });
+    expectRejected(Fingerprint, { algorithm: 'a11y-neighborhood-v2', hash: 1 });
+    expectRejected(Fingerprint, { algorithm: 'a11y-neighborhood-v2', hash: DIGEST_A, unexpected: true });
   });
 });
 
@@ -642,7 +646,7 @@ describe('GroundingDocument', () => {
       entries: {
         'login-flow': {
           kind: 'element',
-          fingerprint: { algorithm: 'a11y-neighborhood-v1', hash: DIGEST_A },
+          fingerprint: { algorithm: 'a11y-neighborhood-v2', hash: DIGEST_A },
         },
       },
     });
@@ -679,7 +683,7 @@ describe('GroundingDocument', () => {
       entries: {
         'login-flow': {
           kind: 'element',
-          fingerprint: { algorithm: 'a11y-neighborhood-v1', hash: DIGEST_A },
+          fingerprint: { algorithm: 'a11y-neighborhood-v2', hash: DIGEST_A },
         },
         'submit-review': {
           kind: 'ai',
@@ -694,13 +698,13 @@ describe('GroundingDocument', () => {
 
   it('rejects wrong document fields, invalid entry keys, and unknown properties', () => {
     expectRejected(GroundingDocument, { schemaVersion: 1, planDigest: 'b'.repeat(63), entries: {} });
-    expectRejected(GroundingDocument, { schemaVersion: 1, planDigest: DIGEST_B, entries: { '1': { kind: 'element', fingerprint: { algorithm: 'a11y-neighborhood-v1', hash: DIGEST_A } } } });
+    expectRejected(GroundingDocument, { schemaVersion: 1, planDigest: DIGEST_B, entries: { '1': { kind: 'element', fingerprint: { algorithm: 'a11y-neighborhood-v2', hash: DIGEST_A } } } });
     expectRejected(GroundingDocument, { schemaVersion: 1, planDigest: DIGEST_B, entries: {}, unexpected: true });
     expectRejected(GroundingDocument, {
       schemaVersion: 1,
       planDigest: DIGEST_B,
       entries: {
-        step: { kind: 'element', fingerprint: { algorithm: 'a11y-neighborhood-v1', hash: DIGEST_A }, unexpected: true },
+        step: { kind: 'element', fingerprint: { algorithm: 'a11y-neighborhood-v2', hash: DIGEST_A }, unexpected: true },
       },
     });
   });
@@ -710,7 +714,7 @@ describe('GroundingDocument', () => {
       schemaVersion: 1,
       planDigest: DIGEST_B,
       entries: {
-        step: { fingerprint: { algorithm: 'a11y-neighborhood-v1', hash: DIGEST_A } },
+        step: { fingerprint: { algorithm: 'a11y-neighborhood-v2', hash: DIGEST_A } },
       },
     });
   });
@@ -732,7 +736,7 @@ describe('GroundingDocument', () => {
       entries: {
         step: {
           kind: 'element',
-          fingerprint: { algorithm: 'a11y-neighborhood-v1', hash: DIGEST_A },
+          fingerprint: { algorithm: 'a11y-neighborhood-v2', hash: DIGEST_A },
           trace: [{ type: 'click', target: TARGET }],
         },
       },
@@ -746,7 +750,7 @@ describe('GroundingDocument', () => {
       entries: {
         step: {
           kind: 'ai',
-          fingerprint: { algorithm: 'a11y-neighborhood-v1', hash: DIGEST_A },
+          fingerprint: { algorithm: 'a11y-neighborhood-v2', hash: DIGEST_A },
           trace: {
             events: [{ type: 'click', target: TARGET }],
             verification: [{ type: 'assert', check: 'text-visible', text: 'Ready' }],

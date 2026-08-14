@@ -21,10 +21,8 @@ import type {
   PageSnapshot,
   PerformableAction,
 } from '#ports/browser.js';
-import {
-  parseAriaSnapshot,
-  resolveAccessibilityFingerprint,
-} from '#core/ir/fingerprint.js';
+import { parseAriaSnapshot } from '#core/ir/aria-snapshot.js';
+import { resolveAccessibilityFingerprint } from '#core/ir/fingerprint.js';
 import type { ElementRef, Fingerprint, JsonValueT, TargetDefinition } from '#core/ir/schema.js';
 
 type PlaywrightBrowser = import('playwright-core').Browser;
@@ -324,15 +322,11 @@ class ChromiumBrowserSession implements BrowserSession {
    * Verifies recorded grounding before an element may be used.
    *
    * @remarks
-   * This method independently captures its own current body ARIA snapshot,
-   * parses it with `parseAriaSnapshot()`, and delegates the complete
-   * classification to `resolveAccessibilityFingerprint()`. No candidate is an
-   * `element-not-found` miss; one candidate whose neighborhood differs from
-   * `fp` is a `fingerprint-mismatch` miss; and two or more candidates with
-   * the exact role and normalized name are an `ambiguous-match` miss. The
-   * last outcome remains a miss even when one candidate hashes to `fp`,
-   * because this adapter's role locator cannot carry that candidate's identity
-   * to its later `.first()` browser operation.
+   * This method independently captures its own current body ARIA snapshot and
+   * delegates its classification to `resolveAccessibilityFingerprint()`.
+   * Duplicate candidates remain unusable even when one hashes to `fp`:
+   * the role locator cannot carry the selected candidate's identity into its
+   * later `.first()` browser operation.
    *
    * That capture is distinct from `snapshotForResolution()`: callers may
    * request paired diagnostic evidence separately, but it is never reused as

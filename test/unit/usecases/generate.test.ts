@@ -256,6 +256,44 @@ describe('generate', () => {
     expect(recordingStorage.writes).toEqual([]);
   });
 
+  it('treats a v1-tagged grounding document as stale, rewrites it empty, and keeps the plan fresh', async () => {
+    const { deps, execute, recordingStorage } = createScenario();
+    const testPath = await writePrompt(recordingStorage.storage);
+    const plan = await createFreshPlan(recordingStorage.storage, testPath);
+    const groundingPath = `${TEST_DIR}/login.ambercast.grounding.json`;
+    await recordingStorage.storage.writeText(groundingPath, toCanonicalArtifactText({
+      schemaVersion: 1,
+      planDigest: computePlanDigest(plan),
+      entries: {
+        'click-submit': {
+          kind: 'element',
+          fingerprint: { algorithm: 'a11y-neighborhood-v1', hash: 'a'.repeat(64) },
+        },
+        'still-valid-v2': {
+          kind: 'element',
+          fingerprint: { algorithm: 'a11y-neighborhood-v2', hash: 'b'.repeat(64) },
+        },
+      },
+    } as unknown as JsonValueT));
+    recordingStorage.reset();
+
+    await expect(generate(deps, DEFAULT_OPTIONS)).resolves.toMatchObject({
+      results: [{ file: testPath, status: 'skipped-fresh' }],
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(recordingStorage.writes).toEqual([expect.objectContaining({ path: groundingPath })]);
+    const rewrittenGrounding = JSON.parse(await recordingStorage.storage.readText(groundingPath)) as {
+      readonly schemaVersion: number;
+      readonly planDigest: string;
+      readonly entries: unknown;
+    };
+    expect(rewrittenGrounding).toMatchObject({
+      schemaVersion: 1,
+      planDigest: computePlanDigest(plan),
+    });
+    expect(rewrittenGrounding.entries).toStrictEqual({});
+  });
+
   it.each([
     ['a stale plan', { force: false, dryRun: false }, 'generated'],
     ['a fresh plan forced to regenerate', { force: true, dryRun: false }, 'generated'],

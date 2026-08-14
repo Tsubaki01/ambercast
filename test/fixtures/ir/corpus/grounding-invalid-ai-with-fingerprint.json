@@ -7,7 +7,7 @@
     "entries": {
       "step": {
         "kind": "ai",
-        "fingerprint": { "algorithm": "a11y-neighborhood-v1", "hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
+        "fingerprint": { "algorithm": "a11y-neighborhood-v2", "hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
         "trace": {
           "events": [
             { "type": "click", "target": { "strategy": "accessibility", "role": "button", "name": "Submit" } }

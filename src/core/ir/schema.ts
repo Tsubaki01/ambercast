@@ -151,9 +151,15 @@ export type ElementRef = z.infer<typeof ElementRef>;
  * A local neighborhood avoids cache misses from unrelated UI changes. The
  * algorithm identifier makes fingerprint-format changes explicit and
  * versioned.
+ *
+ * @remarks
+ * Only the v2 algorithm literal is accepted. A v1-tagged fingerprint therefore
+ * invalidates its whole grounding document during schema validation; grounding
+ * loading deliberately treats that validation failure as a full cache-miss
+ * fallback rather than a runtime error, so the loader needs no migration path.
  */
 export const Fingerprint = z.strictObject({
-  algorithm: z.literal('a11y-neighborhood-v1'),
+  algorithm: z.literal('a11y-neighborhood-v2'),
   hash: HexSha256,
 });
 

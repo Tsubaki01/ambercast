@@ -8,8 +8,8 @@ import {
 
 const REF: ElementRef = { strategy: 'accessibility', role: 'button', name: 'Submit' };
 const OTHER_REF: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Email' };
-const FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v1', hash: 'a'.repeat(64) };
-const OTHER_FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v1', hash: 'b'.repeat(64) };
+const FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v2', hash: 'a'.repeat(64) };
+const OTHER_FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v2', hash: 'b'.repeat(64) };
 const REF_KEY = JSON.stringify(['accessibility', 'button', 'Submit']);
 
 function entries(exists = true, currentFingerprint: Fingerprint = FINGERPRINT): ReadonlyMap<string, {
