@@ -14,7 +14,7 @@ import type {
 /**
  * A browser engine that a target can select for a run.
  *
-   * @remarks
+ * @remarks
  * Deriving this union from the target contract keeps target validation and
  * driver selection aligned as browser support grows.
  */
@@ -32,6 +32,58 @@ export type PageSnapshot = {
 };
 
 /**
+ * A lightweight, session-local continuity handle for a bound element.
+ *
+ * @remarks
+ * `resolveGrounded` is the sole source of a `BoundElement`: it mints one only
+ * after a stable accessibility capture confirms that exactly one element
+ * matches the supplied {@link ElementRef} (and, in verify mode, that its
+ * descriptor hashes to the expected {@link Fingerprint}). Every later
+ * element-targeted operation accepts this handle instead of a bare
+ * `ElementRef`, preserving session provenance, navigation generation, and
+ * accessibility-fingerprint continuity rather than independently resolving a
+ * locator at each call.
+ *
+ * The two fields are plain, serializable data — a `BoundElement` is safe to
+ * log or include in a diagnostic without leaking anything beyond what the
+ * plan and grounding cache already expose. That is deliberate: the
+ * continuity checks this type represents do not live in these fields. They
+ * live in adapter-private state, keyed by this object's identity, that
+ * records which session minted it, at which navigation generation, and is
+ * consulted — never these public fields — immediately before every operation
+ * (see `perform`/`evaluateAssert`/`captureValue`). A caller that constructs a
+ * look-alike `{ref, fingerprint}` object, or that passes a genuine
+ * `BoundElement` to a different session instance than the one that minted
+ * it, fails that private lookup and is rejected before any Playwright call.
+ * At mint time, the adapter copies both `ref` and `fingerprint` into that
+ * private record without sharing either value with this public object. A
+ * caller's runtime mutation of either public value therefore cannot alter the
+ * provenance, locator, or expected fingerprint that a later operation uses.
+ *
+ * A `BoundElement` is not a DOM node handle and cannot prove physical-node
+ * identity. Its checks narrow, rather than eliminate, wrong-target risk: an
+ * in-place replacement by another node with the same fingerprint before the
+ * next re-verification is indistinguishable. The same residual interval
+ * remains between a successful re-verification and the browser operation.
+ *
+ * The handle is inherently session-local and short-lived: it is never
+ * persisted (grounding stores an `ElementRef` and a `Fingerprint`, not this
+ * type) and it is not meaningful once the session that minted it has
+ * navigated away from the observation it was minted against or has closed.
+ */
+export interface BoundElement {
+  /** The accessibility locator this handle was bound against. */
+  readonly ref: ElementRef;
+
+  /**
+   * The descriptor fingerprint captured at bind time, exposed for diagnostics
+   * and grounding persistence. Operations re-verify the private record's copy
+   * rather than consulting this public field.
+   */
+  readonly fingerprint: Fingerprint;
+}
+
+/**
  * A browser action whose values are ready for direct execution.
  *
  * `fill-secret` identifies materialized secret data that drivers and tracers
@@ -42,13 +94,20 @@ export type PageSnapshot = {
  * shape. The caller that owns run state and secret lookup resolves
  * interpolation and secret references immediately before calling
  * {@link BrowserSession.perform}, so this port never receives either.
+ * Every element-targeted variant carries a {@link BoundElement} rather than a
+ * bare `ElementRef`: the caller obtained it from `resolveGrounded` (directly,
+ * or via AI re-resolution followed by a confirming bind), so the operation
+ * inherits its session, generation, and fingerprint continuity checks rather
+ * than this port independently resolving an unverified locator. Those checks
+ * narrow wrong-target risk; they do not make the handle a physical DOM-node
+ * identity.
  */
 export type PerformableAction =
-  | { readonly type: 'click'; readonly target: ElementRef }
+  | { readonly type: 'click'; readonly target: BoundElement }
   | { readonly type: 'navigate'; readonly url: string }
-  | { readonly type: 'press'; readonly target: ElementRef; readonly key: TracePress['key'] }
-  | { readonly type: 'fill'; readonly target: ElementRef; readonly value: string }
-  | { readonly type: 'fill-secret'; readonly target: ElementRef; readonly value: string };
+  | { readonly type: 'press'; readonly target: BoundElement; readonly key: TracePress['key'] }
+  | { readonly type: 'fill'; readonly target: BoundElement; readonly value: string }
+  | { readonly type: 'fill-secret'; readonly target: BoundElement; readonly value: string };
 
 /**
  * An assertion check with expected values materialized for the current run.
@@ -58,11 +117,21 @@ export type PerformableAction =
  * resolves interpolated text before evaluating it. Its branches contain a
  * target only where the assertion semantics need an element, so callers do
  * not invent one for page-wide text or URL checks.
+ *
+ * `element-visible` and `text-equals` carry a {@link BoundElement}, for the
+ * same reason `PerformableAction`'s element-targeted variants do: each
+ * preserves the session, generation, and fingerprint continuity of a
+ * one-element binding, which narrows rather than eliminates wrong-target
+ * risk. `element-count` deliberately keeps a bare `ElementRef` instead: it
+ * counts every current role/name match on the page, which is structurally
+ * incompatible with a `BoundElement`'s exactly-one-match precondition — an assertion whose
+ * purpose is verifying a duplicate or absent count cannot itself require
+ * singularity to run.
  */
 export type AssertCheck =
   | { readonly check: 'text-visible'; readonly text: string }
-  | { readonly check: 'element-visible'; readonly target: ElementRef }
-  | { readonly check: 'text-equals'; readonly target: ElementRef; readonly text: string }
+  | { readonly check: 'element-visible'; readonly target: BoundElement }
+  | { readonly check: 'text-equals'; readonly target: BoundElement; readonly text: string }
   | { readonly check: 'url-matches'; readonly pattern: string }
   | { readonly check: 'element-count'; readonly target: ElementRef; readonly count: number };
 
@@ -91,39 +160,91 @@ export type AssertOutcome =
 export type CaptureMode = 'text' | 'value';
 
 /**
- * The result of checking whether recorded grounding still identifies an
- * element on the current page.
- *
- * A miss distinguishes absent, invalid, changed, and duplicate accessibility
- * evidence so callers can retain a safe control-flow gate while diagnostics
- * explain the actual resolution failure.
+ * A request to bind an {@link ElementRef} against the current page.
  *
  * @remarks
- * This result carries no resolved-secret values because secret taint guards
- * fingerprint generation before a value can enter the cache. Algorithm
- * versioning rejects incompatible grounding documents before resolution, so
- * this check receives fingerprints produced under the same cache policy.
+ * `verify` mode checks a fingerprint the caller already has — from a
+ * grounding cache hit, or from an earlier local classification the caller
+ * wants continuity with (see the AI re-resolution confirmation bind) — against
+ * one fresh capture. `compute` mode has no such fingerprint to check yet: it
+ * derives one from the same fresh capture, applying the same duplicate- and
+ * secret-taint rejection `computeAccessibilityFingerprint` already applies
+ * for AI re-resolution, and mints a `BoundElement` from whatever unique match
+ * results (unless the taint or duplicate gate rejects it first). Each bind
+ * attempt uses one fresh capture and mints a handle only from an observation
+ * whose navigation generation stayed stable. A `resolveGrounded` call may
+ * retry a navigation race and therefore take up to three captures; no attempt
+ * reuses a caller capture or adds a later capture before minting, which keeps
+ * the handle tied to its stable observation.
+ *
+ * `resolveGrounded` is deliberately the only element-identity entry point:
+ * routing both the "I already trust a fingerprint" and the "I need to derive
+ * one" cases through one method, distinguished only by which query variant
+ * the caller supplies, is what keeps trace replay, fresh agentic execution,
+ * and AI re-resolution from growing separate, potentially divergent
+ * resolution paths.
+ */
+export type GroundingQuery =
+  | {
+      /** Verify the current page against an already-known fingerprint. */
+      readonly mode: 'verify';
+      readonly fingerprint: Fingerprint;
+    }
+  | {
+      /**
+       * Derive a fingerprint from the current page, guarded by the same
+       * secret-taint rejection generation-time computation uses.
+       */
+      readonly mode: 'compute';
+      /**
+       * Resolved secret values whose presence in the bound candidate's
+       * descriptor must reject the bind. Passed through unchanged to
+       * `computeAccessibilityFingerprint`; may be a single-use iterable and is
+       * consumed at most once per call.
+       */
+      readonly resolvedSecrets: Iterable<ReadonlySet<string>>;
+    };
+
+/**
+ * The result of binding an {@link ElementRef} against the current page.
+ *
+ * A miss distinguishes absent, invalid, changed, tainted, and duplicate
+ * accessibility evidence so callers can retain a safe control-flow gate
+ * while diagnostics explain the actual resolution failure.
+ *
+ * @remarks
+ * `fingerprint-mismatch` can only occur for a `verify`-mode query (there is
+ * no expected fingerprint to mismatch in `compute` mode) and
+ * `secret-contaminated` can only occur for a `compute`-mode query (`verify`
+ * mode never derives a fresh descriptor to taint-check — its known
+ * fingerprint already passed that gate whenever it was originally computed).
+ * This mode/reason correlation is a documented invariant of the
+ * implementation, not something this type encodes structurally: two call
+ * sites did not justify a query-keyed generic or overloaded result shape.
  */
 export type GroundedResolution =
   | {
       /** The recorded reference remains valid for the current page. */
       readonly kind: 'hit';
-      /** The live element reference confirmed by the check. */
-      readonly ref: ElementRef;
+      /** The live, session-local handle confirmed by this bind. */
+      readonly element: BoundElement;
     }
   | {
       /** The recorded grounding cannot be used for the current page. */
       readonly kind: 'miss';
       /**
-       * Whether the parser rejected the snapshot, the unique candidate's
-       * neighborhood changed, no candidate exists, or more than one normalized
-       * role-and-name candidate exists.
+       * Whether an expected fingerprint no longer matches, the unique
+       * candidate's neighborhood changed, no candidate exists, more than one
+       * normalized role-and-name candidate exists, the parser rejected the
+       * snapshot, or a resolved secret value contaminated the derived
+       * descriptor.
        */
       readonly reason:
         | 'fingerprint-mismatch'
         | 'element-not-found'
         | 'ambiguous-match'
-        | 'snapshot-invalid';
+        | 'snapshot-invalid'
+        | 'secret-contaminated';
     };
 
 /**
@@ -133,9 +254,14 @@ export interface BrowserSession {
   /**
    * Executes a fully materialized action.
    *
-   * @param action - The action with resolved run and secret values.
+   * @param action - The action with resolved run and secret values, and a
+   *   {@link BoundElement} target for every element-targeted variant.
    * @returns Resolves after the action completes.
-   * @throws If the browser cannot complete the action.
+   * @throws If the browser cannot complete the action, including when the
+   *   action's `BoundElement` fails its operation-immediate re-verification
+   *   (see {@link resolveGrounded}) — a plain, reason-bearing error, not a
+   *   classified `AmbercastError`, matching this port's existing convention
+   *   of leaving browser-rejection classification to the caller.
    */
   perform(action: PerformableAction): Promise<void>;
 
@@ -145,44 +271,51 @@ export interface BrowserSession {
    * A failed assertion is returned as an {@link AssertOutcome}; browser or
    * evaluation errors reject instead.
    *
-   * @param check - The assertion with interpolated expected text resolved.
+   * @param check - The assertion with interpolated expected text resolved,
+   *   and a {@link BoundElement} target for `element-visible`/`text-equals`.
    * @returns A passing or diagnosable failing outcome.
-   * @throws If the assertion cannot be evaluated.
+   * @throws If the assertion cannot be evaluated, including a targeted
+   *   check's `BoundElement` failing its operation-immediate re-verification.
    */
   evaluateAssert(check: AssertCheck): Promise<AssertOutcome>;
 
   /**
    * Reads an element using the caller-selected capture strategy.
    *
-   * @param target - The element to read.
+   * @param target - The already-bound element to read.
    * @param mode - Whether to read visible text or the element value.
    * @returns The captured string, which may be empty.
-   * @throws If the element cannot be read.
+   * @throws If the element cannot be read, including `target` failing its
+   *   operation-immediate re-verification.
    */
-  captureValue(target: ElementRef, mode: CaptureMode): Promise<string>;
+  captureValue(target: BoundElement, mode: CaptureMode): Promise<string>;
 
   /**
-   * Checks whether recorded grounding still identifies a current element.
+   * Binds an {@link ElementRef} against the current page, verifying an
+   * already-known fingerprint or deriving one, per the supplied
+   * {@link GroundingQuery}.
    *
-   * The result preserves why the reference cannot be used. Duplicate
-   * candidates remain unusable even when one has the expected neighborhood,
-   * because a role locator cannot preserve that candidate's identity for its
-   * later browser operation.
+   * The result preserves why a miss occurred. Duplicate candidates remain
+   * unusable even when one has the expected neighborhood, because no
+   * fingerprint can make a role/name locator retain which physical duplicate
+   * it identified — see {@link GroundedResolution}.
    *
-   * @param ref - The recorded element reference to resolve.
-   * @param fp - The recorded fingerprint to verify against the live page.
-   * @returns A confirmed reference or the reason it cannot be used.
+   * @param ref - The element reference to resolve.
+   * @param query - Whether to verify a known fingerprint or derive one.
+   * @returns A confirmed, live {@link BoundElement} or the reason binding
+   *   failed.
    * @throws If the current page cannot be inspected.
    *
    * @remarks
-   * This is a hard gate: every miss remains a miss so stale grounding or an
-   * indeterminate duplicate cannot direct a test to the wrong element.
-   * Resolution deliberately has no resolved-secret parameter. Secret taint
-   * guards fingerprint generation before a value can enter the cache, while
-   * algorithm versioning rejects incompatible grounding documents before this
-   * verification.
+   * This is a hard gate: every miss remains a miss, limiting stale grounding
+   * and ambiguous evidence from widening wrong-target risk. Each attempt
+   * takes one fresh accessibility capture and mints a handle only from a
+   * stable generation. Implementations may retry a navigation race, so one
+   * call can take up to three captures; it never mints from an observation
+   * that straddled a navigation. This continuity check does not make the
+   * resulting handle a physical DOM-node identity — see {@link BoundElement}.
    */
-  resolveGrounded(ref: ElementRef, fp: Fingerprint): Promise<GroundedResolution>;
+  resolveGrounded(ref: ElementRef, query: GroundingQuery): Promise<GroundedResolution>;
 
   /**
    * Captures the accessibility tree and screenshot used for resolution.

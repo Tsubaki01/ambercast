@@ -7,7 +7,12 @@ import type {
   JsonValueT,
   TargetDefinition,
 } from '#core/ir/schema.js';
-import type { AssertCheck, BrowserSession } from '../../../../src/ports/browser.js';
+import type {
+  AssertCheck,
+  BoundElement,
+  BrowserSession,
+  GroundingQuery,
+} from '../../../../src/ports/browser.js';
 import {
   createChromiumBrowserDriver,
   type PlaywrightBrowserHandle,
@@ -83,6 +88,17 @@ const FIXTURE_ACCESSIBILITY_TREE: JsonValueT = {
 const FIXTURE_SCREENSHOT = new Uint8Array([80, 78, 71]);
 const MATERIALIZED_SECRET = 'correct-horse-battery-staple';
 
+const CHANGED_SUBMIT_FIXTURE = [
+  '- main "Application":',
+  '  - form "Sign in":',
+  '    - textbox "Email"',
+  '    - button "Submit"',
+  '    - text: Changed',
+].join('\n');
+
+const SAME_DESCRIPTOR_PAGE = `data:text/html,${encodeURIComponent(`<!doctype html>
+<html lang="en"><body><button type="button">Submit</button></body></html>`)}`;
+
 interface FakeLocatorOptions {
   readonly visible?: boolean;
   readonly text?: string;
@@ -109,6 +125,7 @@ class FakePlaywrightLocator implements PlaywrightLocatorHandle {
   readonly countCalls: undefined[] = [];
   readonly ariaSnapshotCalls: undefined[] = [];
   readonly pressedKeys: string[] = [];
+  ariaSnapshotOverride: (() => Promise<string>) | undefined;
 
   constructor(options: FakeLocatorOptions = {}) {
     this.visible = options.visible ?? true;
@@ -166,6 +183,9 @@ class FakePlaywrightLocator implements PlaywrightLocatorHandle {
 
   async ariaSnapshot(): Promise<string> {
     this.ariaSnapshotCalls.push(undefined);
+    if (this.ariaSnapshotOverride !== undefined) {
+      return this.ariaSnapshotOverride();
+    }
     return this.ariaSnapshotText;
   }
 }
@@ -180,6 +200,7 @@ interface FakePlaywrightOptions {
 
 class FakePlaywrightPage implements PlaywrightPageHandle {
   currentUrl: string;
+  private generation = 0;
   gotoFailure: Error | undefined;
   readonly gotoUrls: string[] = [];
   readonly roleCalls: {
@@ -212,7 +233,25 @@ class FakePlaywrightPage implements PlaywrightPageHandle {
       throw this.gotoFailure;
     }
 
+    this.generation += 1;
     return undefined;
+  }
+
+  navigationGeneration(): number {
+    return this.generation;
+  }
+
+  simulateMainFrameNavigation(): void {
+    this.generation += 1;
+  }
+
+  simulateSubframeNavigation(): void {
+    // Subframe navigation intentionally does not alter the main-frame
+    // generation surfaced through the adapter seam.
+  }
+
+  simulateSameDocumentNavigation(): void {
+    this.generation += 1;
   }
 
   getByRole(
@@ -310,14 +349,14 @@ class FakePlaywrightLauncher implements PlaywrightLauncher {
   }
 }
 
-function fixtureFingerprint(): Fingerprint {
+function fingerprintForSnapshot(snapshot: string): Fingerprint {
   // Deliberately derive the contract value through the production parser and
   // fingerprint algorithm from the same snapshot scripted into fake
   // Playwright. resolveGrounded() independently performs that work, so a hit
   // proves both paths agree; this fixture intentionally is not independent of
   // the core algorithm.
   const fingerprint = computeAccessibilityFingerprint(
-    parseAriaSnapshot(FIXTURE_ARIA_SNAPSHOT),
+    parseAriaSnapshot(snapshot),
     SUBMIT_BUTTON,
     [],
   );
@@ -327,6 +366,10 @@ function fixtureFingerprint(): Fingerprint {
   }
 
   return fingerprint.fingerprint;
+}
+
+function fixtureFingerprint(): Fingerprint {
+  return fingerprintForSnapshot(FIXTURE_ARIA_SNAPSHOT);
 }
 
 function firstAmbiguousCandidateFingerprint(): Fingerprint {
@@ -371,18 +414,83 @@ function expectExactSubmitLookup(launcher: FakePlaywrightLauncher): void {
     role: 'button',
     options: { name: 'Submit', exact: true },
   }]);
-  expect(launcher.page.roleLocator.firstCalls).toHaveLength(1);
+  expect(launcher.page.roleLocator.firstCalls).toHaveLength(0);
+}
+
+function deferred<T>(): { readonly promise: Promise<T>; resolve(value: T): void } {
+  let resolve: ((value: T) => void) | undefined;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+
+  return {
+    promise,
+    resolve(value): void {
+      if (resolve === undefined) {
+        throw new Error('The deferred promise resolver was not initialized.');
+      }
+      resolve(value);
+    },
+  };
+}
+
+const VERIFY_SUBMIT: GroundingQuery = { mode: 'verify', fingerprint: fixtureFingerprint() };
+
+async function bindSubmit(session: BrowserSession, query: GroundingQuery = VERIFY_SUBMIT): Promise<BoundElement> {
+  const result = await session.resolveGrounded(SUBMIT_BUTTON, query);
+  if (result.kind === 'miss') {
+    throw new Error(`The submit fixture unexpectedly failed to bind: ${result.reason}`);
+  }
+
+  return result.element;
 }
 
 registerBrowserDriverContract({
   createDriver: () => createChromiumBrowserDriver({ launcher: new FakePlaywrightLauncher() }),
 });
 
+const chromiumContractLaunchers = new WeakMap<BrowserSession, FakePlaywrightLauncher>();
+
 registerBrowserSessionContract({
-  createSession: (setup) => launchSession(new FakePlaywrightLauncher({
-    ariaSnapshot: setup.exists ? FIXTURE_ARIA_SNAPSHOT : FIXTURE_WITHOUT_SUBMIT,
-  })),
-  actualFingerprintFor: (_setup: BrowserSessionContractSetup) => fixtureFingerprint(),
+  createSession: async (setup) => {
+    const launcher = new FakePlaywrightLauncher({
+      ariaSnapshot: setup.scenario === 'snapshot-invalid'
+        ? 'not an ARIA outline'
+        : setup.scenario === 'ambiguous'
+          ? AMBIGUOUS_SUBMIT_FIXTURE
+          : setup.exists ? FIXTURE_ARIA_SNAPSHOT : FIXTURE_WITHOUT_SUBMIT,
+    });
+    const session = await launchSession(launcher);
+    chromiumContractLaunchers.set(session, launcher);
+    return session;
+  },
+  navigationUrl: () => SAME_DESCRIPTOR_PAGE,
+  actualFingerprintFor: (_session: BrowserSession, _setup: BrowserSessionContractSetup) => fixtureFingerprint(),
+  supportedGroundingMissReasons: [
+    'fingerprint-mismatch',
+    'element-not-found',
+    'ambiguous-match',
+    'snapshot-invalid',
+    'secret-contaminated',
+  ],
+  operationObservation: (session) => {
+    const launcher = chromiumContractLaunchers.get(session);
+    if (launcher === undefined) {
+      throw new Error('The Chromium contract session must retain its launcher observations.');
+    }
+
+    const locator = launcher.page.roleLocator;
+    return {
+      ariaSnapshotCalls: launcher.page.bodyLocator.ariaSnapshotCalls.length,
+      roleLocatorCalls: launcher.page.roleCalls.length,
+      finalOperationCalls: locator.clickCalls.length
+        + locator.fillValues.length
+        + locator.pressedKeys.length
+        + locator.innerTextCalls.length
+        + locator.isVisibleCalls.length
+        + locator.inputValueCalls.length,
+    };
+  },
 });
 
 describe('createChromiumBrowserDriver()', () => {
@@ -433,9 +541,10 @@ describe('createChromiumBrowserDriver()', () => {
 });
 
 describe('ChromiumBrowserSession.perform()', () => {
-  it('maps click to the first exact accessibility role match', async () => {
+  it('maps click to a direct exact accessibility role locator without positional narrowing', async () => {
     await withLaunchedSession({}, async (session, launcher) => {
-      await expect(session.perform({ type: 'click', target: SUBMIT_BUTTON })).resolves.toBeUndefined();
+      const target = await bindSubmit(session);
+      await expect(session.perform({ type: 'click', target })).resolves.toBeUndefined();
 
       expectExactSubmitLookup(launcher);
       expect(launcher.page.roleLocator.clickCalls).toHaveLength(1);
@@ -453,29 +562,32 @@ describe('ChromiumBrowserSession.perform()', () => {
     });
   });
 
-  it('maps press to the first exact accessibility role match', async () => {
+  it('maps press to a direct exact accessibility role locator without positional narrowing', async () => {
     await withLaunchedSession({}, async (session, launcher) => {
-      await expect(session.perform({ type: 'press', target: SUBMIT_BUTTON, key: 'Enter' })).resolves.toBeUndefined();
+      const target = await bindSubmit(session);
+      await expect(session.perform({ type: 'press', target, key: 'Enter' })).resolves.toBeUndefined();
 
       expectExactSubmitLookup(launcher);
       expect(launcher.page.roleLocator.pressedKeys).toEqual(['Enter']);
     });
   });
 
-  it('maps fill to the first exact accessibility role match', async () => {
+  it('maps fill to a direct exact accessibility role locator without positional narrowing', async () => {
     await withLaunchedSession({}, async (session, launcher) => {
-      await expect(session.perform({ type: 'fill', target: SUBMIT_BUTTON, value: 'visible text' })).resolves.toBeUndefined();
+      const target = await bindSubmit(session);
+      await expect(session.perform({ type: 'fill', target, value: 'visible text' })).resolves.toBeUndefined();
 
       expectExactSubmitLookup(launcher);
       expect(launcher.page.roleLocator.fillValues).toEqual(['visible text']);
     });
   });
 
-  it('maps fill-secret to the first exact accessibility role match', async () => {
+  it('maps fill-secret to a direct exact accessibility role locator without positional narrowing', async () => {
     await withLaunchedSession({}, async (session, launcher) => {
+      const target = await bindSubmit(session);
       await expect(session.perform({
         type: 'fill-secret',
-        target: SUBMIT_BUTTON,
+        target,
         value: MATERIALIZED_SECRET,
       })).resolves.toBeUndefined();
 
@@ -495,9 +607,10 @@ describe('ChromiumBrowserSession.perform()', () => {
 
     try {
       await withLaunchedSession({}, async (session) => {
+        const target = await bindSubmit(session);
         await expect(session.perform({
           type: 'fill-secret',
-          target: SUBMIT_BUTTON,
+          target,
           value: MATERIALIZED_SECRET,
         })).resolves.toBeUndefined();
 
@@ -535,12 +648,13 @@ describe('ChromiumBrowserSession.perform()', () => {
     try {
       await withLaunchedSession({}, async (session, launcher) => {
         launcher.page.roleLocator.fillFailure = failure;
+        const target = await bindSubmit(session);
 
         let thrown: unknown;
         try {
           await session.perform({
             type: 'fill-secret',
-            target: SUBMIT_BUTTON,
+            target,
             value: MATERIALIZED_SECRET,
           });
         } catch (error) {
@@ -561,8 +675,9 @@ describe('ChromiumBrowserSession.perform()', () => {
 
 interface AssertionScenario {
   readonly description: string;
-  readonly check: AssertCheck;
   readonly failureMessage?: string;
+  readonly requiresBoundTarget?: boolean;
+  check(target: BoundElement | undefined): AssertCheck;
   configure(launcher: FakePlaywrightLauncher, expectedPassed: boolean): void;
   assertPlaywright(launcher: FakePlaywrightLauncher): void;
 }
@@ -570,7 +685,7 @@ interface AssertionScenario {
 const ASSERTION_SCENARIOS: readonly AssertionScenario[] = [
   {
     description: 'text-visible',
-    check: { check: 'text-visible', text: 'Welcome' },
+    check: () => ({ check: 'text-visible', text: 'Welcome' }),
     configure(launcher, expectedPassed): void {
       launcher.page.textLocator.visible = expectedPassed;
     },
@@ -583,7 +698,13 @@ const ASSERTION_SCENARIOS: readonly AssertionScenario[] = [
   },
   {
     description: 'element-visible',
-    check: { check: 'element-visible', target: SUBMIT_BUTTON },
+    requiresBoundTarget: true,
+    check: (target) => {
+      if (target === undefined) {
+        throw new Error('element-visible requires a bound submit target.');
+      }
+      return { check: 'element-visible', target };
+    },
     configure(launcher, expectedPassed): void {
       launcher.page.roleLocator.visible = expectedPassed;
     },
@@ -594,7 +715,13 @@ const ASSERTION_SCENARIOS: readonly AssertionScenario[] = [
   },
   {
     description: 'text-equals',
-    check: { check: 'text-equals', target: SUBMIT_BUTTON, text: 'Send form' },
+    requiresBoundTarget: true,
+    check: (target) => {
+      if (target === undefined) {
+        throw new Error('text-equals requires a bound submit target.');
+      }
+      return { check: 'text-equals', target, text: 'Send form' };
+    },
     failureMessage: 'Element text does not equal: Submit; expected "Send form", received "Send later".',
     configure(launcher, expectedPassed): void {
       launcher.page.roleLocator.text = expectedPassed ? 'Send form' : 'Send later';
@@ -606,7 +733,7 @@ const ASSERTION_SCENARIOS: readonly AssertionScenario[] = [
   },
   {
     description: 'element-count',
-    check: { check: 'element-count', target: SUBMIT_BUTTON, count: 2 },
+    check: () => ({ check: 'element-count', target: SUBMIT_BUTTON, count: 2 }),
     failureMessage: 'Element count does not equal: Submit; expected 2, received 1.',
     configure(launcher, expectedPassed): void {
       launcher.page.roleLocator.resultCount = expectedPassed ? 2 : 1;
@@ -622,7 +749,7 @@ const ASSERTION_SCENARIOS: readonly AssertionScenario[] = [
   },
   {
     description: 'url-matches',
-    check: { check: 'url-matches', pattern: '^https://example\\.test/account$' },
+    check: () => ({ check: 'url-matches', pattern: '^https://example\\.test/account$' }),
     configure(launcher, expectedPassed): void {
       launcher.page.currentUrl = expectedPassed
         ? 'https://example.test/account'
@@ -642,8 +769,9 @@ describe('ChromiumBrowserSession.evaluateAssert()', () => {
       it(`returns ${expectedPassed ? 'a pass' : 'a failure'} for ${scenario.description}`, async () => {
         await withLaunchedSession({}, async (session, launcher) => {
           scenario.configure(launcher, expectedPassed);
+          const target = scenario.requiresBoundTarget ? await bindSubmit(session) : undefined;
 
-          const outcome = await session.evaluateAssert(scenario.check);
+          const outcome = await session.evaluateAssert(scenario.check(target));
 
           expect(outcome.passed).toBe(expectedPassed);
           if (!outcome.passed) {
@@ -690,7 +818,8 @@ describe('ChromiumBrowserSession.captureValue()', () => {
         value: 'submit-control-value',
       }),
     }, async (session, launcher) => {
-      await expect(session.captureValue(SUBMIT_BUTTON, mode)).resolves.toBe(expectedValue);
+      const target = await bindSubmit(session);
+      await expect(session.captureValue(target, mode)).resolves.toBe(expectedValue);
 
       expectExactSubmitLookup(launcher);
       expect(launcher.page.roleLocator.innerTextCalls).toHaveLength(mode === 'text' ? 1 : 0);
@@ -700,11 +829,109 @@ describe('ChromiumBrowserSession.captureValue()', () => {
 });
 
 describe('ChromiumBrowserSession.resolveGrounded()', () => {
+  it.each([
+    ['verify', VERIFY_SUBMIT, fixtureFingerprint()],
+    ['compute', { mode: 'compute', resolvedSecrets: [] } as const, fixtureFingerprint()],
+  ] as const)('captures exactly one ARIA snapshot for a %s bind and derives its fingerprint from that capture', async (_mode, query, expectedFingerprint) => {
+    await withLaunchedSession({ ariaSnapshot: FIXTURE_ARIA_SNAPSHOT }, async (session, launcher) => {
+      await expect(session.resolveGrounded(SUBMIT_BUTTON, query)).resolves.toEqual({
+        kind: 'hit',
+        element: expect.objectContaining({
+          ref: SUBMIT_BUTTON,
+          fingerprint: expectedFingerprint,
+        }),
+      });
+
+      expect(launcher.page.bodyLocator.ariaSnapshotCalls).toHaveLength(1);
+      expect(launcher.page.screenshotCalls).toHaveLength(0);
+    });
+  });
+
+  it('derives each successive computed fingerprint from that bind\'s one fresh scripted capture', async () => {
+    const scriptedSnapshots = [FIXTURE_ARIA_SNAPSHOT, CHANGED_SUBMIT_FIXTURE];
+    const expectedFingerprints = scriptedSnapshots.map(fingerprintForSnapshot);
+
+    await withLaunchedSession({ ariaSnapshot: FIXTURE_ARIA_SNAPSHOT }, async (session, launcher) => {
+      launcher.page.bodyLocator.ariaSnapshotOverride = async () => {
+        const snapshot = scriptedSnapshots.shift();
+        if (snapshot === undefined) {
+          throw new Error('The scripted bind fixture ran out of distinct ARIA snapshots.');
+        }
+        return snapshot;
+      };
+
+      const first = await session.resolveGrounded(SUBMIT_BUTTON, { mode: 'compute', resolvedSecrets: [] });
+      const second = await session.resolveGrounded(SUBMIT_BUTTON, { mode: 'compute', resolvedSecrets: [] });
+
+      if (first.kind === 'miss' || second.kind === 'miss') {
+        throw new Error('Both sequential computed binds must resolve their scripted submit tree.');
+      }
+
+      expect(expectedFingerprints[0]).not.toEqual(expectedFingerprints[1]);
+      expect(first.element.fingerprint).toEqual(expectedFingerprints[0]);
+      expect(second.element.fingerprint).toEqual(expectedFingerprints[1]);
+      expect(launcher.page.bodyLocator.ariaSnapshotCalls).toHaveLength(2);
+    });
+  });
+
+  it('retries a bind when navigation changes generation during its capture, then consumes single-use secrets only for the stable attempt', async () => {
+    let captures = 0;
+    let secretIterations = 0;
+    const resolvedSecrets: Iterable<ReadonlySet<string>> = {
+      *[Symbol.iterator](): Iterator<ReadonlySet<string>> {
+        secretIterations += 1;
+        if (secretIterations > 1) {
+          throw new Error('An unstable bind attempt consumed the single-use secret iterable.');
+        }
+        yield new Set(['unrelated-secret']);
+      },
+    };
+
+    await withLaunchedSession({}, async (session, launcher) => {
+      launcher.page.bodyLocator.ariaSnapshotOverride = async () => {
+        captures += 1;
+        if (captures === 1) {
+          launcher.page.simulateMainFrameNavigation();
+        }
+        return FIXTURE_ARIA_SNAPSHOT;
+      };
+
+      await expect(session.resolveGrounded(SUBMIT_BUTTON, {
+        mode: 'compute',
+        resolvedSecrets,
+      })).resolves.toEqual({
+        kind: 'hit',
+        element: expect.objectContaining({ fingerprint: fixtureFingerprint() }),
+      });
+
+      expect(launcher.page.bodyLocator.ariaSnapshotCalls).toHaveLength(2);
+      expect(secretIterations).toBe(1);
+    });
+  });
+
+  it('returns element-not-found after all three bind attempts observe navigation during capture', async () => {
+    await withLaunchedSession({}, async (session, launcher) => {
+      launcher.page.bodyLocator.ariaSnapshotOverride = async () => {
+        launcher.page.simulateMainFrameNavigation();
+        return FIXTURE_ARIA_SNAPSHOT;
+      };
+
+      await expect(session.resolveGrounded(SUBMIT_BUTTON, VERIFY_SUBMIT)).resolves.toEqual({
+        kind: 'miss',
+        reason: 'element-not-found',
+      });
+      expect(launcher.page.bodyLocator.ariaSnapshotCalls).toHaveLength(3);
+    });
+  });
+
   it('maps parser-invalid evidence to the snapshot-invalid grounding miss reason', async () => {
     await withLaunchedSession({ ariaSnapshot: 'not an ARIA outline' }, async (session) => {
       await expect(session.resolveGrounded(SUBMIT_BUTTON, {
-        algorithm: 'a11y-neighborhood-v2',
-        hash: 'a'.repeat(64),
+        mode: 'verify',
+        fingerprint: {
+          algorithm: 'a11y-neighborhood-v2',
+          hash: 'a'.repeat(64),
+        },
       })).resolves.toEqual({
         kind: 'miss',
         reason: 'snapshot-invalid',
@@ -725,7 +952,7 @@ describe('ChromiumBrowserSession.resolveGrounded()', () => {
       });
       launcher.page.bodyLocator.ariaSnapshotText = FIXTURE_WITHOUT_SUBMIT;
 
-      await expect(session.resolveGrounded(SUBMIT_BUTTON, fixtureFingerprint())).resolves.toEqual({
+      await expect(session.resolveGrounded(SUBMIT_BUTTON, VERIFY_SUBMIT)).resolves.toEqual({
         kind: 'miss',
         reason: 'element-not-found',
       });
@@ -738,10 +965,120 @@ describe('ChromiumBrowserSession.resolveGrounded()', () => {
 
   it('reports ambiguous-match when two submit candidates exist even if one has the supplied hash', async () => {
     await withLaunchedSession({ ariaSnapshot: AMBIGUOUS_SUBMIT_FIXTURE }, async (session) => {
-      await expect(session.resolveGrounded(SUBMIT_BUTTON, firstAmbiguousCandidateFingerprint())).resolves.toEqual({
+      await expect(session.resolveGrounded(SUBMIT_BUTTON, {
+        mode: 'verify',
+        fingerprint: firstAmbiguousCandidateFingerprint(),
+      })).resolves.toEqual({
         kind: 'miss',
         reason: 'ambiguous-match',
       });
+    });
+  });
+
+  it('rejects compute-mode binding when a resolved secret contaminates the candidate descriptor', async () => {
+    await withLaunchedSession({}, async (session) => {
+      await expect(session.resolveGrounded(SUBMIT_BUTTON, {
+        mode: 'compute',
+        resolvedSecrets: [new Set(['Submit'])],
+      })).resolves.toEqual({
+        kind: 'miss',
+        reason: 'secret-contaminated',
+      });
+    });
+  });
+});
+
+describe('ChromiumBrowserSession bound-element re-verification', () => {
+  it('uses main-frame and same-document generation changes through the session while leaving subframe navigation valid', async () => {
+    await withLaunchedSession({}, async (session, launcher) => {
+      const subframeTarget = await bindSubmit(session);
+      launcher.page.simulateSubframeNavigation();
+      await expect(session.perform({ type: 'click', target: subframeTarget })).resolves.toBeUndefined();
+
+      const mainFrameTarget = await bindSubmit(session);
+      await session.perform({ type: 'navigate', url: SAME_DESCRIPTOR_PAGE });
+      await expect(session.perform({ type: 'click', target: mainFrameTarget })).rejects.toThrow('navigation');
+
+      const sameDocumentTarget = await bindSubmit(session);
+      launcher.page.simulateSameDocumentNavigation();
+      await expect(session.perform({ type: 'click', target: sameDocumentTarget })).rejects.toThrow('navigation');
+
+      expect(launcher.page.roleLocator.clickCalls).toHaveLength(1);
+    });
+  });
+
+  it('rejects a handle after navigation even when the destination descriptor has the same fingerprint', async () => {
+    await withLaunchedSession({}, async (session, launcher) => {
+      const target = await bindSubmit(session);
+      launcher.page.simulateMainFrameNavigation();
+
+      await expect(session.perform({ type: 'click', target })).rejects.toThrow('navigation');
+      expect(launcher.page.roleLocator.clickCalls).toEqual([]);
+    });
+  });
+
+  it('rejects a handle when main-frame navigation commits during its pending re-verification capture', async () => {
+    await withLaunchedSession({}, async (session, launcher) => {
+      const target = await bindSubmit(session);
+      const snapshot = deferred<string>();
+      const captureStarted = deferred<void>();
+      launcher.page.bodyLocator.ariaSnapshotOverride = () => {
+        captureStarted.resolve(undefined);
+        return snapshot.promise;
+      };
+      const operation = session.perform({ type: 'click', target });
+      await captureStarted.promise;
+      expect(launcher.page.bodyLocator.ariaSnapshotCalls).toHaveLength(2);
+      launcher.page.simulateMainFrameNavigation();
+      snapshot.resolve(FIXTURE_ARIA_SNAPSHOT);
+
+      await expect(operation).rejects.toThrow('navigation');
+      expect(launcher.page.roleLocator.clickCalls).toEqual([]);
+    });
+  });
+
+  it.each([
+    ['perform', async (session: BrowserSession, target: BoundElement) => session.perform({ type: 'click', target })],
+    ['element-visible', async (session: BrowserSession, target: BoundElement) => session.evaluateAssert({ check: 'element-visible', target })],
+    ['text-equals', async (session: BrowserSession, target: BoundElement) => session.evaluateAssert({ check: 'text-equals', target, text: 'Submit' })],
+    ['captureValue', async (session: BrowserSession, target: BoundElement) => session.captureValue(target, 'text')],
+  ] as const)('rejects %s when the descriptor changes in place without navigation', async (_operation, invoke) => {
+    await withLaunchedSession({}, async (session, launcher) => {
+      const target = await bindSubmit(session);
+      const generation = launcher.page.navigationGeneration();
+      launcher.page.bodyLocator.ariaSnapshotText = CHANGED_SUBMIT_FIXTURE;
+
+      await expect(invoke(session, target)).rejects.toThrow('fingerprint');
+      expect(launcher.page.navigationGeneration()).toBe(generation);
+      expect(launcher.page.roleLocator.clickCalls).toEqual([]);
+      expect(launcher.page.roleLocator.isVisibleCalls).toEqual([]);
+      expect(launcher.page.roleLocator.innerTextCalls).toEqual([]);
+      expect(launcher.page.roleLocator.inputValueCalls).toEqual([]);
+    });
+  });
+
+  it.each([
+    ['perform', async (session: BrowserSession, target: BoundElement) => session.perform({ type: 'click', target })],
+    ['element-visible', async (session: BrowserSession, target: BoundElement) => session.evaluateAssert({ check: 'element-visible', target })],
+    ['text-equals', async (session: BrowserSession, target: BoundElement) => session.evaluateAssert({ check: 'text-equals', target, text: 'Submit' })],
+    ['captureValue', async (session: BrowserSession, target: BoundElement) => session.captureValue(target, 'text')],
+  ] as const)('keeps the private bind record authoritative for %s after public and original bind inputs are mutated', async (_operation, invoke) => {
+    await withLaunchedSession({}, async (session, launcher) => {
+      const ref: ElementRef = { ...SUBMIT_BUTTON };
+      const fingerprint: Fingerprint = { ...fixtureFingerprint() };
+      const result = await session.resolveGrounded(ref, { mode: 'verify', fingerprint });
+      if (result.kind === 'miss') {
+        throw new Error(`The mutable provenance fixture unexpectedly failed to bind: ${result.reason}`);
+      }
+
+      const element = result.element as { ref: ElementRef; fingerprint: Fingerprint };
+      (element.ref as { name: string }).name = 'Attacker controlled name';
+      (element.fingerprint as { hash: string }).hash = 'b'.repeat(64);
+      (ref as { name: string }).name = 'Mutated original name';
+      (fingerprint as { hash: string }).hash = 'c'.repeat(64);
+
+      await invoke(session, result.element);
+      expectExactSubmitLookup(launcher);
     });
   });
 });

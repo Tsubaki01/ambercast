@@ -2,23 +2,33 @@ import type { ElementRef, Fingerprint } from '../../src/core/ir/schema.js';
 import type {
   AssertCheck,
   AssertOutcome,
+  BoundElement,
   BrowserSession,
   CaptureMode,
   GroundedResolution,
+  GroundingQuery,
   PageSnapshot,
   PerformableAction,
 } from '../../src/ports/browser.js';
 
+type VerifyMissReason = Exclude<Extract<GroundedResolution, { readonly kind: 'miss' }>['reason'], 'secret-contaminated'>;
+type ComputeMissReason = Exclude<Extract<GroundedResolution, { readonly kind: 'miss' }>['reason'], 'fingerprint-mismatch'>;
+
 /**
  * The current state used to arrange one grounded element for a session fake.
  *
- * The fake derives the resolution result from this state instead of accepting
- * a precomputed verdict, so tests exercise the production-facing comparison
- * and not-found precedence rules.
+ * A test may script evidence failures that the fake cannot derive from its
+ * compact descriptor fixture. Ordinary presence and fingerprint checks remain
+ * modeled statefully, so a scripted result never turns binding or later use
+ * into an unconditional success path.
  */
 export interface FakeBrowserSessionEntry {
-  readonly currentFingerprint: Fingerprint;
-  readonly exists: boolean;
+  currentFingerprint: Fingerprint;
+  exists: boolean;
+  readonly scriptedMissReasons?: {
+    readonly verify?: VerifyMissReason;
+    readonly compute?: ComputeMissReason;
+  };
 }
 
 /**
@@ -55,15 +65,15 @@ export interface FakeBrowserSessionOptions {
 /**
  * A browser-facing operation observed by the session fake.
  *
- * Resource cleanup is deliberately absent: tests use this log to prove that
- * replay's trust pre-scan performed no browser work, while every completed
- * session still receives its required `close()` call in production code.
+ * Rejected targeted operations are intentionally absent: callers use this
+ * trace to prove that provenance and staleness checks stop work before it can
+ * reach the browser-facing operation boundary.
  */
 export type FakeBrowserSessionOperation =
   | { readonly type: 'perform'; readonly action: PerformableAction }
   | { readonly type: 'evaluate-assert'; readonly check: AssertCheck }
-  | { readonly type: 'capture-value'; readonly target: ElementRef; readonly mode: CaptureMode }
-  | { readonly type: 'resolve-grounded'; readonly target: ElementRef; readonly fingerprint: Fingerprint }
+  | { readonly type: 'capture-value'; readonly target: BoundElement; readonly mode: CaptureMode }
+  | { readonly type: 'resolve-grounded'; readonly target: ElementRef; readonly query: GroundingQuery }
   | { readonly type: 'snapshot-for-resolution' };
 
 /**
@@ -73,6 +83,40 @@ export interface FakeBrowserSession extends BrowserSession {
   /** Returns a fresh copy of browser-facing work in the order it occurred. */
   operations(): readonly FakeBrowserSessionOperation[];
 }
+
+/**
+ * The browser-boundary work observed by the fake after successful validation.
+ *
+ * These counters model the three calls that a real targeted operation must
+ * keep behind provenance validation. Contract tests use them to prove that a
+ * fabricated or foreign handle cannot even start evidence capture, locator
+ * construction, or its final browser operation.
+ */
+export interface FakeBrowserSessionOperationObservation {
+  readonly ariaSnapshotCalls: number;
+  readonly roleLocatorCalls: number;
+  readonly finalOperationCalls: number;
+}
+
+type FakeBindingRecord = {
+  readonly generation: number;
+  readonly ref: ElementRef;
+  readonly fingerprint: Fingerprint;
+};
+
+type FakeBrowserSessionState = {
+  readonly entries: Map<string, FakeBrowserSessionEntry>;
+  readonly bindings: WeakMap<BoundElement, FakeBindingRecord>;
+  readonly operations: FakeBrowserSessionOperation[];
+  generation: number;
+  closed: boolean;
+  assertOutcomeIndex: number;
+  ariaSnapshotCalls: number;
+  roleLocatorCalls: number;
+  finalOperationCalls: number;
+};
+
+const sessionStates = new WeakMap<FakeBrowserSession, FakeBrowserSessionState>();
 
 /**
  * Encoders remain exhaustive as the IR gains element-reference strategies.
@@ -118,19 +162,189 @@ export function fingerprintsEqual(left: Fingerprint, right: Fingerprint): boolea
   return Object.values(fingerprintComparisons).every((compare) => compare(left, right));
 }
 
+function copyRef(ref: ElementRef): ElementRef {
+  return { ...ref };
+}
+
+function copyFingerprint(fingerprint: Fingerprint): Fingerprint {
+  return { ...fingerprint };
+}
+
+function mintBoundElement(
+  state: FakeBrowserSessionState,
+  ref: ElementRef,
+  fingerprint: Fingerprint,
+): BoundElement {
+  const record: FakeBindingRecord = {
+    generation: state.generation,
+    ref: copyRef(ref),
+    fingerprint: copyFingerprint(fingerprint),
+  };
+  const element: BoundElement = {
+    ref: copyRef(ref),
+    fingerprint: copyFingerprint(fingerprint),
+  };
+  state.bindings.set(element, record);
+  return element;
+}
+
+function computeDescriptorContainsResolvedSecret(ref: ElementRef, query: GroundingQuery): boolean {
+  if (query.mode !== 'compute') {
+    return false;
+  }
+
+  for (const values of query.resolvedSecrets) {
+    for (const secret of values) {
+      if (secret === '') {
+        continue;
+      }
+
+      if (ref.role === secret || ref.name === secret) {
+        return true;
+      }
+      if (secret.length >= 3 && (ref.role.includes(secret) || ref.name.includes(secret))) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+function resolveBinding(
+  state: FakeBrowserSessionState,
+  ref: ElementRef,
+  query: GroundingQuery,
+): GroundedResolution {
+  const entry = state.entries.get(elementRefKey(ref));
+  if (entry === undefined || !entry.exists) {
+    return { kind: 'miss', reason: 'element-not-found' };
+  }
+
+  const scriptedReason = entry.scriptedMissReasons?.[query.mode];
+  if (scriptedReason !== undefined) {
+    return { kind: 'miss', reason: scriptedReason };
+  }
+
+  if (computeDescriptorContainsResolvedSecret(ref, query)) {
+    return { kind: 'miss', reason: 'secret-contaminated' };
+  }
+
+  if (query.mode === 'verify') {
+    if (!fingerprintsEqual(query.fingerprint, entry.currentFingerprint)) {
+      return { kind: 'miss', reason: 'fingerprint-mismatch' };
+    }
+
+    return {
+      kind: 'hit',
+      element: mintBoundElement(state, ref, entry.currentFingerprint),
+    };
+  }
+
+  return {
+    kind: 'hit',
+    element: mintBoundElement(state, ref, entry.currentFingerprint),
+  };
+}
+
+function requireCurrentBinding(state: FakeBrowserSessionState, element: BoundElement): FakeBindingRecord {
+  const record = state.bindings.get(element);
+  if (record === undefined) {
+    throw new Error('Bound element provenance is invalid for this browser session.');
+  }
+
+  if (record.generation !== state.generation) {
+    throw new Error('Bound element navigation generation is stale.');
+  }
+
+  const entry = state.entries.get(elementRefKey(record.ref));
+  if (entry === undefined || !entry.exists) {
+    throw new Error('Bound element no longer exists on the current page.');
+  }
+
+  if (!fingerprintsEqual(record.fingerprint, entry.currentFingerprint)) {
+    throw new Error('Bound element fingerprint no longer matches the current descriptor.');
+  }
+
+  return record;
+}
+
+/**
+ * Mints a fake-session handle synchronously for a test that is not exercising
+ * asynchronous bind control flow itself.
+ *
+ * The factory uses the same presence, scripted-evidence, and fingerprint
+ * validation as `resolveGrounded`; it only omits that method's asynchronous
+ * boundary and operation-log entry. The returned handle is registered in the
+ * supplied fake session's private provenance registry, so later operations
+ * perform the same generation and descriptor checks as a normally resolved
+ * handle.
+ *
+ * @param session - The fake session that will own the returned handle.
+ * @param ref - The current accessibility reference to bind.
+ * @param fingerprint - An optional expected descriptor; omitting it selects
+ *   compute-mode validation.
+ * @returns A session-local handle that passed the equivalent fake bind check.
+ * @throws If the arranged fake evidence cannot bind this reference.
+ */
+export function bindForTest(
+  session: FakeBrowserSession,
+  ref: ElementRef,
+  fingerprint?: Fingerprint,
+): BoundElement {
+  const state = sessionStates.get(session);
+  if (state === undefined) {
+    throw new Error('bindForTest requires a session created by createFakeBrowserSession.');
+  }
+
+  const query: GroundingQuery = fingerprint === undefined
+    ? { mode: 'compute', resolvedSecrets: [] }
+    : { mode: 'verify', fingerprint };
+  const result = resolveBinding(state, ref, query);
+  if (result.kind === 'miss') {
+    throw new Error(`Fake binding failed: ${result.reason}`);
+  }
+
+  return result.element;
+}
+
+/**
+ * Returns the fake's current browser-boundary counters without exposing its
+ * mutable session state. The counters intentionally distinguish validation
+ * work from a final action so contracts can detect a provenance rejection
+ * implemented too late in an adapter.
+ */
+export function operationObservation(
+  session: FakeBrowserSession,
+): FakeBrowserSessionOperationObservation {
+  const state = sessionStates.get(session);
+  if (state === undefined) {
+    throw new Error('operationObservation requires a session created by createFakeBrowserSession.');
+  }
+
+  return {
+    ariaSnapshotCalls: state.ariaSnapshotCalls,
+    roleLocatorCalls: state.roleLocatorCalls,
+    finalOperationCalls: state.finalOperationCalls,
+  };
+}
+
 /**
  * Builds a deterministic browser-session double from current-page fixtures.
  *
  * The double keeps all state inside this factory and treats a missing element
  * as more informative than a fingerprint mismatch, matching the hard
- * grounding gate that protects callers from a wrong-element pass.
+ * grounding gate that protects callers from a wrong-element pass. Unlike a
+ * passive recorder, it records session-local handles and revalidates their
+ * private provenance, navigation generation, and current descriptor before
+ * every targeted operation.
  *
- * @param entries - Current element state indexed by {@link elementRefKey}.
+ * @param entries - Mutable current element state indexed by {@link elementRefKey}.
  * @param options - Optional scripted results and call-observation hooks.
  * @returns A browser session that follows the public port contract.
  */
 export function createFakeBrowserSession(
-  entries: ReadonlyMap<string, FakeBrowserSessionEntry>,
+  entries: Map<string, FakeBrowserSessionEntry>,
   options: FakeBrowserSessionOptions = {},
 ): FakeBrowserSession {
   const assertOutcome = options.assertOutcome ?? { passed: true };
@@ -138,49 +352,79 @@ export function createFakeBrowserSession(
     accessibilityTree: {},
     screenshot: new Uint8Array(),
   };
-  let closed = false;
-  let assertOutcomeIndex = 0;
-  const operations: FakeBrowserSessionOperation[] = [];
+  const state: FakeBrowserSessionState = {
+    entries,
+    bindings: new WeakMap(),
+    operations: [],
+    generation: 0,
+    closed: false,
+    assertOutcomeIndex: 0,
+    ariaSnapshotCalls: 0,
+    roleLocatorCalls: 0,
+    finalOperationCalls: 0,
+  };
 
-  return {
+  const session: FakeBrowserSession = {
     async perform(action): Promise<void> {
-      operations.push({ type: 'perform', action });
-      options.onPerform?.(action);
+      switch (action.type) {
+        case 'navigate':
+          state.operations.push({ type: 'perform', action });
+          options.onPerform?.(action);
+          state.generation += 1;
+          return;
+        case 'click':
+        case 'press':
+        case 'fill':
+        case 'fill-secret':
+          requireCurrentBinding(state, action.target);
+          state.roleLocatorCalls += 1;
+          state.finalOperationCalls += 1;
+          state.operations.push({ type: 'perform', action });
+          options.onPerform?.(action);
+          return;
+      }
     },
     async evaluateAssert(check): Promise<AssertOutcome> {
-      operations.push({ type: 'evaluate-assert', check });
+      switch (check.check) {
+        case 'element-visible':
+        case 'text-equals':
+          requireCurrentBinding(state, check.target);
+          state.roleLocatorCalls += 1;
+          state.finalOperationCalls += 1;
+          break;
+        case 'text-visible':
+        case 'url-matches':
+        case 'element-count':
+          break;
+      }
+
+      state.operations.push({ type: 'evaluate-assert', check });
       options.onEvaluateAssert?.(check);
       if (options.assertOutcomes === undefined) {
         return assertOutcome;
       }
 
-      const outcome = options.assertOutcomes[assertOutcomeIndex];
-      assertOutcomeIndex += 1;
+      const outcome = options.assertOutcomes[state.assertOutcomeIndex];
+      state.assertOutcomeIndex += 1;
       if (outcome === undefined) {
         throw new Error('No scripted assertion outcome remains.');
       }
 
       return outcome;
     },
-    async captureValue(target: ElementRef, mode: CaptureMode): Promise<string> {
-      operations.push({ type: 'capture-value', target, mode });
-      return options.captureValues?.get(elementRefKey(target))?.[mode] ?? '';
+    async captureValue(target: BoundElement, mode: CaptureMode): Promise<string> {
+      const record = requireCurrentBinding(state, target);
+      state.roleLocatorCalls += 1;
+      state.finalOperationCalls += 1;
+      state.operations.push({ type: 'capture-value', target, mode });
+      return options.captureValues?.get(elementRefKey(record.ref))?.[mode] ?? '';
     },
-    async resolveGrounded(ref: ElementRef, fp: Fingerprint): Promise<GroundedResolution> {
-      operations.push({ type: 'resolve-grounded', target: ref, fingerprint: fp });
-      const entry = entries.get(elementRefKey(ref));
-      if (entry === undefined || !entry.exists) {
-        return { kind: 'miss', reason: 'element-not-found' };
-      }
-
-      if (!fingerprintsEqual(fp, entry.currentFingerprint)) {
-        return { kind: 'miss', reason: 'fingerprint-mismatch' };
-      }
-
-      return { kind: 'hit', ref };
+    async resolveGrounded(ref: ElementRef, query: GroundingQuery): Promise<GroundedResolution> {
+      state.operations.push({ type: 'resolve-grounded', target: ref, query });
+      return resolveBinding(state, ref, query);
     },
     async snapshotForResolution(): Promise<PageSnapshot> {
-      operations.push({ type: 'snapshot-for-resolution' });
+      state.operations.push({ type: 'snapshot-for-resolution' });
       return snapshot;
     },
     async screenshot(): Promise<Uint8Array> {
@@ -190,15 +434,18 @@ export function createFakeBrowserSession(
       return snapshot.accessibilityTree;
     },
     async close(): Promise<void> {
-      if (closed) {
+      if (state.closed) {
         return;
       }
 
-      closed = true;
+      state.closed = true;
       options.onClose?.();
     },
     operations(): readonly FakeBrowserSessionOperation[] {
-      return operations.map((operation) => ({ ...operation }));
+      return state.operations.map((operation) => ({ ...operation }));
     },
   };
+
+  sessionStates.set(session, state);
+  return session;
 }

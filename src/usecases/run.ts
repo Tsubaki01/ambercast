@@ -37,7 +37,7 @@ import type { LayoutResolver } from '#core/layout/resolve.js';
 import { joinPath, relativeWithin } from '#core/paths.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import type { AiActionController, AiExecutor } from '#ports/ai.js';
-import type { AssertCheck, AssertOutcome, BrowserSession, PerformableAction } from '#ports/browser.js';
+import type { AssertCheck, AssertOutcome, BoundElement, BrowserSession, PerformableAction } from '#ports/browser.js';
 import type { BrowserDriverResolver } from '#ports/index.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { Clock, EventSink, SecretsProvider } from '#ports/system.js';
@@ -414,11 +414,11 @@ function materializeTrustedRunText(value: string, context: DispatchContext): str
  * Its error contract remains fully static: destination-derived text might
  * be a captured or secret value transformed by URL normalization, so
  * value-based redaction cannot safely justify returning it in an error. The
- * check appears in deterministic-step materialization for path A, at the
- * trace-action browser boundary shared by paths B and C, and in path C's
- * whole-trace pre-scan before any action runs. Together those checkpoints
- * preserve the invariant that every navigation URL reaching the browser port
- * passes through this guard.
+ * check appears in deterministic grounding, at the trace-action browser
+ * boundary shared by trace replay and fresh agentic execution, and in the
+ * latter's whole-trace pre-scan before any action runs. Together those
+ * checkpoints preserve the invariant that every navigation URL reaching the
+ * browser port passes through this guard.
  *
  * @param url - The navigation destination after any permitted interpolation.
  * @param baseUrl - The configured base URL of the resolved replay target.
@@ -470,38 +470,47 @@ function recordResolvedSecret(registry: Map<string, Set<string>>, ref: string, v
  * Converts a trusted unresolved trace action into the browser port's
  * materialized action shape immediately before execution.
  *
- * Trace actions intentionally carry the authored element locator unchanged.
- * The wrapper does not attempt a second grounding lookup because a recorded
- * trace is itself the replay recipe; only run interpolation and secret lookup
- * are runtime-bound fields. Every non-empty resolved secret is retained in
- * the case-wide registry before browser work so later diagnostics can redact
- * both replayed and freshly resolved values.
+ * Trace actions retain their authored locator in durable trace data, but every
+ * element-targeted branch obtains a session-local `BoundElement` through the
+ * compute-mode grounding query at the browser boundary. A trace has no saved
+ * fingerprint to verify, so compute mode is the only safe way to derive one
+ * from the page observation used to bind its unique candidate.
+ *
+ * `fill-secret` resolves and records its own value before it requests that
+ * compute-mode bind. Both operations use `context.resolvedSecrets`, so that
+ * registry is also the bind's taint gate. Ordering them within one branch
+ * prevents a descriptor that echoes the action's secret from becoming valid
+ * merely because its value was not yet available to the gate. Every non-empty
+ * resolved secret remains available for later diagnostic redaction.
  */
-function materializeTraceAction(
+async function materializeTraceAction(
   action: TraceAction,
   context: DispatchContext,
   secretRefs: ReadonlySet<string>,
-  resolvedSecrets: Map<string, Set<string>>,
-): PerformableAction {
+): Promise<PerformableAction> {
   switch (action.type) {
     case 'click':
-      return { type: 'click', target: action.target };
+      return { type: 'click', target: await bindTraceTarget(action.target, context) };
     case 'navigate': {
       const url = materializeTrustedRunText(action.url, context);
-      /*
-       * Fresh agentic control (path B) and trace replay (path C) share this
-       * browser-boundary checkpoint.
-       */
       assertSameOriginNavigation(url, context.target.baseUrl);
       return { type: 'navigate', url };
     }
     case 'press':
-      return { type: 'press', target: action.target, key: action.key };
+      return {
+        type: 'press',
+        target: await bindTraceTarget(action.target, context),
+        key: action.key,
+      };
     case 'fill':
-      return { type: 'fill', target: action.target, value: materializeTrustedRunText(action.value, context) };
+      return {
+        type: 'fill',
+        target: await bindTraceTarget(action.target, context),
+        value: materializeTrustedRunText(action.value, context),
+      };
     case 'fill-secret': {
       if (!secretRefs.has(action.secretRef)) {
-        throw new IntegrityViolationError('An AI action references a secret that this step is not allowed to use.', {
+        throw new IntegrityViolationError('An AI trace references a secret that this step is not allowed to use.', {
           secretRef: action.secretRef,
         });
       }
@@ -511,8 +520,12 @@ function materializeTraceAction(
         throw new SecretUnresolvedError('The referenced secret is unavailable.', { secretRef: action.secretRef });
       }
 
-      recordResolvedSecret(resolvedSecrets, action.secretRef, value);
-      return { type: 'fill-secret', target: action.target, value };
+      recordResolvedSecret(context.resolvedSecrets, action.secretRef, value);
+      return {
+        type: 'fill-secret',
+        target: await bindTraceTarget(action.target, context),
+        value,
+      };
     }
   }
 }
@@ -523,18 +536,24 @@ function materializeTraceAction(
  *
  * Assertions never resolve secrets, but their text and URL expectations may
  * reference a captured case value and must therefore use the same grant and
- * availability checks as trace actions.
+ * availability checks as trace actions. `element-visible` and `text-equals`
+ * bind their trace locator in compute mode immediately before evaluation;
+ * `element-count` remains page-scoped and retains its bare `ElementRef` so it
+ * can measure absent or duplicate matches without requiring false singularity.
  */
-function materializeTraceAssert(check: TraceAssert, context: DispatchContext): AssertCheck {
+async function materializeTraceAssert(
+  check: TraceAssert,
+  context: DispatchContext,
+): Promise<AssertCheck> {
   switch (check.check) {
     case 'text-visible':
       return { check: 'text-visible', text: materializeTrustedRunText(check.text, context) };
     case 'element-visible':
-      return { check: 'element-visible', target: check.target };
+      return { check: 'element-visible', target: await bindTraceTarget(check.target, context) };
     case 'text-equals':
       return {
         check: 'text-equals',
-        target: check.target,
+        target: await bindTraceTarget(check.target, context),
         text: materializeTrustedRunText(check.text, context),
       };
     case 'url-matches':
@@ -542,6 +561,18 @@ function materializeTraceAssert(check: TraceAssert, context: DispatchContext): A
     case 'element-count':
       return { check: 'element-count', target: check.target, count: check.count };
   }
+}
+
+async function bindTraceTarget(target: ElementRef, context: DispatchContext): Promise<BoundElement> {
+  const resolved = await context.session.resolveGrounded(target, {
+    mode: 'compute',
+    resolvedSecrets: [...context.resolvedSecrets.values()],
+  });
+  if (resolved.kind === 'miss') {
+    throw new Error(`The trace target could not be bound: ${resolved.reason}.`);
+  }
+
+  return resolved.element;
 }
 
 /**
@@ -600,8 +631,8 @@ function preScanTraceEntry(
 }
 
 /**
- * Performs path C's complete dynamic-trust pass before replay touches the
- * browser.
+ * Performs a stored AI trace's complete dynamic-trust pass before trace
+ * replay touches the browser.
  *
  * Events precede verification in both storage and execution. Walking both
  * lists here keeps a later bad reference from allowing an earlier action to
@@ -657,9 +688,11 @@ function preScanTrace(trace: z.infer<typeof TraceRecord>, context: DispatchConte
  * Replays a trusted trace in journal order and returns whether the browser
  * confirmed every recorded observation.
  *
- * A false assertion is an expected behavioral miss. Browser rejections are
- * left to the caller so it can distinguish ordinary behavioral failure from
- * the classified integrity and resolution failures emitted by materialization.
+ * A false assertion is an expected behavioral miss. An ordinary browser
+ * rejection, including a compute-mode bind miss from trace materialization,
+ * propagates as a plain error. Its caller treats that error as a replay miss
+ * and continues to the existing agentic fallback; integrity, secret, and
+ * case-abort failures retain their classified control flow instead.
  */
 async function replayTrace(
   trace: z.infer<typeof TraceRecord>,
@@ -668,18 +701,22 @@ async function replayTrace(
 ): Promise<boolean> {
   for (const entry of trace.events) {
     if (entry.type === 'assert') {
-      const outcome = await context.session.evaluateAssert(materializeTraceAssert(entry, context));
+      const outcome = await context.session.evaluateAssert(await materializeTraceAssert(entry, context));
       if (!outcome.passed) {
         return false;
       }
       continue;
     }
 
-    await context.session.perform(materializeTraceAction(entry, context, secretRefs, context.resolvedSecrets));
+    await context.session.perform(await materializeTraceAction(
+      entry,
+      context,
+      secretRefs,
+    ));
   }
 
   for (const assertion of trace.verification) {
-    const outcome = await context.session.evaluateAssert(materializeTraceAssert(assertion, context));
+    const outcome = await context.session.evaluateAssert(await materializeTraceAssert(assertion, context));
     if (!outcome.passed) {
       return false;
     }
@@ -1087,6 +1124,12 @@ class AgenticRunPipeline implements AiActionController {
    * before materialization and a successful browser call is the only event
    * that enters the journal. A perform always breaks terminal verification,
    * even when the call later rejects and aborts the entire agentic execution.
+   *
+   * Its compute-mode bind is deliberately awaited inside the same rejection
+   * boundary as the browser call. Unlike trace replay, fresh agentic control
+   * has no fallback below this method: a bind miss is redacted and returned to
+   * the AI executor as an ordinary browser rejection rather than being
+   * reinterpreted as a reason to start another control path.
    */
   async perform(action: TraceAction): Promise<void> {
     const parsed = TraceAction.safeParse(action);
@@ -1099,8 +1142,12 @@ class AgenticRunPipeline implements AiActionController {
     this.#trailingPassedAssertRun = 0;
     this.#lastObservation = 'perform';
     assertNoMaterializedLiteral(parsed.data, this.context, this.context.resolvedSecrets);
-    const materialized = materializeTraceAction(parsed.data, this.context, this.#secretRefs, this.context.resolvedSecrets);
     try {
+      const materialized = await materializeTraceAction(
+        parsed.data,
+        this.context,
+        this.#secretRefs,
+      );
       await this.context.session.perform(materialized);
     } catch (error) {
       throw scrubBrowserRejection(error, this.context.resolvedSecrets, this.context.runState);
@@ -1114,6 +1161,12 @@ class AgenticRunPipeline implements AiActionController {
    * A passing observation is journaled and extends the final verification run;
    * every other assertion outcome breaks it. Its diagnostic is redacted only
    * in the value returned to the adapter, never in the unresolved record.
+   *
+   * A target-scoped compute-mode bind shares the evaluation's rejection
+   * boundary. Therefore a bind miss receives the same redaction and terminal
+   * agentic-failure treatment as an assertion browser rejection; it does not
+   * trigger the trace-replay fallback, which applies only before live agentic
+   * execution begins.
    */
   async evaluateAssert(check: TraceAssert): Promise<AssertOutcome> {
     const parsed = TraceAssert.safeParse(check);
@@ -1124,9 +1177,9 @@ class AgenticRunPipeline implements AiActionController {
     }
 
     assertNoMaterializedLiteral(parsed.data, this.context, this.context.resolvedSecrets);
-    const materialized = materializeTraceAssert(parsed.data, this.context);
     let outcome: AssertOutcome;
     try {
+      const materialized = await materializeTraceAssert(parsed.data, this.context);
       outcome = await this.context.session.evaluateAssert(materialized);
     } catch (error) {
       throw scrubBrowserRejection(error, this.context.resolvedSecrets, this.context.runState);
@@ -1232,10 +1285,6 @@ async function executeAgentic(
   fallbackFromReplay: boolean,
 ): Promise<DispatchOutcome> {
   const secretRefs = step.secrets ?? [];
-  if (priorTrace !== undefined) {
-    preScanTrace(priorTrace, context, new Set(secretRefs));
-  }
-
   const executor = await context.resolveAiExecutor();
   const pipeline = new AgenticRunPipeline(context, secretRefs, step, fallbackFromReplay);
   context.events.emit({ type: 'ai-call', stepId: step.id });
@@ -1300,35 +1349,34 @@ async function executeAiStep(
  * Re-resolves an element grounding miss through a structured AI confirmation
  * request when the caller has allowed fallback.
  *
- * The authored `ElementRef` remains immutable because grounding stores no
- * alternate locator. After capturing resolution evidence, this path derives
- * the fingerprint from the unredacted accessibility tree before it resolves
- * an AI executor or emits an `ai-call` event. An absent, ambiguous,
- * parser-invalid, or secret-contaminated local result has no safe target for
- * confirmation, so it raises `CaseAbort` without provider work or a grounding
- * write. The messages guide recovery: duplicate candidates need a
- * distinguishing accessible name, invalid evidence warrants a retry and
- * parser-compatibility check, and secret-tainted evidence needs an accessible
- * name that does not echo the secret. The secret value itself never appears in
- * the diagnostic.
+ * Local classification before an AI call fails fast when the page offers no
+ * safe candidate and supplies evidence for a focused confirmation request.
+ * The AI sees only redacted evidence, so its confirmation cannot expose a
+ * resolved secret.
  *
- * The AI receives a redacted copy of the evidence and answers only whether
- * the existing locator identifies the intended element. A denial raises
- * `CaseAbort`; confirmation persists only the already-derived local
- * fingerprint before subsequent browser work. Persisting that page fact
- * before the action remains intentional: it survives a later action failure
- * and joins the case's single final atomic grounding flush.
+ * A post-confirmation bind uses verify mode, not compute mode, to retain
+ * continuity with the AI-confirmed candidate. A compute bind could accept a
+ * different unique element that appeared during the AI round trip; verify
+ * mode detects that change against a fresh observation before producing the
+ * operation-ready handle.
+ *
+ * Grounding changes only after a successful binding. Any miss, denial, or
+ * unavailable candidate leaves the existing grounding untouched, preventing
+ * failed recovery from replacing known evidence with unconfirmed data.
  */
 async function groundedTarget(
   context: DispatchContext,
   step: ActionStep | AssertStep | CaptureStep,
   target: ElementRef,
-): Promise<ElementRef> {
+): Promise<BoundElement> {
   const entry = context.grounding.entries[step.id];
   if (entry?.kind === 'element') {
-    const resolved = await context.session.resolveGrounded(target, entry.fingerprint);
+    const resolved = await context.session.resolveGrounded(target, {
+      mode: 'verify',
+      fingerprint: entry.fingerprint,
+    });
     if (resolved.kind === 'hit') {
-      return resolved.ref;
+      return resolved.element;
     }
   }
 
@@ -1343,34 +1391,25 @@ async function groundedTarget(
     context.resolvedSecrets.values(),
   );
   switch (classification.kind) {
+    case 'no-match':
+      throw groundingAbort('element-not-found');
+    case 'ambiguous-match':
+      throw groundingAbort('ambiguous-match');
+    case 'snapshot-invalid':
+      throw groundingAbort('snapshot-invalid');
+    case 'secret-contaminated':
+      throw groundingAbort('secret-contaminated');
     case 'ok':
       break;
-    case 'no-match':
-      throw new CaseAbort('The supplied locator has no matching element in the current accessibility evidence.');
-    case 'ambiguous-match':
-      throw new CaseAbort('The supplied locator matches more than one element in the current accessibility evidence. Add a distinguishing aria-label (or other accessible-name difference) to one of the matching elements so the locator can identify a single element.');
-    case 'snapshot-invalid':
-      throw new CaseAbort('The current accessibility evidence could not be parsed and cannot be trusted for this locator. Retry the run; if this persists, the page structure may use a form this parser does not recognize.');
-    case 'secret-contaminated':
-      throw new CaseAbort("The supplied locator's accessibility evidence contains a resolved secret value and cannot be fingerprinted or cached. Add an aria-label that does not echo the secret value to the affected element.");
   }
-
-  const fingerprint = classification.fingerprint;
 
   const executor = await context.resolveAiExecutor();
   context.events.emit({ type: 'ai-call', stepId: step.id });
   const response = await callAiExecutor(context, (signal) => executor.execute({
     prompt: 'Confirm whether the supplied locator still identifies the intended element.',
     responseSchema: CONFIRMATION_RESPONSE_SCHEMA,
-    /**
-     * The redacted accessibility tree lets the provider make its confirm/deny
-     * semantic judgment. Screenshot pixels are excluded because string
-     * substitution cannot safely redact them; redacting string values and
-     * object keys keeps materialized secrets and run values out of provider
-     * input without altering the tree's JSON structure.
-     */
     context: {
-      target: target as unknown as JsonValueT,
+      target,
       snapshot: {
         accessibilityTree: redactJsonStrings(
           snapshot.accessibilityTree,
@@ -1381,14 +1420,44 @@ async function groundedTarget(
     },
     signal,
   }));
-
-  if (response.data.confirmed === false) {
+  if (!response.data.confirmed) {
     throw new CaseAbort('The AI could not confirm that the supplied locator identifies the intended element.');
   }
 
-  context.updateGroundingEntry(step.id, { kind: 'element', fingerprint });
+  const resolved = await context.session.resolveGrounded(target, {
+    mode: 'verify',
+    fingerprint: classification.fingerprint,
+  });
+  if (resolved.kind === 'miss') {
+    throw groundingAbort(resolved.reason);
+  }
+
+  context.updateGroundingEntry(step.id, { kind: 'element', fingerprint: resolved.element.fingerprint });
   context.resolvedVias.set(step.id, 'ai-resolve');
-  return target;
+  return resolved.element;
+}
+
+function groundingAbort(
+  reason: 'fingerprint-mismatch' | 'element-not-found' | 'ambiguous-match' | 'snapshot-invalid' | 'secret-contaminated',
+): CaseAbort {
+  switch (reason) {
+    case 'fingerprint-mismatch':
+      return new CaseAbort('The supplied locator changed shape after AI confirmation and cannot be safely bound.');
+    case 'element-not-found':
+      return new CaseAbort('The supplied locator has no matching element in the current accessibility evidence.');
+    case 'ambiguous-match':
+      return new CaseAbort(
+        'The supplied locator matches more than one element in the current accessibility evidence. Add a distinguishing aria-label (or other accessible-name difference) to one of the matching elements so the locator can identify a single element.',
+      );
+    case 'snapshot-invalid':
+      return new CaseAbort(
+        'The current accessibility evidence could not be parsed and cannot be trusted for this locator. Retry the run; if this persists, the page structure may use a form this parser does not recognize.',
+      );
+    case 'secret-contaminated':
+      return new CaseAbort(
+        'The supplied locator\'s accessibility evidence contains a resolved secret value and cannot be fingerprinted or cached. Add an aria-label that does not echo the secret value to the affected element.',
+      );
+  }
 }
 
 /**
@@ -1396,8 +1465,11 @@ async function groundedTarget(
  *
  * Element actions resolve trusted grounding immediately before browser use,
  * and secret values are resolved only at that boundary then retained for
- * later diagnostic redaction. This keeps plans and grounding reference-only
- * while preserving the values required to sanitize a subsequent failure.
+ * later diagnostic redaction. A `fill-secret` records its resolved value
+ * before grounding so any compute-mode bind can reject a target descriptor
+ * contaminated by that action's own secret. This keeps plans and grounding
+ * reference-only while preserving the values required to sanitize a subsequent
+ * failure.
  */
 async function executeAction(step: Step, context: DispatchContext): Promise<DispatchOutcome> {
   if (step.kind !== 'action') {
@@ -1427,13 +1499,13 @@ async function executeAction(step: Step, context: DispatchContext): Promise<Disp
       };
       break;
     case 'fill-secret': {
-      const target = await groundedTarget(context, step, step.target);
       const value = context.secrets.resolve(step.secretRef);
       if (value === undefined) {
         throw new SecretUnresolvedError('The referenced secret is unavailable.', { secretRef: step.secretRef });
       }
 
       recordResolvedSecret(context.resolvedSecrets, step.secretRef, value);
+      const target = await groundedTarget(context, step, step.target);
       action = { type: 'fill-secret', target, value };
       break;
     }
@@ -1480,7 +1552,7 @@ async function executeAssert(step: Step, context: DispatchContext): Promise<Disp
     case 'element-count':
       check = {
         check: 'element-count',
-        target: await groundedTarget(context, step, step.target),
+        target: step.target,
         count: step.count,
       };
       break;
@@ -1504,9 +1576,9 @@ function expectedForAssert(check: AssertCheck): string {
     case 'text-visible':
       return `Text "${check.text}" is visible.`;
     case 'element-visible':
-      return `Element ${check.target.role} "${check.target.name}" is visible.`;
+      return `Element ${check.target.ref.role} "${check.target.ref.name}" is visible.`;
     case 'text-equals':
-      return `Element ${check.target.role} "${check.target.name}" has text "${check.text}".`;
+      return `Element ${check.target.ref.role} "${check.target.ref.name}" has text "${check.text}".`;
     case 'url-matches':
       return `URL matches "${check.pattern}".`;
     case 'element-count':
@@ -1816,9 +1888,10 @@ export interface RunDeps {
   /**
    * Lazily resolves the executor used only by an allowed per-case fallback.
    *
-   * `runCase` memoizes this resolver after the first actual fallback, so path
-   * B and path C calls in the same case share one executor without probing a
-   * provider for cache-only or complete-cache replay.
+   * `runCase` memoizes this resolver after the first actual fallback, so AI
+   * re-resolution and fresh agentic execution in the same case share one
+   * executor without probing a provider for cache-only or complete-cache
+   * replay.
    */
   readonly resolveAiExecutor: (signal?: AbortSignal) => Promise<AiExecutor>;
 

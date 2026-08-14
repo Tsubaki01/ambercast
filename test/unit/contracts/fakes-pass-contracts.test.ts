@@ -16,7 +16,13 @@ import { createRecordingEventSink } from '../../doubles/create-recording-event-s
 import { createFakeAiActionController } from '../../doubles/fake-ai-action-controller.js';
 import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
 import { createFakeBrowserDriver } from '../../doubles/fake-browser-driver.js';
-import { createFakeBrowserSession, elementRefKey } from '../../doubles/fake-browser-session.js';
+import {
+  createFakeBrowserSession,
+  elementRefKey,
+  operationObservation,
+  type FakeBrowserSession,
+  type FakeBrowserSessionEntry,
+} from '../../doubles/fake-browser-session.js';
 import { createFakeEnvironmentInfo } from '../../doubles/fake-environment-info.js';
 import { createFakeSecretsProvider } from '../../doubles/fake-secrets-provider.js';
 
@@ -24,15 +30,52 @@ function sessionKey(ref: { readonly strategy: 'accessibility'; readonly role: st
   return elementRefKey(ref);
 }
 
+const fakeContractEntries = new WeakMap<FakeBrowserSession, Map<string, FakeBrowserSessionEntry>>();
+
 function createContractSession(): BrowserSession {
   return createFakeBrowserSession(new Map());
 }
 
 registerBrowserSessionContract({
-  createSession: (setup) => createFakeBrowserSession(new Map([[
-    sessionKey(setup.ref),
-    { currentFingerprint: setup.currentFingerprint, exists: setup.exists },
-  ]])),
+  createSession: (setup) => {
+    const scriptedMissReasons = setup.scenario === 'ambiguous'
+      ? { verify: 'ambiguous-match', compute: 'ambiguous-match' } as const
+      : setup.scenario === 'snapshot-invalid'
+        ? { verify: 'snapshot-invalid', compute: 'snapshot-invalid' } as const
+        : undefined;
+    const entries = new Map<string, FakeBrowserSessionEntry>([[
+      sessionKey(setup.ref),
+      {
+        currentFingerprint: setup.currentFingerprint,
+        exists: setup.exists,
+        ...(scriptedMissReasons === undefined ? {} : { scriptedMissReasons }),
+      },
+    ]]);
+    const session = createFakeBrowserSession(entries);
+    fakeContractEntries.set(session, entries);
+    return session;
+  },
+  navigationUrl: () => 'data:text/html,same-descriptor',
+  supportedGroundingMissReasons: [
+    'fingerprint-mismatch',
+    'element-not-found',
+    'ambiguous-match',
+    'snapshot-invalid',
+    'secret-contaminated',
+  ],
+  invalidateDescriptor: async (session, setup) => {
+    const entries = fakeContractEntries.get(session as FakeBrowserSession);
+    const entry = entries?.get(sessionKey(setup.ref));
+    if (entry === undefined) {
+      throw new Error('The fake contract fixture must retain the descriptor entry to invalidate it.');
+    }
+
+    entry.currentFingerprint = {
+      ...entry.currentFingerprint,
+      hash: `${entry.currentFingerprint.hash[0] === '0' ? '1' : '0'}${entry.currentFingerprint.hash.slice(1)}`,
+    };
+  },
+  operationObservation: (session) => operationObservation(session as FakeBrowserSession),
 });
 
 registerBrowserDriverContract({

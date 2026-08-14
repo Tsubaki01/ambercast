@@ -9,20 +9,34 @@
  * `CommandRunner` in the AI adapters: a page-methods-only fake would leave
  * launch options, context creation, and cleanup unexercised. The complete seam
  * lets unit tests drive that sequence without starting a browser.
+ *
+ * Element operations never positionally narrow a role/name locator. Binding
+ * establishes exactly one current candidate, and each use rechecks the
+ * session-private bind record, navigation generation, and accessibility
+ * fingerprint before constructing that candidate's locator. A navigation or
+ * in-place mutation can still land after that check but before Playwright
+ * receives the call; the ARIA snapshot API cannot expose a DOM handle that
+ * would close that interval. Rejecting stale evidence immediately before the
+ * call is the deliberately conservative mitigation.
  */
 
 import type {
   AssertCheck,
   AssertOutcome,
+  BoundElement,
   BrowserDriver,
   BrowserSession,
   CaptureMode,
   GroundedResolution,
+  GroundingQuery,
   PageSnapshot,
   PerformableAction,
 } from '#ports/browser.js';
 import { parseAriaSnapshot } from '#core/ir/aria-snapshot.js';
-import { resolveAccessibilityFingerprint } from '#core/ir/fingerprint.js';
+import {
+  computeAccessibilityFingerprint,
+  resolveAccessibilityFingerprint,
+} from '#core/ir/fingerprint.js';
 import type { ElementRef, Fingerprint, JsonValueT, TargetDefinition } from '#core/ir/schema.js';
 
 type PlaywrightBrowser = import('playwright-core').Browser;
@@ -40,7 +54,6 @@ type PlaywrightRole = Parameters<PlaywrightPage['getByRole']>[0];
  * can both supply it, while adapter callers remain independent of Playwright.
  */
 export interface PlaywrightLocatorHandle {
-  first(): PlaywrightLocatorHandle;
   click(): Promise<void>;
   fill(value: string): Promise<void>;
   press(key: string): Promise<void>;
@@ -67,6 +80,20 @@ export interface PlaywrightPageHandle {
   ): PlaywrightLocatorHandle;
   getByText(text: string): PlaywrightLocatorHandle;
   locator(selector: string): PlaywrightLocatorHandle;
+
+  /**
+   * Returns the generation associated with main-frame navigation.
+   *
+   * @remarks
+   * The production page adapter advances this value from Playwright's
+   * `framenavigated` event for the main frame. That event also covers
+   * same-document navigation such as `history.pushState`, so generation
+   * invalidation intentionally over-approximates DOM replacement: an SPA
+   * route change can reject an otherwise usable binding, but it can never
+   * permit a stale binding to act on the wrong page.
+   */
+  navigationGeneration(): number;
+
   url(): string;
   screenshot(): Promise<Uint8Array>;
 }
@@ -128,7 +155,6 @@ export interface CreateChromiumBrowserDriverOptions {
  */
 function adaptLocator(locator: PlaywrightLocator): PlaywrightLocatorHandle {
   return {
-    first: () => adaptLocator(locator.first()),
     click: () => locator.click(),
     fill: (value) => locator.fill(value),
     press: (key) => locator.press(key),
@@ -149,11 +175,19 @@ function adaptLocator(locator: PlaywrightLocator): PlaywrightLocatorHandle {
  * invoked, rather than widening the adapter's public structural interface.
  */
 function adaptPage(page: PlaywrightPage): PlaywrightPageHandle {
+  let generation = 0;
+  page.on('framenavigated', (frame) => {
+    if (frame === page.mainFrame()) {
+      generation += 1;
+    }
+  });
+
   return {
     goto: (url) => page.goto(url),
     getByRole: (role, options) => adaptLocator(page.getByRole(role as PlaywrightRole, options)),
     getByText: (text) => adaptLocator(page.getByText(text)),
     locator: (selector) => adaptLocator(page.locator(selector)),
+    navigationGeneration: () => generation,
     url: () => page.url(),
     screenshot: () => page.screenshot(),
   };
@@ -198,6 +232,29 @@ function createDefaultPlaywrightLauncher(): PlaywrightLauncher {
 }
 
 /**
+ * The adapter-owned facts that make one bound-element object meaningful to
+ * exactly one browser session and one observed navigation generation.
+ */
+type PrivateBindRecord = {
+  readonly generation: number;
+  readonly ref: ElementRef;
+  readonly fingerprint: Fingerprint;
+};
+
+type ReverifiedBinding = {
+  readonly locator: PlaywrightLocatorHandle;
+  readonly ref: ElementRef;
+};
+
+function copyElementRef(ref: ElementRef): ElementRef {
+  return { ...ref };
+}
+
+function copyFingerprint(fingerprint: Fingerprint): Fingerprint {
+  return { ...fingerprint };
+}
+
+/**
  * Owns the port view of one Chromium page session.
  *
  * Materialized `fill-secret` values may reach the browser only to perform the
@@ -207,6 +264,12 @@ function createDefaultPlaywrightLauncher(): PlaywrightLauncher {
 class ChromiumBrowserSession implements BrowserSession {
   private closed = false;
 
+  /**
+   * Records bind provenance by handle identity rather than trusting the
+   * serializable fields a caller can mutate or fabricate.
+   */
+  readonly #bindings = new WeakMap<BoundElement, PrivateBindRecord>();
+
   constructor(
     private readonly page: PlaywrightPageHandle,
     private readonly context: PlaywrightContextHandle,
@@ -214,37 +277,42 @@ class ChromiumBrowserSession implements BrowserSession {
   ) {}
 
   /**
-   * Narrows an accessibility reference to the first exact role-and-name
-   * match for operations that require one element.
-   */
-  private firstRoleLocator(target: ElementRef): PlaywrightLocatorHandle {
-    return this.page.getByRole(target.role, { name: target.name, exact: true }).first();
-  }
-
-  /**
    * Executes a materialized replay action through its Playwright equivalent.
    *
    * @remarks
-   * Element-targeted actions use the first exact role-and-name match because a
-   * replay action operates on one recorded identity even if the page contains
-   * duplicates. Navigation leaves relative-URL resolution to the context base
-   * URL, avoiding a second URL-resolution rule in this adapter. A materialized
+   * Navigation leaves relative-URL resolution to the context base URL,
+   * avoiding a second URL-resolution rule in this adapter. A materialized
    * secret is used only to fulfill its action and is never logged or returned.
+   *
+   * Before a targeted call, the adapter treats its private bind record as the
+   * authority: the handle must have been minted by this session, its recorded
+   * navigation generation must still bracket one fresh accessibility capture,
+   * and that capture must still resolve the recorded fingerprint. Only then
+   * may the adapter build a locator from the recorded reference. The public
+   * `BoundElement` fields never make these decisions. Each failed check throws
+   * a plain reason-bearing `Error`, leaving the run usecase to classify the
+   * browser rejection consistently with other adapter failures.
    */
   async perform(action: PerformableAction): Promise<void> {
     switch (action.type) {
-      case 'click':
-        await this.firstRoleLocator(action.target).click();
+      case 'click': {
+        const { locator } = await this.reverifyBinding(action.target);
+        await locator.click();
         return;
+      }
+      case 'press': {
+        const { locator } = await this.reverifyBinding(action.target);
+        await locator.press(action.key);
+        return;
+      }
+      case 'fill':
+      case 'fill-secret': {
+        const { locator } = await this.reverifyBinding(action.target);
+        await locator.fill(action.value);
+        return;
+      }
       case 'navigate':
         await this.page.goto(action.url);
-        return;
-      case 'press':
-        await this.firstRoleLocator(action.target).press(action.key);
-        return;
-      case 'fill':
-      case 'fill-secret':
-        await this.firstRoleLocator(action.target).fill(action.value);
         return;
     }
   }
@@ -253,15 +321,21 @@ class ChromiumBrowserSession implements BrowserSession {
    * Evaluates an assertion using page-visible browser evidence.
    *
    * @remarks
-   * Targeted assertions preserve the exact role-and-name lookup policy used
-   * for actions; checks that require one element narrow duplicate matches to
-   * the first, while a count deliberately retains the full match set. Visible
-   * text uses Playwright's structured text locator so supplied text is data
-   * rather than selector syntax.
+   * Targeted assertions use the same bound-element guarantee as actions,
+   * while `element-count` deliberately retains the full role/name match set.
+   * Visible text uses Playwright's structured text locator so supplied text is
+   * data rather than selector syntax.
    *
    * A malformed URL pattern remains a `RegExp` construction error. The run
    * usecase folds that rejection into its unified case-abort stopgap instead of
    * assigning the adapter a classification it cannot justify.
+   *
+   * `element-visible` and `text-equals` apply the same three-stage
+   * operation-immediate gate as `perform`: private provenance, navigation
+   * generation bracketing a fresh accessibility capture, then fingerprint
+   * re-verification against that capture. Its failures intentionally remain
+   * plain `Error`s, because this adapter cannot assign a core error category
+   * more accurately than the run usecase's existing browser-rejection path.
    */
   async evaluateAssert(check: AssertCheck): Promise<AssertOutcome> {
     switch (check.check) {
@@ -272,17 +346,22 @@ class ChromiumBrowserSession implements BrowserSession {
           : { passed: false, message: `Text is not visible: ${check.text}` };
       }
       case 'element-visible': {
-        const passed = await this.firstRoleLocator(check.target).isVisible();
+        const { locator, ref } = await this.reverifyBinding(check.target);
+        const passed = await locator.isVisible();
         return passed
           ? { passed: true }
-          : { passed: false, message: `Element is not visible: ${check.target.name}` };
+          : { passed: false, message: `Element is not visible: ${ref.name}` };
       }
       case 'text-equals': {
-        const actualText = await this.firstRoleLocator(check.target).innerText();
-        const passed = actualText === check.text;
+        const { locator, ref } = await this.reverifyBinding(check.target);
+        const actual = await locator.innerText();
+        const passed = actual === check.text;
         return passed
           ? { passed: true }
-          : { passed: false, message: `Element text does not equal: ${check.target.name}; expected "${check.text}", received "${actualText}".` };
+          : {
+            passed: false,
+            message: `Element text does not equal: ${ref.name}; expected "${check.text}", received "${actual}".`,
+          };
       }
       case 'url-matches': {
         const expression = new RegExp(check.pattern);
@@ -311,37 +390,141 @@ class ChromiumBrowserSession implements BrowserSession {
    * The port distinguishes rendered text from a control value so callers can
    * preserve the meaning of later interpolation instead of treating every
    * element as one generic string source.
+   *
+   * A capture applies the same operation-immediate private-provenance,
+   * navigation-generation, and fingerprint checks as targeted actions and
+   * assertions. Those checks reject with plain `Error`s so the adapter stays
+   * independent of core error classification while the run usecase preserves
+   * one browser-failure boundary.
    */
-  async captureValue(target: ElementRef, mode: CaptureMode): Promise<string> {
-    const locator = this.firstRoleLocator(target);
-
+  async captureValue(target: BoundElement, mode: CaptureMode): Promise<string> {
+    const { locator } = await this.reverifyBinding(target);
     return mode === 'text' ? locator.innerText() : locator.inputValue();
   }
 
   /**
-   * Verifies recorded grounding before an element may be used.
+   * Binds one accessibility reference before an element may be used.
    *
    * @remarks
-   * This method independently captures its own current body ARIA snapshot and
-   * delegates its classification to `resolveAccessibilityFingerprint()`.
-   * Duplicate candidates remain unusable even when one hashes to `fp`:
-   * the role locator cannot carry the selected candidate's identity into its
-   * later `.first()` browser operation.
+   * Every binding captures its own current body ARIA snapshot. Verify mode
+   * compares its one unique candidate against the supplied fingerprint;
+   * compute mode derives a fingerprint from the same capture while applying
+   * the secret-taint gate. Duplicate candidates remain unusable in both modes
+   * because a role/name locator cannot carry physical-node identity through a
+   * later browser operation.
    *
    * That capture is distinct from `snapshotForResolution()`: callers may
    * request paired diagnostic evidence separately, but it is never reused as
-   * this method's comparison input.
+   * this method's binding input.
+   *
+   * The capture is bracketed by navigation-generation reads. A generation that
+   * changes during capture is an ordinary failed bind attempt, retried at most
+   * three times because no operation is pending yet; exhausting that bound
+   * reports the ordinary element-not-found miss rather than minting a handle
+   * from an observation that straddled navigation. In compute mode, the
+   * generation comparison succeeds before the method consumes
+   * `resolvedSecrets` to classify the capture. That iterable may be single
+   * use, so a capture retried because its generation changed leaves it
+   * untouched for the later stable capture.
    */
-  async resolveGrounded(ref: ElementRef, fp: Fingerprint): Promise<GroundedResolution> {
-    const resolution = resolveAccessibilityFingerprint(
-      await this.accessibilitySnapshot(),
-      ref,
-      fp,
-    );
+  async resolveGrounded(ref: ElementRef, query: GroundingQuery): Promise<GroundedResolution> {
+    const recordedRef = copyElementRef(ref);
+    const expectedFingerprint = query.mode === 'verify'
+      ? copyFingerprint(query.fingerprint)
+      : undefined;
 
-    return resolution === 'hit'
-      ? { kind: 'hit', ref }
-      : { kind: 'miss', reason: resolution };
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const before = this.page.navigationGeneration();
+      const tree = await this.accessibilitySnapshot();
+      const after = this.page.navigationGeneration();
+
+      if (before !== after) {
+        continue;
+      }
+
+      if (query.mode === 'verify') {
+        if (expectedFingerprint === undefined) {
+          throw new Error('A verify grounding query requires a fingerprint.');
+        }
+
+        const result = resolveAccessibilityFingerprint(tree, recordedRef, expectedFingerprint);
+        return result === 'hit'
+          ? { kind: 'hit', element: this.mintBoundElement(recordedRef, expectedFingerprint, after) }
+          : { kind: 'miss', reason: result };
+      }
+
+      const result = computeAccessibilityFingerprint(tree, recordedRef, query.resolvedSecrets);
+      if (result.kind === 'ok') {
+        return {
+          kind: 'hit',
+          element: this.mintBoundElement(recordedRef, result.fingerprint, after),
+        };
+      }
+
+      return {
+        kind: 'miss',
+        reason: result.kind === 'no-match' ? 'element-not-found' : result.kind,
+      };
+    }
+
+    return { kind: 'miss', reason: 'element-not-found' };
+  }
+
+  /**
+   * Re-establishes a target's binding immediately before its browser call.
+   *
+   * Provenance is checked before capture so foreign or fabricated handles
+   * cannot observe this page. A valid private record must then retain its
+   * generation across one fresh capture and still resolve its own recorded
+   * fingerprint. The returned locator is built only after those checks from
+   * the private reference, preserving the handle's session-local identity.
+   */
+  private async reverifyBinding(target: BoundElement): Promise<ReverifiedBinding> {
+    const record = this.#bindings.get(target);
+    if (record === undefined) {
+      throw new Error('Bound element provenance is not valid for this browser session.');
+    }
+
+    const before = this.page.navigationGeneration();
+    const tree = await this.accessibilitySnapshot();
+    const after = this.page.navigationGeneration();
+    if (before !== record.generation || after !== record.generation) {
+      throw new Error('Bound element navigation generation is stale.');
+    }
+
+    const result = resolveAccessibilityFingerprint(tree, record.ref, record.fingerprint);
+    if (result !== 'hit') {
+      throw new Error(`Bound element fingerprint verification failed: ${result}.`);
+    }
+
+    return {
+      locator: this.page.getByRole(record.ref.role, {
+        name: record.ref.name,
+        exact: true,
+      }),
+      ref: record.ref,
+    };
+  }
+
+  /**
+   * Creates the public handle and the independent private facts its later
+   * operation-immediate re-verification must trust.
+   */
+  private mintBoundElement(
+    ref: ElementRef,
+    fingerprint: Fingerprint,
+    generation: number,
+  ): BoundElement {
+    const element: BoundElement = {
+      ref: copyElementRef(ref),
+      fingerprint: copyFingerprint(fingerprint),
+    };
+    this.#bindings.set(element, {
+      generation,
+      ref: copyElementRef(ref),
+      fingerprint: copyFingerprint(fingerprint),
+    });
+    return element;
   }
 
   /**
