@@ -14,6 +14,7 @@ import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
+import { isSnapshotInvalid } from '#core/ir/aria-snapshot.js';
 import {
   GroundingDocument,
   PlanDocument,
@@ -40,6 +41,7 @@ import type { AiActionController, AiExecutor } from '#ports/ai.js';
 import type {
   AssertCheck,
   AssertOutcome,
+  AccessibilityCapture,
   BoundElement,
   BrowserSession,
   GroundingMissReason,
@@ -1637,69 +1639,90 @@ async function captureScreenshotEvidence(
 /**
  * Captures redacted accessibility evidence for a failed live browser step.
  *
- * One raw tree serves both the omission signal and persisted observed
- * evidence: the helper checks the original tree for a
- * resolved-secret hit, then redacts that same tree before compact
- * serialization. Redaction must precede serialization because JSON escaping
- * can hide a raw value from string-based replacement. Snapshot acquisition
- * must fail closed after any case secret resolves: an uninspectable page can
- * still display a value filled by an earlier step. Once a tree exists,
- * detector failure is likewise unsafe and returns a true signal: a throwing
- * getter or other malformed evidence must not turn uncertain secret presence
- * into permission to capture a screenshot. Rendering is separately
- * best-effort and retains the already-established signal.
+ * Accessibility capture supports separate detection and persistence decisions.
+ * `accessibilityCaptureContainsResolvedSecret` uses all three capture channels
+ * to decide whether a screenshot is unsafe to retain, while `Observed` keeps
+ * only the redacted parsed tree. Redaction must precede serialization because
+ * JSON escaping can hide a raw value from string-based replacement. Snapshot
+ * acquisition must fail closed after any case secret resolves: an
+ * uninspectable page can still display a value filled by an earlier step. Once
+ * a capture exists, detector failure is likewise unsafe and returns a true
+ * signal: a throwing getter or other malformed evidence must not turn
+ * uncertain secret presence into permission to capture a screenshot.
+ * Rendering is separately best-effort and retains the already-established
+ * signal.
  */
 async function captureObservedEvidence(
   session: BrowserSession,
   resolvedSecrets: ReadonlyMap<string, ReadonlySet<string>>,
   runState: ReadonlyMap<RunVariableName, string>,
-): Promise<{ readonly observed?: Observed; readonly rawTreeContainsSecret: boolean }> {
-  let rawTree: JsonValueT;
+): Promise<{ readonly observed?: Observed; readonly captureContainsResolvedSecret: boolean }> {
+  let capture: AccessibilityCapture;
   try {
-    rawTree = await session.accessibilitySnapshot();
+    capture = await session.accessibilitySnapshot();
   } catch {
     // An uninspectable page cannot authorize a screenshot once this case knows a secret exists.
-    return { rawTreeContainsSecret: resolvedSecrets.size > 0 };
+    return { captureContainsResolvedSecret: resolvedSecrets.size > 0 };
   }
 
-  let rawTreeContainsSecret: boolean;
+  let captureContainsResolvedSecret: boolean;
   try {
-    rawTreeContainsSecret = jsonContainsResolvedSecret(rawTree, resolvedSecrets);
+    captureContainsResolvedSecret = accessibilityCaptureContainsResolvedSecret(capture, resolvedSecrets);
   } catch {
-    return { rawTreeContainsSecret: true };
+    return { captureContainsResolvedSecret: true };
   }
 
   try {
     return {
-      rawTreeContainsSecret,
+      captureContainsResolvedSecret,
       observed: {
         note: OBSERVED_NOTE,
-        accessibilitySnapshot: JSON.stringify(redactJsonStrings(rawTree, resolvedSecrets, runState)),
+        accessibilitySnapshot: JSON.stringify(redactJsonStrings(capture.tree, resolvedSecrets, runState)),
       },
     };
   } catch {
-    return { rawTreeContainsSecret };
+    return { captureContainsResolvedSecret };
   }
+}
+
+/**
+ * Decides whether one accessibility capture contains a resolved secret before
+ * a screenshot may be retained.
+ *
+ * @remarks
+ * The detector combines raw renderer output, the identity-bearing tree, and
+ * decoded discarded scalars. It reuses the established string and JSON
+ * traversal rules instead of an exact-only tree comparator. Those rules
+ * protect longer substrings and short exact values. An invalid
+ * tree with a resolved secret is unsafe independently of the other channels:
+ * failed identity parsing cannot establish that the page is safe to capture.
+ *
+ * Canvas/image/CSS-rendered pixel content and the scan-vs-screenshot timing
+ * gap remain undetectable.
+ */
+function accessibilityCaptureContainsResolvedSecret(
+  capture: AccessibilityCapture,
+  resolvedSecrets: ReadonlyMap<string, ReadonlySet<string>>,
+): boolean {
+  if (isSnapshotInvalid(capture.tree) && resolvedSecrets.size > 0) {
+    return true;
+  }
+
+  return containsResolvedSecret(capture.rawYaml, resolvedSecrets)
+    || jsonContainsResolvedSecret(capture.tree, resolvedSecrets)
+    || capture.scalarValues.some((value) => containsResolvedSecret(value, resolvedSecrets));
 }
 
 /**
  * Coordinates failure evidence while keeping screenshot capture from writing
  * a known secret disclosure to disk.
  *
- * The coordinator awaits accessibility capture first because its
- * raw tree participates in the screenshot-omission decision. It combines
- * that signal with the raw assertion pair when present through the existing
- * `containsResolvedSecret` and `jsonContainsResolvedSecret` boundaries, so
- * evidence capture cannot drift into a second secret detector. Any hit
- * returns the observed detail available so far and `screenshotOmitted`
- * without calling the browser screenshot or storage port. On a miss,
- * screenshot capture has its own caught failure boundary, so an accessibility
- * capture failure permits it only while the case has resolved no secret; a
- * screenshot capture/write failure still preserves observed evidence. This
- * deliberate sequencing changes only dependency order, not the independence
- * of diagnostic failures.
- * Assertion-specific fields stay at the caller so an environment error cannot
- * invent them.
+ * Accessibility capture precedes the screenshot decision so known secrets
+ * gate pixel persistence before it can occur. Persisted observed evidence is
+ * the redacted parsed tree, while detection-only capture channels never cross
+ * that boundary. Diagnostic failures remain independent, so losing one form
+ * of evidence does not discard other available failure detail or invent
+ * assertion-specific fields.
  */
 async function captureFailureEvidence(
   session: BrowserSession,
@@ -1710,8 +1733,8 @@ async function captureFailureEvidence(
   runState: ReadonlyMap<RunVariableName, string>,
   rawAssertionText: readonly string[] = [],
 ): Promise<FailureDetail> {
-  const { observed, rawTreeContainsSecret } = await captureObservedEvidence(session, resolvedSecrets, runState);
-  if (rawTreeContainsSecret || rawAssertionText.some((text) => containsResolvedSecret(text, resolvedSecrets))) {
+  const { observed, captureContainsResolvedSecret } = await captureObservedEvidence(session, resolvedSecrets, runState);
+  if (captureContainsResolvedSecret || rawAssertionText.some((text) => containsResolvedSecret(text, resolvedSecrets))) {
     return { ...(observed === undefined ? {} : { observed }), screenshotOmitted: 'secret-detected' };
   }
 

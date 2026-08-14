@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { isSnapshotInvalid, parseAriaSnapshot, SNAPSHOT_INVALID } from '#core/ir/aria-snapshot.js';
+import {
+  extractDiscardedScalarValues,
+  isSnapshotInvalid,
+  parseAriaSnapshot,
+  SNAPSHOT_INVALID,
+} from '#core/ir/aria-snapshot.js';
 import type { JsonValueT } from '#core/ir/schema.js';
 
 function root(children: JsonValueT[]): JsonValueT {
@@ -323,5 +328,42 @@ describe('parseAriaSnapshot', () => {
     ['an object with a string marker field', { snapshotInvalid: 'true' }],
   ])('does not over-match %s as an invalid marker', (_description, value) => {
     expect(isSnapshotInvalid(value)).toBe(false);
+  });
+});
+
+describe('extractDiscardedScalarValues', () => {
+  it('excludes an unnamed text colon value because the tree promotes it into the node name', () => {
+    expect(extractDiscardedScalarValues('- text: Promoted tree value')).toEqual([]);
+  });
+
+  it('includes colon values discarded from non-text and explicitly named text nodes', () => {
+    expect(extractDiscardedScalarValues([
+      '- textbox: Discarded textbox value',
+      '- text "Explicit tree name": Discarded replacement value',
+    ].join('\n'))).toEqual([
+      'Discarded textbox value',
+      'Discarded replacement value',
+    ]);
+  });
+
+  it('includes decoded url and placeholder metadata values that never become tree nodes', () => {
+    expect(extractDiscardedScalarValues([
+      '- form "Sign in":',
+      '  - /url: /account/sign-in',
+      '  - /placeholder: Email address',
+    ].join('\n'))).toEqual([
+      '/account/sign-in',
+      'Email address',
+    ]);
+  });
+
+  it('keeps independently valid scalar evidence when an unrelated line makes the whole tree invalid', () => {
+    const yaml = [
+      '- textbox: Retained scalar value',
+      'not an ARIA outline',
+    ].join('\n');
+
+    expect(parseAriaSnapshot(yaml)).toBe(SNAPSHOT_INVALID);
+    expect(extractDiscardedScalarValues(yaml)).toEqual(['Retained scalar value']);
   });
 });
