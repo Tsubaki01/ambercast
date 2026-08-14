@@ -32,6 +32,38 @@ export type PageSnapshot = {
 };
 
 /**
+ * Complete accessibility evidence used to decide whether a screenshot may be
+ * retained.
+ *
+ * `tree` contains the identity-bearing values that the ARIA parser placed in
+ * nodes. `scalarValues` contains YAML-decoded values that the parser
+ * deliberately discarded or never placed in a node, while `rawYaml` retains
+ * the renderer output as a backstop for evidence neither structured channel
+ * recognizes.
+ *
+ * @remarks
+ * These channels form one capture, rather than three independent browser
+ * observations: implementations derive all of them from one `ariaSnapshot()`
+ * call. That invariant prevents the channels from describing different DOM
+ * instants, which would make a detection decision internally inconsistent.
+ */
+export type AccessibilityCapture = {
+  /** The verbatim accessibility renderer output used only for detection. */
+  readonly rawYaml: string;
+
+  /**
+   * The parsed, identity-bearing tree used by resolution and diagnostics.
+   * Parse failure is represented structurally by the `SNAPSHOT_INVALID`
+   * sentinel from the ARIA snapshot parser, rather than by rejecting this
+   * capture, because `JsonValueT` alone cannot express that distinction.
+   */
+  readonly tree: JsonValueT;
+
+  /** Decoded scalar evidence intentionally outside the identity-bearing tree. */
+  readonly scalarValues: readonly string[];
+};
+
+/**
  * A lightweight, session-local continuity handle for a bound element.
  *
  * @remarks
@@ -343,12 +375,19 @@ export interface BrowserSession {
   screenshot(): Promise<Uint8Array>;
 
   /**
-   * Captures the current serializable accessibility representation.
+   * Captures the full accessibility evidence used for detection.
    *
-   * @returns The tree evidence used by resolution and diagnostics.
+   * `rawYaml` and `scalarValues` support screenshot-retention detection only
+   * and must never be forwarded to AI, report, grounding, or log paths.
+   *
+   * @remarks
+   * Architecture tests mechanically enforce the detection-only boundary.
+   *
+   * @returns One same-instant accessibility capture, including the parsed tree
+   *   used by resolution and diagnostics.
    * @throws If the accessibility representation cannot be captured.
    */
-  accessibilitySnapshot(): Promise<JsonValueT>;
+  accessibilitySnapshot(): Promise<AccessibilityCapture>;
 
   /**
    * Releases resources held by the session.

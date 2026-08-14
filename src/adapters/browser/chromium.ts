@@ -23,6 +23,7 @@
 import type {
   AssertCheck,
   AssertOutcome,
+  AccessibilityCapture,
   BoundElement,
   BrowserDriver,
   BrowserSession,
@@ -32,12 +33,12 @@ import type {
   PageSnapshot,
   PerformableAction,
 } from '#ports/browser.js';
-import { parseAriaSnapshot } from '#core/ir/aria-snapshot.js';
+import { extractDiscardedScalarValues, parseAriaSnapshot } from '#core/ir/aria-snapshot.js';
 import {
   computeAccessibilityFingerprint,
   resolveAccessibilityFingerprint,
 } from '#core/ir/fingerprint.js';
-import type { ElementRef, Fingerprint, JsonValueT, TargetDefinition } from '#core/ir/schema.js';
+import type { ElementRef, Fingerprint, TargetDefinition } from '#core/ir/schema.js';
 
 type PlaywrightBrowser = import('playwright-core').Browser;
 type PlaywrightContext = import('playwright-core').BrowserContext;
@@ -443,7 +444,7 @@ class ChromiumBrowserSession implements BrowserSession {
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const before = this.page.navigationGeneration();
-      const tree = await this.accessibilitySnapshot();
+      const capture = await this.accessibilitySnapshot();
       const after = this.page.navigationGeneration();
 
       if (before !== after) {
@@ -455,13 +456,13 @@ class ChromiumBrowserSession implements BrowserSession {
           throw new Error('A verify grounding query requires a fingerprint.');
         }
 
-        const result = resolveAccessibilityFingerprint(tree, recordedRef, expectedFingerprint);
+        const result = resolveAccessibilityFingerprint(capture.tree, recordedRef, expectedFingerprint);
         return result === 'hit'
           ? { kind: 'hit', element: this.mintBoundElement(recordedRef, expectedFingerprint, after) }
           : { kind: 'miss', reason: result };
       }
 
-      const result = computeAccessibilityFingerprint(tree, recordedRef, query.resolvedSecrets);
+      const result = computeAccessibilityFingerprint(capture.tree, recordedRef, query.resolvedSecrets);
       if (result.kind === 'ok') {
         return {
           kind: 'hit',
@@ -494,13 +495,13 @@ class ChromiumBrowserSession implements BrowserSession {
     }
 
     const before = this.page.navigationGeneration();
-    const tree = await this.accessibilitySnapshot();
+    const capture = await this.accessibilitySnapshot();
     const after = this.page.navigationGeneration();
     if (before !== record.generation || after !== record.generation) {
       throw new Error('Bound element navigation generation is stale.');
     }
 
-    const result = resolveAccessibilityFingerprint(tree, record.ref, record.fingerprint);
+    const result = resolveAccessibilityFingerprint(capture.tree, record.ref, record.fingerprint);
     if (result !== 'hit') {
       throw new Error(`Bound element fingerprint verification failed: ${result}.`);
     }
@@ -541,19 +542,20 @@ class ChromiumBrowserSession implements BrowserSession {
    * an element.
    *
    * @remarks
-   * The returned `PageSnapshot` pairs the accessibility tree produced from
-   * the page's `ariaSnapshot()` through `parseAriaSnapshot()` with a screenshot
-   * from that page's screenshot capture. This method does not compute a fingerprint:
-   * `resolveGrounded()` makes its own independent capture and delegates that
-   * fingerprint computation to the core algorithm.
+   * `PageSnapshot` has shape `{ accessibilityTree, screenshot }` and takes
+   * only the capture's parsed tree, so detection-only raw YAML and
+   * discarded scalar values have no structural route into AI re-resolution.
+   * This method does not compute a fingerprint: `resolveGrounded()` makes its
+   * own independent capture and delegates that computation to the core
+   * algorithm.
    */
   async snapshotForResolution(): Promise<PageSnapshot> {
-    const [accessibilityTree, screenshot] = await Promise.all([
+    const [capture, screenshot] = await Promise.all([
       this.accessibilitySnapshot(),
       this.screenshot(),
     ]);
 
-    return { accessibilityTree, screenshot };
+    return { accessibilityTree: capture.tree, screenshot };
   }
 
   async screenshot(): Promise<Uint8Array> {
@@ -561,11 +563,21 @@ class ChromiumBrowserSession implements BrowserSession {
   }
 
   /**
-   * Produces the same parsed ARIA-tree representation used for grounding and
-   * resolution evidence, rather than exposing Playwright's raw result.
+   * Produces the one same-instant accessibility capture used by grounding and
+   * screenshot-retention detection.
+   *
+   * All three fields derive from one body `ariaSnapshot()` observation rather
+   * than separate browser reads. Keeping the evidence tied to one DOM instant
+   * prevents a detector from combining raw and parsed values from different
+   * page states.
    */
-  async accessibilitySnapshot(): Promise<JsonValueT> {
-    return parseAriaSnapshot(await this.page.locator('body').ariaSnapshot());
+  async accessibilitySnapshot(): Promise<AccessibilityCapture> {
+    const rawYaml = await this.page.locator('body').ariaSnapshot();
+    return {
+      rawYaml,
+      tree: parseAriaSnapshot(rawYaml),
+      scalarValues: extractDiscardedScalarValues(rawYaml),
+    };
   }
 
   /**

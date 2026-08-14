@@ -96,6 +96,8 @@ const CHANGED_SUBMIT_FIXTURE = [
   '    - text: Changed',
 ].join('\n');
 
+const DISCARDED_SCALAR_FIXTURE = '- textbox: "#quoted\\\\backslash"';
+
 const SAME_DESCRIPTOR_PAGE = `data:text/html,${encodeURIComponent(`<!doctype html>
 <html lang="en"><body><button type="button">Submit</button></body></html>`)}`;
 
@@ -1112,9 +1114,26 @@ describe('ChromiumBrowserSession evidence capture', () => {
     });
   });
 
-  it('maps accessibilitySnapshot to a parsed body ARIA snapshot', async () => {
+  it('derives the complete accessibility capture from one body ARIA snapshot', async () => {
     await withLaunchedSession({}, async (session, launcher) => {
-      await expect(session.accessibilitySnapshot()).resolves.toEqual(FIXTURE_ACCESSIBILITY_TREE);
+      await expect(session.accessibilitySnapshot()).resolves.toEqual({
+        rawYaml: FIXTURE_ARIA_SNAPSHOT,
+        tree: FIXTURE_ACCESSIBILITY_TREE,
+        scalarValues: [],
+      });
+
+      expect(launcher.page.locatorCalls).toEqual(['body']);
+      expect(launcher.page.bodyLocator.ariaSnapshotCalls).toHaveLength(1);
+    });
+  });
+
+  it('preserves raw YAML and extracts decoded discarded scalars from that same one capture', async () => {
+    await withLaunchedSession({ ariaSnapshot: DISCARDED_SCALAR_FIXTURE }, async (session, launcher) => {
+      await expect(session.accessibilitySnapshot()).resolves.toEqual({
+        rawYaml: DISCARDED_SCALAR_FIXTURE,
+        tree: parseAriaSnapshot(DISCARDED_SCALAR_FIXTURE),
+        scalarValues: ['#quoted\\backslash'],
+      });
 
       expect(launcher.page.locatorCalls).toEqual(['body']);
       expect(launcher.page.bodyLocator.ariaSnapshotCalls).toHaveLength(1);

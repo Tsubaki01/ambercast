@@ -296,7 +296,7 @@ describe('createFakeBrowserSession', () => {
     ]);
   });
 
-  it('returns each configured snapshot view from the same snapshot and closes only once', async () => {
+  it('returns each configured snapshot view and neutral detection channels by default, then closes only once', async () => {
     const closes: string[] = [];
     const snapshot = {
       accessibilityTree: { role: 'document', name: 'Sign in' },
@@ -306,10 +306,40 @@ describe('createFakeBrowserSession', () => {
 
     await expect(session.snapshotForResolution()).resolves.toBe(snapshot);
     await expect(session.screenshot()).resolves.toBe(snapshot.screenshot);
-    await expect(session.accessibilitySnapshot()).resolves.toBe(snapshot.accessibilityTree);
+    await expect(session.accessibilitySnapshot()).resolves.toEqual({
+      rawYaml: '',
+      tree: snapshot.accessibilityTree,
+      scalarValues: [],
+    });
     await expect(session.close()).resolves.toBeUndefined();
     await expect(session.close()).resolves.toBeUndefined();
 
     expect(closes).toEqual(['closed']);
+  });
+
+  it('overrides either detection-only channel independently without changing the parsed tree fixture', async () => {
+    const snapshot = {
+      accessibilityTree: { role: 'document', name: 'Sign in' },
+      screenshot: new Uint8Array([137, 80, 78, 71]),
+    } as const;
+    const rawOnly = createFakeBrowserSession(entries(), {
+      snapshot,
+      accessibilityCapture: { rawYaml: '- button "Raw-only artifact" [checked]' },
+    });
+    const scalarsOnly = createFakeBrowserSession(entries(), {
+      snapshot,
+      accessibilityCapture: { scalarValues: ['Discarded scalar artifact'] },
+    });
+
+    await expect(rawOnly.accessibilitySnapshot()).resolves.toEqual({
+      rawYaml: '- button "Raw-only artifact" [checked]',
+      tree: snapshot.accessibilityTree,
+      scalarValues: [],
+    });
+    await expect(scalarsOnly.accessibilitySnapshot()).resolves.toEqual({
+      rawYaml: '',
+      tree: snapshot.accessibilityTree,
+      scalarValues: ['Discarded scalar artifact'],
+    });
   });
 });

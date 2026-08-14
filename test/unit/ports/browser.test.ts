@@ -1,6 +1,7 @@
 import { describe, expectTypeOf, it } from 'vitest';
 import type { ElementRef, Fingerprint, JsonValueT, TargetDefinition } from '../../../src/core/ir/schema.js';
 import type {
+  AccessibilityCapture,
   AssertCheck,
   AssertOutcome,
   BoundElement,
@@ -21,6 +22,11 @@ type ResolveGroundedIsRequired = {} extends Pick<BrowserSession, 'resolveGrounde
 describe('browser port shapes', () => {
   it('defines the materialized action, assertion, evidence, and grounding shapes', () => {
     expectTypeOf<BrowserEngine>().toEqualTypeOf<TargetDefinition['browser']>();
+    expectTypeOf<AccessibilityCapture>().toEqualTypeOf<{
+      readonly rawYaml: string;
+      readonly tree: JsonValueT;
+      readonly scalarValues: readonly string[];
+    }>();
     expectTypeOf<PageSnapshot>().toEqualTypeOf<{
       readonly accessibilityTree: JsonValueT;
       readonly screenshot: Uint8Array;
@@ -70,7 +76,7 @@ describe('browser port shapes', () => {
     >();
     expectTypeOf<BrowserSession['snapshotForResolution']>().toEqualTypeOf<() => Promise<PageSnapshot>>();
     expectTypeOf<BrowserSession['screenshot']>().toEqualTypeOf<() => Promise<Uint8Array>>();
-    expectTypeOf<BrowserSession['accessibilitySnapshot']>().toEqualTypeOf<() => Promise<JsonValueT>>();
+    expectTypeOf<BrowserSession['accessibilitySnapshot']>().toEqualTypeOf<() => Promise<AccessibilityCapture>>();
     expectTypeOf<BrowserSession['close']>().toEqualTypeOf<() => Promise<void>>();
   });
 

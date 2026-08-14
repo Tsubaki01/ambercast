@@ -2,6 +2,7 @@ import type { ElementRef, Fingerprint } from '../../src/core/ir/schema.js';
 import type {
   AssertCheck,
   AssertOutcome,
+  AccessibilityCapture,
   BoundElement,
   BrowserSession,
   CaptureMode,
@@ -50,6 +51,12 @@ export interface FakeBrowserSessionOptions {
    * observation while still receiving a plausible replay outcome.
    */
   readonly assertOutcomes?: readonly AssertOutcome[];
+  /**
+   * Detection-only capture channels scripted independently of parsed tree
+   * evidence. Neutral defaults keep fixtures free of
+   * secret-detection content unless a test explicitly requests it.
+   */
+  readonly accessibilityCapture?: Partial<Pick<AccessibilityCapture, 'rawYaml' | 'scalarValues'>>;
   readonly snapshot?: PageSnapshot;
   readonly onPerform?: (action: PerformableAction) => void;
   readonly onEvaluateAssert?: (check: AssertCheck) => void;
@@ -440,8 +447,12 @@ export function createFakeBrowserSession(
     async screenshot(): Promise<Uint8Array> {
       return snapshot.screenshot;
     },
-    async accessibilitySnapshot() {
-      return snapshot.accessibilityTree;
+    async accessibilitySnapshot(): Promise<AccessibilityCapture> {
+      return {
+        rawYaml: options.accessibilityCapture?.rawYaml ?? '',
+        tree: snapshot.accessibilityTree,
+        scalarValues: options.accessibilityCapture?.scalarValues ?? [],
+      };
     },
     async close(): Promise<void> {
       if (state.closed) {

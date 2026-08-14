@@ -57,6 +57,13 @@ type ParsedValue = {
   readonly nextIndex: number;
 };
 
+type ParsedNodeLineScalars = {
+  readonly role: string;
+  readonly name: string;
+  readonly hasExplicitName: boolean;
+  readonly colonValue: string | undefined;
+};
+
 function yamlStringNeedsQuotes(value: string): boolean {
   return value.length === 0
     || /^\s|\s$/.test(value)
@@ -294,7 +301,15 @@ function parseOuterQuotedKey(input: string, start: number): ParsedKey | undefine
   return undefined;
 }
 
-function parseNodeLine(line: string, start: number): AccessibilityNode | undefined {
+/**
+ * Classifies the scalar parts of one node line before either capture channel
+ * decides whether its colon value belongs to identity evidence or discarded
+ * evidence.
+ *
+ * Keeping this narrow grammar shared prevents the tree and scalar channels
+ * from drifting on their partition as accepted renderer syntax evolves.
+ */
+function parseNodeLineScalars(line: string, start: number): ParsedNodeLineScalars | undefined {
   const outerQuoted = line[start] === "'";
   const parsedKey = outerQuoted
     ? parseOuterQuotedKey(line, start)
@@ -327,26 +342,94 @@ function parseNodeLine(line: string, start: number): AccessibilityNode | undefin
 
   return {
     role: parsedKey.role,
-    name: !parsedKey.hasExplicitName && parsedKey.role === 'text' && colonValue !== undefined
-      ? colonValue
-      : parsedKey.name,
+    name: parsedKey.name,
+    hasExplicitName: parsedKey.hasExplicitName,
+    colonValue,
+  };
+}
+
+function parseNodeLine(line: string, start: number): AccessibilityNode | undefined {
+  const parsed = parseNodeLineScalars(line, start);
+  if (parsed === undefined) {
+    return undefined;
+  }
+
+  return {
+    role: parsed.role,
+    name: !parsed.hasExplicitName && parsed.role === 'text' && parsed.colonValue !== undefined
+      ? parsed.colonValue
+      : parsed.name,
     children: [],
   };
 }
 
 function isValidMetadataLine(line: string, start: number): boolean {
+  return parseMetadataLineValue(line, start) !== undefined;
+}
+
+function parseMetadataLineValue(line: string, start: number): string | undefined {
   const colon = line.indexOf(':', start);
   if (colon === -1 || line[colon + 1] !== ' ') {
-    return false;
+    return undefined;
   }
 
   const property = line.slice(start + 1, colon);
   if (property !== 'url' && property !== 'placeholder') {
-    return false;
+    return undefined;
   }
 
   const parsedValue = parseRendererValue(line, colon + 2);
-  return parsedValue !== undefined && parsedValue.nextIndex === line.length;
+  return parsedValue !== undefined && parsedValue.nextIndex === line.length
+    ? parsedValue.value
+    : undefined;
+}
+
+/**
+ * Extracts YAML-decoded scalar evidence that the identity parser leaves
+ * outside its tree.
+ *
+ * @param yaml - The renderer's newline-delimited ARIA outline.
+ * @returns Decoded values from non-`text` or explicitly named node values,
+ *   plus `/url` and `/placeholder` metadata values. An unnamed `text` node's
+ *   colon value is excluded because it is promoted into the parsed tree.
+ *
+ * @remarks
+ * Extraction is intentionally best-effort per line rather than sharing
+ * {@link parseAriaSnapshot}'s whole-document fail-closed result. The tree
+ * protects identity decisions, where a partial parse is unsafe; this channel
+ * instead preserves independently useful detection evidence when another
+ * line invalidates that identity-focused parse. The implementation uses the
+ * same node-line classification as the tree builder so promotion and
+ * discarding remain a partition rather than gradually overlapping rules.
+ */
+export function extractDiscardedScalarValues(yaml: string): readonly string[] {
+  const scalarValues: string[] = [];
+
+  for (const line of yaml.split(/\r?\n/)) {
+    const contentStart = line.search(/\S/);
+    if (contentStart < 0 || !line.startsWith('- ', contentStart)) {
+      continue;
+    }
+
+    const itemStart = contentStart + 2;
+    if (line[itemStart] === '/') {
+      const metadataValue = parseMetadataLineValue(line, itemStart);
+      if (metadataValue !== undefined) {
+        scalarValues.push(metadataValue);
+      }
+      continue;
+    }
+
+    const parsed = parseNodeLineScalars(line, itemStart);
+    if (
+      parsed?.colonValue !== undefined
+      && (parsed.role !== 'text' || parsed.hasExplicitName)
+    ) {
+      scalarValues.push(parsed.colonValue);
+    }
+  }
+
+  return scalarValues;
 }
 
 /**

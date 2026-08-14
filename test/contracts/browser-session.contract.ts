@@ -398,7 +398,11 @@ export function registerBrowserSessionContract(harness: BrowserSessionContractHa
         expect(isJsonValue(resolutionSnapshot.accessibilityTree)).toBe(true);
 
         expect(await session.screenshot()).toBeInstanceOf(Uint8Array);
-        expect(isJsonValue(await session.accessibilitySnapshot())).toBe(true);
+        const accessibilityCapture = await session.accessibilitySnapshot();
+        expect(typeof accessibilityCapture.rawYaml).toBe('string');
+        expect(isJsonValue(accessibilityCapture.tree)).toBe(true);
+        expect(Array.isArray(accessibilityCapture.scalarValues)).toBe(true);
+        expect(accessibilityCapture.scalarValues.every((value) => typeof value === 'string')).toBe(true);
       });
     });
   });

@@ -17,7 +17,11 @@ import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
-import { SNAPSHOT_INVALID } from '#core/ir/aria-snapshot.js';
+import {
+  extractDiscardedScalarValues,
+  parseAriaSnapshot,
+  SNAPSHOT_INVALID,
+} from '#core/ir/aria-snapshot.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import {
   GroundingDocument,
@@ -349,6 +353,40 @@ function expectStopgapOutcome(
       { id: skippedStepId, status: 'skipped' },
     ],
   });
+}
+
+async function runFailureEvidenceScenario(
+  session: BrowserSession,
+  secretValues: ReadonlyMap<string, string>,
+): Promise<Awaited<ReturnType<typeof run>>> {
+  const secretRefs = [...secretValues.keys()];
+  const { deps, recordingStorage } = createScenario({
+    browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+    secrets: createFakeSecretsProvider(secretValues),
+  });
+  const testPath = await writePrompt(
+    recordingStorage.storage,
+    'login.test.md',
+    `${PROMPT}${secretRefs.length === 0 ? '' : `\n${secretRefs.join('\n')}\n`}`,
+  );
+  const fillSteps: Step[] = secretRefs.map((secretRef, index) => ({
+    id: `fill-secret-${index}`,
+    kind: 'action',
+    action: 'fill-secret',
+    target: PASSWORD,
+    secretRef,
+  }));
+  await seedFreshArtifacts(
+    recordingStorage.storage,
+    testPath,
+    [
+      ...fillSteps,
+      { id: 'assert-dashboard', kind: 'assert', check: 'text-visible', text: 'Dashboard' },
+    ],
+    elementGrounding(fillSteps.map(({ id }) => id)),
+  );
+
+  return run(deps, DEFAULT_OPTIONS);
 }
 
 describe('run', () => {
@@ -4129,6 +4167,201 @@ describe('run failure evidence', () => {
     expect(outcome.results[0]?.result.steps.at(-1)).not.toHaveProperty('screenshot');
     expect(screenshot).not.toHaveBeenCalled();
     expect(writeBinary).not.toHaveBeenCalled();
+  });
+
+  it('omits screenshots when only the parsed tree exactly contains a two-character resolved secret', async () => {
+    const secretRef = '{{secrets.tree_only}}';
+    const rawYaml = '- text: xy';
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: {
+        accessibilityTree: parseAriaSnapshot(rawYaml),
+        screenshot: new Uint8Array([11]),
+      },
+      accessibilityCapture: { rawYaml },
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+
+    const outcome = await runFailureEvidenceScenario(session, new Map([[secretRef, 'xy']]));
+
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({ screenshotOmitted: 'secret-detected' });
+    expect(screenshot).not.toHaveBeenCalled();
+  });
+
+  it('omits screenshots when only decoded scalar values contain a quoting-forced backslash secret', async () => {
+    const secretRef = '{{secrets.scalar_only}}';
+    const secretValue = '#scalar\\secret';
+    const rawYaml = '- textbox: "#scalar\\\\secret"';
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: { role: 'root', name: '', children: [] }, screenshot: new Uint8Array([12]) },
+      accessibilityCapture: { rawYaml, scalarValues: [secretValue] },
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+
+    const outcome = await runFailureEvidenceScenario(session, new Map([[secretRef, secretValue]]));
+
+    expect(rawYaml).not.toContain(secretValue);
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({ screenshotOmitted: 'secret-detected' });
+    expect(screenshot).not.toHaveBeenCalled();
+  });
+
+  it('omits screenshots when only raw YAML contains an attribute-token secret', async () => {
+    const secretRef = '{{secrets.raw_yaml_only}}';
+    const secretValue = 'raw-attribute-secret';
+    const rawYaml = '- button "Continue" [data-token=raw-attribute-secret]';
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: { role: 'button', name: 'Continue' }, screenshot: new Uint8Array([13]) },
+      accessibilityCapture: {
+        rawYaml,
+        scalarValues: [],
+      },
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+
+    const outcome = await runFailureEvidenceScenario(session, new Map([[secretRef, secretValue]]));
+
+    expect(extractDiscardedScalarValues(rawYaml)).toEqual([]);
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({ screenshotOmitted: 'secret-detected' });
+    expect(screenshot).not.toHaveBeenCalled();
+  });
+
+  it('keeps persisted observed evidence limited to the parsed tree when non-tree channels trigger omission', async () => {
+    const rawSecretRef = '{{secrets.raw_sentinel}}';
+    const scalarSecretRef = '{{secrets.scalar_sentinel}}';
+    const rawSentinel = 'RAW-CHANNEL-SENTINEL';
+    const scalarSentinel = 'SCALAR-CHANNEL-SENTINEL';
+    const tree = { role: 'document', name: 'Tree evidence only' } as const;
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: tree, screenshot: new Uint8Array([14]) },
+      accessibilityCapture: {
+        rawYaml: `- button "Continue" [data-token=${rawSentinel}]`,
+        scalarValues: [scalarSentinel],
+      },
+    });
+
+    const outcome = await runFailureEvidenceScenario(session, new Map([
+      [rawSecretRef, rawSentinel],
+      [scalarSecretRef, scalarSentinel],
+    ]));
+    const observed = outcome.results[0]?.result.steps.at(-1)?.observed?.accessibilitySnapshot;
+
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({ screenshotOmitted: 'secret-detected' });
+    expect(observed).toBeDefined();
+    const persistedTree = JSON.parse(observed ?? '{}') as JsonValueT;
+    expect(JSON.stringify(persistedTree)).toContain('Tree evidence only');
+    expect(JSON.stringify(persistedTree)).not.toContain(rawSentinel);
+    expect(JSON.stringify(persistedTree)).not.toContain(scalarSentinel);
+  });
+
+  it('permits screenshot capture when all three channels are empty despite a nonempty resolved secret', async () => {
+    const secretRef = '{{secrets.empty_capture}}';
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: { role: 'root', name: '', children: [] }, screenshot: new Uint8Array([15]) },
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+
+    const outcome = await runFailureEvidenceScenario(session, new Map([[secretRef, 'not-present']]));
+
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({ screenshot: expect.any(String) });
+    expect(outcome.results[0]?.result.steps.at(-1)).not.toHaveProperty('screenshotOmitted');
+    expect(screenshot).toHaveBeenCalledOnce();
+  });
+
+  it('excludes empty resolved secret values from every accessibility detection channel', async () => {
+    const secretRef = '{{secrets.empty_value}}';
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: { role: '', name: '', children: [] }, screenshot: new Uint8Array([16]) },
+      accessibilityCapture: { rawYaml: '', scalarValues: [''] },
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+
+    const outcome = await runFailureEvidenceScenario(session, new Map([[secretRef, '']]));
+
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({ screenshot: expect.any(String) });
+    expect(outcome.results[0]?.result.steps.at(-1)).not.toHaveProperty('screenshotOmitted');
+    expect(screenshot).toHaveBeenCalledOnce();
+  });
+
+  it('uses the three-character substring branch for the first duplicate scalar match', async () => {
+    const secretRef = '{{secrets.scalar_substring}}';
+    const secretValue = 'abc';
+    let secondScalarReads = 0;
+    const scalarValues = ['prefix-abcsuffix'] as string[];
+    Object.defineProperty(scalarValues, 1, {
+      enumerable: true,
+      get(): string {
+        secondScalarReads += 1;
+        return 'second scalar must not be read';
+      },
+    });
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: { role: 'root', name: '', children: [] }, screenshot: new Uint8Array([17]) },
+      accessibilityCapture: {
+        rawYaml: '',
+        scalarValues,
+      },
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+
+    const outcome = await runFailureEvidenceScenario(session, new Map([[secretRef, secretValue]]));
+
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({ screenshotOmitted: 'secret-detected' });
+    expect(secondScalarReads).toBe(0);
+    expect(screenshot).not.toHaveBeenCalled();
+  });
+
+  it('fails closed for an invalid parsed tree when a resolved secret exists', async () => {
+    const secretRef = '{{secrets.invalid_tree}}';
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: SNAPSHOT_INVALID, screenshot: new Uint8Array([18]) },
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+
+    const outcome = await runFailureEvidenceScenario(session, new Map([[secretRef, 'not-in-tree']]));
+
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({ screenshotOmitted: 'secret-detected' });
+    expect(screenshot).not.toHaveBeenCalled();
+  });
+
+  it('permits screenshot capture for an invalid parsed tree when the case has no resolved secret', async () => {
+    const session = createFakeBrowserSession(new Map(), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: SNAPSHOT_INVALID, screenshot: new Uint8Array([19]) },
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+
+    const outcome = await runFailureEvidenceScenario(session, new Map());
+
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({ screenshot: expect.any(String) });
+    expect(outcome.results[0]?.result.steps.at(-1)).not.toHaveProperty('screenshotOmitted');
+    expect(screenshot).toHaveBeenCalledOnce();
+  });
+
+  it('fails closed when the three-channel detector itself throws, even without a resolved secret', async () => {
+    const session = createFakeBrowserSession(new Map(), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: { role: 'document', name: 'Clean tree' }, screenshot: new Uint8Array([20]) },
+    });
+    vi.spyOn(session, 'accessibilitySnapshot').mockResolvedValue({
+      get rawYaml(): string {
+        throw new Error('Raw YAML detector access failed.');
+      },
+      tree: { role: 'document', name: 'Clean tree' },
+      scalarValues: [],
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+
+    const outcome = await runFailureEvidenceScenario(session, new Map());
+
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({ screenshotOmitted: 'secret-detected' });
+    expect(screenshot).not.toHaveBeenCalled();
   });
 
   it('omits screenshots when accessibility capture fails after an earlier fill-secret', async () => {
