@@ -17,6 +17,11 @@ import { AmbercastError } from './types.js';
 export type AiProviderAvailabilityFailureReason = 'timeout' | 'not-found';
 
 /**
+ * Names a concrete AI provider supported by executor selection.
+ */
+export type AiProviderName = 'claude' | 'codex';
+
+/**
  * Records one provider considered while resolving the automatic policy.
  *
  * The readonly shape gives resolver callers a stable diagnostic vocabulary
@@ -25,7 +30,7 @@ export type AiProviderAvailabilityFailureReason = 'timeout' | 'not-found';
  */
 export interface AiProviderAvailabilityAttempt {
   /** Provider whose availability probe completed without selecting it. */
-  readonly provider: 'claude' | 'codex';
+  readonly provider: AiProviderName;
 
   /** Classification derived from that probe's individual deadline. */
   readonly reason: AiProviderAvailabilityFailureReason;
