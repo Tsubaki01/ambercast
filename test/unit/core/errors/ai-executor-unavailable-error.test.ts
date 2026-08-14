@@ -1,6 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
+import { AI_EXECUTOR_FACTORIES } from '#adapters/ai/registry.js';
 import { ERROR_EXIT_CODES } from '#core/errors/exit-codes.js';
-import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
+import {
+  AiExecutorUnavailableError,
+  type AiProviderAvailabilityAttempt,
+  type AiProviderName,
+} from '#core/errors/ai-executor-unavailable-error.js';
 
 describe('AiExecutorUnavailableError', () => {
   it('constructs an Error with the fixed ai-executor-unavailable classification and mapped exit code', () => {
@@ -26,5 +31,11 @@ describe('AiExecutorUnavailableError', () => {
 
     expect(error.details).toBeUndefined();
     expect(error.cause).toBeUndefined();
+  });
+
+  it('publishes the canonical provider vocabulary used by availability attempts and factories', () => {
+    expectTypeOf<AiProviderName>().toEqualTypeOf<'claude' | 'codex'>();
+    expectTypeOf<AiProviderAvailabilityAttempt['provider']>().toEqualTypeOf<AiProviderName>();
+    expectTypeOf<keyof typeof AI_EXECUTOR_FACTORIES>().toEqualTypeOf<AiProviderName>();
   });
 });
