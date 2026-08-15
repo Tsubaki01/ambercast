@@ -8,13 +8,16 @@
  * schemas, never maintained as a hand-written parallel definition. Strict
  * objects keep zod and the generated JSON Schema aligned on rejecting unknown
  * properties. Structural zod constructs preserve the same constraints across
- * both representations. Except for duplicate
- * plan-step identifiers (which JSON Schema 2020-12 cannot express), no
- * `.refine()` or `.superRefine()` may encode a constraint that would vanish
- * when this module is converted to JSON Schema.
+ * both representations. Except for duplicate plan-step identifiers (which
+ * JSON Schema 2020-12 cannot express as projected-field uniqueness across
+ * array items) and SourceSpan's endLine/startLine ordering (which it cannot
+ * express as a comparison between sibling property values), no `.refine()`
+ * or `.superRefine()` may encode a constraint that would vanish when this
+ * module is converted to JSON Schema.
  *
- * The exported schemas and inferred aliases include the one duplicate-ID
- * `PlanDocument` refinement that JSON Schema cannot express.
+ * The exported schemas and inferred aliases include the two deliberate
+ * JSON-Schema-inexpressible refinements: duplicate `PlanDocument` IDs and
+ * `SourceSpan` endLine/startLine ordering.
  */
 import { z } from 'zod';
 
@@ -190,10 +193,18 @@ export type StepId = z.infer<typeof StepId>;
  * Replay locates the source afresh, so retaining line numbers rather than
  * offsets avoids persisting a second coordinate system that could disagree
  * with the parsed prompt.
+ *
+ * This is one of this module's two deliberate JSON-Schema-inexpressible
+ * refinements: JSON Schema 2020-12 cannot compare sibling property values;
+ * the other rejects duplicate `PlanDocument` IDs because it cannot enforce
+ * projected-field uniqueness across array items.
  */
 export const SourceSpan = z.strictObject({
   startLine: z.int().positive(),
   endLine: z.int().positive(),
+}).refine((span) => span.endLine >= span.startLine, {
+  message: 'endLine must be greater than or equal to startLine',
+  path: ['endLine'],
 });
 
 /**

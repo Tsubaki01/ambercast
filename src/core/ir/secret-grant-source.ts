@@ -85,7 +85,9 @@ export function extractSecretGrants(normalizedTestMd: NormalizedTestMd): readonl
     }
 
     if (node.children !== undefined) {
-      nodes.push(...node.children);
+      for (const child of node.children) {
+        nodes.push(child);
+      }
     }
   }
 

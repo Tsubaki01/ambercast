@@ -160,6 +160,7 @@ describe('IR primitive schemas', () => {
       { startLine: 1, endLine: 1.5 },
       { startLine: 1, endLine: 0 },
       { startLine: 1, endLine: -1 },
+      { startLine: 9, endLine: 4 },
       { startLine: 1, endLine: 1, unexpected: true },
     ]) {
       expectRejected(SourceSpan, value);

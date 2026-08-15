@@ -114,4 +114,10 @@ describe('extractSecretGrants', () => {
   it.each(['', '# Prompt\n\nThere are no secret grants here.\n'])('returns no grants for an empty or grant-free document', (markdown) => {
     expect(grants(markdown)).toEqual([]);
   });
+
+  it('does not exhaust call arguments for a very wide Markdown tree', () => {
+    const markdown = Array.from({ length: 150_000 }, () => 'Paragraph.').join('\n\n');
+
+    expect(() => extractSecretGrants(normalizeTestMd(markdown))).not.toThrow();
+  });
 });
