@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { access, constants, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, constants, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -108,9 +108,14 @@ describe('bin/ambercast.js (e2e)', () => {
     expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
     expect(envelope).toMatchObject({
       command: 'run',
+      reportPersistence: 'persisted',
       summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 },
       results: [expect.objectContaining({ file: expect.stringContaining('test.test.md'), status: 'listed' })],
     });
+    const reportDirectories = await readdir(join(project, 'tests', '.runs'));
+    expect(reportDirectories).toHaveLength(1);
+    await expect(readFile(join(project, 'tests', '.runs', reportDirectories[0]!, 'report.json'), 'utf8'))
+      .resolves.toBe(JSON.stringify(envelope));
   });
 
   it('renders matched run listings in human text', async () => {
@@ -148,6 +153,7 @@ describe('bin/ambercast.js (e2e)', () => {
     expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
     expect(envelope).toMatchObject({
       command: 'run',
+      reportPersistence: 'persisted',
       errors: [expect.objectContaining({ scope: 'case', code: 'MISSING_PLAN' })],
     });
   });
@@ -163,6 +169,7 @@ describe('bin/ambercast.js (e2e)', () => {
     expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
     expect(envelope).toMatchObject({
       command: 'run',
+      reportPersistence: 'persisted',
       errors: [expect.objectContaining({ scope: 'case', code: 'STALE_PLAN' })],
     });
   });

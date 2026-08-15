@@ -56,8 +56,14 @@ export interface RunReportOutput {
   /** Highest-priority exit status present in the command outcome. */
   readonly exitCode: ExitCode;
 
-  /** Complete machine-readable envelope for the `run` command. */
-  readonly envelope: ReportEnvelope;
+  /**
+   * Complete machine-readable envelope for the `run` command.
+   *
+   * @remarks
+   * This builder only produces the `run` branch, so its output preserves that
+   * narrower command contract for runtime consumers.
+   */
+  readonly envelope: Extract<ReportEnvelope, { command: 'run' }>;
 }
 
 /**
@@ -74,6 +80,11 @@ export interface RunReportOutput {
  * than maintain a report-specific precedence branch. The shared order is 2,
  * then 3, 4, 1, 5, and 0, so a higher-priority outcome wins regardless of
  * where its case appears in the batch.
+ *
+ * Every envelope built here marks report persistence as `'not-attempted'`.
+ * This builder has no visibility into storage, so runtime alone replaces that
+ * provisional state after an attempted write. The separation keeps every
+ * payload persisted by the command from retaining `'not-attempted'`.
  *
  * Classified case errors contribute their established exit codes. An aborted
  * result without its own classified error contributes the generic exit-3
@@ -107,6 +118,7 @@ export function buildRunReport(input: RunReportInput): RunReportOutput {
         summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 },
         errors: [reportError(input.error, { scope: 'run' })],
         results: [],
+        reportPersistence: 'not-attempted',
       },
     };
   }
@@ -169,6 +181,7 @@ export function buildRunReport(input: RunReportInput): RunReportOutput {
       summary,
       errors,
       results,
+      reportPersistence: 'not-attempted',
     },
   };
 }

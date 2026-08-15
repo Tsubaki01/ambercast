@@ -9,6 +9,7 @@ import {
   type RunCommandInput,
   type RunCommandOutput,
 } from '#runtime/run-command.js';
+import type { RunOutcome } from '#usecases/run.js';
 import { createFixedClock } from '../../doubles/create-fixed-clock.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
 import { createRecordingEventSink } from '../../doubles/create-recording-event-sink.js';
@@ -58,6 +59,7 @@ vi.mock('#usecases/run-report.js', () => ({ buildRunReport: mocks.buildRunReport
 const CONFIG: ResolvedConfig = {
   testDir: '/workspace/tests',
   runsDir: '/workspace/tests/.runs',
+  projectRoot: '/workspace',
   testMatch: ['**/*.test.md'],
   testIgnore: ['**/.runs/**'],
   targets: { web: { baseUrl: 'https://example.test', browser: 'chromium' } },
@@ -78,6 +80,7 @@ function reportOutput(exitCode: RunCommandOutput['exitCode'], errors: ReportErro
       summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 },
       errors,
       results: [],
+      reportPersistence: 'not-attempted',
     },
   };
 
@@ -170,7 +173,7 @@ describe('runRunCommand', () => {
       steps: result.steps.map((step) => (
         !('screenshot' in step) || step.screenshot === undefined
           ? step
-          : { ...step, screenshot: `${runId}/login/assert-dashboard.png` }
+          : { ...step, screenshot: `tests/.runs/${runId}/login/assert-dashboard.png` }
       )),
     }));
     const output: RunCommandOutput = {
@@ -178,7 +181,12 @@ describe('runRunCommand', () => {
       envelope: {
         schemaVersion: '1.0', command: 'run', startedAt: '2026-08-09T00:00:00Z', durationMs: 1,
         summary: { total: 2, passed: 1, failed: 1, errored: 0, skipped: 0 }, errors: [], results: persistedResults,
+        reportPersistence: 'not-attempted',
       },
+    };
+    const persistedOutput: RunCommandOutput = {
+      ...output,
+      envelope: { ...output.envelope, reportPersistence: 'persisted' },
     };
 
     mocks.createFsStorage.mockReturnValue(storage);
@@ -191,19 +199,20 @@ describe('runRunCommand', () => {
     mocks.buildRunReport.mockReturnValue(output);
     const writeText = vi.spyOn(storage, 'writeText');
 
-    await expect(runRunCommand(input())).resolves.toBe(output);
+    await expect(runRunCommand(input())).resolves.toEqual(persistedOutput);
 
     expect(mocks.run).toHaveBeenCalledWith(expect.objectContaining({ runId }), expect.anything());
     expect(mocks.buildRunReport).toHaveBeenCalledWith(expect.objectContaining({
       outcome: expect.objectContaining({ results: expect.arrayContaining([expect.objectContaining({
-        result: expect.objectContaining({ steps: expect.arrayContaining([expect.objectContaining({ screenshot: `${runId}/login/assert-dashboard.png` })]) }),
+        result: expect.objectContaining({ steps: expect.arrayContaining([expect.objectContaining({ screenshot: `tests/.runs/${runId}/login/assert-dashboard.png` })]) }),
       })]) }),
     }));
     expect(layout.runReportPathFor).toHaveBeenCalledWith(runId);
-    expect(writeText).toHaveBeenCalledWith(`${CONFIG.runsDir}/${runId}/report.json`, JSON.stringify(output.envelope));
+    expect(writeText).toHaveBeenCalledWith(`${CONFIG.runsDir}/${runId}/report.json`, JSON.stringify(persistedOutput.envelope));
     const persistedEnvelope = JSON.parse(await storage.readText(`${CONFIG.runsDir}/${runId}/report.json`));
-    expect(persistedEnvelope.results[0].steps[0].screenshot).toBe(`${runId}/login/assert-dashboard.png`);
-    expect(JSON.stringify(persistedEnvelope)).not.toContain(CONFIG.runsDir);
+    expect(persistedEnvelope.results[0].steps[0].screenshot).toBe(`tests/.runs/${runId}/login/assert-dashboard.png`);
+    expect(persistedEnvelope.results[0].steps[0].screenshot).not.toContain(CONFIG.projectRoot);
+    expect(persistedEnvelope).toEqual(persistedOutput.envelope);
   });
 
   it('omits an uncontained screenshot without replacing the completed outcome with a crash report', async () => {
@@ -250,7 +259,12 @@ describe('runRunCommand', () => {
             expected: 'Text "Dashboard" is visible.', actual: 'The dashboard is absent.',
           }],
         }],
+        reportPersistence: 'not-attempted',
       },
+    };
+    const persistedOutput: RunCommandOutput = {
+      ...output,
+      envelope: { ...output.envelope, reportPersistence: 'persisted' },
     };
 
     mocks.createFsStorage.mockReturnValue(storage);
@@ -262,7 +276,7 @@ describe('runRunCommand', () => {
     mocks.run.mockResolvedValue(outcome);
     mocks.buildRunReport.mockReturnValue(output);
 
-    await expect(runRunCommand(input())).resolves.toBe(output);
+    await expect(runRunCommand(input())).resolves.toEqual(persistedOutput);
 
     expect(output).toMatchObject({ exitCode: 1, envelope: { summary: { total: 1, failed: 1, errored: 0 } } });
     expect(mocks.buildRunReport).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ outcome: expect.any(Object) }));
@@ -279,10 +293,79 @@ describe('runRunCommand', () => {
     expect(JSON.stringify(persistedEnvelope)).not.toContain('/host/diagnostics');
   });
 
-  it('keeps a completed report result when its best-effort persistence write rejects', async () => {
+  it('omits a screenshot inside a runs directory that sits outside projectRoot', async () => {
+    const storage = createInMemoryStorage();
+    const writeText = vi.spyOn(storage, 'writeText');
+    const config = { ...CONFIG, runsDir: '/elsewhere/.runs' };
+    const runId = '2026-08-09T000000Z-550e8400-e29b-41d4-a716-446655440000';
+    const reportPath = `${config.runsDir}/${runId}/report.json`;
+    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => reportPath) };
+    const outcome = {
+      noTestsFound: false,
+      listed: [],
+      results: [{
+        result: {
+          id: 'login',
+          file: '/workspace/tests/login.test.md',
+          planFile: '/workspace/tests/login.ambercast.plan.json',
+          status: 'failed' as const,
+          durationMs: 12,
+          explanation: 'The page did not contain the dashboard.',
+          steps: [{
+            id: 'assert-dashboard', type: 'assert' as const, status: 'failed' as const, kind: 'assertion' as const,
+            expected: 'Text "Dashboard" is visible.', actual: 'The dashboard is absent.',
+            screenshot: `${config.runsDir}/${runId}/login/assert-dashboard.png`,
+          }],
+        },
+      }],
+    };
+    const output: RunCommandOutput = {
+      exitCode: 1,
+      envelope: {
+        schemaVersion: '1.0', command: 'run', startedAt: '2026-08-09T00:00:00Z', durationMs: 1,
+        summary: { total: 1, passed: 0, failed: 1, errored: 0, skipped: 0 }, errors: [],
+        results: [{
+          id: 'login', file: '/workspace/tests/login.test.md', planFile: '/workspace/tests/login.ambercast.plan.json',
+          status: 'failed', durationMs: 12, explanation: 'The page did not contain the dashboard.',
+          steps: [{
+            id: 'assert-dashboard', type: 'assert', status: 'failed', kind: 'assertion',
+            expected: 'Text "Dashboard" is visible.', actual: 'The dashboard is absent.',
+          }],
+        }],
+        reportPersistence: 'not-attempted',
+      },
+    };
+    const persistedOutput: RunCommandOutput = {
+      ...output,
+      envelope: { ...output.envelope, reportPersistence: 'persisted' },
+    };
+
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(config);
+    mocks.createBrowserDriverResolver.mockReturnValue(createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
+    mocks.createEnvSecretsProvider.mockReturnValue(createFakeSecretsProvider(new Map()));
+    mocks.createNoopEventSink.mockReturnValue(createRecordingEventSink().sink);
+    mocks.createAmbercast.mockReturnValue({ storage, layout, clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 20), discoverTestFiles: vi.fn(async () => []) });
+    mocks.run.mockResolvedValue(outcome);
+    mocks.buildRunReport.mockReturnValue(output);
+
+    const result = await runRunCommand(input());
+
+    const reportInput = mocks.buildRunReport.mock.calls[0]?.[0];
+    expect(reportInput?.outcome?.results[0]?.result.steps[0]).not.toHaveProperty('screenshot');
+    expect(writeText).toHaveBeenCalledWith(reportPath, JSON.stringify(persistedOutput.envelope));
+    expect(result).toEqual(persistedOutput);
+    expect(result.envelope.results[0]).not.toHaveProperty('steps.0.screenshot');
+  });
+
+  it('reports a failed completed-report persistence write without masking its semantic exit code', async () => {
     const storage = createInMemoryStorage();
     const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => '/workspace/tests/.runs/report.json') };
     const output = reportOutput(1);
+    const failedOutput: RunCommandOutput = {
+      ...output,
+      envelope: { ...output.envelope, reportPersistence: 'failed' },
+    };
 
     mocks.createFsStorage.mockReturnValue(storage);
     mocks.loadConfig.mockResolvedValue(CONFIG);
@@ -294,13 +377,108 @@ describe('runRunCommand', () => {
     mocks.buildRunReport.mockReturnValue(output);
     vi.spyOn(storage, 'writeText').mockRejectedValueOnce(new Error('disk full'));
 
-    await expect(runRunCommand(input())).resolves.toBe(output);
+    await expect(runRunCommand(input())).resolves.toEqual(failedOutput);
 
     expect(mocks.buildRunReport).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ outcome: expect.any(Object) }));
     expect(storage.writeText).toHaveBeenCalledOnce();
+    await expect(storage.exists('/workspace/tests/.runs/report.json')).resolves.toBe(false);
   });
 
-  it('propagates a configuration failure as a run-scoped report error', async () => {
+  it.each([
+    [0, 3],
+    [1, 1],
+    [2, 2],
+    [3, 3],
+    [4, 4],
+    [5, 5],
+  ] as const)('changes a failed persistence write from semantic exit %i to %i', async (semanticExitCode, expectedExitCode) => {
+    const storage = createInMemoryStorage();
+    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => '/workspace/tests/.runs/report.json') };
+    const output = reportOutput(semanticExitCode);
+    const failedOutput: RunCommandOutput = {
+      ...output,
+      exitCode: expectedExitCode,
+      envelope: { ...output.envelope, reportPersistence: 'failed' },
+    };
+
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.createBrowserDriverResolver.mockReturnValue(createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
+    mocks.createEnvSecretsProvider.mockReturnValue(createFakeSecretsProvider(new Map()));
+    mocks.createNoopEventSink.mockReturnValue(createRecordingEventSink().sink);
+    mocks.createAmbercast.mockReturnValue({ storage, layout, clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 20), discoverTestFiles: vi.fn(async () => []) });
+    mocks.run.mockResolvedValue({ results: [], noTestsFound: false, listed: [] });
+    mocks.buildRunReport.mockReturnValue(output);
+    vi.spyOn(storage, 'writeText').mockRejectedValueOnce(new Error('disk full'));
+
+    await expect(runRunCommand(input())).resolves.toEqual(failedOutput);
+  });
+
+  it.each([
+    ['a case-scoped usage error', 2, {
+      noTestsFound: false,
+      listed: [],
+      results: [{
+        result: {
+          id: 'configuration.test.md',
+          file: '/workspace/tests/configuration.test.md',
+          planFile: '/workspace/tests/configuration.ambercast.plan.json',
+          status: 'error',
+          durationMs: 1,
+          explanation: 'The case configuration is invalid.',
+          steps: [],
+        },
+        error: new ConfigInvalidError('The case configuration is invalid.'),
+      }],
+    } satisfies RunOutcome],
+    ['an unclassified aborted case', 3, {
+      noTestsFound: false,
+      listed: [],
+      results: [{
+        result: {
+          id: 'aborted.test.md',
+          file: '/workspace/tests/aborted.test.md',
+          planFile: '/workspace/tests/aborted.ambercast.plan.json',
+          status: 'error',
+          durationMs: 1,
+          explanation: 'The case stopped before completion.',
+          steps: [],
+        },
+      }],
+    } satisfies RunOutcome],
+    ['an empty selection', 5, {
+      noTestsFound: true,
+      listed: [],
+      results: [],
+    } satisfies RunOutcome],
+  ] as const)('persists a completed outcome from %s with semantic exit %i', async (_description, semanticExitCode, outcome) => {
+    const storage = createInMemoryStorage();
+    const writeText = vi.spyOn(storage, 'writeText');
+    const reportPath = '/workspace/tests/.runs/report.json';
+    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => reportPath) };
+    const output = reportOutput(semanticExitCode);
+    const persistedOutput: RunCommandOutput = {
+      ...output,
+      envelope: { ...output.envelope, reportPersistence: 'persisted' },
+    };
+
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.createBrowserDriverResolver.mockReturnValue(createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
+    mocks.createEnvSecretsProvider.mockReturnValue(createFakeSecretsProvider(new Map()));
+    mocks.createNoopEventSink.mockReturnValue(createRecordingEventSink().sink);
+    mocks.createAmbercast.mockReturnValue({ storage, layout, clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 20), discoverTestFiles: vi.fn(async () => []) });
+    mocks.run.mockResolvedValue(outcome);
+    mocks.buildRunReport.mockReturnValue(output);
+
+    await expect(runRunCommand(input())).resolves.toEqual(persistedOutput);
+
+    expect(mocks.buildRunReport).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ outcome }));
+    expect(writeText).toHaveBeenCalledWith(reportPath, JSON.stringify(persistedOutput.envelope));
+    await expect(storage.readText(reportPath)).resolves.toBe(JSON.stringify(persistedOutput.envelope));
+  });
+
+  it('keeps a top-level configuration failure not attempted without an exit-code override', async () => {
     const storage = createInMemoryStorage();
     const error = new ConfigInvalidError('Configuration is invalid.');
     const output = reportOutput(2, [{
@@ -318,13 +496,21 @@ describe('runRunCommand', () => {
     expect(output.envelope.errors).toEqual([expect.objectContaining({
       scope: 'run', code: 'CONFIG_INVALID',
     })]);
+    expect(output.envelope.reportPersistence).toBe('not-attempted');
+    expect(output.exitCode).toBe(2);
   });
 
-  it('threads allow-empty and list to replay and report construction after a successful run', async () => {
+  it('threads allow-empty and list to replay and report construction, then persists the list report', async () => {
     const storage = createInMemoryStorage();
-    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => '/workspace/tests/.runs/report.json') };
+    const writeText = vi.spyOn(storage, 'writeText');
+    const reportPath = '/workspace/tests/.runs/report.json';
+    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => reportPath) };
     const outcome = { results: [], noTestsFound: true, listed: [] };
     const output = reportOutput(0);
+    const persistedOutput: RunCommandOutput = {
+      ...output,
+      envelope: { ...output.envelope, reportPersistence: 'persisted' },
+    };
 
     mocks.createFsStorage.mockReturnValue(storage);
     mocks.loadConfig.mockResolvedValue(CONFIG);
@@ -340,7 +526,7 @@ describe('runRunCommand', () => {
     mocks.run.mockResolvedValue(outcome);
     mocks.buildRunReport.mockReturnValue(output);
 
-    await expect(runRunCommand(input({ allowEmpty: true, list: true }))).resolves.toBe(output);
+    await expect(runRunCommand(input({ allowEmpty: true, list: true }))).resolves.toEqual(persistedOutput);
 
     expect(mocks.run).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       allowEmpty: true,
@@ -350,6 +536,8 @@ describe('runRunCommand', () => {
       options: { allowEmpty: true, list: true },
       outcome,
     }));
+    expect(writeText).toHaveBeenCalledWith(reportPath, JSON.stringify(persistedOutput.envelope));
+    await expect(storage.readText(reportPath)).resolves.toBe(JSON.stringify(persistedOutput.envelope));
   });
 
   it('threads allow-empty and list into the report context on the command-error path', async () => {
@@ -411,6 +599,10 @@ describe('runRunCommand', () => {
     const discoverTestFiles = vi.fn(async () => []);
     const outcome = { results: [], noTestsFound: false, listed: [] };
     const output = reportOutput(0);
+    const persistedOutput: RunCommandOutput = {
+      ...output,
+      envelope: { ...output.envelope, reportPersistence: 'persisted' },
+    };
     const grep = /login/;
     const commandEnvironment = {
       AMBERCAST_RUNTIME_ALLOWED: 'allowed',
@@ -445,7 +637,7 @@ describe('runRunCommand', () => {
       headed: true,
       cacheOnly: true,
       aiProviderOverride: 'codex',
-    }))).resolves.toEqual(output);
+    }))).resolves.toEqual(persistedOutput);
 
     expect(mocks.createBrowserDriverResolver).toHaveBeenCalledWith({ headed: true });
     expect(mocks.createAmbercast).toHaveBeenCalledWith({
@@ -508,6 +700,10 @@ describe('runRunCommand', () => {
     const controller = new AbortController();
     const outcome = { results: [], noTestsFound: false, listed: [] };
     const output = reportOutput(0);
+    const persistedOutput: RunCommandOutput = {
+      ...output,
+      envelope: { ...output.envelope, reportPersistence: 'persisted' },
+    };
 
     mocks.createFsStorage.mockReturnValue(storage);
     mocks.loadConfig.mockResolvedValue(CONFIG);
@@ -523,7 +719,7 @@ describe('runRunCommand', () => {
     mocks.run.mockResolvedValue(outcome);
     mocks.buildRunReport.mockReturnValue(output);
 
-    await expect(runRunCommand(input({ signal: controller.signal }))).resolves.toEqual(output);
+    await expect(runRunCommand(input({ signal: controller.signal }))).resolves.toEqual(persistedOutput);
 
     expect(mocks.run).toHaveBeenCalledWith(expect.objectContaining({ signal: controller.signal }), expect.anything());
   });
@@ -568,6 +764,10 @@ describe('runRunCommand', () => {
     const discoverTestFiles = vi.fn(async () => []);
     const outcome = { results: [], noTestsFound: false, listed: [] };
     const output = reportOutput(0);
+    const persistedOutput: RunCommandOutput = {
+      ...output,
+      envelope: { ...output.envelope, reportPersistence: 'persisted' },
+    };
 
     mocks.createFsStorage.mockReturnValue(storage);
     mocks.loadConfig.mockResolvedValue(CONFIG);
@@ -582,7 +782,7 @@ describe('runRunCommand', () => {
     mocks.run.mockResolvedValue(outcome);
     mocks.buildRunReport.mockReturnValue(output);
 
-    await expect(runRunCommand(input())).resolves.toEqual(output);
+    await expect(runRunCommand(input())).resolves.toEqual(persistedOutput);
 
     expect(mocks.resolveAiProvider).not.toHaveBeenCalled();
     expect(mocks.claudeFactory).not.toHaveBeenCalled();

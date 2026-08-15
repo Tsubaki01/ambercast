@@ -35,6 +35,7 @@ vi.mock('#adapters/system/system-clock.js', () => ({ createSystemClock: mocks.cr
 const CONFIG: ResolvedConfig = {
   testDir: '/workspace/tests',
   runsDir: '/workspace/tests/.runs',
+  projectRoot: '/workspace',
   testMatch: ['**/*.test.md'],
   testIgnore: [],
   targets: { web: { baseUrl: 'https://example.test', browser: 'chromium' } },

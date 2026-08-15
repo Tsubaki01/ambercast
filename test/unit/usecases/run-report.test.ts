@@ -121,8 +121,24 @@ describe('buildRunReport', () => {
         caseId: 'login.test.md',
         message: error.message,
       }]);
+      expect(output.envelope.reportPersistence).toBe('not-attempted');
     },
   );
+
+  it.each(REPORTABLE_CASE_ERROR_MAPPINGS)(
+    'marks a top-level %s error as not attempted for persistence',
+    (_errorKind, error) => {
+      const output = buildRunReport({ ...BASE, error } as RunReportInput);
+
+      expect(output.envelope.reportPersistence).toBe('not-attempted');
+    },
+  );
+
+  it('marks a completed outcome as not attempted for persistence', () => {
+    const output = report({ outcome: { noTestsFound: false, results: [caseOutcome('passed', 'login.test.md')], listed: [] } });
+
+    expect(output.envelope.reportPersistence).toBe('not-attempted');
+  });
 
   it.each(PRIORITY_PAIRS)(
     'selects the declared priority for %s regardless of result order',

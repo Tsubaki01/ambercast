@@ -69,9 +69,11 @@ export interface LayoutConfig {
  * This type structurally extends {@link LayoutConfig}, allowing a complete
  * configuration to satisfy the layout resolver without an adapter or a
  * duplicate path representation. Nested values are readonly so loading can
- * establish one stable configuration snapshot.
+ * establish one stable configuration snapshot. Its `projectRoot` identifies
+ * the basis used to relativize report paths before they become public.
  */
 export interface ResolvedConfig extends LayoutConfig {
+  readonly projectRoot: string;
   readonly testMatch: readonly string[];
   readonly testIgnore: readonly string[];
   readonly targets: Readonly<Record<string, Readonly<TargetDefinition>>>;

@@ -21,8 +21,9 @@
  * For either valid command, this layer creates one `AbortController`, aborting
  * it when `SIGINT` or `SIGTERM` arrives, and passes its signal with the parsed
  * input to the matching runtime command. Runtime returns an envelope and
- * selected exit code; `--json` writes exactly `JSON.stringify(envelope)`,
- * while human output renders that same envelope with ANSI styling disabled by
+ * selected exit code; `--json` writes the `JSON.stringify(envelope)` payload
+ * to the stream with a trailing newline appended at the write call, while human
+ * output renders that same envelope with ANSI styling disabled by
  * `--no-color`. After output has been written, this
  * module sets the selected process exit code and lets Node exit naturally once
  * pending stream writes have drained.
@@ -86,6 +87,18 @@ interface ParsedRunCommand {
 }
 
 const USAGE = `Usage: ambercast <command> [options]\n\nCommands:\n  generate [files...]  Generate deterministic plans\n  run [files...]       Replay deterministic plans\n\nGenerate options:\n  --strict  --force  --dry-run  --target <name>  --ai <claude|codex>\n  --allow-empty  --list  --json  --config <path>  --no-color\n\nRun options:\n  --grep <pattern>  --target <name>  --headed  --cache-only  --allow-empty  --list\n  --stale <fail>  --json  --no-color\n`;
+
+/**
+ * Fixed warning that `main()` writes to stderr exactly once when a run
+ * envelope's `reportPersistence` is `'failed'`, in both JSON and human-rendered
+ * modes.
+ *
+ * @remarks
+ * The classification-only wording embeds `FS_IO_ERROR` while excluding
+ * interpolated host paths and raw errors, preserving the host-path
+ * non-disclosure invariant.
+ */
+export const REPORT_PERSISTENCE_FAILED_WARNING = 'Warning: the run report could not be written to disk (FS_IO_ERROR); results above reflect this invocation only.';
 
 function writeUsage(stream: NodeJS.WritableStream): void {
   stream.write(USAGE);
@@ -374,6 +387,13 @@ export async function main(
       const output = parsed.command === 'generate'
         ? await runGenerateCommand(parsed.input)
         : await runRunCommand(parsed.input);
+      if (
+        parsed.command === 'run'
+        && output.envelope.command === 'run'
+        && output.envelope.reportPersistence === 'failed'
+      ) {
+        stderr.write(`${REPORT_PERSISTENCE_FAILED_WARNING}\n`);
+      }
       stdout.write(parsed.json ? `${JSON.stringify(output.envelope)}\n` : renderHumanReport(output.envelope, parsed.color));
       process.exitCode = output.exitCode;
     } catch {

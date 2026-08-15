@@ -10,7 +10,10 @@
  * an invariant of the loader, not of TypeScript's string type: loadConfig
  * alone anchors these opaque path strings to the selected config file or its
  * caller's directory, just as StorageAdapter leaves path interpretation to
- * its caller.
+ * its caller. `projectRoot` has no static relative default because loading
+ * derives it from the caller directory or selected configuration file, so this
+ * template purposefully omits it rather than supply a value that cannot be
+ * meaningful before loading.
  */
 
 import type { ResolvedConfig } from '#core/config/schema.js';
@@ -48,4 +51,4 @@ export const DEFAULT_RAW_CONFIG = {
     heal: false,
     updateGroundingCache: false,
   },
-} as const satisfies ResolvedConfig;
+} as const satisfies Omit<ResolvedConfig, 'projectRoot'>;

@@ -169,9 +169,8 @@ export type Observed = z.infer<typeof Observed>;
  * best-effort live-session evidence capture may supply redacted `observed`
  * data. Raw text evidence that identifies a resolved secret withholds the
  * screenshot and emits `screenshotOmitted: 'secret-detected'`; otherwise, a
- * successfully captured screenshot has an absolute path. The report command
- * converts a produced screenshot path to the configured runs-root-relative
- * form before it persists the report.
+ * successfully captured screenshot has an absolute path. Public report
+ * screenshot paths are relative to `ResolvedConfig.projectRoot`.
  *
  * Those are producer and persisted-report guarantees, not validation rules
  * of this schema. `StepResult.parse()` accepts every diagnostic field
@@ -399,7 +398,12 @@ const ReportEnvelopeFields = {
  * `startedAt` validates the exact `YYYY-MM-DDTHH:mm:ssZ` character shape, not
  * calendar or clock semantics. This follows the portable-but-shallow regex
  * constraints used in `src/core/ir/schema.ts` rather than full semantic date
- * validation.
+ * validation. On run reports, `reportPersistence` distinguishes the envelope
+ * returned for stdout or JSON rendering from one persisted to disk:
+ * `persisted` means `JSON.stringify` of the returned envelope equals the
+ * disk file's content, `failed` means no partial content from this invocation
+ * became visible at the target path, and `not-attempted` means no write was
+ * tried.
  */
 export const ReportEnvelope = z.discriminatedUnion('command', [
   z.strictObject({
@@ -411,6 +415,7 @@ export const ReportEnvelope = z.discriminatedUnion('command', [
     ...ReportEnvelopeFields,
     command: z.literal('run'),
     results: z.array(RunResult),
+    reportPersistence: z.enum(['persisted', 'failed', 'not-attempted']),
   }),
   z.strictObject({
     ...ReportEnvelopeFields,
