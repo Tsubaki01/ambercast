@@ -23,4 +23,4 @@ export const EXPECTED_DEFAULT_CONFIG = {
     heal: false,
     updateGroundingCache: false,
   },
-} as const satisfies ResolvedConfig;
+} as const satisfies Omit<ResolvedConfig, 'projectRoot'>;

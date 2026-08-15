@@ -96,7 +96,8 @@ export interface LoadConfigOptions {
  * user selections, so their missing files fail immediately instead of falling
  * through to a less specific source. Relative selection paths are anchored to
  * `cwd`; discovered relative `testDir` and `runsDir` values are instead
- * anchored to the directory containing the selected config file.
+ * anchored to the directory containing the selected config file. That
+ * `configRoot` is also exposed as `projectRoot` for report-path relativization.
  *
  * The merge applies top-level overrides, merges only one level of `ai`,
  * `viewer`, and `ci`, and replaces `targets` as a whole. Atomic target
@@ -184,6 +185,7 @@ export async function loadConfig(options: LoadConfigOptions): Promise<ResolvedCo
   const config: ResolvedConfig = {
     testDir,
     runsDir,
+    projectRoot: configRoot,
     testMatch: [...(overrides.testMatch ?? DEFAULT_RAW_CONFIG.testMatch)],
     testIgnore: [...(overrides.testIgnore ?? DEFAULT_RAW_CONFIG.testIgnore)],
     targets,

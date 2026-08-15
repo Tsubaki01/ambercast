@@ -8,7 +8,7 @@ const runRunCommand = vi.hoisted(() => vi.fn());
 vi.mock('#runtime/generate-command.js', () => ({ runGenerateCommand }));
 vi.mock('#runtime/run-command.js', () => ({ runRunCommand }));
 
-import { main } from '../../src/cli/main.js';
+import { main, REPORT_PERSISTENCE_FAILED_WARNING } from '../../src/cli/main.js';
 
 class MemoryWritable extends Writable {
   chunks: string[] = [];
@@ -41,6 +41,7 @@ const RUN_ENVELOPE = {
   summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 },
   errors: [],
   results: [],
+  reportPersistence: 'persisted' as const,
 };
 
 let cwdSpy: ReturnType<typeof vi.spyOn> | undefined;
@@ -249,6 +250,33 @@ describe('main()', () => {
     await run(['run', '--ai', 'codex']);
 
     expect(runRunCommand).toHaveBeenCalledWith(expect.objectContaining({ aiProviderOverride: 'codex' }));
+  });
+
+  it.each([
+    ['JSON', ['run', '--json']],
+    ['human-rendered', ['run', '--no-color']],
+  ] as const)('writes the fixed persistence warning for a failed %s run', async (_mode, argv) => {
+    runRunCommand.mockResolvedValue({
+      exitCode: 3,
+      envelope: { ...RUN_ENVELOPE, reportPersistence: 'failed' as const },
+    });
+
+    const result = await run(argv);
+
+    expect(result.stderr).toBe(`${REPORT_PERSISTENCE_FAILED_WARNING}\n`);
+    expect(result.stderr).not.toContain('/workspace');
+    expect(result.stderr).not.toContain('disk full');
+  });
+
+  it.each(['persisted', 'not-attempted'] as const)('omits the persistence warning for a %s run', async (reportPersistence) => {
+    runRunCommand.mockResolvedValue({
+      exitCode: 0,
+      envelope: { ...RUN_ENVELOPE, reportPersistence },
+    });
+
+    const result = await run(['run', '--json']);
+
+    expect(result.stderr).not.toContain(REPORT_PERSISTENCE_FAILED_WARNING);
   });
 
   it('accepts fail as an explicit run stale policy', async () => {

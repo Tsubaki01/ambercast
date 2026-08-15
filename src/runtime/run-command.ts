@@ -62,19 +62,19 @@ function runIdFor(startedAt: string, uuid: string): string {
  * milliseconds. Runtime leaves `RunDeps.clock` untouched and rounds only this
  * report-boundary view, preserving the use case's measurement while ensuring
  * CLI JSON always satisfies its published schema. Screenshot paths are also
- * made relative to the configured runs root here, where a report consumer can
+ * made relative to the project root here, where a report consumer can
  * resolve them without exposing a host filesystem prefix. An uncontained path
  * is omitted from only its diagnostic step: it must never reach the report,
  * but one bad evidence field must not replace a completed replay outcome with
  * a crash report.
  *
  * @param outcome - The completed replay outcome with absolute internal paths.
- * @param runsDir - The resolved absolute root used to determine reportable
+ * @param projectRoot - The resolved absolute root used to determine reportable
  *   screenshot paths.
  * @returns A copy suitable for the public report contract, with any
  *   uncontained screenshot field omitted.
  */
-function reportableOutcome(outcome: RunOutcome, runsDir: string): RunOutcome {
+function reportableOutcome(outcome: RunOutcome, projectRoot: string): RunOutcome {
   return {
     ...outcome,
     results: outcome.results.map((caseOutcome) => ({
@@ -89,7 +89,7 @@ function reportableOutcome(outcome: RunOutcome, runsDir: string): RunOutcome {
             return step;
           }
 
-          const screenshot = relativeWithin(runsDir, step.screenshot);
+          const screenshot = relativeWithin(projectRoot, step.screenshot);
           if (screenshot === undefined) {
             // Do not leak a host path or let one diagnostic field crash a completed replay.
             const withoutScreenshot = { ...step };
@@ -186,15 +186,19 @@ export interface RunCommandOutput {
  *
  * Every invocation resolves to the documented report and exit-code contract:
  * known ambercast errors remain classified, and other failures become
- * `UnexpectedCrashError` values for report rendering. Once a replay outcome
- * exists, its already-built compact report is persisted best effort beneath
- * its invocation directory; persistence must not replace that result with a
- * new command-level failure. Runtime creates one cryptographically random,
+ * `UnexpectedCrashError` values for report rendering. Only completed outcomes
+ * attempt persistence, so every pre-outcome failure remains `not-attempted`,
+ * including one after configuration loads. Runtime marks a write candidate
+ * `persisted` before I/O so a disk payload never claims that no write was
+ * attempted. A failed write returns `failed` without adding an `errors[]`
+ * entry: a diagnostic artifact failure must not recast a batch whose cases
+ * passed as a report error. It changes only semantic exit code 0 to 3, which
+ * preserves the priority of every already-nonzero semantic outcome.
+ * Runtime creates one cryptographically random,
  * timestamp-prefixed ID at command start, before composition; after resolved
  * configuration establishes the runs root, it supplies that unchanged ID to
  * every case for evidence paths and then uses it for the single batch report
- * path. A failure before configuration resolves has no runs root, so it
- * returns its report without attempting persistence.
+ * path.
  */
 export async function runRunCommand(input: RunCommandInput): Promise<RunCommandOutput> {
   const clock = createSystemClock();
@@ -263,13 +267,20 @@ export async function runRunCommand(input: RunCommandInput): Promise<RunCommandO
       stale: input.stale,
     });
 
-    const report = buildRunReport({ ...reportContext(), outcome: reportableOutcome(outcome, config.runsDir) });
+    const report = buildRunReport({ ...reportContext(), outcome: reportableOutcome(outcome, config.projectRoot) });
+    // The persisted candidate keeps an attempted write from reaching disk as not-attempted.
+    const persistedEnvelope = { ...report.envelope, reportPersistence: 'persisted' as const };
     try {
-      await ambercast.storage.writeText(ambercast.layout.runReportPathFor(runId), JSON.stringify(report.envelope));
+      await ambercast.storage.writeText(
+        ambercast.layout.runReportPathFor(runId),
+        JSON.stringify(persistedEnvelope),
+      );
+      return { exitCode: report.exitCode, envelope: persistedEnvelope };
     } catch {
-      // A report already exists in memory, so persistence cannot reclassify it.
+      // Preserve every semantic failure's selected priority over a diagnostic write failure.
+      const envelope = { ...report.envelope, reportPersistence: 'failed' as const };
+      return { exitCode: report.exitCode === 0 ? 3 : report.exitCode, envelope };
     }
-    return report;
   } catch (error) {
     const classified = error instanceof AmbercastError
       ? error

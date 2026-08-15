@@ -120,6 +120,7 @@ function reportEnvelope(command: string, results: unknown[], overrides: Record<s
     summary: SUMMARY,
     results,
     errors: [],
+    ...(command === 'run' ? { reportPersistence: 'persisted' } : {}),
     ...overrides,
   };
 }
@@ -236,6 +237,24 @@ for (const variant of COMMAND_VARIANTS) {
     });
   });
 }
+
+describe('run reportPersistence', () => {
+  it.each(['persisted', 'failed', 'not-attempted'] as const)('accepts the %s state', (reportPersistence) => {
+    expectAccepted(ReportEnvelope, reportEnvelope('run', [RUN_RESULT], { reportPersistence }));
+  });
+
+  it('rejects a run envelope without reportPersistence', () => {
+    expectRejected(ReportEnvelope, without(reportEnvelope('run', [RUN_RESULT]), 'reportPersistence'));
+  });
+
+  it('rejects an invalid run reportPersistence state', () => {
+    expectRejected(ReportEnvelope, reportEnvelope('run', [RUN_RESULT], { reportPersistence: 'unknown' }));
+  });
+
+  it('rejects reportPersistence on a non-run envelope', () => {
+    expectRejected(ReportEnvelope, reportEnvelope('generate', [GENERATE_RESULT], { reportPersistence: 'persisted' }));
+  });
+});
 
 describe('valid nested schema fixtures', () => {
   it('parses a valid Summary fixture', () => {

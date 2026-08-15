@@ -29,6 +29,7 @@ function expectedDefaults(configRoot: string): ResolvedConfig {
   return {
     testDir: `${rootPrefix}/tests/ambercast`,
     runsDir: `${rootPrefix}/tests/ambercast/.runs`,
+    projectRoot: configRoot,
     testMatch: ['**/*.test.md'],
     testIgnore: ['**/.runs/**', '**/*.ambercast.plan.json', '**/*.ambercast.grounding.json'],
     targets: {
@@ -237,7 +238,7 @@ describe('loadConfig', () => {
     it('reaches the filesystem root and uses defaults when no configuration file exists', async () => {
       const config = await load(createInMemoryStorage(), { cwd: '/' });
 
-      expect(config).toStrictEqual(expectedDefaults(''));
+      expect(config).toStrictEqual(expectedDefaults('/'));
     });
 
     it('checks the root candidate before falling back to defaults', async () => {
@@ -250,6 +251,21 @@ describe('loadConfig', () => {
         ...expectedDefaults('/'),
         viewer: { port: 4_608 },
       });
+    });
+
+    it('sets projectRoot to the selected configuration file parent directory', async () => {
+      const storage = createInMemoryStorage();
+      await writeConfig(storage, ANCESTOR_CONFIG_PATH, {});
+
+      const config = await load(storage);
+
+      expect(config.projectRoot).toBe('/workspace/project');
+    });
+
+    it('sets projectRoot to cwd when no configuration file exists', async () => {
+      const config = await load(createInMemoryStorage());
+
+      expect(config.projectRoot).toBe(CWD);
     });
 
     it.each([

@@ -40,6 +40,7 @@ describe('loadConfig() with FsStorage', () => {
 
       expect(config.testDir).toBe(join(projectDirectory, 'prompt-tests'));
       expect(config.runsDir).toBe(join(projectDirectory, 'artifacts/runs'));
+      expect(config.projectRoot).toBe(projectDirectory);
     });
   });
 
@@ -62,6 +63,21 @@ describe('loadConfig() with FsStorage', () => {
       expect(config.viewer).toStrictEqual({ port: 4_611 });
       expect(config.testDir).toBe(join(projectDirectory, 'outer-tests'));
       expect(config.runsDir).toBe(join(projectDirectory, 'outer-runs'));
+      expect(config.projectRoot).toBe(projectDirectory);
+    });
+  });
+
+  it('uses the real working directory as projectRoot when no configuration file exists', async () => {
+    await withIsolatedConfigDirectory(async (root) => {
+      const workingDirectory = join(root, 'project', 'apps', 'web');
+      await mkdir(workingDirectory, { recursive: true });
+
+      const config = await loadConfig({
+        cwd: workingDirectory,
+        storage: createFsStorage(),
+      });
+
+      expect(config.projectRoot).toBe(workingDirectory);
     });
   });
 
