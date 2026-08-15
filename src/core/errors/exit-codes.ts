@@ -29,7 +29,7 @@ export const ERROR_EXIT_CODES = {
   'secret-unresolved': 2,
   'target-unresolved': 2,
   'secret-literal-rejected': 2,
-  'secret-ref-undeclared': 2,
+  'secret-grant-unattributable': 2,
   'missing-plan': 4,
   'stale-ir': 4,
   'integrity-violation': 4,

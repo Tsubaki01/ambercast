@@ -28,7 +28,7 @@ export type ErrorKind =
   | 'secret-unresolved'
   | 'target-unresolved'
   | 'secret-literal-rejected'
-  | 'secret-ref-undeclared'
+  | 'secret-grant-unattributable'
   | 'missing-plan'
   | 'stale-ir'
   | 'integrity-violation'

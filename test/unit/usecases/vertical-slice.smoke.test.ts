@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { SecretRefUndeclaredError } from '#core/errors/secret-ref-undeclared-error.js';
+import { SecretGrantUnattributableError } from '#core/errors/secret-grant-unattributable-error.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computePlanDigest } from '#core/ir/digest.js';
 import {
@@ -166,14 +166,14 @@ describe('fake vertical slice', () => {
         id: 'complete-sign-in',
         kind: 'ai',
         instruction: 'Complete sign-in.',
-        secrets: [secretRef],
+        secrets: [{ ref: secretRef, citation: `@ambercast-secret ${secretRef}` }],
       }],
       ambiguities: [],
     };
     const storage = createInMemoryStorage();
     const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
     const execute = vi.fn(async () => ({ data: generatedResponse, raw: JSON.stringify(generatedResponse) }));
-    await storage.writeText(TEST_PATH, `${PROMPT}\n${secretRef}\n`);
+    await storage.writeText(TEST_PATH, `${PROMPT}\n@ambercast-secret ${secretRef}\n`);
 
     const generateDeps: GenerateDeps = {
       storage,
@@ -195,7 +195,10 @@ describe('fake vertical slice', () => {
 
     expect(generation.results).toMatchObject([{ status: 'generated' }]);
     const plan = PlanDocument.parse(JSON.parse(await storage.readText(layout.planPathFor(TEST_PATH))));
-    expect(plan.steps).toEqual([expect.objectContaining({ id: 'complete-sign-in', secrets: [secretRef] })]);
+    expect(plan.steps).toEqual([expect.objectContaining({
+      id: 'complete-sign-in',
+      secrets: [{ ref: secretRef, sourceSpan: { startLine: 5, endLine: 5 } }],
+    })]);
 
     const grounding = GroundingDocument.parse({
       schemaVersion: 1,
@@ -270,7 +273,7 @@ describe('fake vertical slice', () => {
         id: 'complete-sign-in',
         kind: 'ai',
         instruction: 'Complete sign-in.',
-        secrets: [undeclaredSecretRef],
+        secrets: [{ ref: undeclaredSecretRef, citation: `@ambercast-secret ${undeclaredSecretRef}` }],
       }],
       ambiguities: [],
     };
@@ -298,7 +301,7 @@ describe('fake vertical slice', () => {
     const generation = await generate(generateDeps, GENERATE_OPTIONS);
 
     expect(generation.results[0]).toMatchObject({ status: 'failed' });
-    expect(generation.results[0]?.error).toBeInstanceOf(SecretRefUndeclaredError);
+    expect(generation.results[0]?.error).toBeInstanceOf(SecretGrantUnattributableError);
     expect(await storage.exists(layout.planPathFor(TEST_PATH))).toBe(false);
     expect(await storage.exists(layout.groundingPathFor(TEST_PATH))).toBe(false);
   });

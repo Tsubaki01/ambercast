@@ -5,7 +5,8 @@ import {
   toCanonicalDigestBytes,
 } from '../../../../src/core/ir/canonical-json.js';
 import { PlanDocument } from '../../../../src/core/ir/schema.js';
-import type { JsonValueT } from '../../../../src/core/ir/schema.js';
+import type { JsonValueT, Step } from '../../../../src/core/ir/schema.js';
+import { normalizeAiStepSecretGrants } from '../../../../src/usecases/generator-secret-policy.js';
 
 const goldenFixtureDirectory = new URL('../../../fixtures/ir/golden/', import.meta.url);
 const goldenArtifactText = readFileSync(new URL('plan.golden.artifact.json', goldenFixtureDirectory), 'utf8');
@@ -155,5 +156,116 @@ describe('canonical JSON serialization', () => {
     const firstArtifactText = toCanonicalArtifactText(value);
 
     expect(toCanonicalArtifactText(JSON.parse(firstArtifactText) as JsonValueT)).toBe(firstArtifactText);
+  });
+
+  it('canonically serializes committed secret provenance alongside ordinary plan data', () => {
+    const plan = PlanDocument.parse({
+      schemaVersion: 1,
+      source: { inputsDigest: 'a'.repeat(64) },
+      targets: { web: { baseUrl: 'https://example.test', browser: 'chromium' } },
+      steps: [{
+        id: 'fill-password',
+        kind: 'action',
+        action: 'fill-secret',
+        target: { strategy: 'accessibility', role: 'textbox', name: 'Password' },
+        secretRef: '{{secrets.account.password}}',
+        secretGrantSpan: { startLine: 4, endLine: 4 },
+      }, {
+        id: 'verify-account',
+        kind: 'ai',
+        instruction: 'Verify the signed-in account.',
+        secrets: [{
+          ref: '{{secrets.account.password}}',
+          sourceSpan: { startLine: 6, endLine: 6 },
+        }, {
+          ref: '{{secrets.account.password}}',
+          sourceSpan: { startLine: 8, endLine: 8 },
+        }],
+      }],
+    });
+
+    expect(digestText(asJsonValue(plan))).toBe('{"schemaVersion":1,"source":{"inputsDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"steps":[{"action":"fill-secret","id":"fill-password","kind":"action","secretGrantSpan":{"endLine":4,"startLine":4},"secretRef":"{{secrets.account.password}}","target":{"name":"Password","role":"textbox","strategy":"accessibility"}},{"id":"verify-account","instruction":"Verify the signed-in account.","kind":"ai","secrets":[{"ref":"{{secrets.account.password}}","sourceSpan":{"endLine":6,"startLine":6}},{"ref":"{{secrets.account.password}}","sourceSpan":{"endLine":8,"startLine":8}}]}],"targets":{"web":{"baseUrl":"https://example.test","browser":"chromium"}}}');
+
+    expect(toCanonicalArtifactText(asJsonValue(plan))).toBe([
+      '{',
+      '  "schemaVersion": 1,',
+      '  "source": {',
+      '    "inputsDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"',
+      '  },',
+      '  "steps": [',
+      '    {',
+      '      "action": "fill-secret",',
+      '      "id": "fill-password",',
+      '      "kind": "action",',
+      '      "secretGrantSpan": {',
+      '        "endLine": 4,',
+      '        "startLine": 4',
+      '      },',
+      '      "secretRef": "{{secrets.account.password}}",',
+      '      "target": {',
+      '        "name": "Password",',
+      '        "role": "textbox",',
+      '        "strategy": "accessibility"',
+      '      }',
+      '    },',
+      '    {',
+      '      "id": "verify-account",',
+      '      "instruction": "Verify the signed-in account.",',
+      '      "kind": "ai",',
+      '      "secrets": [',
+      '        {',
+      '          "ref": "{{secrets.account.password}}",',
+      '          "sourceSpan": {',
+      '            "endLine": 6,',
+      '            "startLine": 6',
+      '          }',
+      '        },',
+      '        {',
+      '          "ref": "{{secrets.account.password}}",',
+      '          "sourceSpan": {',
+      '            "endLine": 8,',
+      '            "startLine": 8',
+      '          }',
+      '        }',
+      '      ]',
+      '    }',
+      '  ],',
+      '  "targets": {',
+      '    "web": {',
+      '      "baseUrl": "https://example.test",',
+      '      "browser": "chromium"',
+      '    }',
+      '  }',
+      '}',
+      '',
+    ].join('\n'));
+  });
+
+  it('makes reversed verified AI-grant input serialize byte-identically', () => {
+    const grants: Extract<Step, { kind: 'ai' }>['secrets'] = [{
+      ref: '{{secrets.account.password}}',
+      sourceSpan: { startLine: 8, endLine: 8 },
+    }, {
+      ref: '{{secrets.account.password}}',
+      sourceSpan: { startLine: 4, endLine: 4 },
+    }, {
+      ref: '{{secrets.account.token}}',
+      sourceSpan: { startLine: 6, endLine: 6 },
+    }];
+    const first = normalizeAiStepSecretGrants([{
+      id: 'complete-sign-in',
+      kind: 'ai',
+      instruction: 'Complete sign-in.',
+      secrets: grants,
+    }]);
+    const second = normalizeAiStepSecretGrants([{
+      id: 'complete-sign-in',
+      kind: 'ai',
+      instruction: 'Complete sign-in.',
+      secrets: [...grants].reverse(),
+    }]);
+
+    expect(toCanonicalArtifactText(first as unknown as JsonValueT))
+      .toBe(toCanonicalArtifactText(second as unknown as JsonValueT));
   });
 });

@@ -48,6 +48,7 @@ const TARGETS = { web: { baseUrl: 'https://example.test', browser: 'chromium' } 
 const PROMPT = '# Sign in\n\nWhen I submit valid credentials, I reach the dashboard.\n';
 const SECRET_REF = '{{secrets.AMBERCAST_SECRET_DUMMY}}';
 const SECRET_VALUE = 'sk-AMBERCAST_SECRET_DUMMY';
+const SECRET_GRANT_SPAN = { startLine: 1, endLine: 1 } as const;
 const FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v2', hash: 'a'.repeat(64) };
 const EMAIL: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Email' };
 const PASSWORD: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Password' };
@@ -99,9 +100,13 @@ function elementGrounding(stepIds: readonly string[]): GroundingDocument['entrie
   return Object.fromEntries(stepIds.map((id) => [id, { kind: 'element', fingerprint: FINGERPRINT }])) as GroundingDocument['entries'];
 }
 
-async function writePrompt(storage: StorageAdapter, contents = PROMPT): Promise<string> {
+async function writePrompt(
+  storage: StorageAdapter,
+  contents = PROMPT,
+  includeSecretGrant = true,
+): Promise<string> {
   const path = `${TEST_DIR}/login.test.md`;
-  await storage.writeText(path, contents);
+  await storage.writeText(path, `${includeSecretGrant ? `@ambercast-secret ${SECRET_REF}\n` : ''}${contents}`);
   return path;
 }
 
@@ -149,7 +154,7 @@ function aiStep(): Extract<Step, { kind: 'ai' }> {
     id: 'recorded-ai',
     kind: 'ai',
     instruction: 'Complete the sign-in flow and verify the dashboard.',
-    secrets: [SECRET_REF],
+    secrets: [{ ref: SECRET_REF, sourceSpan: SECRET_GRANT_SPAN }],
   };
 }
 
@@ -538,7 +543,7 @@ describe('run secret sinks', () => {
       id: authoredStepId,
       kind: 'ai',
       instruction: 'Complete the sign-in flow and verify the dashboard.',
-      secrets: [SECRET_REF],
+      secrets: [{ ref: SECRET_REF, sourceSpan: SECRET_GRANT_SPAN }],
     }]);
     recordingStorage.writes.length = 0;
 
@@ -564,7 +569,7 @@ describe('run secret sinks', () => {
       execute: async () => ({ data: response, raw: JSON.stringify(response) }),
     });
     const { deps, recordingStorage } = createGenerateScenario(executor);
-    await writePrompt(recordingStorage.storage);
+    await writePrompt(recordingStorage.storage, PROMPT, false);
     recordingStorage.writes.length = 0;
 
     const outcome = await generate(deps, GENERATE_OPTIONS);
@@ -583,7 +588,7 @@ describe('run secret sinks', () => {
     const failedScenario = createRunScenario(failedSession, createFakeAiExecutor(), new Map([[SECRET_REF, SECRET_VALUE]]));
     const failedPath = await writePrompt(failedScenario.recordingStorage.storage, `${PROMPT}\n${SECRET_REF}\n`);
     await seedFreshArtifacts(failedScenario.recordingStorage.storage, failedPath, [
-      { id: 'fill-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef: SECRET_REF },
+      { id: 'fill-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef: SECRET_REF, secretGrantSpan: SECRET_GRANT_SPAN },
       { id: 'secret-assertion', kind: 'assert', check: 'text-equals', target: PASSWORD, text: 'Dashboard' },
     ], elementGrounding(['fill-secret', 'secret-assertion']));
     const failedOutcome = await run(failedScenario.deps, RUN_OPTIONS);
@@ -598,7 +603,7 @@ describe('run secret sinks', () => {
     const exceptionScenario = createRunScenario(exceptionSession, createFakeAiExecutor(), new Map([[SECRET_REF, SECRET_VALUE]]));
     const exceptionPath = await writePrompt(exceptionScenario.recordingStorage.storage, `${PROMPT}\n${SECRET_REF}\n`);
     await seedFreshArtifacts(exceptionScenario.recordingStorage.storage, exceptionPath, [
-      { id: 'fill-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef: SECRET_REF },
+      { id: 'fill-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef: SECRET_REF, secretGrantSpan: SECRET_GRANT_SPAN },
       { id: 'go-dashboard', kind: 'action', action: 'navigate', url: '/dashboard' },
     ], elementGrounding(['fill-secret']));
     const exceptionOutcome = await run(exceptionScenario.deps, RUN_OPTIONS);
@@ -656,7 +661,7 @@ describe('run secret sinks', () => {
     const generateExecutor = createCodexCliExecutor({ run: generateRunner.run });
     // This sink exercises the real adapter's filesystem I/O, unlike the fake-executor cases above.
     const generateScenario = createGenerateScenario(generateExecutor, 5_000);
-    await writePrompt(generateScenario.recordingStorage.storage);
+    await writePrompt(generateScenario.recordingStorage.storage, PROMPT, false);
 
     await expect(generate(generateScenario.deps, GENERATE_OPTIONS)).resolves.toMatchObject({
       results: [{ status: 'generated' }],

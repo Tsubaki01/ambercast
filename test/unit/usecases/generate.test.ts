@@ -12,7 +12,7 @@ import { normalizeTestMd } from '#core/ir/normalize.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
 import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
-import { SecretRefUndeclaredError } from '#core/errors/secret-ref-undeclared-error.js';
+import { SecretGrantUnattributableError } from '#core/errors/secret-grant-unattributable-error.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/generate.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
@@ -24,36 +24,108 @@ const RUNS_DIR = '/workspace/tests/.runs';
 const TARGETS = { web: { baseUrl: 'https://example.test', browser: 'chromium' } } as const;
 const PROMPT = '# Sign in\n\nWhen I submit valid credentials, I reach the dashboard.\n';
 const RESPONSE: GeneratedPlanResponse = { steps: [], ambiguities: [] };
-const UNDECLARED_SECRET_REF = '{{secrets.FOO}}';
+const FIRST_SECRET_REF = '{{secrets.FOO}}';
+const SECOND_SECRET_REF = '{{secrets.BAR}}';
 const PASSWORD_TARGET = { strategy: 'accessibility', role: 'textbox', name: 'Password' } as const;
 
-const UNDECLARED_SECRET_RESPONSES = [
+const SECRET_GRANT_CITATION_FAILURES = [
   [
-    'fill-secret action',
+    'citation not found',
     {
       steps: [{
         id: 'fill-password',
         kind: 'action',
         action: 'fill-secret',
         target: PASSWORD_TARGET,
-        secretRef: UNDECLARED_SECRET_REF,
+        secretRef: FIRST_SECRET_REF,
+        citation: 'This text does not occur in the prompt.',
       }],
       ambiguities: [],
     },
+    `${PROMPT}\n@ambercast-secret ${FIRST_SECRET_REF}\n`,
+    'citation-not-found',
   ],
   [
-    'AI-step secret grant',
+    'citation not unique',
     {
       steps: [{
         id: 'complete-sign-in',
         kind: 'ai',
         instruction: 'Complete the sign-in flow.',
-        secrets: [UNDECLARED_SECRET_REF],
+        secrets: [{ ref: FIRST_SECRET_REF, citation: `@ambercast-secret ${FIRST_SECRET_REF}` }],
       }],
       ambiguities: [],
     },
+    `${PROMPT}\n@ambercast-secret ${FIRST_SECRET_REF}\n@ambercast-secret ${FIRST_SECRET_REF}\n`,
+    'citation-not-unique',
   ],
-] as const satisfies readonly (readonly [string, GeneratedPlanResponse])[];
+  [
+    'citation missing its reference',
+    {
+      steps: [
+        {
+          id: 'fill-password',
+          kind: 'action',
+          action: 'fill-secret',
+          target: PASSWORD_TARGET,
+          secretRef: FIRST_SECRET_REF,
+          citation: `@ambercast-secret ${SECOND_SECRET_REF}`,
+        },
+      ],
+      ambiguities: [],
+    },
+    `${PROMPT}\n@ambercast-secret ${SECOND_SECRET_REF}\n`,
+    'citation-missing-ref',
+  ],
+  [
+    'citation unresolved to a grant',
+    {
+      steps: [{
+        id: 'fill-password',
+        kind: 'action',
+        action: 'fill-secret',
+        target: PASSWORD_TARGET,
+        secretRef: FIRST_SECRET_REF,
+        citation: `Use ${FIRST_SECRET_REF} only as prose.`,
+      }],
+      ambiguities: [],
+    },
+    `${PROMPT}\nUse ${FIRST_SECRET_REF} only as prose.\n`,
+    'citation-unresolved',
+  ],
+  [
+    'multiply attributed grant',
+    {
+      steps: [
+        {
+          id: 'first-password',
+          kind: 'action',
+          action: 'fill-secret',
+          target: PASSWORD_TARGET,
+          secretRef: FIRST_SECRET_REF,
+          citation: `@ambercast-secret ${FIRST_SECRET_REF}`,
+        },
+        {
+          id: 'second-password',
+          kind: 'action',
+          action: 'fill-secret',
+          target: PASSWORD_TARGET,
+          secretRef: FIRST_SECRET_REF,
+          citation: `@ambercast-secret ${FIRST_SECRET_REF}`,
+        },
+      ],
+      ambiguities: [],
+    },
+    `${PROMPT}\n@ambercast-secret ${FIRST_SECRET_REF}\n`,
+    'multiply-attributed-grant',
+  ],
+  [
+    'uncovered grant',
+    { steps: [], ambiguities: [] },
+    `${PROMPT}\n@ambercast-secret ${FIRST_SECRET_REF}\n`,
+    'uncovered-grant',
+  ],
+] as const satisfies readonly (readonly [string, GeneratedPlanResponse, string, string])[];
 
 const DEFAULT_OPTIONS: GenerateOptions = {
   files: [],
@@ -779,40 +851,82 @@ describe('generate', () => {
     expect(recordingStorage.writes.map(({ path }) => path)).not.toContain(`${TEST_DIR}/unsafe.ambercast.grounding.json`);
   });
 
-  it.each(UNDECLARED_SECRET_RESPONSES)(
-    'rejects an ungrounded %s before writing generated artifacts',
-    async (_description, response) => {
+  it('continues to the next file when secret-grant attribution fails for one generated response', async () => {
+    const unattributableResponse: GeneratedPlanResponse = {
+      steps: [{
+        id: 'fill-password',
+        kind: 'action',
+        action: 'fill-secret',
+        target: PASSWORD_TARGET,
+        secretRef: FIRST_SECRET_REF,
+        citation: 'This citation is absent from the first prompt.',
+      }],
+      ambiguities: [],
+    };
+    const responses: readonly GeneratedPlanResponse[] = [unattributableResponse, RESPONSE];
+    let responseIndex = 0;
+    const execute = vi.fn(async () => {
+      const response = responses[responseIndex];
+      responseIndex += 1;
+      if (response === undefined) {
+        throw new Error('The batch fixture received an unexpected extra AI call.');
+      }
+      return { data: response, raw: JSON.stringify(response) };
+    });
+    const { deps, recordingStorage } = createScenario({
+      aiExecutor: createFakeAiExecutor({ execute }),
+      discoverTestFiles: async () => ['unattributable.test.md', 'valid.test.md'],
+    });
+    await writePrompt(recordingStorage.storage, 'unattributable.test.md', `@ambercast-secret ${FIRST_SECRET_REF}\n`);
+    await writePrompt(recordingStorage.storage, 'valid.test.md', 'A prompt without secret grants.\n');
+    recordingStorage.reset();
+
+    const outcome = await generate(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results).toMatchObject([
+      { file: `${TEST_DIR}/unattributable.test.md`, status: 'failed' },
+      { file: `${TEST_DIR}/valid.test.md`, status: 'generated' },
+    ]);
+    expect(outcome.results[0]?.error).toBeInstanceOf(SecretGrantUnattributableError);
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(SECRET_GRANT_CITATION_FAILURES)(
+    'rejects %s before writing generated artifacts',
+    async (_description, response, testMd, reason) => {
       const { deps, recordingStorage } = createScenario({
         aiExecutor: createFakeAiExecutor({
           execute: async () => ({ data: response, raw: JSON.stringify(response) }),
         }),
       });
-      const testPath = await writePrompt(recordingStorage.storage);
+      const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', testMd);
       recordingStorage.reset();
 
       const outcome = await generate(deps, DEFAULT_OPTIONS);
 
       expect(outcome.results[0]).toMatchObject({ file: testPath, status: 'failed' });
-      expect(outcome.results[0]?.error).toBeInstanceOf(SecretRefUndeclaredError);
+      expect(outcome.results[0]?.error).toBeInstanceOf(SecretGrantUnattributableError);
+      expect(outcome.results[0]?.error).toMatchObject({ details: { reason } });
       expect(recordingStorage.writes).toEqual([]);
     },
   );
 
-  it.each(UNDECLARED_SECRET_RESPONSES)(
-    'rejects an ungrounded %s through the --dry-run path without writing artifacts',
-    async (_description, response) => {
+  it.each(SECRET_GRANT_CITATION_FAILURES)(
+    'rejects %s through the --dry-run path without writing artifacts',
+    async (_description, response, testMd, reason) => {
       const { deps, recordingStorage } = createScenario({
         aiExecutor: createFakeAiExecutor({
           execute: async () => ({ data: response, raw: JSON.stringify(response) }),
         }),
       });
-      const testPath = await writePrompt(recordingStorage.storage);
+      const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', testMd);
       recordingStorage.reset();
 
       const outcome = await generate(deps, { ...DEFAULT_OPTIONS, dryRun: true });
 
       expect(outcome.results[0]).toMatchObject({ file: testPath, status: 'failed' });
-      expect(outcome.results[0]?.error).toBeInstanceOf(SecretRefUndeclaredError);
+      expect(outcome.results[0]?.error).toBeInstanceOf(SecretGrantUnattributableError);
+      expect(outcome.results[0]?.error).toMatchObject({ details: { reason } });
       expect(recordingStorage.writes).toEqual([]);
     },
   );
@@ -822,6 +936,7 @@ describe('generate', () => {
     ['dry-run', { ...DEFAULT_OPTIONS, dryRun: true }, 'would-generate'],
   ] as const)('keeps grounded secret usage on the existing %s path', async (_mode, options, status) => {
     const declaredSecretRef = '{{secrets.LOGIN_PASSWORD}}';
+    const secondDeclaredSecretRef = '{{secrets.PAYMENT_TOKEN}}';
     const response: GeneratedPlanResponse = {
       steps: [
         {
@@ -830,12 +945,13 @@ describe('generate', () => {
           action: 'fill-secret',
           target: PASSWORD_TARGET,
           secretRef: declaredSecretRef,
+          citation: `@ambercast-secret ${declaredSecretRef}`,
         },
         {
           id: 'complete-sign-in',
           kind: 'ai',
           instruction: 'Complete the sign-in flow.',
-          secrets: [declaredSecretRef],
+          secrets: [{ ref: secondDeclaredSecretRef, citation: `@ambercast-secret ${secondDeclaredSecretRef}` }],
         },
       ],
       ambiguities: [],
@@ -845,7 +961,11 @@ describe('generate', () => {
         execute: async () => ({ data: response, raw: JSON.stringify(response) }),
       }),
     });
-    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${declaredSecretRef}\n`);
+    const testPath = await writePrompt(
+      recordingStorage.storage,
+      'login.test.md',
+      `${PROMPT}\n@ambercast-secret ${declaredSecretRef}\n@ambercast-secret ${secondDeclaredSecretRef}\n`,
+    );
     recordingStorage.reset();
 
     const outcome = await generate(deps, options);
@@ -874,5 +994,33 @@ describe('generate', () => {
       results: [{ status: 'failed', error: { kind: 'ai-response-invalid' } }],
     });
     expect(recordingStorage.writes).toEqual([]);
+  });
+
+  it('round-trips a generated secret-bearing plan with byte-identical artifact text', async () => {
+    const secretRef = '{{secrets.LOGIN_PASSWORD}}';
+    const response: GeneratedPlanResponse = {
+      steps: [{
+        id: 'fill-password',
+        kind: 'action',
+        action: 'fill-secret',
+        target: PASSWORD_TARGET,
+        secretRef,
+        citation: `@ambercast-secret ${secretRef}`,
+      }],
+      ambiguities: [],
+    };
+    const { deps, recordingStorage } = createScenario({
+      aiExecutor: createFakeAiExecutor({
+        execute: async () => ({ data: response, raw: JSON.stringify(response) }),
+      }),
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n@ambercast-secret ${secretRef}\n`);
+
+    const outcome = await generate(deps, DEFAULT_OPTIONS);
+    const text = await recordingStorage.storage.readText(deps.layout.planPathFor(testPath));
+    const parsed = PlanDocument.parse(JSON.parse(text));
+
+    expect(outcome.results[0]).toMatchObject({ status: 'generated' });
+    expect(toCanonicalArtifactText(parsed as unknown as JsonValueT)).toBe(text);
   });
 });
