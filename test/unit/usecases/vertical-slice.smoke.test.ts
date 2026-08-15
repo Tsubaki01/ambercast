@@ -14,6 +14,7 @@ import { createLayoutResolver } from '#core/layout/resolve.js';
 import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/generate.js';
 import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
 import { createFixedClock } from '../../doubles/create-fixed-clock.js';
+import { baseUrlSecretPolicy } from '../../doubles/base-url-secret-policy.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
 import { createRecordingEventSink } from '../../doubles/create-recording-event-sink.js';
 import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
@@ -54,7 +55,6 @@ const GENERATE_OPTIONS: GenerateOptions = {
   list: false,
 };
 const RUN_OPTIONS: RunOptions = { files: [TEST_PATH], cacheOnly: false, allowEmpty: false, list: false, stale: 'fail' };
-
 describe('fake vertical slice', () => {
   it('replays a generated plan from pre-seeded grounding without AI calls', async () => {
     const storage = createInMemoryStorage();
@@ -223,7 +223,10 @@ describe('fake vertical slice', () => {
         algorithm: 'a11y-neighborhood-v2',
         hash: 'a'.repeat(64),
       } }],
-    ]));
+    ]), {
+      baseUrl: TARGETS.web.baseUrl,
+      currentUrl: TARGETS.web.baseUrl,
+    });
     const events = createRecordingEventSink();
     const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => {
       throw new Error('Path-C replay must not resolve an AI executor.');
@@ -252,12 +255,10 @@ describe('fake vertical slice', () => {
 
     expect(outcome.results[0]?.result.status).toBe('passed');
     expect(session.operations()).toContainEqual({
-      type: 'perform',
-      action: {
-        type: 'fill-secret',
-        target: expect.objectContaining({ ref: secretTarget }),
-        value: 'resolved-at-run-time',
-      },
+      type: 'fill-secret',
+      target: expect.objectContaining({ ref: secretTarget }),
+      value: 'resolved-at-run-time',
+      policy: baseUrlSecretPolicy(secretRef, TARGETS.web),
     });
     expect(events.emitted().filter((event) => event.type === 'ai-call')).toEqual([]);
     expect(resolveAiExecutor).not.toHaveBeenCalled();

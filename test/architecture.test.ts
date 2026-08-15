@@ -1,12 +1,13 @@
 import { readdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import * as ts from 'typescript';
 import { describe, expect, test } from 'vitest';
 import { computeInputsDigest as aliasComputeInputsDigest } from '#core/ir/digest.js';
 import { computeInputsDigest as relativeComputeInputsDigest } from '../src/core/ir/digest.js';
 import { scanAccessibilityCaptureFieldAccess } from '../tools/accessibility-capture-scanner.js';
 import { scanComputeInputsDigestCalls } from '../tools/digest-scanner.js';
+import { scanFillSecretCallSites } from '../tools/fill-secret-call-scanner.js';
 
 const SOURCE_ROOT = fileURLToPath(new URL('../src/', import.meta.url));
 const DIGEST_MODULE_FILE = fileURLToPath(new URL('../src/core/ir/digest.ts', import.meta.url));
@@ -72,6 +73,98 @@ describe('architecture guardrails', () => {
 
   test('resolves the core subpath alias to the relative digest module', () => {
     expect(aliasComputeInputsDigest).toBe(relativeComputeInputsDigest);
+  });
+
+  test('restricts browser secret-fill calls to the materialized-action dispatcher', async () => {
+    const sourceFiles = await findTypeScriptFiles(SOURCE_ROOT);
+    const tsconfigFileName = ts.sys.resolvePath('tsconfig.json');
+    const configFile = ts.readConfigFile(tsconfigFileName, ts.sys.readFile);
+    if (configFile.error !== undefined) {
+      throw new Error(`The architecture test could not read ${tsconfigFileName}.`);
+    }
+    const parsedConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, dirname(tsconfigFileName));
+    const program = ts.createProgram({
+      rootNames: sourceFiles,
+      options: { ...parsedConfig.options, noEmit: true },
+    });
+
+    expect(sourceFiles).toEqual(expect.arrayContaining([PORTS_MODULE_FILE, RUN_MODULE_FILE]));
+    expect(program.getSyntacticDiagnostics()).toEqual([]);
+    expect(program.getSemanticDiagnostics()).toEqual([]);
+
+    const callSites = scanFillSecretCallSites(
+      program,
+      PORTS_MODULE_FILE,
+      new Set([RUN_MODULE_FILE]),
+    );
+
+    expect(callSites.every((site) => site.allowed)).toBe(true);
+    expect(callSites).toHaveLength(1);
+
+    const runModule = program.getSourceFile(RUN_MODULE_FILE);
+    if (runModule === undefined) {
+      throw new Error('The architecture program must include the run module.');
+    }
+    const dispatcher = runModule.statements.find((statement): statement is ts.FunctionDeclaration => (
+      ts.isFunctionDeclaration(statement) && statement.name?.text === 'performMaterializedAction'
+    ));
+    if (dispatcher?.body === undefined) {
+      throw new Error('The run module must declare the materialized-action dispatcher with a body.');
+    }
+
+    const bodyStartLine = runModule.getLineAndCharacterOfPosition(dispatcher.body.getStart(runModule)).line + 1;
+    const bodyEndLine = runModule.getLineAndCharacterOfPosition(dispatcher.body.getEnd()).line + 1;
+    expect(callSites[0]).toMatchObject({ fileName: RUN_MODULE_FILE, allowed: true });
+    expect(callSites[0]?.line).toBeGreaterThan(bodyStartLine);
+    expect(callSites[0]?.line).toBeLessThan(bodyEndLine);
+    expect(dispatcher.parameters).toHaveLength(2);
+    expect(dispatcher.parameters[1]?.type?.getText(runModule)).toBe('BrowserSession');
+
+    const portsFileName = '/virtual/ports.ts';
+    const forbiddenFileName = '/virtual/forbidden.ts';
+    const virtualSources = new Map<string, string>([
+      [portsFileName, 'export interface BrowserSession { fillSecret(): void; }'],
+      [
+        forbiddenFileName,
+        [
+          "import type { BrowserSession } from './ports.js';",
+          'declare const session: BrowserSession;',
+          'session.fillSecret();',
+          "session['fillSecret']();",
+        ].join('\n'),
+      ],
+    ]);
+    const options: ts.CompilerOptions = {
+      module: ts.ModuleKind.NodeNext,
+      moduleResolution: ts.ModuleResolutionKind.NodeNext,
+      noEmit: true,
+      strict: true,
+      target: ts.ScriptTarget.ES2023,
+    };
+    const host = ts.createCompilerHost(options, true);
+    const originalFileExists = host.fileExists.bind(host);
+    const originalDirectoryExists = host.directoryExists?.bind(host) ?? (() => false);
+    const originalReadFile = host.readFile.bind(host);
+    const originalGetSourceFile = host.getSourceFile.bind(host);
+    host.fileExists = (fileName) => virtualSources.has(fileName) || originalFileExists(fileName);
+    host.directoryExists = (directoryName) => directoryName === '/virtual' || originalDirectoryExists(directoryName);
+    host.readFile = (fileName) => virtualSources.get(fileName) ?? originalReadFile(fileName);
+    host.getSourceFile = (fileName, languageVersion, onError, shouldCreateNewSourceFile) => {
+      const text = virtualSources.get(fileName);
+      return text === undefined
+        ? originalGetSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile)
+        : ts.createSourceFile(fileName, text, languageVersion, true);
+    };
+    const virtualProgram = ts.createProgram({
+      rootNames: [...virtualSources.keys()],
+      options,
+      host,
+    });
+
+    expect(scanFillSecretCallSites(virtualProgram, portsFileName, new Set())).toEqual([
+      expect.objectContaining({ fileName: forbiddenFileName, line: 3, allowed: false }),
+      expect.objectContaining({ fileName: forbiddenFileName, line: 4, allowed: false }),
+    ]);
   });
 
   test('restricts detection-only accessibility capture fields to the run detector and excludes them from persisted shapes', async () => {

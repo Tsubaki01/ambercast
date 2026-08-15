@@ -292,6 +292,34 @@ describe('generate', () => {
     });
   });
 
+  it('embeds configured secret-sink origins verbatim in a generated plan target snapshot', async () => {
+    const targets = {
+      web: {
+        baseUrl: 'https://example.test',
+        browser: 'chromium' as const,
+        secretSinkOrigins: { '{{secrets.app.password}}': ['https://idp.example.test'] },
+      },
+    };
+    const { deps, recordingStorage } = createScenario({
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: ['**/.runs/**'],
+        targets,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 100 },
+      },
+    });
+    await writePrompt(recordingStorage.storage);
+
+    await expect(generate(deps, DEFAULT_OPTIONS)).resolves.toMatchObject({
+      results: [{ status: 'generated' }],
+    });
+
+    const plan = PlanDocument.parse(JSON.parse(await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.plan.json`)));
+    expect(plan.targets).toEqual(targets);
+  });
+
   it.each([
     ['default', DEFAULT_OPTIONS],
     ['allow-empty', { ...DEFAULT_OPTIONS, allowEmpty: true }],

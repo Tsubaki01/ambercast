@@ -1,12 +1,16 @@
 import { describe, expect, it } from 'vitest';
+import type { SecretSinkPolicy } from '#core/secrets/sink-policy.js';
 import type { BoundElement, GroundingQuery } from '../../../src/ports/browser.js';
 import type { ElementRef, Fingerprint } from '../../../src/core/ir/schema.js';
+import { captureRejection } from '../../doubles/capture-rejection.js';
+import { expectSecretSinkOriginViolation } from '../../doubles/expect-secret-sink-origin-violation.js';
 import {
   bindForTest,
   createFakeBrowserSession,
   elementRefKey,
   fingerprintsEqual,
   operationObservation,
+  setFakeCurrentUrl,
   type FakeBrowserSession,
   type FakeBrowserSessionEntry,
 } from '../../doubles/fake-browser-session.js';
@@ -16,6 +20,11 @@ const OTHER_REF: ElementRef = { strategy: 'accessibility', role: 'textbox', name
 const FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v2', hash: 'a'.repeat(64) };
 const OTHER_FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v2', hash: 'b'.repeat(64) };
 const REF_KEY = JSON.stringify(['accessibility', 'button', 'Submit']);
+const SECRET_POLICY: SecretSinkPolicy = {
+  secretRef: '{{secrets.app.password}}',
+  allowedOrigins: ['https://example.test'],
+  source: 'base-url-default',
+};
 
 function entries(
   exists = true,
@@ -71,6 +80,8 @@ describe('createFakeBrowserSession', () => {
     const element = bindForTest(session, REF, FINGERPRINT);
 
     expect(typeof session.perform).toBe('function');
+    expect(typeof session.fillSecret).toBe('function');
+    expect(typeof session.currentUrl).toBe('function');
     expect(typeof session.evaluateAssert).toBe('function');
     expect(typeof session.captureValue).toBe('function');
     expect(typeof session.resolveGrounded).toBe('function');
@@ -216,6 +227,139 @@ describe('createFakeBrowserSession', () => {
 
     await session.perform({ type: 'navigate', url: 'https://example.test/next' });
     await expectTargetedOperationsToReject(session, element);
+  });
+
+  it('returns configured and default current URLs, follows navigate resolution, and supports URL-only mutation', async () => {
+    const defaultSession = createFakeBrowserSession(entries());
+    const configuredSession = createFakeBrowserSession(entries(), {
+      baseUrl: 'https://example.test/app/',
+      currentUrl: 'https://example.test/start',
+    });
+
+    await expect(defaultSession.currentUrl()).resolves.toBe('about:blank');
+    await expect(configuredSession.currentUrl()).resolves.toBe('https://example.test/start');
+
+    await configuredSession.perform({ type: 'navigate', url: '/dashboard' });
+    await expect(configuredSession.currentUrl()).resolves.toBe('https://example.test/dashboard');
+
+    setFakeCurrentUrl(configuredSession, 'https://idp.example.test/login');
+    await expect(configuredSession.currentUrl()).resolves.toBe('https://idp.example.test/login');
+  });
+
+  it('records an origin-allowed secret fill only after the bound element remains current', async () => {
+    const filled: unknown[] = [];
+    const session = createFakeBrowserSession(entries(), {
+      baseUrl: 'https://example.test',
+      currentUrl: 'https://example.test/login',
+      onFillSecret: (action) => filled.push(action),
+    });
+    const element = bindForTest(session, REF, FINGERPRINT);
+
+    await expect(session.fillSecret(element, 'materialized-secret', SECRET_POLICY)).resolves.toBeUndefined();
+    expect(session.operations()).toContainEqual({
+      type: 'fill-secret',
+      target: element,
+      value: 'materialized-secret',
+      policy: SECRET_POLICY,
+    });
+    expect(filled).toEqual([{
+      type: 'fill-secret',
+      target: element,
+      value: 'materialized-secret',
+      policy: SECRET_POLICY,
+    }]);
+    const recordedFill = session.operations().find((operation) => operation.type === 'fill-secret');
+    if (recordedFill?.type !== 'fill-secret') {
+      throw new Error('The successful fill must be recorded as a secret-fill operation.');
+    }
+    expect(recordedFill.policy).toBe(SECRET_POLICY);
+    expect(operationObservation(session)).toEqual({
+      ariaSnapshotCalls: 1,
+      roleLocatorCalls: 1,
+      finalOperationCalls: 1,
+    });
+  });
+
+  it('rejects a disallowed secret-fill origin before browser work', async () => {
+    const session = createFakeBrowserSession(entries(), {
+      baseUrl: 'https://example.test',
+      currentUrl: 'https://idp.example.test/login',
+    });
+    const element = bindForTest(session, REF, FINGERPRINT);
+
+    expectSecretSinkOriginViolation(
+      await captureRejection(session.fillSecret(element, 'materialized-secret', SECRET_POLICY)),
+      SECRET_POLICY,
+    );
+    expect(session.operations()).toEqual([]);
+    expect(operationObservation(session)).toEqual({
+      ariaSnapshotCalls: 0,
+      roleLocatorCalls: 0,
+      finalOperationCalls: 0,
+    });
+  });
+
+  it('rejects fabricated and foreign secret-fill handles after an allowed origin check without browser work', async () => {
+    const first = createFakeBrowserSession(entries(), {
+      baseUrl: 'https://example.test',
+      currentUrl: 'https://example.test/login',
+    });
+    const second = createFakeBrowserSession(entries(), {
+      baseUrl: 'https://example.test',
+      currentUrl: 'https://example.test/login',
+    });
+    const fabricated: BoundElement = { ref: REF, fingerprint: FINGERPRINT };
+    const foreign = bindForTest(first, REF, FINGERPRINT);
+
+    await expect(second.fillSecret(fabricated, 'materialized-secret', SECRET_POLICY)).rejects.toThrow('provenance');
+    await expect(second.fillSecret(foreign, 'materialized-secret', SECRET_POLICY)).rejects.toThrow('provenance');
+    expect(second.operations()).toEqual([]);
+    expect(operationObservation(second)).toEqual({
+      ariaSnapshotCalls: 0,
+      roleLocatorCalls: 0,
+      finalOperationCalls: 0,
+    });
+  });
+
+  it('preserves origin-check precedence over a navigation-staled secret-fill handle', async () => {
+    const session = createFakeBrowserSession(entries(), {
+      baseUrl: 'https://example.test',
+      currentUrl: 'https://example.test/login',
+    });
+    const element = bindForTest(session, REF, FINGERPRINT);
+    await session.perform({ type: 'navigate', url: 'https://idp.example.test/login' });
+
+    expectSecretSinkOriginViolation(
+      await captureRejection(session.fillSecret(element, 'materialized-secret', SECRET_POLICY)),
+      SECRET_POLICY,
+    );
+    expect(session.operations().filter((operation) => operation.type === 'fill-secret')).toEqual([]);
+    expect(operationObservation(session)).toEqual({
+      ariaSnapshotCalls: 0,
+      roleLocatorCalls: 0,
+      finalOperationCalls: 0,
+    });
+  });
+
+  it('rejects a still-same-origin secret-fill handle whose descriptor changed', async () => {
+    const liveEntries = entries();
+    const session = createFakeBrowserSession(liveEntries, {
+      baseUrl: 'https://example.test',
+      currentUrl: 'https://example.test/login',
+    });
+    const element = bindForTest(session, REF, FINGERPRINT);
+    const entry = liveEntries.get(REF_KEY);
+    if (entry === undefined) {
+      throw new Error('The descriptor fixture must retain its entry.');
+    }
+    entry.currentFingerprint = OTHER_FINGERPRINT;
+
+    await expect(session.fillSecret(element, 'materialized-secret', SECRET_POLICY)).rejects.toThrow('fingerprint');
+    expect(operationObservation(session)).toEqual({
+      ariaSnapshotCalls: 1,
+      roleLocatorCalls: 0,
+      finalOperationCalls: 0,
+    });
   });
 
   it('invalidates every targeted operation when the descriptor fingerprint changes without navigation', async () => {

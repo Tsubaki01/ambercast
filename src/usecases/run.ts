@@ -16,6 +16,11 @@ import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import { isSnapshotInvalid } from '#core/ir/aria-snapshot.js';
 import {
+  isAllowedSecretSinkOrigin,
+  resolveSecretSinkPolicy,
+  type SecretSinkPolicy,
+} from '#core/secrets/sink-policy.js';
+import {
   GroundingDocument,
   PlanDocument,
   RunRef,
@@ -77,6 +82,23 @@ type ResolutionVia = 'grounding' | 'ai-resolve' | 'trace-replay';
 type DispatchOutcome =
   | { readonly kind: 'passed'; readonly via?: ResolutionVia }
   | { readonly kind: 'assertion-failed'; readonly expected: string; readonly actual: string };
+
+/**
+ * Carries a materialized secret fill through the private run dispatcher.
+ *
+ * This run-local counterpart to {@link PerformableAction} is never persisted
+ * or passed across a port boundary as a bare value. It funnels deterministic
+ * replay, trace replay, and live agentic execution through one secret-fill
+ * dispatch point while the policy travels unchanged with the resolved value.
+ */
+type MaterializedFillSecretAction = {
+  readonly type: 'fill-secret';
+  readonly target: BoundElement;
+  readonly value: string;
+  readonly policy: SecretSinkPolicy;
+};
+
+type MaterializedAction = PerformableAction | MaterializedFillSecretAction;
 
 interface DispatchContext {
   readonly session: BrowserSession;
@@ -456,6 +478,45 @@ function assertSameOriginNavigation(url: string, baseUrl: string): void {
 }
 
 /**
+ * Resolves and checks the live target's secret-sink policy before lookup.
+ *
+ * This is the sink-side counterpart to, not a replacement for,
+ * {@link assertSameOriginNavigation}. It resolves a policy from
+ * `context.target`, which is always the live-config-resolved target rather
+ * than a target copied from a parsed plan, then reads
+ * `context.session.currentUrl()`. A disallowed origin throws
+ * {@link IntegrityViolationError} with the secret reference, allowed origins,
+ * and policy source, never a resolved value, before deterministic or fresh
+ * agentic dispatch resolves the value for that fill. Replay entry
+ * materialization likewise applies this gate before resolving its fill value.
+ * Trace pre-scan has the narrower, documented role of priming granted
+ * references for whole-trace taint checks; it performs no browser action. This
+ * per-entry gate still rejects before replay can dispatch the fill, and its
+ * integrity failure suppresses agentic fallback.
+ *
+ * @param context - The live dispatch context that owns configuration and session state.
+ * @param secretRef - The secret whose fill destination requires authorization.
+ * @returns The policy to carry unchanged to the operation-immediate browser check.
+ * @throws {IntegrityViolationError} When the current origin is not allowed.
+ */
+async function assertAllowedSecretSinkOrigin(
+  context: DispatchContext,
+  secretRef: string,
+): Promise<SecretSinkPolicy> {
+  const policy = resolveSecretSinkPolicy(context.target, secretRef);
+  const currentUrl = await context.session.currentUrl();
+  if (!isAllowedSecretSinkOrigin(policy, currentUrl)) {
+    throw new IntegrityViolationError('The current page origin is not allowed to receive this secret.', {
+      secretRef: policy.secretRef,
+      allowedOrigins: policy.allowedOrigins,
+      source: policy.source,
+    });
+  }
+
+  return policy;
+}
+
+/**
  * Retains every non-empty resolved secret value for every later redaction
  * boundary in this case.
  *
@@ -476,6 +537,33 @@ function recordResolvedSecret(registry: Map<string, Set<string>>, ref: string, v
 }
 
 /**
+ * Routes one already-materialized action to the browser operation that owns it.
+ *
+ * This is the only intended location in `src/**` for a direct
+ * `session.fillSecret(...)` call. `test/architecture.test.ts` and the
+ * fill-secret call-site scanner provide a declaration-aware direct-call check,
+ * not a complete data-flow proof: an aliased indirection or a call through a
+ * differently typed value could evade it. Taking only the session-shaped
+ * dependency keeps the dispatcher independent of the broader dispatch
+ * context, whose remaining state it never needs.
+ *
+ * @param materialized - An ordinary action or the private secret-fill action.
+ * @param session - The browser session that owns the corresponding port methods.
+ * @returns Resolves after the selected browser operation completes.
+ */
+async function performMaterializedAction(
+  materialized: MaterializedAction,
+  session: BrowserSession,
+): Promise<void> {
+  if (materialized.type === 'fill-secret') {
+    await session.fillSecret(materialized.target, materialized.value, materialized.policy);
+    return;
+  }
+
+  await session.perform(materialized);
+}
+
+/**
  * Converts a trusted unresolved trace action into the browser port's
  * materialized action shape immediately before execution.
  *
@@ -485,18 +573,18 @@ function recordResolvedSecret(registry: Map<string, Set<string>>, ref: string, v
  * fingerprint to verify, so compute mode is the only safe way to derive one
  * from the page observation used to bind its unique candidate.
  *
- * `fill-secret` resolves and records its own value before it requests that
- * compute-mode bind. Both operations use `context.resolvedSecrets`, so that
- * registry is also the bind's taint gate. Ordering them within one branch
- * prevents a descriptor that echoes the action's secret from becoming valid
- * merely because its value was not yet available to the gate. Every non-empty
- * resolved secret remains available for later diagnostic redaction.
+ * `fill-secret` first applies its per-entry sink-origin gate before resolving
+ * and recording its own value, then requests the compute-mode bind. Both later
+ * operations use `context.resolvedSecrets`, so that registry remains the
+ * bind's taint gate. The pre-scan priming pass is intentionally distinct: it
+ * resolves all trace secrets before per-entry checks so a pre-navigation
+ * origin cannot incorrectly reject a legitimate later cross-origin redirect.
  */
 async function materializeTraceAction(
   action: TraceAction,
   context: DispatchContext,
   secretRefs: ReadonlySet<string>,
-): Promise<PerformableAction> {
+): Promise<MaterializedAction> {
   switch (action.type) {
     case 'click':
       return { type: 'click', target: await bindTraceTarget(action.target, context) };
@@ -524,6 +612,8 @@ async function materializeTraceAction(
         });
       }
 
+      const policy = await assertAllowedSecretSinkOrigin(context, action.secretRef);
+
       const value = context.secrets.resolve(action.secretRef);
       if (value === undefined) {
         throw new SecretUnresolvedError('The referenced secret is unavailable.', { secretRef: action.secretRef });
@@ -534,6 +624,7 @@ async function materializeTraceAction(
         type: 'fill-secret',
         target: await bindTraceTarget(action.target, context),
         value,
+        policy,
       };
     }
   }
@@ -656,6 +747,11 @@ function preScanTrace(trace: z.infer<typeof TraceRecord>, context: DispatchConte
    * literal that precedes its trace's fill-secret action is still rejected
    * before replay. Missing values and ungranted references retain their
    * classified failure behavior rather than becoming a permissive cache miss.
+   * This priming deliberately happens before any per-entry origin check: the
+   * page's pre-navigation origin cannot decide whether a later cross-origin
+   * redirect is an allowed sink. `materializeTraceAction` performs the
+   * per-entry check at actual replay time, immediately before that entry can
+   * reach `fillSecret`.
    */
   const primeResolvedSecret = (entry: TraceAction | TraceAssert): void => {
     if (entry.type !== 'fill-secret') {
@@ -717,11 +813,10 @@ async function replayTrace(
       continue;
     }
 
-    await context.session.perform(await materializeTraceAction(
-      entry,
-      context,
-      secretRefs,
-    ));
+    await performMaterializedAction(
+      await materializeTraceAction(entry, context, secretRefs),
+      context.session,
+    );
   }
 
   for (const assertion of trace.verification) {
@@ -1157,7 +1252,7 @@ class AgenticRunPipeline implements AiActionController {
         this.context,
         this.#secretRefs,
       );
-      await this.context.session.perform(materialized);
+      await performMaterializedAction(materialized, this.context.session);
     } catch (error) {
       throw scrubBrowserRejection(error, this.context.resolvedSecrets, this.context.runState);
     }
@@ -1470,20 +1565,19 @@ function groundingAbort(reason: GroundingMissReason): CaseAbort {
 /**
  * Materializes and performs one deterministic action through the live session.
  *
- * Element actions resolve trusted grounding immediately before browser use,
- * and secret values are resolved only at that boundary then retained for
- * later diagnostic redaction. A `fill-secret` records its resolved value
- * before grounding so any compute-mode bind can reject a target descriptor
- * contaminated by that action's own secret. This keeps plans and grounding
- * reference-only while preserving the values required to sanitize a subsequent
- * failure.
+ * Element actions resolve trusted grounding immediately before browser use.
+ * A `fill-secret` applies its sink-origin gate before resolving its value,
+ * then retains that value for later diagnostic redaction before grounding can
+ * reject a descriptor contaminated by the secret. This keeps plans and
+ * grounding reference-only while preserving the values required to sanitize a
+ * subsequent failure.
  */
 async function executeAction(step: Step, context: DispatchContext): Promise<DispatchOutcome> {
   if (step.kind !== 'action') {
     throw new Error('The action dispatcher received a non-action step.');
   }
 
-  let action: PerformableAction;
+  let action: MaterializedAction;
   switch (step.action) {
     case 'click':
       action = { type: 'click', target: await groundedTarget(context, step, step.target) };
@@ -1506,6 +1600,7 @@ async function executeAction(step: Step, context: DispatchContext): Promise<Disp
       };
       break;
     case 'fill-secret': {
+      const policy = await assertAllowedSecretSinkOrigin(context, step.secretRef);
       const value = context.secrets.resolve(step.secretRef);
       if (value === undefined) {
         throw new SecretUnresolvedError('The referenced secret is unavailable.', { secretRef: step.secretRef });
@@ -1513,12 +1608,12 @@ async function executeAction(step: Step, context: DispatchContext): Promise<Disp
 
       recordResolvedSecret(context.resolvedSecrets, step.secretRef, value);
       const target = await groundedTarget(context, step, step.target);
-      action = { type: 'fill-secret', target, value };
+      action = { type: 'fill-secret', target, value, policy };
       break;
     }
   }
 
-  await context.session.perform(action);
+  await performMaterializedAction(action, context.session);
   return { kind: 'passed' };
 }
 

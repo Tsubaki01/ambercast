@@ -43,14 +43,18 @@ import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/gen
 import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
 import { buildRunReport } from '#usecases/run-report.js';
 import { OBSERVED_NOTE, RunResult } from '#report/schema.js';
+import { baseUrlSecretPolicy } from '../../doubles/base-url-secret-policy.js';
 import { boundTarget } from '../../doubles/bound-target.js';
 import { createFixedClock } from '../../doubles/create-fixed-clock.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
 import { createRecordingEventSink } from '../../doubles/create-recording-event-sink.js';
+import { expectSecretSinkOriginViolation } from '../../doubles/expect-secret-sink-origin-violation.js';
 import { createFakeBrowserDriver } from '../../doubles/fake-browser-driver.js';
 import {
-  createFakeBrowserSession,
+  createFakeBrowserSession as createRawFakeBrowserSession,
   elementRefKey,
+  setFakeCurrentUrl,
+  type FakeBrowserSessionOptions,
   type FakeBrowserSessionEntry,
 } from '../../doubles/fake-browser-session.js';
 import { createFakeSecretsProvider } from '../../doubles/fake-secrets-provider.js';
@@ -86,6 +90,17 @@ const GENERATE_OPTIONS: GenerateOptions = {
 };
 const AI_TIMEOUT_MESSAGE = 'The AI provider did not respond within the configured timeout.';
 const GENERIC_ABORT_EXPLANATION = 'The browser session could not complete this case and no deterministic fallback is available.';
+
+function createFakeBrowserSession(
+  entries: Map<string, FakeBrowserSessionEntry>,
+  options: FakeBrowserSessionOptions = {},
+) {
+  return createRawFakeBrowserSession(entries, {
+    baseUrl: TARGETS.web.baseUrl,
+    currentUrl: TARGETS.web.baseUrl,
+    ...options,
+  });
+}
 
 interface RecordingStorage {
   readonly storage: StorageAdapter;
@@ -262,8 +277,9 @@ async function seedFreshArtifacts(
   testPath: string,
   steps: readonly TestStep[] = [],
   entries: GroundingDocument['entries'] = {},
+  targetDefinitions: PlanDocument['targets'] = TARGETS,
 ): Promise<PlanDocument> {
-  const plan = await createFreshPlan(storage, testPath, steps);
+  const plan = await createFreshPlan(storage, testPath, steps, targetDefinitions);
   const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
   const grounding: GroundingDocument = {
     schemaVersion: 1,
@@ -684,11 +700,15 @@ describe('run', () => {
     expect(closed).toHaveBeenCalledTimes(1);
   });
 
-  it('materializes every action variant through BrowserSession.perform', async () => {
+  it('materializes ordinary actions through BrowserSession.perform and secret values through fillSecret', async () => {
     const performed: PerformableAction[] = [];
+    const filled: unknown[] = [];
     const session = createFakeBrowserSession(liveEntries([SUBMIT, EMAIL, PASSWORD]), {
       onPerform(action) {
         performed.push(action);
+      },
+      onFillSecret(action) {
+        filled.push(action);
       },
     });
     const secretRef = '{{secrets.auth.password}}';
@@ -719,8 +739,13 @@ describe('run', () => {
       { type: 'navigate', url: '/dashboard' },
       { type: 'press', target: boundTarget(EMAIL, FINGERPRINT), key: 'Enter' },
       { type: 'fill', target: boundTarget(EMAIL, FINGERPRINT), value: 'person@example.test' },
-      { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: 'not-in-the-plan' },
     ]);
+    expect(filled).toEqual([{
+      type: 'fill-secret',
+      target: boundTarget(PASSWORD, FINGERPRINT),
+      value: 'not-in-the-plan',
+      policy: baseUrlSecretPolicy(secretRef, TARGETS.web),
+    }]);
   });
 
   it('rejects a cross-origin deterministic navigate before it reaches the browser', async () => {
@@ -871,7 +896,7 @@ describe('run', () => {
     expect(closed).toHaveBeenCalledTimes(1);
   });
 
-  it('resolves a fill-secret immediately before perform without exposing the secret to the plan', async () => {
+  it('resolves a fill-secret immediately before fillSecret without exposing the secret to the plan', async () => {
     const calls: string[] = [];
     const secretRef = '{{secrets.auth.password}}';
     const secrets = createFakeSecretsProvider(new Map([[secretRef, 'resolved-at-run-time']]));
@@ -880,8 +905,8 @@ describe('run', () => {
       return 'resolved-at-run-time';
     });
     const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
-      onPerform() {
-        calls.push('perform');
+      onFillSecret() {
+        calls.push('fillSecret');
       },
     });
     const { deps, recordingStorage } = createScenario({
@@ -896,13 +921,13 @@ describe('run', () => {
 
     expect(outcome.results[0]?.result.status).toBe('passed');
     expect(resolve).toHaveBeenCalledWith(secretRef);
-    expect(calls).toEqual([`secret:${secretRef}`, 'perform']);
+    expect(calls).toEqual([`secret:${secretRef}`, 'fillSecret']);
   });
 
-  it('fails closed for an unresolved fill-secret without calling perform and closes the session', async () => {
+  it('fails closed for an unresolved fill-secret without calling fillSecret and closes the session', async () => {
     const closed = vi.fn();
-    const perform = vi.fn();
-    const session = createFakeBrowserSession(liveEntries([PASSWORD]), { onPerform: perform, onClose: closed });
+    const fillSecret = vi.fn();
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), { onFillSecret: fillSecret, onClose: closed });
     const secretRef = '{{secrets.auth.password}}';
     const { deps, recordingStorage } = createScenario({
       browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
@@ -926,8 +951,304 @@ describe('run', () => {
         { id: 'after-password', status: 'skipped' },
       ],
     });
-    expect(perform).not.toHaveBeenCalled();
+    expect(fillSecret).not.toHaveBeenCalled();
     expect(closed).toHaveBeenCalledTimes(1);
+  });
+
+  describe('secret-sink origins', () => {
+    const SECRET_REF = '{{secrets.auth.password}}';
+    const SECRET_VALUE = 'resolved-at-run-time';
+    const FILL_STEP: TestStep = {
+      id: 'fill-password',
+      kind: 'action',
+      action: 'fill-secret',
+      target: PASSWORD,
+      secretRef: SECRET_REF,
+    };
+    const DENY_EVERYWHERE_TARGETS: RunDeps['config']['targets'] = {
+      web: {
+        ...TARGETS.web,
+        secretSinkOrigins: { [SECRET_REF]: [] },
+      },
+    };
+    const IDP_ONLY_TARGETS: RunDeps['config']['targets'] = {
+      web: {
+        ...TARGETS.web,
+        secretSinkOrigins: { [SECRET_REF]: ['https://idp.example.test'] },
+      },
+    };
+
+    it('never resolves a deterministic secret when its sink origin is denied', async () => {
+      const session = createFakeBrowserSession(liveEntries([PASSWORD]));
+      const secrets = createFakeSecretsProvider(new Map([[SECRET_REF, SECRET_VALUE]]));
+      const resolve = vi.spyOn(secrets, 'resolve');
+      const { deps, recordingStorage } = createScenario({
+        browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+        config: { ...createScenario().deps.config, targets: DENY_EVERYWHERE_TARGETS },
+        secrets,
+      });
+      const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${SECRET_REF}\n`);
+      await seedFreshArtifacts(recordingStorage.storage, testPath, [FILL_STEP], elementGrounding([FILL_STEP.id]), DENY_EVERYWHERE_TARGETS);
+
+      const outcome = await run(deps, DEFAULT_OPTIONS);
+
+      expectSecretSinkOriginViolation(outcome.results[0]?.error, {
+        secretRef: SECRET_REF,
+        allowedOrigins: [],
+        source: 'configured',
+      });
+      expect(resolve).not.toHaveBeenCalled();
+      expect(session.operations()).toEqual([]);
+    });
+
+    it('never resolves an agentic secret when its sink origin is denied', async () => {
+      const session = createFakeBrowserSession(liveEntries([PASSWORD]));
+      const secrets = createFakeSecretsProvider(new Map([[SECRET_REF, SECRET_VALUE]]));
+      const resolve = vi.spyOn(secrets, 'resolve');
+      const executor = createFakeAiExecutor({
+        async executeAgentic(request) {
+          await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: SECRET_REF });
+          return { outcome: 'success' };
+        },
+      });
+      const { deps, recordingStorage } = createScenario({
+        browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+        config: { ...createScenario().deps.config, targets: DENY_EVERYWHERE_TARGETS },
+        resolveAiExecutor: async () => executor,
+        secrets,
+      });
+      const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${SECRET_REF}\n`);
+      await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep('recorded-ai', [SECRET_REF])], {}, DENY_EVERYWHERE_TARGETS);
+
+      const outcome = await run(deps, DEFAULT_OPTIONS);
+
+      expectSecretSinkOriginViolation(outcome.results[0]?.error, {
+        secretRef: SECRET_REF,
+        allowedOrigins: [],
+        source: 'configured',
+      });
+      expect(resolve).not.toHaveBeenCalled();
+      expect(session.operations()).toEqual([]);
+    });
+
+    it.each([
+      ['allows the default policy at the base URL origin', TARGETS, TARGETS.web.baseUrl, true],
+      ['denies the default policy at a different origin', TARGETS, 'https://idp.example.test/login', false],
+    ] as const)('%s', async (_description, targets, currentUrl, allowed) => {
+      const session = createFakeBrowserSession(liveEntries([PASSWORD]), { currentUrl });
+      const { deps, recordingStorage } = createScenario({
+        browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+        config: { ...createScenario().deps.config, targets },
+        secrets: createFakeSecretsProvider(new Map([[SECRET_REF, SECRET_VALUE]])),
+      });
+      const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${SECRET_REF}\n`);
+      await seedFreshArtifacts(recordingStorage.storage, testPath, [FILL_STEP], elementGrounding([FILL_STEP.id]), targets);
+
+      const outcome = await run(deps, DEFAULT_OPTIONS);
+
+      if (allowed) {
+        expect(outcome.results[0]?.result.status).toBe('passed');
+        expect(session.operations()).toContainEqual({
+          type: 'fill-secret',
+          target: boundTarget(PASSWORD, FINGERPRINT),
+          value: SECRET_VALUE,
+          policy: baseUrlSecretPolicy(SECRET_REF, targets.web),
+        });
+      } else {
+        expectSecretSinkOriginViolation(outcome.results[0]?.error, baseUrlSecretPolicy(SECRET_REF, targets.web));
+        expect(session.operations().filter((operation) => operation.type === 'fill-secret')).toEqual([]);
+      }
+    });
+
+    it('allows an explicit IdP origin while denying the target base URL as a replacement policy', async () => {
+      const allowedSession = createFakeBrowserSession(liveEntries([PASSWORD]));
+      setFakeCurrentUrl(allowedSession, 'https://idp.example.test/login');
+      const allowedScenario = createScenario({
+        browserDriver: vi.fn(() => createFakeBrowserDriver(() => allowedSession)),
+        config: { ...createScenario().deps.config, targets: IDP_ONLY_TARGETS },
+        discoverTestFiles: vi.fn(async () => ['allowed.test.md']),
+        secrets: createFakeSecretsProvider(new Map([[SECRET_REF, SECRET_VALUE]])),
+      });
+      const allowedPath = await writePrompt(allowedScenario.recordingStorage.storage, 'allowed.test.md', `${PROMPT}\n${SECRET_REF}\n`);
+      await seedFreshArtifacts(allowedScenario.recordingStorage.storage, allowedPath, [FILL_STEP], elementGrounding([FILL_STEP.id]), IDP_ONLY_TARGETS);
+
+      const allowedOutcome = await run(allowedScenario.deps, DEFAULT_OPTIONS);
+
+      expect(allowedOutcome.results[0]?.result.status).toBe('passed');
+      expect(allowedSession.operations()).toContainEqual({
+        type: 'fill-secret',
+        target: boundTarget(PASSWORD, FINGERPRINT),
+        value: SECRET_VALUE,
+        policy: {
+          secretRef: SECRET_REF,
+          allowedOrigins: ['https://idp.example.test'],
+          source: 'configured',
+        },
+      });
+
+      const deniedSession = createFakeBrowserSession(liveEntries([PASSWORD]));
+      const deniedScenario = createScenario({
+        browserDriver: vi.fn(() => createFakeBrowserDriver(() => deniedSession)),
+        config: { ...createScenario().deps.config, targets: IDP_ONLY_TARGETS },
+        discoverTestFiles: vi.fn(async () => ['denied.test.md']),
+        secrets: createFakeSecretsProvider(new Map([[SECRET_REF, SECRET_VALUE]])),
+      });
+      const deniedPath = await writePrompt(deniedScenario.recordingStorage.storage, 'denied.test.md', `${PROMPT}\n${SECRET_REF}\n`);
+      await seedFreshArtifacts(deniedScenario.recordingStorage.storage, deniedPath, [FILL_STEP], elementGrounding([FILL_STEP.id]), IDP_ONLY_TARGETS);
+
+      const deniedOutcome = await run(deniedScenario.deps, DEFAULT_OPTIONS);
+
+      expectSecretSinkOriginViolation(deniedOutcome.results[0]?.error, {
+        secretRef: SECRET_REF,
+        allowedOrigins: ['https://idp.example.test'],
+        source: 'configured',
+      });
+      expect(deniedSession.operations().filter((operation) => operation.type === 'fill-secret')).toEqual([]);
+    });
+
+    it('keeps trace priming while rejecting the replayed fill before the browser and agentic fallback', async () => {
+      const session = createFakeBrowserSession(liveEntries([PASSWORD]), { currentUrl: 'https://idp.example.test/login' });
+      const secrets = createFakeSecretsProvider(new Map([[SECRET_REF, SECRET_VALUE]]));
+      const resolve = vi.spyOn(secrets, 'resolve');
+      const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => createFakeAiExecutor({
+        async executeAgentic() {
+          throw new Error('A rejected trace must not start a fresh agentic fallback.');
+        },
+      }));
+      const { deps, recordingStorage } = createScenario({
+        browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+        resolveAiExecutor,
+        secrets,
+      });
+      const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${SECRET_REF}\n`);
+      await seedFreshArtifacts(
+        recordingStorage.storage,
+        testPath,
+        [aiStep('recorded-ai', [SECRET_REF])],
+        aiGrounding(trace([{ type: 'fill-secret', target: PASSWORD, secretRef: SECRET_REF }], [passingText('Dashboard')])),
+      );
+
+      const outcome = await run(deps, DEFAULT_OPTIONS);
+
+      expectSecretSinkOriginViolation(outcome.results[0]?.error, baseUrlSecretPolicy(SECRET_REF, TARGETS.web));
+      expect(resolve).toHaveBeenCalledWith(SECRET_REF);
+      expect(session.operations().filter((operation) => operation.type === 'fill-secret')).toEqual([]);
+      expect(resolveAiExecutor).not.toHaveBeenCalled();
+    });
+
+    it('uses live config rather than a forged plan target snapshot in either direction', async () => {
+      const narrowSession = createFakeBrowserSession(liveEntries([PASSWORD]), { currentUrl: 'https://idp.example.test/login' });
+      const narrowSecrets = createFakeSecretsProvider(new Map([[SECRET_REF, SECRET_VALUE]]));
+      const narrowResolve = vi.spyOn(narrowSecrets, 'resolve');
+      const narrowSessionFactory = vi.fn(() => narrowSession);
+      const narrowDriver = vi.fn<(engine: BrowserEngine) => BrowserDriver>(() => createFakeBrowserDriver(narrowSessionFactory));
+      const narrowCurrentUrl = vi.spyOn(narrowSession, 'currentUrl');
+      const narrowScenario = createScenario({
+        browserDriver: narrowDriver,
+        discoverTestFiles: vi.fn(async () => ['narrow.test.md']),
+        secrets: narrowSecrets,
+      });
+      const narrowPath = await writePrompt(narrowScenario.recordingStorage.storage, 'narrow.test.md', `${PROMPT}\n${SECRET_REF}\n`);
+      const narrowPlan = await createFreshPlan(narrowScenario.recordingStorage.storage, narrowPath, [FILL_STEP]);
+      const narrowLayout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
+      await narrowScenario.recordingStorage.storage.writeText(
+        narrowLayout.planPathFor(narrowPath),
+        toCanonicalArtifactText({
+          ...narrowPlan,
+          targets: {
+            web: {
+              ...narrowPlan.targets.web!,
+              secretSinkOrigins: { [SECRET_REF]: ['https://idp.example.test'] },
+            },
+          },
+        } as unknown as JsonValueT),
+      );
+
+      const narrowOutcome = await run(narrowScenario.deps, DEFAULT_OPTIONS);
+
+      expectSecretSinkOriginViolation(narrowOutcome.results[0]?.error, baseUrlSecretPolicy(SECRET_REF, TARGETS.web));
+      expect(narrowDriver).toHaveBeenCalled();
+      expect(narrowSessionFactory).toHaveBeenCalledOnce();
+      expect(narrowCurrentUrl).toHaveBeenCalledOnce();
+      expect(narrowResolve).not.toHaveBeenCalled();
+      expect(narrowSession.operations().filter((operation) => operation.type === 'fill-secret')).toEqual([]);
+
+      const wideSnapshot = {
+        accessibilityTree: {
+          role: 'root',
+          name: '',
+          children: [{
+            role: 'main',
+            name: 'Application',
+            children: [{ role: 'textbox', name: 'Password', children: [] }],
+          }],
+        },
+        screenshot: new Uint8Array(),
+      };
+      const wideFingerprint = pathBFingerprint(wideSnapshot.accessibilityTree, PASSWORD);
+      const wideSession = createFakeBrowserSession(liveEntries([PASSWORD], wideFingerprint), {
+        currentUrl: 'https://idp.example.test/login',
+        snapshot: wideSnapshot,
+      });
+      const wideTargets: RunDeps['config']['targets'] = {
+        web: { ...TARGETS.web, secretSinkOrigins: { [SECRET_REF]: ['https://idp.example.test'] } },
+      };
+      const wideScenario = createScenario({
+        browserDriver: vi.fn(() => createFakeBrowserDriver(() => wideSession)),
+        config: { ...createScenario().deps.config, targets: wideTargets },
+        discoverTestFiles: vi.fn(async () => ['wide.test.md']),
+        resolveAiExecutor: async () => createFakeAiExecutor({
+          execute: async () => ({ data: { confirmed: true }, raw: '{"confirmed":true}' }),
+        }),
+        secrets: createFakeSecretsProvider(new Map([[SECRET_REF, SECRET_VALUE]])),
+      });
+      const widePath = await writePrompt(wideScenario.recordingStorage.storage, 'wide.test.md', `${PROMPT}\n${SECRET_REF}\n`);
+      const widePlan = await createFreshPlan(wideScenario.recordingStorage.storage, widePath, [FILL_STEP], wideTargets);
+      const wideLayout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
+      await wideScenario.recordingStorage.storage.writeText(
+        wideLayout.planPathFor(widePath),
+        toCanonicalArtifactText({
+          ...widePlan,
+          targets: { web: { ...widePlan.targets.web!, secretSinkOrigins: { [SECRET_REF]: [] } } },
+        } as unknown as JsonValueT),
+      );
+
+      const wideOutcome = await run(wideScenario.deps, DEFAULT_OPTIONS);
+
+      expect(wideOutcome.results[0]?.result.status).toBe('passed');
+      expect(wideSession.operations()).toContainEqual({
+        type: 'fill-secret',
+        target: boundTarget(PASSWORD, wideFingerprint),
+        value: SECRET_VALUE,
+        policy: {
+          secretRef: SECRET_REF,
+          allowedOrigins: ['https://idp.example.test'],
+          source: 'configured',
+        },
+      });
+    });
+
+    it('keeps explicit navigate origin enforcement independent from a secret-sink allow-list', async () => {
+      const session = createFakeBrowserSession(new Map());
+      const { deps, recordingStorage } = createScenario({
+        browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+        config: { ...createScenario().deps.config, targets: IDP_ONLY_TARGETS },
+      });
+      const testPath = await writePrompt(recordingStorage.storage);
+      await seedFreshArtifacts(
+        recordingStorage.storage,
+        testPath,
+        [{ id: 'leave-target', kind: 'action', action: 'navigate', url: 'https://idp.example.test/login' }],
+        {},
+        IDP_ONLY_TARGETS,
+      );
+
+      const outcome = await run(deps, DEFAULT_OPTIONS);
+
+      expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+      expect(outcome.results[0]?.error).toMatchObject({ exitCode: 4 });
+      expect(session.operations()).toEqual([]);
+    });
   });
 
   it('records an assertion failure as results-only evidence and skips later steps', async () => {
@@ -1939,7 +2260,7 @@ describe('run path-B element recovery', () => {
     });
     expect(session.operations()).toEqual([
       { type: 'resolve-grounded', target: PASSWORD, query: { mode: 'verify', fingerprint: FINGERPRINT } },
-      { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: secretValue } },
+      { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: secretValue, policy: baseUrlSecretPolicy(secretRef, TARGETS.web) },
       { type: 'resolve-grounded', target: SUBMIT, query: { mode: 'verify', fingerprint: FINGERPRINT } },
       { type: 'snapshot-for-resolution' },
       { type: 'resolve-grounded', target: SUBMIT, query: { mode: 'verify', fingerprint: expectedFingerprint } },
@@ -2204,7 +2525,7 @@ describe('run path-B element recovery', () => {
     expect(await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`)).toBe(groundingBefore);
     expect(session.operations()).toEqual([
       { type: 'resolve-grounded', target: PASSWORD, query: { mode: 'verify', fingerprint: FINGERPRINT } },
-      { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: secretValue } },
+      { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: secretValue, policy: baseUrlSecretPolicy(secretRef, TARGETS.web) },
       { type: 'resolve-grounded', target: SUBMIT, query: { mode: 'verify', fingerprint: FINGERPRINT } },
       { type: 'snapshot-for-resolution' },
     ]);
@@ -3749,10 +4070,12 @@ describe('run agentic materialization boundary', () => {
 
     expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
     expect(recordingStorage.writes).toEqual([]);
-    expect(session.operations().filter((operation) => operation.type === 'perform')).toEqual(
+    expect(session.operations().filter((operation) => (
+      operation.type === 'perform' || operation.type === 'fill-secret'
+    ))).toEqual(
       _description === 'a captured run value'
         ? []
-        : [{ type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: 'SECRET-LITERAL-SENTINEL' } }],
+        : [{ type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: 'SECRET-LITERAL-SENTINEL', policy: baseUrlSecretPolicy(secretRef, TARGETS.web) }],
     );
   });
 
@@ -3795,7 +4118,7 @@ describe('run agentic materialization boundary', () => {
           target: PASSWORD,
           query: expect.objectContaining({ mode: 'compute' }),
         }),
-        { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: secretValue } },
+        { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: secretValue, policy: baseUrlSecretPolicy(secretRef, TARGETS.web) },
       ]);
       return;
     }
@@ -4003,8 +4326,10 @@ describe('run per-case grounding flush and dispatch wiring', () => {
 
     expect(writeText).toHaveBeenCalledTimes(1);
     expect(session.operations()).toContainEqual({
-      type: 'perform',
-      action: { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: secretValue },
+      type: 'fill-secret',
+      target: boundTarget(PASSWORD, FINGERPRINT),
+      value: secretValue,
+      policy: baseUrlSecretPolicy(secretRef, TARGETS.web),
     });
     expect({
       errorMessage: caseOutcome?.error?.message,

@@ -1,4 +1,6 @@
 import type { ElementRef, Fingerprint } from '../../src/core/ir/schema.js';
+import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
+import { isAllowedSecretSinkOrigin, type SecretSinkPolicy } from '#core/secrets/sink-policy.js';
 import type {
   AssertCheck,
   AssertOutcome,
@@ -44,6 +46,16 @@ export interface FakeBrowserSessionOptions {
   readonly captureValues?: ReadonlyMap<string, { readonly text: string; readonly value: string }>;
   readonly assertOutcome?: AssertOutcome;
   /**
+   * Base URL used as `new URL(navigateUrl, baseUrl)` for each fake navigation.
+   *
+   * An omitted value is `about:blank`, so a relative navigation fails loudly
+   * instead of acquiring a fabricated origin. Supplying the target's launch
+   * base URL mirrors Chromium's context-level relative-URL resolution.
+   */
+  readonly baseUrl?: string;
+  /** Current page URL; an omitted value starts at Chromium's `about:blank`. */
+  readonly currentUrl?: string;
+  /**
    * Ordered assertion outcomes for scenarios that model multiple observations.
    *
    * Supplying this list makes an exhausted script fail loudly instead of
@@ -59,6 +71,8 @@ export interface FakeBrowserSessionOptions {
   readonly accessibilityCapture?: Partial<Pick<AccessibilityCapture, 'rawYaml' | 'scalarValues'>>;
   readonly snapshot?: PageSnapshot;
   readonly onPerform?: (action: PerformableAction) => void;
+  /** Observes a successful secret-fill operation after the fake's gates pass. */
+  readonly onFillSecret?: (action: FakeFillSecretOperation) => void;
   readonly onEvaluateAssert?: (check: AssertCheck) => void;
   /**
    * Observes the first successful `close` call.
@@ -69,6 +83,14 @@ export interface FakeBrowserSessionOptions {
   readonly onClose?: () => void;
 }
 
+/** A successful secret-fill operation observed by the fake browser session. */
+export type FakeFillSecretOperation = {
+  readonly type: 'fill-secret';
+  readonly target: BoundElement;
+  readonly value: string;
+  readonly policy: SecretSinkPolicy;
+};
+
 /**
  * A browser-facing operation observed by the session fake.
  *
@@ -78,6 +100,7 @@ export interface FakeBrowserSessionOptions {
  */
 export type FakeBrowserSessionOperation =
   | { readonly type: 'perform'; readonly action: PerformableAction }
+  | FakeFillSecretOperation
   | { readonly type: 'evaluate-assert'; readonly check: AssertCheck }
   | { readonly type: 'capture-value'; readonly target: BoundElement; readonly mode: CaptureMode }
   | { readonly type: 'resolve-grounded'; readonly target: ElementRef; readonly query: GroundingQuery }
@@ -116,6 +139,7 @@ type FakeBrowserSessionState = {
   readonly bindings: WeakMap<BoundElement, FakeBindingRecord>;
   readonly operations: FakeBrowserSessionOperation[];
   generation: number;
+  currentUrl: string;
   closed: boolean;
   assertOutcomeIndex: number;
   ariaSnapshotCalls: number;
@@ -347,6 +371,27 @@ export function operationObservation(
 }
 
 /**
+ * Changes only a fake session's current URL.
+ *
+ * Keeping URL mutation independent from generation lets a test isolate an
+ * origin re-check from bound-element continuity. A fake `navigate` changes
+ * both fields separately to model the real navigation race that invalidates a
+ * browser binding as well as changing its URL.
+ *
+ * @param session - The fake session whose page URL changes.
+ * @param url - The new current URL without a simulated navigation event.
+ * @throws If `session` did not originate from {@link createFakeBrowserSession}.
+ */
+export function setFakeCurrentUrl(session: FakeBrowserSession, url: string): void {
+  const state = sessionStates.get(session);
+  if (state === undefined) {
+    throw new Error('setFakeCurrentUrl requires a session created by createFakeBrowserSession.');
+  }
+
+  state.currentUrl = url;
+}
+
+/**
  * Builds a deterministic browser-session double from current-page fixtures.
  *
  * The double keeps all state inside this factory and treats a missing element
@@ -365,6 +410,7 @@ export function createFakeBrowserSession(
   options: FakeBrowserSessionOptions = {},
 ): FakeBrowserSession {
   const assertOutcome = options.assertOutcome ?? { passed: true };
+  const baseUrl = options.baseUrl ?? 'about:blank';
   const snapshot = options.snapshot ?? {
     accessibilityTree: {},
     screenshot: new Uint8Array(),
@@ -374,6 +420,8 @@ export function createFakeBrowserSession(
     bindings: new WeakMap(),
     operations: [],
     generation: 0,
+    // Chromium starts a newly created page at about:blank, so omitted test setup fails closed.
+    currentUrl: options.currentUrl ?? 'about:blank',
     closed: false,
     assertOutcomeIndex: 0,
     ariaSnapshotCalls: 0,
@@ -388,11 +436,11 @@ export function createFakeBrowserSession(
           state.operations.push({ type: 'perform', action });
           options.onPerform?.(action);
           state.generation += 1;
+          state.currentUrl = new URL(action.url, baseUrl).toString();
           return;
         case 'click':
         case 'press':
         case 'fill':
-        case 'fill-secret':
           requireCurrentBinding(state, action.target);
           state.roleLocatorCalls += 1;
           state.finalOperationCalls += 1;
@@ -400,6 +448,46 @@ export function createFakeBrowserSession(
           options.onPerform?.(action);
           return;
       }
+    },
+    /**
+     * Fills a bound fake element with a materialized secret value.
+     *
+     * @remarks
+     * The fake uses the adapter's origin-before-continuity ordering so
+     * usecase tests exercise the same race classification. A rejected origin
+     * reports policy diagnostics but never `value`; a real cross-origin
+     * navigation also changes generation, so continuity first would mask that
+     * integrity failure as ordinary staleness.
+     *
+     * @param target - The fake-session-bound element to receive the secret.
+     * @param value - The materialized secret value, which diagnostics must not expose.
+     * @param policy - The already-resolved policy that authorizes `value`.
+     * @returns Resolves after the fake records a successful secret fill.
+     * @throws {IntegrityViolationError} When the current origin is disallowed.
+     * @throws A plain, reason-bearing `Error` when `target` fails continuity verification.
+     */
+    async fillSecret(
+      target: BoundElement,
+      value: string,
+      policy: SecretSinkPolicy,
+    ): Promise<void> {
+      if (!isAllowedSecretSinkOrigin(policy, state.currentUrl)) {
+        throw new IntegrityViolationError('The current page origin is not allowed to receive this secret.', {
+          secretRef: policy.secretRef,
+          allowedOrigins: policy.allowedOrigins,
+          source: policy.source,
+        });
+      }
+
+      requireCurrentBinding(state, target);
+      state.roleLocatorCalls += 1;
+      state.finalOperationCalls += 1;
+      const action = { type: 'fill-secret' as const, target, value, policy };
+      state.operations.push(action);
+      options.onFillSecret?.(action);
+    },
+    async currentUrl(): Promise<string> {
+      return state.currentUrl;
     },
     async evaluateAssert(check): Promise<AssertOutcome> {
       switch (check.check) {

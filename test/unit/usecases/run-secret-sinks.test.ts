@@ -28,12 +28,14 @@ import type { SecretsProvider } from '#ports/system.js';
 import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/generate.js';
 import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
 import { buildRunReport } from '#usecases/run-report.js';
+import { baseUrlSecretPolicy } from '../../doubles/base-url-secret-policy.js';
 import { boundTarget } from '../../doubles/bound-target.js';
 import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
 import { createFakeBrowserDriver } from '../../doubles/fake-browser-driver.js';
 import {
-  createFakeBrowserSession,
+  createFakeBrowserSession as createRawFakeBrowserSession,
   elementRefKey,
+  type FakeBrowserSessionOptions,
   type FakeBrowserSessionEntry,
 } from '../../doubles/fake-browser-session.js';
 import { createFixedClock } from '../../doubles/create-fixed-clock.js';
@@ -62,6 +64,17 @@ const GENERATE_OPTIONS: GenerateOptions = {
   allowEmpty: false,
   list: false,
 };
+
+function createFakeBrowserSession(
+  entries: Map<string, FakeBrowserSessionEntry>,
+  options: FakeBrowserSessionOptions = {},
+) {
+  return createRawFakeBrowserSession(entries, {
+    baseUrl: TARGETS.web.baseUrl,
+    currentUrl: TARGETS.web.baseUrl,
+    ...options,
+  });
+}
 
 interface RecordingStorage {
   readonly storage: StorageAdapter;
@@ -345,7 +358,7 @@ describe('run secret sinks', () => {
         target: PASSWORD,
         query: expect.objectContaining({ mode: 'compute' }),
       }),
-      { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: SECRET_VALUE } },
+      { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: SECRET_VALUE, policy: baseUrlSecretPolicy(SECRET_REF, TARGETS.web) },
     ]);
   });
 
@@ -397,6 +410,7 @@ describe('run secret sinks', () => {
       expect([...computeQuery.resolvedSecrets]).toEqual([new Set([preScanValue, materializationValue])]);
     }
     expect(session.operations().filter((operation) => operation.type === 'perform')).toEqual([]);
+    expect(session.operations().filter((operation) => operation.type === 'fill-secret')).toEqual([]);
     expect(JSON.stringify(outcome)).not.toContain(materializationValue);
   });
 
@@ -436,6 +450,7 @@ describe('run secret sinks', () => {
       expect([...computeQuery.resolvedSecrets]).toEqual([new Set([SECRET_VALUE])]);
     }
     expect(session.operations().filter((operation) => operation.type === 'perform')).toEqual([]);
+    expect(session.operations().filter((operation) => operation.type === 'fill-secret')).toEqual([]);
     expect(recordingStorage.writes).toEqual([]);
     expect(JSON.stringify(outcome)).not.toContain(SECRET_VALUE);
   });
@@ -471,11 +486,11 @@ describe('run secret sinks', () => {
     expect(recordingStorage.writes).toEqual([]);
     expect(session.operations()).toEqual([
       expect.objectContaining({ type: 'resolve-grounded', target: PASSWORD, query: expect.objectContaining({ mode: 'compute' }) }),
-      { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: firstSecretValue } },
+      { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: firstSecretValue, policy: baseUrlSecretPolicy(SECRET_REF, TARGETS.web) },
       expect.objectContaining({ type: 'resolve-grounded', target: unsafeTarget, query: expect.objectContaining({ mode: 'compute' }) }),
       { type: 'perform', action: { type: 'click', target: boundTarget(unsafeTarget, FINGERPRINT) } },
       expect.objectContaining({ type: 'resolve-grounded', target: PASSWORD, query: expect.objectContaining({ mode: 'compute' }) }),
-      { type: 'perform', action: { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: persistenceOnlySecret } },
+      { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: persistenceOnlySecret, policy: baseUrlSecretPolicy(SECRET_REF, TARGETS.web) },
       { type: 'evaluate-assert', check: { check: 'text-visible', text: 'Dashboard' } },
     ]);
   });

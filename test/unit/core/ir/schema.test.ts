@@ -173,6 +173,20 @@ describe('TargetDefinition', () => {
     expectAccepted(TargetDefinition, TARGET_DEFINITION);
     expectAccepted(TargetDefinition, { baseUrl: 'http://example.test', browser: 'chromium' });
     expectAccepted(TargetDefinition, { baseUrl: 'https://example.test/path?query=value#section', browser: 'chromium' });
+    expectAccepted(TargetDefinition, {
+      ...TARGET_DEFINITION,
+      secretSinkOrigins: { '{{secrets.app.password}}': ['https://login.example.test'] },
+    });
+    expectAccepted(TargetDefinition, {
+      ...TARGET_DEFINITION,
+      secretSinkOrigins: {
+        '{{secrets.app.password}}': ['https://login.example.test', 'http://localhost:3000'],
+      },
+    });
+    expectAccepted(TargetDefinition, {
+      ...TARGET_DEFINITION,
+      secretSinkOrigins: { '{{secrets.app.password}}': [] },
+    });
   });
 
   it('rejects malformed or non-HTTP URLs, embedded secret references, unsupported browsers, wrong field types, and unknown properties', () => {
@@ -184,6 +198,45 @@ describe('TargetDefinition', () => {
     expectRejected(TargetDefinition, { baseUrl: 'https://example.test', browser: 'firefox' });
     expectRejected(TargetDefinition, { baseUrl: 42, browser: 'chromium' });
     expectRejected(TargetDefinition, { ...TARGET_DEFINITION, unexpected: true });
+  });
+
+  it.each([
+    ['userinfo', 'https://user@host'],
+    ['path', 'https://host/path'],
+    ['query', 'https://host?q=1'],
+    ['fragment', 'https://host#f'],
+    ['wildcard', 'https://*.host'],
+    ['trailing slash', 'https://host/'],
+    ['trailing-dot host', 'https://host.'],
+    ['non-HTTP(S) scheme', 'ftp://host'],
+    ['bracketed IPv6', 'https://[::1]'],
+    ['embedded secret reference', 'https://{{secrets.X}}.example.test'],
+  ] as const)('rejects a secret-sink origin with %s', (_description, origin) => {
+    expectRejected(TargetDefinition, {
+      ...TARGET_DEFINITION,
+      secretSinkOrigins: { '{{secrets.app.password}}': [origin] },
+    });
+  });
+
+  it('rejects a secret-sink map key that is not a whole secret reference', () => {
+    expectRejected(TargetDefinition, {
+      ...TARGET_DEFINITION,
+      secretSinkOrigins: { apiKey: ['https://login.example.test'] },
+    });
+  });
+
+  it.each([1, 65_535])('accepts a secret-sink origin with valid port %d', (port) => {
+    expectAccepted(TargetDefinition, {
+      ...TARGET_DEFINITION,
+      secretSinkOrigins: { '{{secrets.app.password}}': [`https://login.example.test:${port}`] },
+    });
+  });
+
+  it.each([0, 65_536])('rejects a secret-sink origin with out-of-range port %d', (port) => {
+    expectRejected(TargetDefinition, {
+      ...TARGET_DEFINITION,
+      secretSinkOrigins: { '{{secrets.app.password}}': [`https://login.example.test:${port}`] },
+    });
   });
 });
 
