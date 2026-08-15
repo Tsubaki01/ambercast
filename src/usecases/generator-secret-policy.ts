@@ -23,7 +23,7 @@ import {
   SecretGrantUnattributableError,
 } from '#core/errors/secret-grant-unattributable-error.js';
 
-type SecretDetector =
+export type SecretDetector =
   | 'credential-prefix-sk'
   | 'credential-prefix-ghp'
   | 'credential-prefix-aws-access-key'
@@ -381,7 +381,20 @@ function hasHighEntropy(value: string): boolean {
   return entropy >= 4;
 }
 
-function detectSecretLiteral(value: string): SecretDetector | undefined {
+/**
+ * Classifies a string using the shared credential-literal heuristic.
+ *
+ * Both `assertNoLiteralSecrets` and a run-time trust boundary consume this
+ * primitive, while the result intentionally identifies only the matched
+ * detector. It carries neither the caller's identity nor its reason for
+ * classifying the value, so each boundary retains ownership of its own
+ * exemptions and enforcement policy.
+ *
+ * @param value - Text to classify without retaining it in the result.
+ * @returns The matched detector identifier, or `undefined` when no detector
+ * matches.
+ */
+export function detectSecretLiteral(value: string): SecretDetector | undefined {
   if (value.startsWith('sk-')) {
     return 'credential-prefix-sk';
   }

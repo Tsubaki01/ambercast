@@ -57,7 +57,11 @@ import type { StorageAdapter } from '#ports/storage.js';
 import type { Clock, EventSink, SecretsProvider } from '#ports/system.js';
 import { OBSERVED_NOTE, type ExecutedRunResult, type Observed, type StepResult } from '#report/schema.js';
 import { z } from 'zod';
-import { reattributeSecretGrants } from './generator-secret-policy.js';
+import {
+  detectSecretLiteral,
+  reattributeSecretGrants,
+  type SecretDetector,
+} from './generator-secret-policy.js';
 
 /**
  * Execution evidence while a case is still in progress.
@@ -680,8 +684,15 @@ async function bindTraceTarget(target: ElementRef, context: DispatchContext): Pr
  *
  * `readUsableGrounding` has already validated the complete document shape and
  * `preScanTrace` has validated and resolved every trace secret. This checks
- * the remaining runtime facts: current-case run grants, captured values, and
- * materialized values in fields that can cross the replay boundary.
+ * the remaining runtime facts: current-case run grants and materialized values
+ * in fields that can cross the replay boundary. A `fill` value receives its
+ * credential-shaped-literal check only after run-reference validation so an
+ * invalid reference retains diagnostic precedence.
+ *
+ * The resolved-secret scan remains separate from the narrow `fill` heuristic:
+ * the former protects every provider- or case-derived trace field, while the
+ * latter avoids extending credential classification to URLs, assertions, and
+ * locator names where high-entropy text can be legitimate.
  */
 function preScanTraceEntry(
   entry: TraceAction | TraceAssert,
@@ -690,22 +701,18 @@ function preScanTraceEntry(
   /*
    * `preScanTrace` primes the resolved-secret registry from the complete trace
    * before this validation pass, making each inspection independent of journal
-   * order. The four fields mirror the live provider guard: navigate URLs, fill
-   * values, assertion text, and URL-match patterns. Rejecting them before replay
-   * prevents a contaminated historical trace from reaching either browser
-   * execution or an AI adapter as `priorTrace`.
+   * order. Rejecting a materialized secret before replay prevents a contaminated
+   * historical trace from reaching either browser execution or an AI adapter as
+   * `priorTrace`.
    */
-  const assertSafeTraceField = (value: string): void => {
-    assertTrustedRunReferences(value, context);
-    if (containsResolvedSecret(value, context.resolvedSecrets)) {
-      throw new IntegrityViolationError('An AI trace contains a materialized secret value.');
-    }
-  };
+  if (dataBearingTraceFields(entry).some((field) => containsResolvedSecret(field, context.resolvedSecrets))) {
+    throw new IntegrityViolationError('An AI trace contains a materialized secret value.');
+  }
 
   switch (entry.type === 'assert' ? entry.check : entry.type) {
     case 'navigate': {
       const url = (entry as Extract<TraceAction, { type: 'navigate' }>).url;
-      assertSafeTraceField(url);
+      assertTrustedRunReferences(url, context);
       /*
        * Pre-scanning the whole trace preserves replay atomicity: a later
        * unsafe navigation cannot let an earlier valid action execute.
@@ -713,18 +720,27 @@ function preScanTraceEntry(
       assertSameOriginNavigation(materializeTrustedRunText(url, context), context.target.baseUrl);
       return;
     }
-    case 'fill':
-      assertSafeTraceField((entry as Extract<TraceAction, { type: 'fill' }>).value);
+    case 'fill': {
+      const value = (entry as Extract<TraceAction, { type: 'fill' }>).value;
+      assertTrustedRunReferences(value, context);
+      assertNoCredentialShapedFillValue(value, context.runState);
       return;
-    case 'text-visible':
-      assertSafeTraceField((entry as Extract<TraceAssert, { check: 'text-visible' }>).text);
+    }
+    case 'text-visible': {
+      const text = (entry as Extract<TraceAssert, { check: 'text-visible' }>).text;
+      assertTrustedRunReferences(text, context);
       return;
-    case 'text-equals':
-      assertSafeTraceField((entry as Extract<TraceAssert, { check: 'text-equals' }>).text);
+    }
+    case 'text-equals': {
+      const text = (entry as Extract<TraceAssert, { check: 'text-equals' }>).text;
+      assertTrustedRunReferences(text, context);
       return;
-    case 'url-matches':
-      assertSafeTraceField((entry as Extract<TraceAssert, { check: 'url-matches' }>).pattern);
+    }
+    case 'url-matches': {
+      const pattern = (entry as Extract<TraceAssert, { check: 'url-matches' }>).pattern;
+      assertTrustedRunReferences(pattern, context);
       return;
+    }
     default:
       return;
   }
@@ -873,37 +889,151 @@ function containsResolvedSecret(
 }
 
 /**
+ * Extracts the provider- or case-derived text from one trace entry for the
+ * resolved-secret guard.
+ *
+ * The finite field set includes locator names and payload text but excludes
+ * the closed `type` and `check` discriminants, locator `strategy` and `role`,
+ * and keyboard `key`: they classify a trace entry rather than carrying case
+ * data. Scanning that vocabulary could reject a legitimate entry when a short
+ * resolved secret happens to equal one of its tokens. A `secretRef` is also
+ * excluded because it is an authorized reference identifier rather than a
+ * resolved value, and its name may merely contain a secret value.
+ *
+ * Explicit exhaustive selection makes a new discriminant branch a compile
+ * error until its data-bearing fields receive a reviewed decision. A string
+ * field added to an existing branch still requires manual review.
+ *
+ * @param entry - Parsed trace action or assertion whose data-bearing fields are
+ * considered by the resolved-secret guard.
+ * @returns The strings that may carry provider- or case-derived data.
+ */
+function dataBearingTraceFields(entry: TraceAction | TraceAssert): readonly string[] {
+  const fields: string[] = [];
+  if ('target' in entry) {
+    fields.push(entry.target.name);
+  }
+
+  switch (entry.type === 'assert' ? entry.check : entry.type) {
+    case 'click':
+    case 'press':
+    case 'fill-secret':
+    case 'element-visible':
+    case 'element-count':
+      return fields;
+    case 'navigate':
+      fields.push((entry as Extract<TraceAction, { type: 'navigate' }>).url);
+      return fields;
+    case 'fill':
+      fields.push((entry as Extract<TraceAction, { type: 'fill' }>).value);
+      return fields;
+    case 'text-visible':
+    case 'text-equals':
+      fields.push((entry as Extract<TraceAssert, { check: 'text-visible' | 'text-equals' }>).text);
+      return fields;
+    case 'url-matches':
+      fields.push((entry as Extract<TraceAssert, { check: 'url-matches' }>).pattern);
+      return fields;
+  }
+}
+
+/**
+ * Removes current captured values before reclassifying high-entropy fill text.
+ *
+ * Captured application data such as session tokens and generated identifiers
+ * can legitimately satisfy the entropy heuristic when embedded in ordinary
+ * case text. Removing only that known data lets the heuristic still reject
+ * unrelated high-entropy residue without broadening the exemption to prefix
+ * detectors. Values are removed longest-first so a shorter captured prefix
+ * cannot fragment an overlapping longer value before it is matched.
+ */
+function stripCapturedRunValues(value: string, runState: ReadonlyMap<RunVariableName, string>): string {
+  let residue = value;
+
+  const capturedValues = [...runState.values()]
+    .filter((captured) => captured !== '')
+    .sort((left, right) => right.length - left.length);
+  for (const captured of capturedValues) {
+    residue = residue.split(captured).join('');
+  }
+
+  return residue;
+}
+
+/**
+ * Rejects one credential-shaped literal supplied as a fill value.
+ *
+ * Prefix-shaped credentials remain unconditional because captured application
+ * data cannot justify a credential prefix. A high-entropy value may instead be
+ * wholly explained by captured case data, so only its remaining residue is
+ * reclassified. Its diagnostic identifies the matching detector, never the
+ * literal. Fill values need no secret-reference exemption because their schema
+ * rejects every `{{secrets.` substring before either runtime boundary reaches
+ * this guard.
+ *
+ * @param value - The single parsed fill value to classify.
+ * @param runState - Values captured from the current case.
+ * @throws {@link IntegrityViolationError} when a prefix detector matches or
+ * high-entropy-token residue remains classified after captured values are removed.
+ */
+function assertNoCredentialShapedFillValue(value: string, runState: ReadonlyMap<RunVariableName, string>): void {
+  const detector: SecretDetector | undefined = detectSecretLiteral(value);
+  if (detector === undefined) {
+    return;
+  }
+
+  if (detector !== 'high-entropy-token') {
+    throw new IntegrityViolationError('An AI-supplied fill value resembles a credential literal.', { detector });
+  }
+
+  const residueDetector = detectSecretLiteral(stripCapturedRunValues(value, runState));
+  if (residueDetector !== undefined) {
+    throw new IntegrityViolationError('An AI-supplied fill value resembles a credential literal.', {
+      detector: residueDetector,
+    });
+  }
+}
+
+/**
  * Rejects a provider literal that crosses back over the materialization
  * boundary instead of using its unresolved reference.
  *
- * Resolved secrets are more sensitive than captured run values: a sufficiently
- * long secret substring cannot remain in a provider field because later
- * persistence could retain it irreversibly. Captured values keep exact-field
- * matching because ordinary provider prose may legitimately contain them as
- * a substring; widening that existing run-state rule would reject valid work.
+ * Resolved secrets are more sensitive than captured run values because a
+ * sufficiently long secret substring cannot remain in provider data without
+ * risking irreversible persistence, while ordinary provider prose may
+ * legitimately contain a captured value as a substring. The separate
+ * fill-only credential heuristic avoids extending that classification to URLs,
+ * assertions, and locator names. Resolved-secret rejection takes precedence
+ * when one fill value violates both policies, preserving the more specific
+ * materialization diagnosis.
  */
 function assertNoMaterializedLiteral(
   entry: TraceAction | TraceAssert,
   context: DispatchContext,
   resolvedSecrets: ReadonlyMap<string, ReadonlySet<string>>,
 ): void {
-  let value: string | undefined;
+  if (dataBearingTraceFields(entry).some((field) => containsResolvedSecret(field, resolvedSecrets))) {
+    throw new IntegrityViolationError('The AI adapter supplied a materialized value instead of an unresolved reference.');
+  }
+
+  let runStateCandidate: string | undefined;
 
   switch (entry.type) {
     case 'navigate':
-      value = entry.url;
+      runStateCandidate = entry.url;
       break;
     case 'fill':
-      value = entry.value;
+      runStateCandidate = entry.value;
+      assertNoCredentialShapedFillValue(entry.value, context.runState);
       break;
     case 'assert':
       switch (entry.check) {
         case 'text-visible':
         case 'text-equals':
-          value = entry.text;
+          runStateCandidate = entry.text;
           break;
         case 'url-matches':
-          value = entry.pattern;
+          runStateCandidate = entry.pattern;
           break;
         default:
           return;
@@ -913,10 +1043,7 @@ function assertNoMaterializedLiteral(
       return;
   }
 
-  if (
-    (value !== undefined && containsResolvedSecret(value, resolvedSecrets))
-    || [...context.runState.values()].some((candidate) => candidate === value)
-  ) {
+  if ([...context.runState.values()].some((candidate) => candidate === runStateCandidate)) {
     throw new IntegrityViolationError('The AI adapter supplied a materialized value instead of an unresolved reference.');
   }
 }
