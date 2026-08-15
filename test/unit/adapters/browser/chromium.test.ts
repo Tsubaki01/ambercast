@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
 import { parseAriaSnapshot } from '#core/ir/aria-snapshot.js';
-import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
 import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
 import type { SecretSinkPolicy } from '#core/secrets/sink-policy.js';
 import type {
@@ -23,6 +22,8 @@ import {
   type PlaywrightLocatorHandle,
   type PlaywrightPageHandle,
 } from '../../../../src/adapters/browser/chromium.js';
+import { captureRejection } from '../../../doubles/capture-rejection.js';
+import { expectSecretSinkOriginViolation } from '../../../doubles/expect-secret-sink-origin-violation.js';
 import { registerBrowserDriverContract } from '../../../contracts/browser-driver.contract.js';
 import {
   registerBrowserSessionContract,
@@ -426,33 +427,6 @@ function expectExactSubmitLookup(launcher: FakePlaywrightLauncher): void {
     options: { name: 'Submit', exact: true },
   }]);
   expect(launcher.page.roleLocator.firstCalls).toHaveLength(0);
-}
-
-async function captureRejection(operation: Promise<unknown>): Promise<unknown> {
-  try {
-    await operation;
-  } catch (error) {
-    return error;
-  }
-
-  throw new Error('Expected the operation to reject.');
-}
-
-function expectSecretSinkOriginViolation(error: unknown, policy: SecretSinkPolicy): void {
-  expect(error).toBeInstanceOf(IntegrityViolationError);
-  if (!(error instanceof IntegrityViolationError)) {
-    return;
-  }
-
-  expect({ kind: error.kind, exitCode: error.exitCode }).toStrictEqual({
-    kind: 'integrity-violation',
-    exitCode: 4,
-  });
-  expect(error.details).toStrictEqual({
-    secretRef: policy.secretRef,
-    allowedOrigins: policy.allowedOrigins,
-    source: policy.source,
-  });
 }
 
 function deferred<T>(): { readonly promise: Promise<T>; resolve(value: T): void } {

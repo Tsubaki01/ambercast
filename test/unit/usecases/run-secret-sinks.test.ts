@@ -8,7 +8,6 @@ import { createSpawnCommandRunner } from '#adapters/ai/shared/command-runner.js'
 import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
-import type { SecretSinkPolicy } from '#core/secrets/sink-policy.js';
 import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
@@ -29,6 +28,7 @@ import type { SecretsProvider } from '#ports/system.js';
 import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/generate.js';
 import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
 import { buildRunReport } from '#usecases/run-report.js';
+import { baseUrlSecretPolicy } from '../../doubles/base-url-secret-policy.js';
 import { boundTarget } from '../../doubles/bound-target.js';
 import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
 import { createFakeBrowserDriver } from '../../doubles/fake-browser-driver.js';
@@ -74,14 +74,6 @@ function createFakeBrowserSession(
     currentUrl: TARGETS.web.baseUrl,
     ...options,
   });
-}
-
-function baseUrlSecretPolicy(secretRef: string): SecretSinkPolicy {
-  return {
-    secretRef,
-    allowedOrigins: [new URL(TARGETS.web.baseUrl).origin],
-    source: 'base-url-default',
-  };
 }
 
 interface RecordingStorage {
@@ -366,7 +358,7 @@ describe('run secret sinks', () => {
         target: PASSWORD,
         query: expect.objectContaining({ mode: 'compute' }),
       }),
-      { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: SECRET_VALUE, policy: baseUrlSecretPolicy(SECRET_REF) },
+      { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: SECRET_VALUE, policy: baseUrlSecretPolicy(SECRET_REF, TARGETS.web) },
     ]);
   });
 
@@ -494,11 +486,11 @@ describe('run secret sinks', () => {
     expect(recordingStorage.writes).toEqual([]);
     expect(session.operations()).toEqual([
       expect.objectContaining({ type: 'resolve-grounded', target: PASSWORD, query: expect.objectContaining({ mode: 'compute' }) }),
-      { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: firstSecretValue, policy: baseUrlSecretPolicy(SECRET_REF) },
+      { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: firstSecretValue, policy: baseUrlSecretPolicy(SECRET_REF, TARGETS.web) },
       expect.objectContaining({ type: 'resolve-grounded', target: unsafeTarget, query: expect.objectContaining({ mode: 'compute' }) }),
       { type: 'perform', action: { type: 'click', target: boundTarget(unsafeTarget, FINGERPRINT) } },
       expect.objectContaining({ type: 'resolve-grounded', target: PASSWORD, query: expect.objectContaining({ mode: 'compute' }) }),
-      { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: persistenceOnlySecret, policy: baseUrlSecretPolicy(SECRET_REF) },
+      { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: persistenceOnlySecret, policy: baseUrlSecretPolicy(SECRET_REF, TARGETS.web) },
       { type: 'evaluate-assert', check: { check: 'text-visible', text: 'Dashboard' } },
     ]);
   });

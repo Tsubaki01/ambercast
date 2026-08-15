@@ -72,12 +72,7 @@ export interface FakeBrowserSessionOptions {
   readonly snapshot?: PageSnapshot;
   readonly onPerform?: (action: PerformableAction) => void;
   /** Observes a successful secret-fill operation after the fake's gates pass. */
-  readonly onFillSecret?: (action: {
-    readonly type: 'fill-secret';
-    readonly target: BoundElement;
-    readonly value: string;
-    readonly policy: SecretSinkPolicy;
-  }) => void;
+  readonly onFillSecret?: (action: FakeFillSecretOperation) => void;
   readonly onEvaluateAssert?: (check: AssertCheck) => void;
   /**
    * Observes the first successful `close` call.
@@ -88,6 +83,14 @@ export interface FakeBrowserSessionOptions {
   readonly onClose?: () => void;
 }
 
+/** A successful secret-fill operation observed by the fake browser session. */
+export type FakeFillSecretOperation = {
+  readonly type: 'fill-secret';
+  readonly target: BoundElement;
+  readonly value: string;
+  readonly policy: SecretSinkPolicy;
+};
+
 /**
  * A browser-facing operation observed by the session fake.
  *
@@ -97,12 +100,7 @@ export interface FakeBrowserSessionOptions {
  */
 export type FakeBrowserSessionOperation =
   | { readonly type: 'perform'; readonly action: PerformableAction }
-  | {
-      readonly type: 'fill-secret';
-      readonly target: BoundElement;
-      readonly value: string;
-      readonly policy: SecretSinkPolicy;
-    }
+  | FakeFillSecretOperation
   | { readonly type: 'evaluate-assert'; readonly check: AssertCheck }
   | { readonly type: 'capture-value'; readonly target: BoundElement; readonly mode: CaptureMode }
   | { readonly type: 'resolve-grounded'; readonly target: ElementRef; readonly query: GroundingQuery }

@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
 import { SecretGrantUnattributableError } from '#core/errors/secret-grant-unattributable-error.js';
-import type { SecretSinkPolicy } from '#core/secrets/sink-policy.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computePlanDigest } from '#core/ir/digest.js';
 import {
@@ -15,6 +14,7 @@ import { createLayoutResolver } from '#core/layout/resolve.js';
 import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/generate.js';
 import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
 import { createFixedClock } from '../../doubles/create-fixed-clock.js';
+import { baseUrlSecretPolicy } from '../../doubles/base-url-secret-policy.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
 import { createRecordingEventSink } from '../../doubles/create-recording-event-sink.js';
 import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
@@ -55,12 +55,6 @@ const GENERATE_OPTIONS: GenerateOptions = {
   list: false,
 };
 const RUN_OPTIONS: RunOptions = { files: [TEST_PATH], cacheOnly: false, allowEmpty: false, list: false, stale: 'fail' };
-const BASE_URL_SECRET_POLICY = (secretRef: string): SecretSinkPolicy => ({
-  secretRef,
-  allowedOrigins: [new URL(TARGETS.web.baseUrl).origin],
-  source: 'base-url-default',
-});
-
 describe('fake vertical slice', () => {
   it('replays a generated plan from pre-seeded grounding without AI calls', async () => {
     const storage = createInMemoryStorage();
@@ -264,7 +258,7 @@ describe('fake vertical slice', () => {
       type: 'fill-secret',
       target: expect.objectContaining({ ref: secretTarget }),
       value: 'resolved-at-run-time',
-      policy: BASE_URL_SECRET_POLICY(secretRef),
+      policy: baseUrlSecretPolicy(secretRef, TARGETS.web),
     });
     expect(events.emitted().filter((event) => event.type === 'ai-call')).toEqual([]);
     expect(resolveAiExecutor).not.toHaveBeenCalled();

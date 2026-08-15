@@ -1,6 +1,6 @@
 import { readdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import * as ts from 'typescript';
 import { describe, expect, test } from 'vitest';
 import { computeInputsDigest as aliasComputeInputsDigest } from '#core/ir/digest.js';
@@ -77,16 +77,15 @@ describe('architecture guardrails', () => {
 
   test('restricts browser secret-fill calls to the materialized-action dispatcher', async () => {
     const sourceFiles = await findTypeScriptFiles(SOURCE_ROOT);
+    const tsconfigFileName = ts.sys.resolvePath('tsconfig.json');
+    const configFile = ts.readConfigFile(tsconfigFileName, ts.sys.readFile);
+    if (configFile.error !== undefined) {
+      throw new Error(`The architecture test could not read ${tsconfigFileName}.`);
+    }
+    const parsedConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, dirname(tsconfigFileName));
     const program = ts.createProgram({
       rootNames: sourceFiles,
-      options: {
-        module: ts.ModuleKind.NodeNext,
-        moduleResolution: ts.ModuleResolutionKind.NodeNext,
-        noEmit: true,
-        strict: true,
-        target: ts.ScriptTarget.ES2023,
-        types: ['node'],
-      },
+      options: { ...parsedConfig.options, noEmit: true },
     });
 
     expect(sourceFiles).toEqual(expect.arrayContaining([PORTS_MODULE_FILE, RUN_MODULE_FILE]));
@@ -131,6 +130,7 @@ describe('architecture guardrails', () => {
           "import type { BrowserSession } from './ports.js';",
           'declare const session: BrowserSession;',
           'session.fillSecret();',
+          "session['fillSecret']();",
         ].join('\n'),
       ],
     ]);
@@ -163,6 +163,7 @@ describe('architecture guardrails', () => {
 
     expect(scanFillSecretCallSites(virtualProgram, portsFileName, new Set())).toEqual([
       expect.objectContaining({ fileName: forbiddenFileName, line: 3, allowed: false }),
+      expect.objectContaining({ fileName: forbiddenFileName, line: 4, allowed: false }),
     ]);
   });
 

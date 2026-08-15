@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
 import type { SecretSinkPolicy } from '#core/secrets/sink-policy.js';
 import type { BoundElement, GroundingQuery } from '../../../src/ports/browser.js';
 import type { ElementRef, Fingerprint } from '../../../src/core/ir/schema.js';
+import { captureRejection } from '../../doubles/capture-rejection.js';
+import { expectSecretSinkOriginViolation } from '../../doubles/expect-secret-sink-origin-violation.js';
 import {
   bindForTest,
   createFakeBrowserSession,
@@ -43,33 +44,6 @@ async function resolvedElement(
   }
 
   return result.element;
-}
-
-async function captureRejection(operation: Promise<unknown>): Promise<unknown> {
-  try {
-    await operation;
-  } catch (error) {
-    return error;
-  }
-
-  throw new Error('Expected the operation to reject.');
-}
-
-function expectSecretSinkOriginViolation(error: unknown, policy: SecretSinkPolicy): void {
-  expect(error).toBeInstanceOf(IntegrityViolationError);
-  if (!(error instanceof IntegrityViolationError)) {
-    return;
-  }
-
-  expect({ kind: error.kind, exitCode: error.exitCode }).toStrictEqual({
-    kind: 'integrity-violation',
-    exitCode: 4,
-  });
-  expect(error.details).toStrictEqual({
-    secretRef: policy.secretRef,
-    allowedOrigins: policy.allowedOrigins,
-    source: policy.source,
-  });
 }
 
 async function expectTargetedOperationsToReject(

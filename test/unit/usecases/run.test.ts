@@ -43,10 +43,12 @@ import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/gen
 import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
 import { buildRunReport } from '#usecases/run-report.js';
 import { OBSERVED_NOTE, RunResult } from '#report/schema.js';
+import { baseUrlSecretPolicy } from '../../doubles/base-url-secret-policy.js';
 import { boundTarget } from '../../doubles/bound-target.js';
 import { createFixedClock } from '../../doubles/create-fixed-clock.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
 import { createRecordingEventSink } from '../../doubles/create-recording-event-sink.js';
+import { expectSecretSinkOriginViolation } from '../../doubles/expect-secret-sink-origin-violation.js';
 import { createFakeBrowserDriver } from '../../doubles/fake-browser-driver.js';
 import {
   createFakeBrowserSession as createRawFakeBrowserSession,
@@ -97,38 +99,6 @@ function createFakeBrowserSession(
     baseUrl: TARGETS.web.baseUrl,
     currentUrl: TARGETS.web.baseUrl,
     ...options,
-  });
-}
-
-function baseUrlSecretPolicy(secretRef: string) {
-  return {
-    secretRef,
-    allowedOrigins: [new URL(TARGETS.web.baseUrl).origin],
-    source: 'base-url-default' as const,
-  };
-}
-
-function expectSecretSinkOriginViolation(
-  error: unknown,
-  policy: {
-    readonly secretRef: string;
-    readonly allowedOrigins: readonly string[];
-    readonly source: 'configured' | 'base-url-default';
-  },
-): void {
-  expect(error).toBeInstanceOf(IntegrityViolationError);
-  if (!(error instanceof IntegrityViolationError)) {
-    return;
-  }
-
-  expect({ kind: error.kind, exitCode: error.exitCode }).toStrictEqual({
-    kind: 'integrity-violation',
-    exitCode: 4,
-  });
-  expect(error.details).toStrictEqual({
-    secretRef: policy.secretRef,
-    allowedOrigins: policy.allowedOrigins,
-    source: policy.source,
   });
 }
 
@@ -774,7 +744,7 @@ describe('run', () => {
       type: 'fill-secret',
       target: boundTarget(PASSWORD, FINGERPRINT),
       value: 'not-in-the-plan',
-      policy: baseUrlSecretPolicy(secretRef),
+      policy: baseUrlSecretPolicy(secretRef, TARGETS.web),
     }]);
   });
 
@@ -1082,10 +1052,10 @@ describe('run', () => {
           type: 'fill-secret',
           target: boundTarget(PASSWORD, FINGERPRINT),
           value: SECRET_VALUE,
-          policy: baseUrlSecretPolicy(SECRET_REF),
+          policy: baseUrlSecretPolicy(SECRET_REF, targets.web),
         });
       } else {
-        expectSecretSinkOriginViolation(outcome.results[0]?.error, baseUrlSecretPolicy(SECRET_REF));
+        expectSecretSinkOriginViolation(outcome.results[0]?.error, baseUrlSecretPolicy(SECRET_REF, targets.web));
         expect(session.operations().filter((operation) => operation.type === 'fill-secret')).toEqual([]);
       }
     });
@@ -1160,7 +1130,7 @@ describe('run', () => {
 
       const outcome = await run(deps, DEFAULT_OPTIONS);
 
-      expectSecretSinkOriginViolation(outcome.results[0]?.error, baseUrlSecretPolicy(SECRET_REF));
+      expectSecretSinkOriginViolation(outcome.results[0]?.error, baseUrlSecretPolicy(SECRET_REF, TARGETS.web));
       expect(resolve).toHaveBeenCalledWith(SECRET_REF);
       expect(session.operations().filter((operation) => operation.type === 'fill-secret')).toEqual([]);
       expect(resolveAiExecutor).not.toHaveBeenCalled();
@@ -1196,7 +1166,7 @@ describe('run', () => {
 
       const narrowOutcome = await run(narrowScenario.deps, DEFAULT_OPTIONS);
 
-      expectSecretSinkOriginViolation(narrowOutcome.results[0]?.error, baseUrlSecretPolicy(SECRET_REF));
+      expectSecretSinkOriginViolation(narrowOutcome.results[0]?.error, baseUrlSecretPolicy(SECRET_REF, TARGETS.web));
       expect(narrowDriver).toHaveBeenCalled();
       expect(narrowSessionFactory).toHaveBeenCalledOnce();
       expect(narrowCurrentUrl).toHaveBeenCalledOnce();
@@ -2290,7 +2260,7 @@ describe('run path-B element recovery', () => {
     });
     expect(session.operations()).toEqual([
       { type: 'resolve-grounded', target: PASSWORD, query: { mode: 'verify', fingerprint: FINGERPRINT } },
-      { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: secretValue, policy: baseUrlSecretPolicy(secretRef) },
+      { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: secretValue, policy: baseUrlSecretPolicy(secretRef, TARGETS.web) },
       { type: 'resolve-grounded', target: SUBMIT, query: { mode: 'verify', fingerprint: FINGERPRINT } },
       { type: 'snapshot-for-resolution' },
       { type: 'resolve-grounded', target: SUBMIT, query: { mode: 'verify', fingerprint: expectedFingerprint } },
@@ -2555,7 +2525,7 @@ describe('run path-B element recovery', () => {
     expect(await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`)).toBe(groundingBefore);
     expect(session.operations()).toEqual([
       { type: 'resolve-grounded', target: PASSWORD, query: { mode: 'verify', fingerprint: FINGERPRINT } },
-      { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: secretValue, policy: baseUrlSecretPolicy(secretRef) },
+      { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: secretValue, policy: baseUrlSecretPolicy(secretRef, TARGETS.web) },
       { type: 'resolve-grounded', target: SUBMIT, query: { mode: 'verify', fingerprint: FINGERPRINT } },
       { type: 'snapshot-for-resolution' },
     ]);
@@ -4105,7 +4075,7 @@ describe('run agentic materialization boundary', () => {
     ))).toEqual(
       _description === 'a captured run value'
         ? []
-        : [{ type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: 'SECRET-LITERAL-SENTINEL', policy: baseUrlSecretPolicy(secretRef) }],
+        : [{ type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: 'SECRET-LITERAL-SENTINEL', policy: baseUrlSecretPolicy(secretRef, TARGETS.web) }],
     );
   });
 
@@ -4148,7 +4118,7 @@ describe('run agentic materialization boundary', () => {
           target: PASSWORD,
           query: expect.objectContaining({ mode: 'compute' }),
         }),
-        { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: secretValue, policy: baseUrlSecretPolicy(secretRef) },
+        { type: 'fill-secret', target: boundTarget(PASSWORD, FINGERPRINT), value: secretValue, policy: baseUrlSecretPolicy(secretRef, TARGETS.web) },
       ]);
       return;
     }
@@ -4359,7 +4329,7 @@ describe('run per-case grounding flush and dispatch wiring', () => {
       type: 'fill-secret',
       target: boundTarget(PASSWORD, FINGERPRINT),
       value: secretValue,
-      policy: baseUrlSecretPolicy(secretRef),
+      policy: baseUrlSecretPolicy(secretRef, TARGETS.web),
     });
     expect({
       errorMessage: caseOutcome?.error?.message,

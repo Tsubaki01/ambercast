@@ -2,11 +2,12 @@
  * Provides the bounded architecture-test guard for direct calls to the
  * browser port's secret-fill method.
  *
- * It recognizes direct property-access calls resolved by TypeScript to
- * `BrowserSession.fillSecret`, not string-matched method names. The guard is
- * deliberately structural rather than a complete data-flow proof: an aliased
- * indirection or a call through a differently typed value can evade it, while
- * unrelated same-named methods remain outside the boundary.
+ * It recognizes direct dot-access and string-literal element-access calls
+ * resolved by TypeScript to `BrowserSession.fillSecret`, not string-matched
+ * method names. The guard is deliberately structural rather than a complete
+ * data-flow proof: a rebound or destructured method reference, an aliased
+ * indirection, or a call through a differently typed value can evade it,
+ * while unrelated same-named methods remain outside the boundary.
  */
 import * as ts from 'typescript';
 
@@ -27,10 +28,11 @@ export type FillSecretCallSite = {
  * `checker.getDeclaredTypeOfSymbol(...)`, and finds the `fillSecret` property
  * with `.getProperty('fillSecret')`; this is an interface method rather than
  * a standalone function declaration. It then walks every non-declaration
- * source file for call expressions whose property-access name is
- * `fillSecret`. A candidate is recorded only when its checker-resolved symbol,
- * after alias resolution, includes that interface-method declaration. Each
- * site records whether its source file appears in the explicit allowlist.
+ * source file for call expressions whose dot-access or string-literal
+ * element-access method name is `fillSecret`. A candidate is recorded only
+ * when its checker-resolved symbol, after alias resolution, includes that
+ * interface-method declaration. Each site records whether its source file
+ * appears in the explicit allowlist.
  *
  * @param program - The TypeScript program containing source files to inspect.
  * @param portsModuleFileName - The source file exporting `BrowserSession`.
@@ -78,12 +80,17 @@ export function scanFillSecretCallSites(
   }
 
   function visit(sourceFile: ts.SourceFile, node: ts.Node): void {
-    if (
-      ts.isCallExpression(node)
-      && ts.isPropertyAccessExpression(node.expression)
+    const accessName = ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)
       && node.expression.name.text === 'fillSecret'
-      && resolvesToFillSecret(checker.getSymbolAtLocation(node.expression.name))
-    ) {
+      ? node.expression.name
+      : ts.isCallExpression(node) && ts.isElementAccessExpression(node.expression)
+        && node.expression.argumentExpression !== undefined
+        && ts.isStringLiteralLike(node.expression.argumentExpression)
+        && node.expression.argumentExpression.text === 'fillSecret'
+        ? node.expression.argumentExpression
+        : undefined;
+
+    if (accessName !== undefined && resolvesToFillSecret(checker.getSymbolAtLocation(accessName))) {
       const position = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
       callSites.push({
         fileName: sourceFile.fileName,
