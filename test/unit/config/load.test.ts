@@ -400,6 +400,40 @@ describe('loadConfig', () => {
       });
     });
 
+    it('preserves a valid secret-sink origin map and rejects an invalid one while loading targets', async () => {
+      const acceptedStorage = createInMemoryStorage();
+      await writeConfig(acceptedStorage, `${CWD}/ambercast.config.json`, {
+        targets: {
+          app: {
+            ...APP_TARGET,
+            secretSinkOrigins: { '{{secrets.app.password}}': ['https://idp.example.test'] },
+          },
+        },
+        defaultTarget: 'app',
+      });
+
+      await expect(load(acceptedStorage)).resolves.toMatchObject({
+        targets: {
+          app: {
+            secretSinkOrigins: { '{{secrets.app.password}}': ['https://idp.example.test'] },
+          },
+        },
+      });
+
+      const rejectedStorage = createInMemoryStorage();
+      await writeConfig(rejectedStorage, `${CWD}/ambercast.config.json`, {
+        targets: {
+          app: {
+            ...APP_TARGET,
+            secretSinkOrigins: { '{{secrets.app.password}}': ['https://idp.example.test/path'] },
+          },
+        },
+        defaultTarget: 'app',
+      });
+
+      await expectConfigInvalid(load(rejectedStorage));
+    });
+
     it('clears the built-in default target even when an atomic replacement still declares web-user', async () => {
       const storage = createInMemoryStorage();
       await writeConfig(storage, `${CWD}/ambercast.config.json`, {

@@ -33,12 +33,15 @@ import type {
   PageSnapshot,
   PerformableAction,
 } from '#ports/browser.js';
+import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
 import { extractDiscardedScalarValues, parseAriaSnapshot } from '#core/ir/aria-snapshot.js';
 import {
   computeAccessibilityFingerprint,
   resolveAccessibilityFingerprint,
 } from '#core/ir/fingerprint.js';
 import type { ElementRef, Fingerprint, TargetDefinition } from '#core/ir/schema.js';
+import { isAllowedSecretSinkOrigin } from '#core/secrets/sink-policy.js';
+import type { SecretSinkPolicy } from '#core/secrets/sink-policy.js';
 
 type PlaywrightBrowser = import('playwright-core').Browser;
 type PlaywrightContext = import('playwright-core').BrowserContext;
@@ -290,8 +293,7 @@ class ChromiumBrowserSession implements BrowserSession {
    *
    * @remarks
    * Navigation leaves relative-URL resolution to the context base URL,
-   * avoiding a second URL-resolution rule in this adapter. A materialized
-   * secret is used only to fulfill its action and is never logged or returned.
+   * avoiding a second URL-resolution rule in this adapter.
    *
    * Before a targeted call, the adapter treats its private bind record as the
    * authority: the handle must have been minted by this session, its recorded
@@ -314,8 +316,7 @@ class ChromiumBrowserSession implements BrowserSession {
         await locator.press(action.key);
         return;
       }
-      case 'fill':
-      case 'fill-secret': {
+      case 'fill': {
         const { locator } = await this.reverifyBinding(action.target);
         await locator.fill(action.value);
         return;
@@ -324,6 +325,32 @@ class ChromiumBrowserSession implements BrowserSession {
         await this.page.goto(action.url);
         return;
     }
+  }
+
+  /**
+   * Fills a bound element with a secret after policy and continuity checks.
+   *
+   * The origin check precedes binding verification because a real
+   * cross-origin navigation also advances `navigationGeneration()`. Reversing
+   * that order would report the ordinary stale-binding error instead of the
+   * integrity-classified origin violation. Origin failures include policy
+   * diagnostics but never the materialized value.
+   */
+  async fillSecret(
+    target: BoundElement,
+    value: string,
+    policy: SecretSinkPolicy,
+  ): Promise<void> {
+    if (!isAllowedSecretSinkOrigin(policy, this.page.url())) {
+      throw new IntegrityViolationError('The current page origin is not allowed to receive this secret.', {
+        secretRef: policy.secretRef,
+        allowedOrigins: policy.allowedOrigins,
+        source: policy.source,
+      });
+    }
+
+    const { locator } = await this.reverifyBinding(target);
+    await locator.fill(value);
   }
 
   /**
@@ -560,6 +587,10 @@ class ChromiumBrowserSession implements BrowserSession {
 
   async screenshot(): Promise<Uint8Array> {
     return this.page.screenshot();
+  }
+
+  async currentUrl(): Promise<string> {
+    return this.page.url();
   }
 
   /**

@@ -1,5 +1,6 @@
 import { describe, expectTypeOf, it } from 'vitest';
 import type { ElementRef, Fingerprint, JsonValueT, TargetDefinition } from '../../../src/core/ir/schema.js';
+import type { SecretSinkPolicy } from '#core/secrets/sink-policy.js';
 import type {
   AccessibilityCapture,
   AssertCheck,
@@ -36,7 +37,6 @@ describe('browser port shapes', () => {
       | { readonly type: 'navigate'; readonly url: string }
       | { readonly type: 'press'; readonly target: BoundElement; readonly key: 'Enter' | 'Tab' | 'Escape' | 'ArrowDown' | 'ArrowUp' }
       | { readonly type: 'fill'; readonly target: BoundElement; readonly value: string }
-      | { readonly type: 'fill-secret'; readonly target: BoundElement; readonly value: string }
     >();
     expectTypeOf<AssertCheck>().toEqualTypeOf<
       | { readonly check: 'text-visible'; readonly text: string }
@@ -69,6 +69,10 @@ describe('browser port shapes', () => {
 
   it('defines every browser session operation with its exact arguments', () => {
     expectTypeOf<BrowserSession['perform']>().toEqualTypeOf<(action: PerformableAction) => Promise<void>>();
+    expectTypeOf<BrowserSession['fillSecret']>().toEqualTypeOf<
+      (target: BoundElement, value: string, policy: SecretSinkPolicy) => Promise<void>
+    >();
+    expectTypeOf<BrowserSession['currentUrl']>().toEqualTypeOf<() => Promise<string>>();
     expectTypeOf<BrowserSession['evaluateAssert']>().toEqualTypeOf<(check: AssertCheck) => Promise<AssertOutcome>>();
     expectTypeOf<BrowserSession['captureValue']>().toEqualTypeOf<(target: BoundElement, mode: CaptureMode) => Promise<string>>();
     expectTypeOf<BrowserSession['resolveGrounded']>().toEqualTypeOf<

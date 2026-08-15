@@ -91,11 +91,19 @@ describe('RawConfig', () => {
     expectRejected(RawConfig, value);
   });
 
-  it('reuses TargetDefinition by accepting only Chromium targets without embedded secret references', () => {
+  it('reuses TargetDefinition by accepting only Chromium targets without malformed secret-sink origins or embedded secret references', () => {
     expectAccepted(RawConfig, { $schema: CONFIG_SCHEMA_URL, targets: { app: TARGET } });
+    expectAccepted(RawConfig, {
+      $schema: CONFIG_SCHEMA_URL,
+      targets: { app: { ...TARGET, secretSinkOrigins: { '{{secrets.app.password}}': ['https://idp.example.test'] } } },
+    });
     expectRejected(RawConfig, { $schema: CONFIG_SCHEMA_URL, targets: { app: { ...TARGET, browser: 'firefox' } } });
     expectRejected(RawConfig, { $schema: CONFIG_SCHEMA_URL, targets: { app: { ...TARGET, browser: 'webkit' } } });
     expectRejected(RawConfig, { $schema: CONFIG_SCHEMA_URL, targets: { app: { ...TARGET, baseUrl: 'https://example.com/{{secrets.TOKEN}}' } } });
+    expectRejected(RawConfig, {
+      $schema: CONFIG_SCHEMA_URL,
+      targets: { app: { ...TARGET, secretSinkOrigins: { '{{secrets.app.password}}': ['https://idp.example.test/path'] } } },
+    });
   });
 
   it.each(['claude', 'codex', 'auto'] as const)('accepts %s as an AI provider', (provider) => {

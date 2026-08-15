@@ -137,6 +137,20 @@ describe('computeInputsDigest', () => {
     expect(computeInputsDigest(renamed)).not.toBe(computeInputsDigest(baseline));
   });
 
+  it('changes when only a target secret-sink origin policy changes', () => {
+    const baseline = createInputs();
+    const changed = createInputs({
+      targetDefinitions: {
+        app: {
+          ...targetDefinition(),
+          secretSinkOrigins: { '{{secrets.app.password}}': ['https://idp.example.test'] },
+        },
+      },
+    });
+
+    expect(computeInputsDigest(changed)).not.toBe(computeInputsDigest(baseline));
+  });
+
   it('does not change when the same named targets are inserted in a different order', () => {
     const first = createInputs({
       targetDefinitions: {

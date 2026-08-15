@@ -10,6 +10,7 @@ import type {
   TargetDefinition,
   TracePress,
 } from '#core/ir/schema.js';
+import type { SecretSinkPolicy } from '#core/secrets/sink-policy.js';
 
 /**
  * A browser engine that a target can select for a run.
@@ -118,14 +119,14 @@ export interface BoundElement {
 /**
  * A browser action whose values are ready for direct execution.
  *
- * `fill-secret` identifies materialized secret data that drivers and tracers
- * must not log.
- *
  * @remarks
  * This deliberately mirrors, rather than reuses, the unresolved IR action
  * shape. The caller that owns run state and secret lookup resolves
- * interpolation and secret references immediately before calling
- * {@link BrowserSession.perform}, so this port never receives either.
+ * interpolation immediately before calling {@link BrowserSession.perform},
+ * so this port never receives unresolved run data. Secret values never flow
+ * through this union or `perform()` at all: {@link BrowserSession.fillSecret}
+ * is the sole port method that receives one and documents that security
+ * boundary.
  * Every element-targeted variant carries a {@link BoundElement} rather than a
  * bare `ElementRef`: the caller obtained it from `resolveGrounded` (directly,
  * or via AI re-resolution followed by a confirming bind), so the operation
@@ -138,8 +139,7 @@ export type PerformableAction =
   | { readonly type: 'click'; readonly target: BoundElement }
   | { readonly type: 'navigate'; readonly url: string }
   | { readonly type: 'press'; readonly target: BoundElement; readonly key: TracePress['key'] }
-  | { readonly type: 'fill'; readonly target: BoundElement; readonly value: string }
-  | { readonly type: 'fill-secret'; readonly target: BoundElement; readonly value: string };
+  | { readonly type: 'fill'; readonly target: BoundElement; readonly value: string };
 
 /**
  * An assertion check with expected values materialized for the current run.
@@ -295,7 +295,7 @@ export interface BrowserSession {
   /**
    * Executes a fully materialized action.
    *
-   * @param action - The action with resolved run and secret values, and a
+   * @param action - The action with resolved run values and a
    *   {@link BoundElement} target for every element-targeted variant.
    * @returns Resolves after the action completes.
    * @throws If the browser cannot complete the action, including when the
@@ -305,6 +305,52 @@ export interface BrowserSession {
    *   of leaving browser-rejection classification to the caller.
    */
   perform(action: PerformableAction): Promise<void>;
+
+  /**
+   * Writes a materialized secret value to an already-bound page element.
+   *
+   * @remarks
+   * This is the only port method permitted to receive a secret value. The
+   * caller resolves `policy` once and supplies it unchanged; implementations
+   * never recompute it. Immediately before the underlying fill, an
+   * implementation must re-check the current page origin against that policy,
+   * applying operation-immediate re-verification to origin just as
+   * `BoundElement` continuity applies it to staleness. The origin check runs
+   * before the continuity re-verification, so a navigation race that changes
+   * both origin and generation remains an origin violation instead of being
+   * masked by the separate stale-binding rejection.
+   *
+   * Origin and `BoundElement` continuity are independent layers: the latter
+   * remains the ordinary failure documented by {@link resolveGrounded}, while
+   * a rejected origin propagates as an integrity violation. Unlike other
+   * targeted port operations, every implementation uses the classified error
+   * required below for this origin-specific path.
+   *
+   * @param target - The session-local element to receive the secret.
+   * @param value - The materialized secret value, which implementations must not expose.
+   * @param policy - The already-resolved secret-sink policy for `value`.
+   * @returns Resolves after the browser fill completes.
+   * @throws A plain, reason-bearing `Error` when `target` fails
+   *   operation-immediate continuity re-verification.
+   * @throws {IntegrityViolationError} When the operation-immediate origin
+   *   check rejects the page. Implementations preserve this exact class so
+   *   replay preserves the integrity failure instead of treating it as a
+   *   behavioral miss eligible for agentic fallback.
+   */
+  fillSecret(target: BoundElement, value: string, policy: SecretSinkPolicy): Promise<void>;
+
+  /**
+   * Returns the browser's current page URL.
+   *
+   * Callers use this before resolving a secret to evaluate its sink policy,
+   * while implementations independently re-read their live page URL
+   * immediately before a secret fill. It is unrelated to the `url-matches`
+   * assertion, which compares materialized text rather than supplying an
+   * origin-policy input.
+   *
+   * @returns The browser's current page URL.
+   */
+  currentUrl(): Promise<string>;
 
   /**
    * Evaluates a fully materialized assertion.

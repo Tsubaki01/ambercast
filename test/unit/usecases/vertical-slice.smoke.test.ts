@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { SecretGrantUnattributableError } from '#core/errors/secret-grant-unattributable-error.js';
+import type { SecretSinkPolicy } from '#core/secrets/sink-policy.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computePlanDigest } from '#core/ir/digest.js';
 import {
@@ -54,6 +55,11 @@ const GENERATE_OPTIONS: GenerateOptions = {
   list: false,
 };
 const RUN_OPTIONS: RunOptions = { files: [TEST_PATH], cacheOnly: false, allowEmpty: false, list: false, stale: 'fail' };
+const BASE_URL_SECRET_POLICY = (secretRef: string): SecretSinkPolicy => ({
+  secretRef,
+  allowedOrigins: [new URL(TARGETS.web.baseUrl).origin],
+  source: 'base-url-default',
+});
 
 describe('fake vertical slice', () => {
   it('replays a generated plan from pre-seeded grounding without AI calls', async () => {
@@ -223,7 +229,10 @@ describe('fake vertical slice', () => {
         algorithm: 'a11y-neighborhood-v2',
         hash: 'a'.repeat(64),
       } }],
-    ]));
+    ]), {
+      baseUrl: TARGETS.web.baseUrl,
+      currentUrl: TARGETS.web.baseUrl,
+    });
     const events = createRecordingEventSink();
     const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => {
       throw new Error('Path-C replay must not resolve an AI executor.');
@@ -252,12 +261,10 @@ describe('fake vertical slice', () => {
 
     expect(outcome.results[0]?.result.status).toBe('passed');
     expect(session.operations()).toContainEqual({
-      type: 'perform',
-      action: {
-        type: 'fill-secret',
-        target: expect.objectContaining({ ref: secretTarget }),
-        value: 'resolved-at-run-time',
-      },
+      type: 'fill-secret',
+      target: expect.objectContaining({ ref: secretTarget }),
+      value: 'resolved-at-run-time',
+      policy: BASE_URL_SECRET_POLICY(secretRef),
     });
     expect(events.emitted().filter((event) => event.type === 'ai-call')).toEqual([]);
     expect(resolveAiExecutor).not.toHaveBeenCalled();

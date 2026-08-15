@@ -36,6 +36,8 @@ const HEX_SHA256_PATTERN = /^[0-9a-f]{64}$/;
 // This flag-independent pattern keeps zod's runtime validator and the generated public JSON Schema aligned: JSON Schema's `pattern` keyword carries no flags, and `z.toJSONSchema()` emits only a regex's source. It rejects a contiguous `{{secrets.` marker at the start of a multi-line string, immediately after an embedded newline, or anywhere later, while accepting a near-miss with a newline inside the marker such as `{{secrets\n.TOKEN}}` because the marker text is not contiguous.
 const NO_SECRETS_LITERAL_PATTERN = /^(?![\s\S]*\{\{secrets\.)[\s\S]*$/;
 const HTTP_URL_PATTERN = /^https?:\/\/[^\s/?#]\S*$/;
+// Character classes admit only scheme://host[:port], including ports 1–65535, so path/query/fragment/wildcard/userinfo need no `.refine()`; IPv6 literals are deliberately out of scope here while `baseUrl` keeps its separate, more permissive HTTP_URL_PATTERN.
+const SECRET_SINK_ORIGIN_PATTERN = /^https?:\/\/[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}))?$/;
 const STEP_ID_PATTERN = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
 const RUN_VARIABLE_NAME_PATTERN = /^[a-z][a-zA-Z0-9]*$/;
 const RUN_REF_PATTERN = /^\{\{run\.[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*\}\}$/;
@@ -55,6 +57,26 @@ export const SecretRef = z.string().regex(SECRET_REF_PATTERN);
  * by parsing untrusted data through the schema rather than casting strings.
  */
 export type SecretRef = z.infer<typeof SecretRef>;
+
+/**
+ * Validates one configuration-authored HTTP(S) origin permitted to receive a
+ * secret value.
+ *
+ * @remarks
+ * Separate `.regex()` calls keep the origin shape and literal-secret ban
+ * independently visible in generated JSON Schema. This follows `baseUrl`'s
+ * same combination because an origin is authored configuration, not an
+ * interpolation target. The schema validates authoring shape only; runtime
+ * comparison is parsed and normalized by `URL` in `core/secrets/sink-policy.ts`.
+ * Keeping that comparison outside this schema preserves this module's
+ * invariant against JSON-Schema-invisible `.refine()` constraints.
+ */
+export const SecretSinkOrigin = z.string()
+  .regex(SECRET_SINK_ORIGIN_PATTERN)
+  .regex(NO_SECRETS_LITERAL_PATTERN);
+
+/** The static origin value accepted by {@link SecretSinkOrigin}. */
+export type SecretSinkOrigin = z.infer<typeof SecretSinkOrigin>;
 
 /**
  * Validates the canonical lowercase SHA-256 digest encoding used by IR
@@ -88,8 +110,8 @@ export const InterpolatableText = z.string().regex(NO_SECRETS_LITERAL_PATTERN);
 export type InterpolatableText = z.infer<typeof InterpolatableText>;
 
 /**
- * Validates the browser target shared by a plan's `targets` record and
- * `RawConfig.targets`.
+ * Validates the browser target shared by `PlanDocument.targets`,
+ * `RawConfig.targets`, and `ResolvedConfig.targets`.
  *
  * A portable regex, rather than `z.url()`, preserves the HTTP(S) restriction
  * in generated JSON Schema without requiring AJV format support. Keeping the
@@ -105,10 +127,24 @@ export type InterpolatableText = z.infer<typeof InterpolatableText>;
  * because target URLs are human-authored configuration rather than
  * interpolation inputs, preventing unresolved references from entering
  * committed IR or runtime requests.
+ *
+ * `secretSinkOrigins` follows the same shared-target contract as `baseUrl`
+ * and `browser`, so changing it has the existing target-config digest
+ * staleness blast radius rather than creating a new cost category. An absent
+ * entry for a secret permits fills only at this target's `baseUrl` origin; a
+ * present empty array explicitly denies that secret everywhere; and a
+ * non-empty array replaces rather than augments the default origin.
+ *
+ * The field belongs in this shared schema so plans retain the same target
+ * snapshot that contributes to freshness, while execution always reads the
+ * live `ResolvedConfig` target rather than the plan's copied value. Its
+ * values are configuration-authoring shape checks only: the live target is
+ * always the runtime authority for allowed origins.
  */
 export const TargetDefinition = z.strictObject({
   baseUrl: z.string().regex(HTTP_URL_PATTERN).regex(NO_SECRETS_LITERAL_PATTERN),
   browser: z.literal('chromium'),
+  secretSinkOrigins: z.record(SecretRef, z.array(SecretSinkOrigin)).optional(),
 });
 
 /**

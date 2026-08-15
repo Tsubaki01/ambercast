@@ -360,7 +360,7 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
       response = await deps.aiExecutor.execute({
         prompt: 'Generate a deterministic ambercast execution plan for the supplied Markdown test.',
         responseSchema: GENERATED_PLAN_RESPONSE_SCHEMA,
-        context: { testMd: normalizedTestMd, targets: resolvedTargets },
+        context: { testMd: normalizedTestMd, targets: resolvedTargets } as unknown as JsonValueT,
         signal: deadline.signal,
       });
     } catch (error) {

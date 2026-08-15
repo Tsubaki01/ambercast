@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { parseAriaSnapshot } from '#core/ir/aria-snapshot.js';
+import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
 import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
+import type { SecretSinkPolicy } from '#core/secrets/sink-policy.js';
 import type {
   ElementRef,
   Fingerprint,
@@ -36,6 +38,12 @@ const SUBMIT_BUTTON: ElementRef = {
   strategy: 'accessibility',
   role: 'button',
   name: 'Submit',
+};
+
+const ALLOWED_POLICY: SecretSinkPolicy = {
+  secretRef: '{{secrets.password}}',
+  allowedOrigins: [new URL(TARGET.baseUrl).origin],
+  source: 'base-url-default',
 };
 
 const FIXTURE_ARIA_SNAPSHOT = [
@@ -236,6 +244,7 @@ class FakePlaywrightPage implements PlaywrightPageHandle {
     }
 
     this.generation += 1;
+    this.currentUrl = new URL(url, TARGET.baseUrl).toString();
     return undefined;
   }
 
@@ -419,6 +428,33 @@ function expectExactSubmitLookup(launcher: FakePlaywrightLauncher): void {
   expect(launcher.page.roleLocator.firstCalls).toHaveLength(0);
 }
 
+async function captureRejection(operation: Promise<unknown>): Promise<unknown> {
+  try {
+    await operation;
+  } catch (error) {
+    return error;
+  }
+
+  throw new Error('Expected the operation to reject.');
+}
+
+function expectSecretSinkOriginViolation(error: unknown, policy: SecretSinkPolicy): void {
+  expect(error).toBeInstanceOf(IntegrityViolationError);
+  if (!(error instanceof IntegrityViolationError)) {
+    return;
+  }
+
+  expect({ kind: error.kind, exitCode: error.exitCode }).toStrictEqual({
+    kind: 'integrity-violation',
+    exitCode: 4,
+  });
+  expect(error.details).toStrictEqual({
+    secretRef: policy.secretRef,
+    allowedOrigins: policy.allowedOrigins,
+    source: policy.source,
+  });
+}
+
 function deferred<T>(): { readonly promise: Promise<T>; resolve(value: T): void } {
   let resolve: ((value: T) => void) | undefined;
   const promise = new Promise<T>((resolvePromise) => {
@@ -584,21 +620,30 @@ describe('ChromiumBrowserSession.perform()', () => {
     });
   });
 
-  it('maps fill-secret to a direct exact accessibility role locator without positional narrowing', async () => {
+  it('propagates a Playwright action failure without reclassifying it', async () => {
+    const failure = new Error('navigation failed');
+
+    await withLaunchedSession({}, async (session, launcher) => {
+      launcher.page.gotoFailure = failure;
+
+      await expect(session.perform({ type: 'navigate', url: '/unreachable' })).rejects.toBe(failure);
+    });
+  });
+
+});
+
+describe('ChromiumBrowserSession.fillSecret()', () => {
+  it('maps a permitted secret fill to a direct exact accessibility role locator without positional narrowing', async () => {
     await withLaunchedSession({}, async (session, launcher) => {
       const target = await bindSubmit(session);
-      await expect(session.perform({
-        type: 'fill-secret',
-        target,
-        value: MATERIALIZED_SECRET,
-      })).resolves.toBeUndefined();
+      await expect(session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY)).resolves.toBeUndefined();
 
       expectExactSubmitLookup(launcher);
       expect(launcher.page.roleLocator.fillValues).toEqual([MATERIALIZED_SECRET]);
     });
   });
 
-  it('does not log a resolved secret when a fill-secret action succeeds', async () => {
+  it('does not log a resolved secret when a permitted fill succeeds', async () => {
     const consoleSpies = [
       vi.spyOn(console, 'debug').mockImplementation(() => undefined),
       vi.spyOn(console, 'error').mockImplementation(() => undefined),
@@ -610,11 +655,7 @@ describe('ChromiumBrowserSession.perform()', () => {
     try {
       await withLaunchedSession({}, async (session) => {
         const target = await bindSubmit(session);
-        await expect(session.perform({
-          type: 'fill-secret',
-          target,
-          value: MATERIALIZED_SECRET,
-        })).resolves.toBeUndefined();
+        await expect(session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY)).resolves.toBeUndefined();
 
         for (const spy of consoleSpies) {
           expect(spy).not.toHaveBeenCalled();
@@ -627,17 +668,7 @@ describe('ChromiumBrowserSession.perform()', () => {
     }
   });
 
-  it('propagates a Playwright action failure without reclassifying it', async () => {
-    const failure = new Error('navigation failed');
-
-    await withLaunchedSession({}, async (session, launcher) => {
-      launcher.page.gotoFailure = failure;
-
-      await expect(session.perform({ type: 'navigate', url: '/unreachable' })).rejects.toBe(failure);
-    });
-  });
-
-  it('does not log or expose a resolved secret when Playwright rejects a fill-secret action', async () => {
+  it('does not log or expose a resolved secret when Playwright rejects a fill', async () => {
     const failure = new Error('input is detached');
     const consoleSpies = [
       vi.spyOn(console, 'debug').mockImplementation(() => undefined),
@@ -654,11 +685,7 @@ describe('ChromiumBrowserSession.perform()', () => {
 
         let thrown: unknown;
         try {
-          await session.perform({
-            type: 'fill-secret',
-            target,
-            value: MATERIALIZED_SECRET,
-          });
+          await session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY);
         } catch (error) {
           thrown = error;
         }
@@ -672,6 +699,83 @@ describe('ChromiumBrowserSession.perform()', () => {
         spy.mockRestore();
       }
     }
+  });
+
+  it('rejects a disallowed current origin before invoking Playwright fill', async () => {
+    await withLaunchedSession({ currentUrl: 'https://idp.example.test/login' }, async (session, launcher) => {
+      const target = await bindSubmit(session);
+
+      expectSecretSinkOriginViolation(
+        await captureRejection(session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY)),
+        ALLOWED_POLICY,
+      );
+      expect(launcher.page.roleLocator.fillValues).toEqual([]);
+    });
+  });
+
+  it('rejects a fabricated bound element before any locator work', async () => {
+    await withLaunchedSession({}, async (session, launcher) => {
+      const fabricated: BoundElement = { ref: SUBMIT_BUTTON, fingerprint: fixtureFingerprint() };
+
+      await expect(session.fillSecret(fabricated, MATERIALIZED_SECRET, ALLOWED_POLICY)).rejects.toThrow('provenance');
+      expect(launcher.page.roleCalls).toEqual([]);
+      expect(launcher.page.roleLocator.fillValues).toEqual([]);
+    });
+  });
+
+  it('rejects a bound element after same-origin navigation', async () => {
+    await withLaunchedSession({}, async (session, launcher) => {
+      const target = await bindSubmit(session);
+      await session.perform({ type: 'navigate', url: '/still-example' });
+
+      await expect(session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY)).rejects.toThrow('navigation');
+      expect(launcher.page.roleLocator.fillValues).toEqual([]);
+    });
+  });
+
+  it('rejects a bound element whose descriptor changes without navigation', async () => {
+    await withLaunchedSession({}, async (session, launcher) => {
+      const target = await bindSubmit(session);
+      launcher.page.bodyLocator.ariaSnapshotText = CHANGED_SUBMIT_FIXTURE;
+
+      await expect(session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY)).rejects.toThrow('fingerprint');
+      expect(launcher.page.roleLocator.fillValues).toEqual([]);
+    });
+  });
+
+  it('rejects a synthetic post-bind origin race before invoking fill', async () => {
+    await withLaunchedSession({}, async (session, launcher) => {
+      const target = await bindSubmit(session);
+      launcher.page.currentUrl = 'https://idp.example.test/login';
+
+      expectSecretSinkOriginViolation(
+        await captureRejection(session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY)),
+        ALLOWED_POLICY,
+      );
+      expect(launcher.page.roleLocator.fillValues).toEqual([]);
+    });
+  });
+
+  it('classifies a real cross-origin navigation race as an origin violation before stale-binding rejection', async () => {
+    await withLaunchedSession({}, async (session, launcher) => {
+      const target = await bindSubmit(session);
+      await session.perform({ type: 'navigate', url: 'https://idp.example.test/login' });
+
+      expectSecretSinkOriginViolation(
+        await captureRejection(session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY)),
+        ALLOWED_POLICY,
+      );
+      expect(launcher.page.roleLocator.fillValues).toEqual([]);
+    });
+  });
+});
+
+describe('ChromiumBrowserSession.currentUrl()', () => {
+  it('returns the page current URL', async () => {
+    await withLaunchedSession({ currentUrl: 'https://example.test/dashboard' }, async (session, launcher) => {
+      await expect(session.currentUrl()).resolves.toBe(launcher.page.currentUrl);
+      expect(launcher.page.urlCalls).toHaveLength(1);
+    });
   });
 });
 
