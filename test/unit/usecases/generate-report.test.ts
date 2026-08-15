@@ -4,7 +4,7 @@ import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.j
 import { FsIoError } from '#core/errors/fs-io-error.js';
 import { MissingPlanError } from '#core/errors/missing-plan-error.js';
 import { SecretLiteralRejectedError } from '#core/errors/secret-literal-rejected-error.js';
-import { SecretRefUndeclaredError } from '#core/errors/secret-ref-undeclared-error.js';
+import { SecretGrantUnattributableError } from '#core/errors/secret-grant-unattributable-error.js';
 import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { buildGenerateReport, type GenerateReportInput } from '#usecases/generate-report.js';
 
@@ -21,10 +21,12 @@ function report(input: Omit<GenerateReportInput, keyof typeof BASE>): ReturnType
 const GENERATION_ERROR_MAPPINGS = [
   [new TargetUnresolvedError('target missing'), 'TARGET_UNRESOLVED', 'usage', 2],
   [new SecretLiteralRejectedError('literal secret'), 'SECRET_LITERAL_REJECTED', 'usage', 2],
-  [new SecretRefUndeclaredError('undeclared secret reference', {
+  [new SecretGrantUnattributableError('unattributable secret grant', {
+    reason: 'citation-not-found',
     secretRef: '{{secrets.PAYMENT_TOKEN}}',
     stepId: 'complete-payment',
-  }), 'SECRET_REF_UNDECLARED', 'usage', 2],
+    hint: 'Correct the prompt citation.',
+  }), 'SECRET_GRANT_UNATTRIBUTABLE', 'usage', 2],
   [new AiExecutorUnavailableError('provider unavailable'), 'AI_EXECUTOR_UNAVAILABLE', 'environment', 3],
   [new AiResponseInvalidError('invalid response'), 'AI_RESPONSE_INVALID', 'environment', 3],
   [new FsIoError('storage failed'), 'FS_IO_ERROR', 'environment', 3],
@@ -177,7 +179,7 @@ describe('buildGenerateReport', () => {
     expect(reversedOutput.exitCode).toBe(3);
   });
 
-  it('surfaces an undeclared secret reference from the first failed file with exit code 2', () => {
+  it('surfaces an unattributable secret grant from the first failed file with exit code 2', () => {
     const output = report({
       outcome: {
         noTestsFound: false,
@@ -185,9 +187,11 @@ describe('buildGenerateReport', () => {
           {
             file: 'first.test.md',
             status: 'failed',
-            error: new SecretRefUndeclaredError('undeclared reference', {
+            error: new SecretGrantUnattributableError('unattributable grant', {
+              reason: 'citation-not-found',
               secretRef: '{{secrets.PAYMENT_TOKEN}}',
               stepId: 'complete-payment',
+              hint: 'Correct the prompt citation.',
             }),
           },
           { file: 'second.test.md', status: 'failed', error: new AiResponseInvalidError('invalid response') },

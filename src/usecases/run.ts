@@ -52,7 +52,7 @@ import type { StorageAdapter } from '#ports/storage.js';
 import type { Clock, EventSink, SecretsProvider } from '#ports/system.js';
 import { OBSERVED_NOTE, type ExecutedRunResult, type Observed, type StepResult } from '#report/schema.js';
 import { z } from 'zod';
-import { assertSecretRefsGrounded, extractDeclaredSecretRefs } from './generator-secret-policy.js';
+import { reattributeSecretGrants } from './generator-secret-policy.js';
 
 /**
  * Execution evidence while a case is still in progress.
@@ -1293,7 +1293,7 @@ async function executeAgentic(
   priorTrace: z.infer<typeof TraceRecord> | undefined,
   fallbackFromReplay: boolean,
 ): Promise<DispatchOutcome> {
-  const secretRefs = step.secrets ?? [];
+  const secretRefs = step.secrets?.map((grant) => grant.ref) ?? [];
   const executor = await context.resolveAiExecutor();
   const pipeline = new AgenticRunPipeline(context, secretRefs, step, fallbackFromReplay);
   context.events.emit({ type: 'ai-call', stepId: step.id });
@@ -1325,7 +1325,7 @@ async function executeAiStep(
   cacheOnly: boolean,
 ): Promise<DispatchOutcome> {
   const entry = context.grounding.entries[step.id];
-  const secretRefs = new Set(step.secrets ?? []);
+  const secretRefs = new Set(step.secrets?.map((grant) => grant.ref) ?? []);
   if (entry?.kind !== 'ai') {
     if (cacheOnly) {
       throw new CaseAbort('AI-directed replay has no usable trace while cache-only mode is enabled.');
@@ -2137,13 +2137,10 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
     });
     const plan = await readTrustedPlan(deps.storage, planPath, inputsDigest);
     /*
-     * Rechecking a trusted plan before replay prepares grounding or launches a
-     * browser prevents a pre-existing artifact from bypassing declaration
-     * policy that generation-time validation could not have applied
-     * retroactively.
+     * Re-attributing persisted grant spans before opening a browser prevents a
+     * hand-edited plan from redirecting a secret use after generation.
      */
-    const declaredRefs = extractDeclaredSecretRefs(normalizedTestMd);
-    assertSecretRefsGrounded(plan, declaredRefs);
+    reattributeSecretGrants(plan, normalizedTestMd);
     planSteps = plan.steps;
     groundingPath = deps.layout.groundingPathFor(file);
     const loadedGrounding = await readUsableGrounding(deps.storage, groundingPath, plan);

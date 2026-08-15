@@ -1,21 +1,27 @@
 /**
  * Defines the secret-policy boundary shared by generated and replayed plans.
  *
- * This module keeps reviewable artifacts free of literal secrets while also
- * requiring every permitted secret reference to have a textual declaration in
- * the test prompt. Owning both checks together gives generation and replay one
- * authorization boundary before a plan can rely on an externally resolved
- * value.
+ * This module keeps reviewable artifacts free of literal secrets while
+ * requiring each permitted secret use to trace to one explicit prompt grant.
+ * Local attribution keeps provider citations transient and gives generation
+ * and replay the same authorization boundary before a plan can rely on an
+ * externally resolved value.
  */
 
 import {
-  SECRET_REF_SOURCE,
   SecretRef,
+  type GeneratedStep,
   type PlanDocument as PlanDocumentType,
   type Step,
 } from '#core/ir/schema.js';
+import type { NormalizedTestMd } from '#core/ir/normalize.js';
+import { extractSecretGrants, type SecretGrant } from '#core/ir/secret-grant-source.js';
 import { SecretLiteralRejectedError } from '#core/errors/secret-literal-rejected-error.js';
-import { SecretRefUndeclaredError } from '#core/errors/secret-ref-undeclared-error.js';
+import {
+  type SecretGrantUnattributableDetails,
+  type SecretGrantUnattributableReason,
+  SecretGrantUnattributableError,
+} from '#core/errors/secret-grant-unattributable-error.js';
 
 type SecretDetector =
   | 'credential-prefix-sk'
@@ -26,23 +32,285 @@ type SecretDetector =
 const REDACTED_KEY_PATH_SEGMENT = '[redacted-key]';
 
 /**
- * Canonicalizes declared secret grants on generated AI steps.
+ * Supplies self-correcting diagnostics for each failed grant-attribution
+ * reason.
  *
- * @param steps - Provider-authored plan steps that have not yet been persisted.
- * @returns New step-array storage with AI-step grants deduplicated, ASCII
- * sorted, and omitted when empty.
+ * Centralizing the text keeps every generation and replay failure actionable
+ * without making error wording depend on an individual throw site. Hints stay
+ * in diagnostic details rather than the structured-report contract.
+ */
+export const SECRET_GRANT_UNATTRIBUTABLE_HINTS: Record<
+  SecretGrantUnattributableReason,
+  (ref: string) => string
+> = {
+  'citation-not-found': (ref) =>
+    `If the secret use is intended, cite an exact, unique prompt excerpt containing one complete @ambercast-secret ${ref} grant line, adding that line if it is absent; otherwise remove the secret use.`,
+  'citation-not-unique': (ref) =>
+    `If the secret use is intended, include enough prompt text for the citation to identify exactly one complete @ambercast-secret ${ref} grant line, adding that line if it is absent; otherwise remove the secret use.`,
+  'citation-missing-ref': (ref) =>
+    `If the secret use is intended, cite one complete @ambercast-secret ${ref} grant line including the literal ${ref} token, adding that line if it is absent; otherwise remove the secret use.`,
+  'citation-unresolved': (ref) =>
+    `If the secret use is intended, cite exactly one complete @ambercast-secret ${ref} grant line outside Markdown code, narrowing the citation or adding that line as needed; otherwise remove the secret use.`,
+  'multiply-attributed-grant': (ref) =>
+    `Remove the duplicate secret use, or give each intended use of ${ref} a distinct @ambercast-secret grant line, cite each line during generation, and regenerate the plan before replay.`,
+  'uncovered-grant': (ref) =>
+    `Use the @ambercast-secret ${ref} grant for one intended secret use and cite it during generation, or remove the unused grant line.`,
+  'stale-grant-span': (ref) =>
+    `If the secret use remains intended, restore its matching @ambercast-secret ${ref} grant line and regenerate the plan; otherwise remove the use and regenerate the plan.`,
+};
+
+/**
+ * Attributes provider-authored secret citations to locally parsed prompt
+ * grants and returns committed plan steps.
+ *
+ * This function treats its input as immutable, returns a new array, and
+ * passes non-secret branches through by reference. It walks steps and AI-step
+ * grant entries in source order, stopping at the first failure so a provider
+ * response has one deterministic correction target. Verified citations become
+ * local source spans before the response can be persisted.
+ *
+ * Claimed occurrences use `grant.offsetStart`, which remains unique when two
+ * complete grant lines have identical text. Citation and duplicate-claim
+ * failures therefore take precedence over the final document-order scan for
+ * an uncovered grant elsewhere in the prompt.
+ *
+ * Each citation failure and `multiply-attributed-grant` uses
+ * `SecretGrantUsageDetails`, with `reason`, `secretRef`, `stepId`, and `hint`.
+ * The final uncovered-grant scan instead uses `SecretGrantUncoveredDetails`,
+ * with `reason: 'uncovered-grant'`, `secretRef`, `sourceSpan`, and `hint`,
+ * because an unused grant has no truthful step identifier.
+ *
+ * @param steps - Schema-validated provider steps whose secret uses still carry
+ * verbatim prompt citations.
+ * @param normalizedTestMd - Canonical prompt from which grants and persisted
+ * line spans are derived.
+ * @returns Committed-shape plan steps with citations replaced by source spans.
+ * @throws {SecretGrantUnattributableError} When a citation is absent,
+ * ambiguous, missing its reference, unresolved to exactly one grant, claims a
+ * grant twice, or leaves a declared grant uncovered.
  * @remarks
- * Grant canonicalization is generator policy rather than schema policy:
- * validation deliberately preserves the digest-visible distinction between an
- * omitted `AiStep.secrets` field and an explicit empty list. Applying this
- * policy before plan validation gives generated artifacts one stable form
- * without changing the meaning or representation of every other step kind.
- * Secret references use an ASCII-only schema, so direct lexical comparison
- * produces the required deterministic ASCII order without locale-dependent
- * collation.
+ * Attribution is usecase policy rather than schema validation because it
+ * requires the complete prompt, citation occurrence counts, and a plan-wide
+ * claimed-grant map. Encoding it as a refinement would hide the contract from
+ * generated JSON Schema and still could not express its document-wide state.
+ */
+export function attributeSecretGrants(
+  steps: readonly GeneratedStep[],
+  normalizedTestMd: NormalizedTestMd,
+): Step[] {
+  const grants = extractSecretGrants(normalizedTestMd);
+  const claimed = new Set<number>();
+  const claim = (grant: SecretGrant, ref: string, stepId: string) => {
+    if (claimed.has(grant.offsetStart)) {
+      throwSecretGrantUsageError('multiply-attributed-grant', ref, stepId);
+    }
+
+    claimed.add(grant.offsetStart);
+    return { startLine: grant.startLine, endLine: grant.endLine };
+  };
+
+  const attributed = steps.map((step): Step => {
+    if (step.kind === 'action') {
+      if (step.action !== 'fill-secret') {
+        return step;
+      }
+
+      const grant = resolveCitation(step.citation, step.secretRef, step.id, normalizedTestMd, grants);
+      const { citation: _citation, ...fillSecret } = step;
+      return {
+        ...fillSecret,
+        secretGrantSpan: claim(grant, step.secretRef, step.id),
+      };
+    }
+
+    if (step.kind !== 'ai') {
+      return step;
+    }
+
+    const { secrets, ...aiStep } = step;
+    if (secrets === undefined) {
+      return aiStep;
+    }
+
+    return {
+      ...aiStep,
+      secrets: secrets.map(({ ref, citation }) => {
+        const grant = resolveCitation(citation, ref, step.id, normalizedTestMd, grants);
+        return { ref, sourceSpan: claim(grant, ref, step.id) };
+      }),
+    };
+  });
+
+  const uncoveredGrant = grants.find((grant) => !claimed.has(grant.offsetStart));
+  if (uncoveredGrant !== undefined) {
+    throwSecretGrantUncoveredError(uncoveredGrant);
+  }
+
+  return attributed;
+}
+
+/**
+ * Resolves one provider citation to its unique matching prompt grant.
+ *
+ * It counts overlapping citation occurrences, which prevents a
+ * self-overlapping excerpt from being misclassified as unique. The citation
+ * is non-empty because its schema enforces that boundary before this function
+ * runs. Its unique source occurrence must include the literal reference and
+ * exactly one same-reference grant by offset containment; text equality alone
+ * would confuse identical grant lines at different locations.
+ *
+ * Validation first counts every occurrence, advancing one code unit after
+ * each match so overlaps count. It next requires the literal reference, then
+ * selects same-reference grants whose complete offset ranges are contained by
+ * the unique citation. Each failure reports `SecretGrantUsageDetails` for the
+ * supplied step.
+ *
+ * @param citation - The schema-validated non-empty provider excerpt.
+ * @param ref - The literal secret reference that the excerpt must contain.
+ * @param stepId - The secret-using step retained in a failure's diagnostics.
+ * @param testMd - Canonical prompt in which the excerpt is resolved.
+ * @param grants - Locally extracted grants in the same prompt.
+ * @returns The unique prompt grant the citation authorizes.
+ * @throws {SecretGrantUnattributableError} When the citation cannot authorize
+ * exactly one grant for this reference.
+ * @remarks
+ * The step identifier enters at this low level so all citation failures name
+ * the actual use that needs correction rather than an arbitrary caller.
+ */
+function resolveCitation(
+  citation: string,
+  ref: string,
+  stepId: string,
+  testMd: NormalizedTestMd,
+  grants: readonly SecretGrant[],
+): SecretGrant {
+  let firstOffset = -1;
+  let occurrences = 0;
+
+  for (let fromIndex = 0; ; ) {
+    const offset = testMd.indexOf(citation, fromIndex);
+    if (offset === -1) {
+      break;
+    }
+
+    if (occurrences === 0) {
+      firstOffset = offset;
+    }
+    occurrences += 1;
+    if (occurrences === 2) {
+      throwSecretGrantUsageError('citation-not-unique', ref, stepId);
+    }
+    fromIndex = offset + 1;
+  }
+
+  if (occurrences === 0) {
+    throwSecretGrantUsageError('citation-not-found', ref, stepId);
+  }
+  if (!citation.includes(ref)) {
+    throwSecretGrantUsageError('citation-missing-ref', ref, stepId);
+  }
+
+  const citationEnd = firstOffset + citation.length;
+  const matchingGrants = grants.filter((grant) => (
+    grant.ref === ref
+    && grant.offsetStart >= firstOffset
+    && grant.offsetEnd <= citationEnd
+  ));
+  if (matchingGrants.length !== 1) {
+    throwSecretGrantUsageError('citation-unresolved', ref, stepId);
+  }
+
+  return matchingGrants[0]!;
+}
+
+/**
+ * Revalidates committed secret-grant spans against the current normalized
+ * prompt before replay.
+ *
+ * This function only reads the plan. It re-extracts grants, checks the
+ * reference and both persisted line boundaries for each secret use in step
+ * order, and rejects duplicate claims of the same grant. A valid generated
+ * plan stores no citation or provider state, so replay has no AI dependency at
+ * this trust boundary.
+ *
+ * A claim uses the resolved grant's `startLine`, because the supported grammar
+ * makes every grant exactly one physical line. Stale-span validation precedes
+ * the duplicate check, so stale provenance takes precedence over a duplicate
+ * claim. Both failures use `SecretGrantUsageDetails`.
+ *
+ * @param plan - The schema-validated committed plan to verify without
+ * mutation.
+ * @param normalizedTestMd - Canonical current prompt from which grants are
+ * re-extracted.
+ * @throws {SecretGrantUnattributableError} When a persisted span is stale or
+ * one grant span is claimed by more than one step.
+ * @remarks
+ * Editing the prompt without regeneration is rejected earlier by the complete
+ * prompt digest freshness check. This boundary covers the distinct reachable
+ * threat of a hand-edited plan whose digest still matches while a stored span
+ * no longer names its reference's grant line.
+ *
+ * Replay does not reject an uncovered grant. A matching digest makes the
+ * prompt and its grant catalog identical to generation, where uncovered
+ * grants are fatal; an otherwise valid plan therefore cannot reach replay
+ * with that condition unless a plan edit has already changed its usage set.
+ */
+export function reattributeSecretGrants(
+  plan: PlanDocumentType,
+  normalizedTestMd: NormalizedTestMd,
+): void {
+  const grantsByStartLine = new Map(
+    extractSecretGrants(normalizedTestMd).map((grant) => [grant.startLine, grant]),
+  );
+  const claimed = new Set<number>();
+  const verifyGrant = (
+    ref: string,
+    sourceSpan: { readonly startLine: number; readonly endLine: number },
+    stepId: string,
+  ): void => {
+    const grant = grantsByStartLine.get(sourceSpan.startLine);
+    if (grant === undefined || grant.ref !== ref || grant.endLine !== sourceSpan.endLine) {
+      throwSecretGrantUsageError('stale-grant-span', ref, stepId);
+    }
+    if (claimed.has(grant.startLine)) {
+      throwSecretGrantUsageError('multiply-attributed-grant', ref, stepId);
+    }
+
+    claimed.add(grant.startLine);
+  };
+
+  for (const step of plan.steps) {
+    if (step.kind === 'action' && step.action === 'fill-secret') {
+      verifyGrant(step.secretRef, step.secretGrantSpan, step.id);
+      continue;
+    }
+    if (step.kind === 'ai') {
+      for (const secret of step.secrets ?? []) {
+        verifyGrant(secret.ref, secret.sourceSpan, step.id);
+      }
+    }
+  }
+}
+
+/**
+ * Canonicalizes verified secret grants on committed AI steps.
+ *
+ * @param steps - Committed-shape steps whose secret grants already passed
+ * attribution.
+ * @returns New step-array storage with AI grants ordered by reference, start
+ * line, and end line, and with explicit empty grant lists omitted.
+ * @remarks
+ * Duplicate removal is deliberately absent. Equal references at different
+ * spans are separate verified authorizations, while equal references at the
+ * same span would already have failed the claimed-grant check before this
+ * function runs. All three comparison keys make canonical JSON independent of
+ * the provider's response order; reference-only sorting would preserve an
+ * unstable order for distinct grants of the same secret. Secret references use
+ * an ASCII-only schema, so direct lexical comparison produces the required
+ * deterministic ASCII order without locale-dependent collation.
  */
 export function normalizeAiStepSecretGrants(steps: readonly Step[]): Step[] {
-  return steps.map((step) => {
+  return steps.map((step): Step => {
     if (step.kind !== 'ai') {
       return step;
     }
@@ -52,87 +320,47 @@ export function normalizeAiStepSecretGrants(steps: readonly Step[]): Step[] {
     }
 
     if (step.secrets.length === 0) {
-      const normalizedStep = { ...step };
-      delete normalizedStep.secrets;
-      return normalizedStep;
+      const { secrets: _secrets, ...aiStep } = step;
+      return aiStep;
     }
 
     return {
       ...step,
-      secrets: [...new Set(step.secrets)].sort((left, right) => {
-        if (left < right) {
-          return -1;
-        }
-        return left > right ? 1 : 0;
-      }),
+      secrets: [...step.secrets].sort((left, right) => (
+        (left.ref < right.ref ? -1 : left.ref > right.ref ? 1 : 0)
+        || left.sourceSpan.startLine - right.sourceSpan.startLine
+        || left.sourceSpan.endLine - right.sourceSpan.endLine
+      )),
     };
   });
 }
 
-/**
- * Collects secret references declared literally by a normalized test prompt.
- *
- * @param normalizedTestMd - Canonical test Markdown whose literal reference
- * tokens define the declarations available to a generated plan.
- * @returns A deduplicated set of complete secret-reference tokens found in the
- * prompt text.
- * @remarks
- * This is a pure function: it only reads its input, returns a new set, and
- * never mutates its argument.
- *
- * It scans with the shared unanchored secret-reference grammar so accepted
- * dotted paths cannot drift from IR validation. Every literal match is a
- * declaration, including a token in code fences or negative prose, because
- * this boundary proves textual presence rather than interpreting Markdown
- * semantics.
- */
-export function extractDeclaredSecretRefs(normalizedTestMd: string): ReadonlySet<string> {
-  return new Set(normalizedTestMd.match(new RegExp(SECRET_REF_SOURCE, 'g')) ?? []);
+function throwSecretGrantUsageError(
+  reason: Exclude<SecretGrantUnattributableReason, 'uncovered-grant'>,
+  secretRef: string,
+  stepId: string,
+): never {
+  throw new SecretGrantUnattributableError(
+    'A secret use could not be attributed to exactly one prompt grant.',
+    {
+      reason,
+      secretRef,
+      stepId,
+      hint: SECRET_GRANT_UNATTRIBUTABLE_HINTS[reason](secretRef),
+    } satisfies SecretGrantUnattributableDetails,
+  );
 }
 
-/**
- * Verifies that every secret reference used by a plan is declared by its test
- * prompt.
- *
- * @param plan - A schema-validated plan whose secret-bearing steps require
- * declaration checks.
- * @param declaredRefs - Complete literal reference tokens extracted from the
- * normalized test Markdown.
- * @throws {import('#core/errors/secret-ref-undeclared-error.js').SecretRefUndeclaredError}
- * When a `fill-secret` action or AI-step grant uses a reference outside
- * `declaredRefs`. The error details object has exactly two keys: `secretRef`,
- * the ungrounded reference string, and `stepId`, the `id` field of the plan
- * step where that reference appears.
- * @remarks
- * This is a pure function: it only reads `plan` and `declaredRefs`, then either
- * returns or throws, and never mutates either argument.
- *
- * It walks `plan.steps` in array order. For an action
- * step whose action is `fill-secret`, it checks that step's single `secretRef`.
- * For an AI step, it checks entries in its `secrets` array in array order. The
- * first ungrounded reference encountered in this walk is the one reported,
- * rather than accepting a partial plan or emitting a warning.
- */
-export function assertSecretRefsGrounded(
-  plan: PlanDocumentType,
-  declaredRefs: ReadonlySet<string>,
-): void {
-  for (const step of plan.steps) {
-    const secretRefs = step.kind === 'action' && step.action === 'fill-secret'
-      ? [step.secretRef]
-      : step.kind === 'ai'
-        ? step.secrets ?? []
-        : [];
-
-    for (const secretRef of secretRefs) {
-      if (!declaredRefs.has(secretRef)) {
-        throw new SecretRefUndeclaredError(
-          'The generated plan uses a secret reference that the test prompt does not declare.',
-          { secretRef, stepId: step.id },
-        );
-      }
-    }
-  }
+function throwSecretGrantUncoveredError(grant: SecretGrant): never {
+  throw new SecretGrantUnattributableError(
+    'A declared secret grant is not used by the generated plan.',
+    {
+      reason: 'uncovered-grant',
+      secretRef: grant.ref,
+      sourceSpan: { startLine: grant.startLine, endLine: grant.endLine },
+      hint: SECRET_GRANT_UNATTRIBUTABLE_HINTS['uncovered-grant'](grant.ref),
+    } satisfies SecretGrantUnattributableDetails,
+  );
 }
 
 function hasHighEntropy(value: string): boolean {

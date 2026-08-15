@@ -8,7 +8,7 @@ const ALL_ERROR_KINDS = [
   'secret-unresolved',
   'target-unresolved',
   'secret-literal-rejected',
-  'secret-ref-undeclared',
+  'secret-grant-unattributable',
   'missing-plan',
   'stale-ir',
   'integrity-violation',
@@ -36,7 +36,7 @@ function exitCodeFor(kind: ErrorKind): ErrorExitCode {
     case 'secret-unresolved':
     case 'target-unresolved':
     case 'secret-literal-rejected':
-    case 'secret-ref-undeclared':
+    case 'secret-grant-unattributable':
       return 2;
     case 'browser-launch-failed':
     case 'ai-executor-unavailable':

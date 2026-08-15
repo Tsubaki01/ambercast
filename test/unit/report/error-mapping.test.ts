@@ -7,7 +7,7 @@ const EXPECTED_REPORT_ERROR_DETAILS = {
   'secret-unresolved': { kind: 'usage', code: 'SECRET_UNRESOLVED' },
   'target-unresolved': { kind: 'usage', code: 'TARGET_UNRESOLVED' },
   'secret-literal-rejected': { kind: 'usage', code: 'SECRET_LITERAL_REJECTED' },
-  'secret-ref-undeclared': { kind: 'usage', code: 'SECRET_REF_UNDECLARED' },
+  'secret-grant-unattributable': { kind: 'usage', code: 'SECRET_GRANT_UNATTRIBUTABLE' },
   'missing-plan': { kind: 'usage', code: 'MISSING_PLAN' },
   'stale-ir': { kind: 'usage', code: 'STALE_PLAN' },
   'integrity-violation': { kind: 'usage', code: 'INTEGRITY_VIOLATION' },

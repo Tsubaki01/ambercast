@@ -22,6 +22,7 @@ import {
   type GroundingDocument as GroundingDocumentType,
   type JsonValueT,
   type PlanDocument as PlanDocumentType,
+  type Step,
   type TargetDefinition,
 } from '#core/ir/schema.js';
 import type { LayoutResolver } from '#core/layout/resolve.js';
@@ -31,8 +32,7 @@ import type { StorageAdapter } from '#ports/storage.js';
 import type { EventSink } from '#ports/system.js';
 import {
   assertNoLiteralSecrets,
-  assertSecretRefsGrounded,
-  extractDeclaredSecretRefs,
+  attributeSecretGrants,
   normalizeAiStepSecretGrants,
 } from './generator-secret-policy.js';
 
@@ -374,7 +374,15 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
       continue;
     }
 
-    const normalizedSteps = normalizeAiStepSecretGrants(response.data.steps);
+    let attributedSteps: Step[];
+    try {
+      attributedSteps = attributeSecretGrants(response.data.steps, normalizedTestMd);
+    } catch (error) {
+      results.push({ file, status: 'failed', error: fileFailure(error, 'The generated plan could not be inspected.') });
+      continue;
+    }
+
+    const normalizedSteps = normalizeAiStepSecretGrants(attributedSteps);
     const candidate = {
       schemaVersion: 1,
       source: { inputsDigest },
@@ -397,12 +405,6 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
 
     try {
       assertNoLiteralSecrets(parsedPlan.data);
-      /*
-       * Keeping declaration validation before either preview or persistence
-       * makes undeclared secret usage fail uniformly without writing artifacts.
-       */
-      const declaredRefs = extractDeclaredSecretRefs(normalizedTestMd);
-      assertSecretRefsGrounded(parsedPlan.data, declaredRefs);
     } catch (error) {
       results.push({ file, status: 'failed', error: fileFailure(error, 'The generated plan could not be inspected.') });
       continue;

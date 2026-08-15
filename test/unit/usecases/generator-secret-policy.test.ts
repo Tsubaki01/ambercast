@@ -1,30 +1,125 @@
 import { describe, expect, it } from 'vitest';
-import type { PlanDocument, Step } from '#core/ir/schema.js';
+import { normalizeTestMd } from '#core/ir/normalize.js';
+import type { GeneratedStep, PlanDocument, Step } from '#core/ir/schema.js';
+import { SecretGrantUnattributableError } from '#core/errors/secret-grant-unattributable-error.js';
 import { SecretLiteralRejectedError } from '#core/errors/secret-literal-rejected-error.js';
-import { SecretRefUndeclaredError } from '#core/errors/secret-ref-undeclared-error.js';
 import {
   assertNoLiteralSecrets,
-  assertSecretRefsGrounded,
-  extractDeclaredSecretRefs,
+  attributeSecretGrants,
   normalizeAiStepSecretGrants,
+  reattributeSecretGrants,
+  SECRET_GRANT_UNATTRIBUTABLE_HINTS,
 } from '#usecases/generator-secret-policy.js';
 
-// This is a valid SHA-256-shaped value with exactly 4.0 bits of Shannon
-// entropy per character, so removing the path exemption would reject it.
 const INPUTS_DIGEST = '0123456789abcdef'.repeat(4);
+const TARGET = { strategy: 'accessibility', role: 'textbox', name: 'Password' } as const;
+const FIRST_REF = '{{secrets.FIRST}}';
+const SECOND_REF = '{{secrets.SECOND}}';
+const THIRD_REF = '{{secrets.THIRD}}';
 const WHOLE_SECRET_REFERENCE = '{{secrets.PRODUCTION_PAYMENTS_API_KEY_Q7X9M2V8R4K6T1C3Z5}}';
 
-function plan(generatorMeta: PlanDocument['generatorMeta'] = {}, steps: readonly Step[] = []): PlanDocument {
+function prompt(...grantRefs: readonly string[]) {
+  return normalizeTestMd([
+    '# Sign in',
+    '',
+    ...grantRefs.map((ref) => `@ambercast-secret ${ref}`),
+    '',
+  ].join('\n'));
+}
+
+function grantLine(ref: string): string {
+  return `@ambercast-secret ${ref}`;
+}
+
+function generatedFill(
+  ref = FIRST_REF,
+  citation = grantLine(ref),
+  id = 'fill-password',
+): Extract<GeneratedStep, { kind: 'action'; action: 'fill-secret' }> {
+  return { id, kind: 'action', action: 'fill-secret', target: TARGET, secretRef: ref, citation };
+}
+
+function generatedAi(
+  secrets: readonly { readonly ref: string; readonly citation: string }[] = [],
+  id = 'complete-sign-in',
+): Extract<GeneratedStep, { kind: 'ai' }> {
+  return { id, kind: 'ai', instruction: 'Complete sign-in.', ...(secrets.length === 0 ? {} : { secrets: [...secrets] }) };
+}
+
+function committedFill(
+  ref = FIRST_REF,
+  startLine = 3,
+  id = 'fill-password',
+): Extract<Step, { kind: 'action'; action: 'fill-secret' }> {
+  return {
+    id,
+    kind: 'action',
+    action: 'fill-secret',
+    target: TARGET,
+    secretRef: ref,
+    secretGrantSpan: { startLine, endLine: startLine },
+  };
+}
+
+function committedAi(
+  secrets: readonly { readonly ref: string; readonly startLine: number }[] = [],
+  id = 'complete-sign-in',
+): Extract<Step, { kind: 'ai' }> {
+  return {
+    id,
+    kind: 'ai',
+    instruction: 'Complete sign-in.',
+    ...(secrets.length === 0 ? {} : {
+      secrets: secrets.map(({ ref, startLine }) => ({ ref, sourceSpan: { startLine, endLine: startLine } })),
+    }),
+  };
+}
+
+function plan(steps: readonly Step[]): PlanDocument {
   return {
     schemaVersion: 1,
     source: { inputsDigest: INPUTS_DIGEST },
     targets: { web: { baseUrl: 'https://example.test', browser: 'chromium' } },
     steps: [...steps],
-    generatorMeta,
   };
 }
 
-function expectRejected(document: PlanDocument, rejectedLiteral: string, detector: unknown, path: string): void {
+function expectAttributionFailure(
+  operation: () => unknown,
+  expected: {
+    readonly reason: keyof typeof SECRET_GRANT_UNATTRIBUTABLE_HINTS;
+    readonly secretRef: string;
+    readonly stepId?: string;
+    readonly sourceSpan?: { readonly startLine: number; readonly endLine: number };
+  },
+): void {
+  let thrown: unknown;
+
+  try {
+    operation();
+  } catch (error) {
+    thrown = error;
+  }
+
+  expect(thrown).toBeInstanceOf(SecretGrantUnattributableError);
+  if (thrown instanceof SecretGrantUnattributableError) {
+    const details = thrown.details;
+    expect(details).toMatchObject(expected);
+    expect(details?.hint).toBe(
+      SECRET_GRANT_UNATTRIBUTABLE_HINTS[expected.reason](expected.secretRef),
+    );
+    if (expected.reason === 'uncovered-grant') {
+      expect(details).not.toHaveProperty('stepId');
+    }
+  }
+}
+
+function expectLiteralSecretRejected(
+  document: PlanDocument,
+  rejectedLiteral: string,
+  detector: unknown,
+  path: string,
+): void {
   let thrown: unknown;
 
   try {
@@ -41,329 +136,235 @@ function expectRejected(document: PlanDocument, rejectedLiteral: string, detecto
   }
 }
 
-function expectUndeclared(
-  document: PlanDocument,
-  declaredRefs: ReadonlySet<string>,
-  secretRef: string,
-  stepId: string,
-): void {
-  let thrown: unknown;
-
-  try {
-    assertSecretRefsGrounded(document, declaredRefs);
-  } catch (error) {
-    thrown = error;
-  }
-
-  expect(thrown).toBeInstanceOf(SecretRefUndeclaredError);
-  if (thrown instanceof SecretRefUndeclaredError) {
-    expect(thrown.details).toStrictEqual({ secretRef, stepId });
-  }
-}
-
 describe('normalizeAiStepSecretGrants', () => {
-  it('deduplicates and ASCII-sorts declared secret grants', () => {
-    const normalized = normalizeAiStepSecretGrants([{
-      id: 'complete-payment',
-      kind: 'ai',
-      instruction: 'Complete the payment flow.',
+  it('orders AI grants by ref, start line, and end line', () => {
+    expect(normalizeAiStepSecretGrants([committedAi([
+      { ref: '{{secrets.zeta}}', startLine: 3 },
+      { ref: '{{secrets.item}}', startLine: 3 },
+      { ref: '{{secrets.Item}}', startLine: 3 },
+      { ref: '{{secrets.alpha}}', startLine: 8 },
+      { ref: '{{secrets.alpha}}', startLine: 4 },
+    ])])).toEqual([committedAi([
+      { ref: '{{secrets.Item}}', startLine: 3 },
+      { ref: '{{secrets.alpha}}', startLine: 4 },
+      { ref: '{{secrets.alpha}}', startLine: 8 },
+      { ref: '{{secrets.item}}', startLine: 3 },
+      { ref: '{{secrets.zeta}}', startLine: 3 },
+    ])]);
+  });
+
+  it('keeps two independently verified grants for the same reference', () => {
+    const normalized = normalizeAiStepSecretGrants([committedAi([
+      { ref: FIRST_REF, startLine: 9 },
+      { ref: FIRST_REF, startLine: 3 },
+    ])]);
+
+    expect(normalized[0]).toMatchObject({
       secrets: [
-        '{{secrets.zeta}}',
-        '{{secrets.Alpha}}',
-        '{{secrets.alpha}}',
-        '{{secrets.zeta}}',
+        { ref: FIRST_REF, sourceSpan: { startLine: 3, endLine: 3 } },
+        { ref: FIRST_REF, sourceSpan: { startLine: 9, endLine: 9 } },
+      ],
+    });
+  });
+
+  it('uses end line as the final tie-break when refs and start lines match', () => {
+    const normalized = normalizeAiStepSecretGrants([{
+      id: 'complete-sign-in',
+      kind: 'ai',
+      instruction: 'Complete sign-in.',
+      secrets: [
+        { ref: FIRST_REF, sourceSpan: { startLine: 3, endLine: 9 } },
+        { ref: FIRST_REF, sourceSpan: { startLine: 3, endLine: 4 } },
       ],
     }]);
 
-    expect(normalized).toEqual([{
-      id: 'complete-payment',
-      kind: 'ai',
-      instruction: 'Complete the payment flow.',
-      secrets: ['{{secrets.Alpha}}', '{{secrets.alpha}}', '{{secrets.zeta}}'],
-    }]);
+    expect(normalized[0]).toMatchObject({
+      secrets: [
+        { ref: FIRST_REF, sourceSpan: { startLine: 3, endLine: 4 } },
+        { ref: FIRST_REF, sourceSpan: { startLine: 3, endLine: 9 } },
+      ],
+    });
   });
 
-  it('omits an explicit empty secret-grants field', () => {
-    const normalized = normalizeAiStepSecretGrants([{
-      id: 'complete-payment',
-      kind: 'ai',
-      instruction: 'Complete the payment flow.',
-      secrets: [],
-    }]);
+  it('omits explicit empty AI grant arrays and preserves untouched branch identity', () => {
+    const action: Step = { id: 'open-home', kind: 'action', action: 'navigate', url: '/' };
+    const emptyAi = committedAi([]);
+    const normalized = normalizeAiStepSecretGrants([action, emptyAi]);
 
-    expect(normalized).toEqual([{
-      id: 'complete-payment',
-      kind: 'ai',
-      instruction: 'Complete the payment flow.',
-    }]);
-    expect(normalized[0]).not.toHaveProperty('secrets');
-  });
-
-  it('passes a non-AI step through unchanged', () => {
-    const action: Step = {
-      id: 'open-payment',
-      kind: 'action',
-      action: 'navigate',
-      url: '/payment',
-    };
-
-    const normalized = normalizeAiStepSecretGrants([action]);
-
-    expect(normalized).toEqual([action]);
     expect(normalized[0]).toBe(action);
-  });
-
-  it('passes an AI step with omitted secret grants through unchanged', () => {
-    const aiStep: Step = {
-      id: 'complete-payment',
-      kind: 'ai',
-      instruction: 'Complete the payment flow.',
-    };
-
-    const normalized = normalizeAiStepSecretGrants([aiStep]);
-
-    expect(normalized).toEqual([aiStep]);
-    expect(normalized[0]).toBe(aiStep);
-    expect(normalized[0]).not.toHaveProperty('secrets');
+    expect(normalized[1]).toEqual({ id: 'complete-sign-in', kind: 'ai', instruction: 'Complete sign-in.' });
+    expect(normalized[1]).not.toHaveProperty('secrets');
   });
 });
 
-describe('extractDeclaredSecretRefs', () => {
-  it('returns an empty set when the prompt contains no secret references', () => {
-    expect(extractDeclaredSecretRefs('# Sign in\n\nUse ordinary credentials.\n')).toEqual(new Set());
+describe('attributeSecretGrants', () => {
+  it.each([
+    ['citation-not-found', [generatedFill(FIRST_REF, 'not in prompt')], prompt(FIRST_REF), { reason: 'citation-not-found', secretRef: FIRST_REF, stepId: 'fill-password' }],
+    ['citation-not-unique', [generatedFill(FIRST_REF, 'aa')], normalizeTestMd('aaaa'), { reason: 'citation-not-unique', secretRef: FIRST_REF, stepId: 'fill-password' }],
+    ['citation-missing-ref', [generatedFill(FIRST_REF, grantLine(SECOND_REF))], prompt(SECOND_REF), { reason: 'citation-missing-ref', secretRef: FIRST_REF, stepId: 'fill-password' }],
+    ['citation-unresolved', [generatedFill(FIRST_REF, `Use ${FIRST_REF} in prose.`)], normalizeTestMd(`Use ${FIRST_REF} in prose.\n`), { reason: 'citation-unresolved', secretRef: FIRST_REF, stepId: 'fill-password' }],
+    ['multiply-attributed-grant', [generatedFill(), generatedFill(FIRST_REF, grantLine(FIRST_REF), 'fill-password-again')], prompt(FIRST_REF), { reason: 'multiply-attributed-grant', secretRef: FIRST_REF, stepId: 'fill-password-again' }],
+    ['uncovered-grant', [], prompt(FIRST_REF), { reason: 'uncovered-grant', secretRef: FIRST_REF, sourceSpan: { startLine: 3, endLine: 3 } }],
+  ] as const)('reports %s with reason-discriminated details', (_description, steps, testMd, details) => {
+    expectAttributionFailure(() => attributeSecretGrants(steps, testMd), details);
   });
 
-  it('ignores negative prose and malformed near-misses outside the shared grammar', () => {
-    expect(extractDeclaredSecretRefs('Never use secrets.ADMIN or {{secret.ADMIN}}.'))
-      .toEqual(new Set());
+  it('recognizes overlapping citation occurrences as non-unique', () => {
+    expectAttributionFailure(
+      () => attributeSecretGrants([generatedFill(FIRST_REF, 'aba')], normalizeTestMd('ababa')),
+      { reason: 'citation-not-unique', secretRef: FIRST_REF, stepId: 'fill-password' },
+    );
   });
 
-  it('extracts one complete secret reference into a fresh set', () => {
-    const prompt = 'Use {{secrets.LOGIN_PASSWORD}} to sign in.';
-    const declared = extractDeclaredSecretRefs(prompt);
-
-    expect(declared).toEqual(new Set(['{{secrets.LOGIN_PASSWORD}}']));
-    expect(extractDeclaredSecretRefs(prompt)).not.toBe(declared);
+  it('attributes a fill-secret action to the locally computed grant span', () => {
+    expect(attributeSecretGrants([generatedFill()], prompt(FIRST_REF))).toEqual([committedFill(FIRST_REF, 3)]);
   });
 
-  it('deduplicates repeated references', () => {
-    expect(extractDeclaredSecretRefs('{{secrets.API_TOKEN}} then {{secrets.API_TOKEN}} again.'))
-      .toEqual(new Set(['{{secrets.API_TOKEN}}']));
+  it('accepts AI steps with zero, one, and multiple independently cited grants', () => {
+    const testMd = prompt(FIRST_REF, SECOND_REF, THIRD_REF);
+    const steps = [
+      generatedAi(),
+      generatedAi([{ ref: FIRST_REF, citation: `# Sign in\n\n${grantLine(FIRST_REF)}` }], 'one-grant'),
+      generatedAi([
+        { ref: SECOND_REF, citation: `${grantLine(FIRST_REF)}\n${grantLine(SECOND_REF)}` },
+        { ref: THIRD_REF, citation: `${grantLine(SECOND_REF)}\n${grantLine(THIRD_REF)}` },
+      ], 'two-grants'),
+    ];
+
+    expect(attributeSecretGrants(steps, testMd)).toEqual([
+      committedAi(),
+      committedAi([{ ref: FIRST_REF, startLine: 3 }], 'one-grant'),
+      committedAi([
+        { ref: SECOND_REF, startLine: 4 },
+        { ref: THIRD_REF, startLine: 5 },
+      ], 'two-grants'),
+    ]);
   });
 
-  it('extracts dotted-path references with the shared grammar', () => {
-    expect(extractDeclaredSecretRefs('Use {{secrets.account.production.password}}.'))
-      .toEqual(new Set(['{{secrets.account.production.password}}']));
+  it('resolves two different reference grants inside one unique citation by their respective refs', () => {
+    const citation = `${grantLine(FIRST_REF)}\n${grantLine(SECOND_REF)}`;
+
+    expect(attributeSecretGrants([
+      generatedAi([
+        { ref: FIRST_REF, citation },
+        { ref: SECOND_REF, citation },
+      ]),
+    ], prompt(FIRST_REF, SECOND_REF))).toEqual([
+      committedAi([
+        { ref: FIRST_REF, startLine: 3 },
+        { ref: SECOND_REF, startLine: 4 },
+      ]),
+    ]);
   });
 
-  it('treats a reference inside a Markdown code fence as a textual declaration', () => {
-    expect(extractDeclaredSecretRefs('```text\n{{secrets.EXAMPLE_TOKEN}}\n```'))
-      .toEqual(new Set(['{{secrets.EXAMPLE_TOKEN}}']));
+  it('rejects one citation that contains two matching-reference grant lines', () => {
+    const citation = `${grantLine(FIRST_REF)}\n${grantLine(FIRST_REF)}`;
+
+    expectAttributionFailure(
+      () => attributeSecretGrants([generatedFill(FIRST_REF, citation)], normalizeTestMd(`${citation}\n`)),
+      { reason: 'citation-unresolved', secretRef: FIRST_REF, stepId: 'fill-password' },
+    );
   });
 
-  it('extracts adjacent references without requiring separating whitespace', () => {
-    expect(extractDeclaredSecretRefs('{{secrets.FIRST}}{{secrets.SECOND}}'))
-      .toEqual(new Set(['{{secrets.FIRST}}', '{{secrets.SECOND}}']));
+  it('permits two steps to claim distinct matching grants for the same ref', () => {
+    const testMd = normalizeTestMd(`${grantLine(FIRST_REF)}\ncontext\n${grantLine(FIRST_REF)}\n`);
+
+    expect(attributeSecretGrants([
+      generatedFill(FIRST_REF, `${grantLine(FIRST_REF)}\ncontext`, 'first-use'),
+      generatedFill(FIRST_REF, `context\n${grantLine(FIRST_REF)}`, 'second-use'),
+    ], testMd)).toEqual([
+      committedFill(FIRST_REF, 1, 'first-use'),
+      committedFill(FIRST_REF, 3, 'second-use'),
+    ]);
+  });
+
+  it('reports the first violation in plan order before later independent violations', () => {
+    expectAttributionFailure(
+      () => attributeSecretGrants([
+        generatedFill(FIRST_REF, 'not present', 'first-invalid'),
+        generatedFill(SECOND_REF, 'also not present', 'second-invalid'),
+      ], prompt(FIRST_REF, SECOND_REF)),
+      { reason: 'citation-not-found', secretRef: FIRST_REF, stepId: 'first-invalid' },
+    );
+  });
+
+  it('does not mutate provider-owned inputs and preserves an unchanged branch by identity', () => {
+    const unchanged: GeneratedStep = { id: 'open-home', kind: 'action', action: 'navigate', url: '/' };
+    const secretStep = generatedFill();
+    const input: readonly GeneratedStep[] = [unchanged, secretStep];
+    const snapshot = structuredClone(input);
+    const attributed = attributeSecretGrants(input, prompt(FIRST_REF));
+
+    expect(input).toStrictEqual(snapshot);
+    expect(attributed).not.toBe(input);
+    expect(attributed[0]).toBe(unchanged);
+  });
+
+  it('retains two same-reference grants when distinct citations resolve distinct occurrences', () => {
+    const testMd = normalizeTestMd(`${grantLine(FIRST_REF)}\nnotes\n${grantLine(FIRST_REF)}\n`);
+
+    expect(attributeSecretGrants([generatedAi([
+      { ref: FIRST_REF, citation: `${grantLine(FIRST_REF)}\nnotes` },
+      { ref: FIRST_REF, citation: `notes\n${grantLine(FIRST_REF)}` },
+    ])], testMd)).toEqual([committedAi([
+      { ref: FIRST_REF, startLine: 1 },
+      { ref: FIRST_REF, startLine: 3 },
+    ])]);
+  });
+
+  it('rejects two same-reference citations that claim the same grant occurrence', () => {
+    expectAttributionFailure(
+      () => attributeSecretGrants([generatedAi([
+        { ref: FIRST_REF, citation: grantLine(FIRST_REF) },
+        { ref: FIRST_REF, citation: grantLine(FIRST_REF) },
+      ])], prompt(FIRST_REF)),
+      { reason: 'multiply-attributed-grant', secretRef: FIRST_REF, stepId: 'complete-sign-in' },
+    );
   });
 });
 
-describe('assertSecretRefsGrounded', () => {
-  it('accepts a grounded fill-secret reference', () => {
-    const secretRef = '{{secrets.LOGIN_PASSWORD}}';
-    const document = plan({}, [{
-      id: 'fill-password',
-      kind: 'action',
-      action: 'fill-secret',
-      target: { strategy: 'accessibility', role: 'textbox', name: 'Password' },
-      secretRef,
-    }]);
-
-    expect(() => assertSecretRefsGrounded(document, new Set([secretRef]))).not.toThrow();
+describe('reattributeSecretGrants', () => {
+  it('rejects a hand-edited fill-secret span that no longer identifies the matching grant', () => {
+    expectAttributionFailure(
+      () => reattributeSecretGrants(plan([committedFill(FIRST_REF, 4)]), prompt(FIRST_REF)),
+      { reason: 'stale-grant-span', secretRef: FIRST_REF, stepId: 'fill-password' },
+    );
   });
 
-  it('reports the exact reference and step for an ungrounded fill-secret action', () => {
-    const secretRef = '{{secrets.LOGIN_PASSWORD}}';
-    const document = plan({}, [{
-      id: 'fill-password',
-      kind: 'action',
-      action: 'fill-secret',
-      target: { strategy: 'accessibility', role: 'textbox', name: 'Password' },
-      secretRef,
-    }]);
-
-    expectUndeclared(document, new Set(), secretRef, 'fill-password');
+  it('rejects a duplicated persisted grant claim after each span passes staleness validation', () => {
+    expectAttributionFailure(
+      () => reattributeSecretGrants(plan([
+        committedFill(FIRST_REF, 3, 'first-use'),
+        committedAi([{ ref: FIRST_REF, startLine: 3 }], 'second-use'),
+      ]), prompt(FIRST_REF)),
+      { reason: 'multiply-attributed-grant', secretRef: FIRST_REF, stepId: 'second-use' },
+    );
   });
 
-  it('accepts a grounded AI-step secret grant', () => {
-    const secretRef = '{{secrets.PAYMENT_TOKEN}}';
-    const document = plan({}, [{
-      id: 'complete-payment',
-      kind: 'ai',
-      instruction: 'Complete the payment flow.',
-      secrets: [secretRef],
-    }]);
-
-    expect(() => assertSecretRefsGrounded(document, new Set([secretRef]))).not.toThrow();
+  it('permits a fresh plan whose prompt has an unused grant', () => {
+    expect(() => reattributeSecretGrants(plan([committedFill(FIRST_REF, 3)]), prompt(FIRST_REF, SECOND_REF))).not.toThrow();
   });
 
-  it('reports the exact reference and step for an ungrounded AI-step secret grant', () => {
-    const secretRef = '{{secrets.PAYMENT_TOKEN}}';
-    const document = plan({}, [{
-      id: 'complete-payment',
-      kind: 'ai',
-      instruction: 'Complete the payment flow.',
-      secrets: [secretRef],
-    }]);
+  it('does not mutate the committed plan while checking persisted spans', () => {
+    const document = plan([committedFill(FIRST_REF, 3)]);
+    const snapshot = structuredClone(document);
 
-    expectUndeclared(document, new Set(), secretRef, 'complete-payment');
+    expect(() => reattributeSecretGrants(document, prompt(FIRST_REF))).not.toThrow();
+    expect(document).toStrictEqual(snapshot);
   });
+});
 
-  it('accepts a plan with no secret usage', () => {
-    const document = plan({}, [{ id: 'open-home', kind: 'action', action: 'navigate', url: '/' }]);
-
-    expect(() => assertSecretRefsGrounded(document, new Set())).not.toThrow();
-  });
-
-  it('reports the first undeclared secret-bearing step in plan array order', () => {
-    const firstSecretRef = '{{secrets.FIRST}}';
-    const document = plan({}, [
-      {
-        id: 'fill-first',
-        kind: 'action',
-        action: 'fill-secret',
-        target: { strategy: 'accessibility', role: 'textbox', name: 'First' },
-        secretRef: firstSecretRef,
-      },
-      {
-        id: 'complete-second',
-        kind: 'ai',
-        instruction: 'Complete the second task.',
-        secrets: ['{{secrets.SECOND}}'],
-      },
-    ]);
-
-    expectUndeclared(document, new Set(), firstSecretRef, 'fill-first');
-  });
-
-  it('continues after a grounded secret-bearing step to report a later ungrounded step', () => {
-    const groundedSecretRef = '{{secrets.FIRST}}';
-    const ungroundedSecretRef = '{{secrets.SECOND}}';
-    const document = plan({}, [
-      {
-        id: 'fill-first',
-        kind: 'action',
-        action: 'fill-secret',
-        target: { strategy: 'accessibility', role: 'textbox', name: 'First' },
-        secretRef: groundedSecretRef,
-      },
-      {
-        id: 'complete-second',
-        kind: 'ai',
-        instruction: 'Complete the second task.',
-        secrets: [ungroundedSecretRef],
-      },
-    ]);
-
-    expectUndeclared(document, new Set([groundedSecretRef]), ungroundedSecretRef, 'complete-second');
-  });
-
-  it('reports an undeclared AI grant before a later undeclared fill-secret action', () => {
-    const aiSecretRef = '{{secrets.FIRST}}';
-    const fillSecretRef = '{{secrets.SECOND}}';
-    const document = plan({}, [
-      {
-        id: 'complete-first',
-        kind: 'ai',
-        instruction: 'Complete the first task.',
-        secrets: [aiSecretRef],
-      },
-      {
-        id: 'fill-second',
-        kind: 'action',
-        action: 'fill-secret',
-        target: { strategy: 'accessibility', role: 'textbox', name: 'Second' },
-        secretRef: fillSecretRef,
-      },
-    ]);
-
-    expectUndeclared(document, new Set(), aiSecretRef, 'complete-first');
-  });
-
-  it('reports the first undeclared grant in an AI step secrets-array order', () => {
-    const firstSecretRef = '{{secrets.FIRST}}';
-    const document = plan({}, [{
-      id: 'complete-flow',
-      kind: 'ai',
-      instruction: 'Complete the flow.',
-      secrets: [firstSecretRef, '{{secrets.SECOND}}'],
-    }]);
-
-    expectUndeclared(document, new Set(), firstSecretRef, 'complete-flow');
-  });
-
-  it('continues after a grounded AI grant to report a later ungrounded grant', () => {
-    const groundedSecretRef = '{{secrets.FIRST}}';
-    const ungroundedSecretRef = '{{secrets.SECOND}}';
-    const document = plan({}, [{
-      id: 'complete-flow',
-      kind: 'ai',
-      instruction: 'Complete the flow.',
-      secrets: [groundedSecretRef, ungroundedSecretRef],
-    }]);
-
-    expectUndeclared(document, new Set([groundedSecretRef]), ungroundedSecretRef, 'complete-flow');
-  });
-
-  it('accepts every declared usage without mutating the plan or declaration set', () => {
-    const fillSecretRef = '{{secrets.LOGIN_PASSWORD}}';
-    const aiSecretRef = '{{secrets.PAYMENT_TOKEN}}';
-    const document = plan({}, [
-      {
-        id: 'fill-password',
-        kind: 'action',
-        action: 'fill-secret',
-        target: { strategy: 'accessibility', role: 'textbox', name: 'Password' },
-        secretRef: fillSecretRef,
-      },
-      {
-        id: 'complete-payment',
-        kind: 'ai',
-        instruction: 'Complete the payment flow.',
-        secrets: [aiSecretRef],
-      },
-    ]);
-    const declaredRefs = new Set([fillSecretRef, aiSecretRef]);
-    const expectedPlan = structuredClone(document);
-    const expectedDeclaredRefs = new Set(declaredRefs);
-
-    expect(() => assertSecretRefsGrounded(document, declaredRefs)).not.toThrow();
-    expect(document).toStrictEqual(expectedPlan);
-    expect(declaredRefs).toStrictEqual(expectedDeclaredRefs);
-  });
-
-  it('does not mutate the plan or declaration set when it rejects an undeclared reference', () => {
-    const secretRef = '{{secrets.LOGIN_PASSWORD}}';
-    const document = plan({}, [{
-      id: 'fill-password',
-      kind: 'action',
-      action: 'fill-secret',
-      target: { strategy: 'accessibility', role: 'textbox', name: 'Password' },
-      secretRef,
-    }]);
-    const declaredRefs = new Set<string>();
-    const expectedPlan = structuredClone(document);
-    const expectedDeclaredRefs = new Set(declaredRefs);
-    let thrown: unknown;
-
-    try {
-      assertSecretRefsGrounded(document, declaredRefs);
-    } catch (error) {
-      thrown = error;
-    }
-
-    expect(document).toStrictEqual(expectedPlan);
-    expect(declaredRefs).toStrictEqual(expectedDeclaredRefs);
-    expect(thrown).toBeInstanceOf(SecretRefUndeclaredError);
+describe('SECRET_GRANT_UNATTRIBUTABLE_HINTS', () => {
+  it.each([
+    ['citation-not-found', `If the secret use is intended, cite an exact, unique prompt excerpt containing one complete @ambercast-secret ${FIRST_REF} grant line, adding that line if it is absent; otherwise remove the secret use.`],
+    ['citation-not-unique', `If the secret use is intended, include enough prompt text for the citation to identify exactly one complete @ambercast-secret ${FIRST_REF} grant line, adding that line if it is absent; otherwise remove the secret use.`],
+    ['citation-missing-ref', `If the secret use is intended, cite one complete @ambercast-secret ${FIRST_REF} grant line including the literal ${FIRST_REF} token, adding that line if it is absent; otherwise remove the secret use.`],
+    ['citation-unresolved', `If the secret use is intended, cite exactly one complete @ambercast-secret ${FIRST_REF} grant line outside Markdown code, narrowing the citation or adding that line as needed; otherwise remove the secret use.`],
+    ['multiply-attributed-grant', `Remove the duplicate secret use, or give each intended use of ${FIRST_REF} a distinct @ambercast-secret grant line, cite each line during generation, and regenerate the plan before replay.`],
+    ['uncovered-grant', `Use the @ambercast-secret ${FIRST_REF} grant for one intended secret use and cite it during generation, or remove the unused grant line.`],
+    ['stale-grant-span', `If the secret use remains intended, restore its matching @ambercast-secret ${FIRST_REF} grant line and regenerate the plan; otherwise remove the use and regenerate the plan.`],
+  ] as const)('keeps the %s remediation text exact', (reason, expected) => {
+    expect(SECRET_GRANT_UNATTRIBUTABLE_HINTS[reason](FIRST_REF)).toBe(expected);
   });
 });
 
@@ -372,80 +373,90 @@ describe('assertNoLiteralSecrets', () => {
     ['sk prefix', 'sk-live-secret-value', 'credential-prefix-sk'],
     ['GitHub token prefix', 'ghp_secret-value', 'credential-prefix-ghp'],
     ['AWS access key prefix', 'AKIASECRET123456789', 'credential-prefix-aws-access-key'],
-  ] as const)('rejects a nested %s without retaining its literal value', (_description, value, detector) => {
-    expectRejected(plan({ nested: { credentials: [value] } }), value, detector, 'generatorMeta.nested.credentials[0]');
+  ] as const)('continues to reject a nested %s without retaining its literal value', (_description, value, detector) => {
+    const document = plan([]);
+    document.generatorMeta = { nested: { credentials: [value] } };
+
+    expectLiteralSecretRejected(document, value, detector, 'generatorMeta.nested.credentials[0]');
   });
 
-  it('rejects a high-entropy unconstrained generator-metadata token', () => {
+  it('continues to reject a high-entropy unconstrained generator-metadata token', () => {
     const token = 'aB3!dE5@fG7#hI9$jK2%mN4^pQ6&rS8T';
-    expectRejected(
-      plan({ token }),
-      token,
-      'high-entropy-token',
-      'generatorMeta.token',
-    );
+    const document = plan([]);
+    document.generatorMeta = { token };
+
+    expectLiteralSecretRejected(document, token, 'high-entropy-token', 'generatorMeta.token');
   });
 
-  it('exempts the usecase-computed source inputs digest by exact field path', () => {
-    expect(() => assertNoLiteralSecrets(plan())).not.toThrow();
+  it('continues to exempt the usecase-computed source inputs digest by exact field path', () => {
+    expect(() => assertNoLiteralSecrets(plan([]))).not.toThrow();
   });
 
-  it('exempts a valid whole-value secret reference', () => {
-    expect(() => assertNoLiteralSecrets(plan({ credential: WHOLE_SECRET_REFERENCE }))).not.toThrow();
+  it('continues to exempt a valid whole secret reference from literal-secret detection', () => {
+    const document = plan([]);
+    document.generatorMeta = { credential: WHOLE_SECRET_REFERENCE };
+
+    expect(() => assertNoLiteralSecrets(document)).not.toThrow();
   });
 
-  it('still rejects an embedded secret-reference marker in unconstrained metadata', () => {
+  it('continues to reject an embedded secret-reference marker in unconstrained metadata', () => {
     const note = 'Use {{secrets.LOGIN_PASSWORD}} exactly as copied.';
-    expectRejected(
-      plan({ note }),
-      note,
-      expect.any(String),
-      'generatorMeta.note',
-    );
+    const document = plan([]);
+    document.generatorMeta = { note };
+
+    expectLiteralSecretRejected(document, note, expect.any(String), 'generatorMeta.note');
   });
 
   it('applies the high-entropy threshold only at 32 characters and 4.0 bits per character', () => {
     const belowLength = 'aB3!dE5@fG7#hI9$jK2%mN4^pQ6&rS8';
     const atThreshold = `${belowLength}T`;
+    const belowLengthDocument = plan([]);
+    belowLengthDocument.generatorMeta = { belowLength };
+    const lowEntropyDocument = plan([]);
+    lowEntropyDocument.generatorMeta = { lowEntropy: 'a'.repeat(32) };
+    const atThresholdDocument = plan([]);
+    atThresholdDocument.generatorMeta = { atThreshold };
 
-    expect(() => assertNoLiteralSecrets(plan({ belowLength }))).not.toThrow();
-    expect(() => assertNoLiteralSecrets(plan({ lowEntropy: 'a'.repeat(32) }))).not.toThrow();
-    expectRejected(plan({ atThreshold }), atThreshold, 'high-entropy-token', 'generatorMeta.atThreshold');
-  });
-
-  it('traverses schema-defined plan fields as well as unconstrained generator metadata', () => {
-    const literal = 'sk-live-secret-in-fill-value';
-    const document: PlanDocument = {
-      ...plan(),
-      steps: [{
-        id: 'fill-token',
-        kind: 'action',
-        action: 'fill',
-        target: { strategy: 'accessibility', role: 'textbox', name: 'API token' },
-        value: literal,
-      }],
-    };
-
-    expectRejected(document, literal, 'credential-prefix-sk', 'steps[0].value');
-  });
-
-  it('reports the deterministic first violation in lexical object-key order', () => {
-    const first = 'ghp_first-secret-value';
-    const later = 'sk-later-secret-value';
-
-    expectRejected(
-      plan({ zeta: later, alpha: first }),
-      first,
-      'credential-prefix-ghp',
-      'generatorMeta.alpha',
+    expect(() => assertNoLiteralSecrets(belowLengthDocument)).not.toThrow();
+    expect(() => assertNoLiteralSecrets(lowEntropyDocument)).not.toThrow();
+    expectLiteralSecretRejected(
+      atThresholdDocument,
+      atThreshold,
+      'high-entropy-token',
+      'generatorMeta.atThreshold',
     );
+  });
+
+  it('continues to traverse schema-defined plan fields as well as unconstrained generator metadata', () => {
+    const literal = 'sk-live-secret-in-fill-value';
+    const document = plan([{
+      id: 'fill-token',
+      kind: 'action',
+      action: 'fill',
+      target: { strategy: 'accessibility', role: 'textbox', name: 'API token' },
+      value: literal,
+    }]);
+
+    expectLiteralSecretRejected(document, literal, 'credential-prefix-sk', 'steps[0].value');
+  });
+
+  it('reports the deterministic first violation in lexical object-key and array-index order', () => {
+    const first = 'ghp_first-secret-value';
+    const second = 'AKIASECONDSECRET123';
+    const later = 'sk-later-secret-value';
+    const document = plan([]);
+    document.generatorMeta = { zeta: later, alpha: [first, second] };
+
+    expectLiteralSecretRejected(document, first, 'credential-prefix-ghp', 'generatorMeta.alpha[0]');
   });
 
   it('detects a secret-like metadata key without exposing that key in diagnostics', () => {
     const rejectedKey = 'sk-live-secret-key';
+    const document = plan([]);
+    document.generatorMeta = { [rejectedKey]: 'ordinary metadata' };
 
-    expectRejected(
-      plan({ [rejectedKey]: 'ordinary metadata' }),
+    expectLiteralSecretRejected(
+      document,
       rejectedKey,
       'credential-prefix-sk',
       'generatorMeta[redacted-key]',

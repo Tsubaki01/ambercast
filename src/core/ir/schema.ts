@@ -8,13 +8,16 @@
  * schemas, never maintained as a hand-written parallel definition. Strict
  * objects keep zod and the generated JSON Schema aligned on rejecting unknown
  * properties. Structural zod constructs preserve the same constraints across
- * both representations. Except for duplicate
- * plan-step identifiers (which JSON Schema 2020-12 cannot express), no
- * `.refine()` or `.superRefine()` may encode a constraint that would vanish
- * when this module is converted to JSON Schema.
+ * both representations. Except for duplicate plan-step identifiers (which
+ * JSON Schema 2020-12 cannot express as projected-field uniqueness across
+ * array items) and SourceSpan's endLine/startLine ordering (which it cannot
+ * express as a comparison between sibling property values), no `.refine()`
+ * or `.superRefine()` may encode a constraint that would vanish when this
+ * module is converted to JSON Schema.
  *
- * The exported schemas and inferred aliases include the one duplicate-ID
- * `PlanDocument` refinement that JSON Schema cannot express.
+ * The exported schemas and inferred aliases include the two deliberate
+ * JSON-Schema-inexpressible refinements: duplicate `PlanDocument` IDs and
+ * `SourceSpan` endLine/startLine ordering.
  */
 import { z } from 'zod';
 
@@ -182,6 +185,64 @@ export const StepId = z.string().regex(STEP_ID_PATTERN);
 export type StepId = z.infer<typeof StepId>;
 
 /**
+ * Validates the inclusive line range in the test prompt that authorizes a
+ * secret use.
+ *
+ * The grant grammar uses one physical line, but a range rather than a bare
+ * line number accommodates multi-line grant forms without a schema revision.
+ * Replay locates the source afresh, so retaining line numbers rather than
+ * offsets avoids persisting a second coordinate system that could disagree
+ * with the parsed prompt.
+ *
+ * This is one of this module's two deliberate JSON-Schema-inexpressible
+ * refinements: JSON Schema 2020-12 cannot compare sibling property values;
+ * the other rejects duplicate `PlanDocument` IDs because it cannot enforce
+ * projected-field uniqueness across array items.
+ */
+export const SourceSpan = z.strictObject({
+  startLine: z.int().positive(),
+  endLine: z.int().positive(),
+}).refine((span) => span.endLine >= span.startLine, {
+  message: 'endLine must be greater than or equal to startLine',
+  path: ['endLine'],
+});
+
+/**
+ * The validated source-location range recorded for secret-grant provenance.
+ */
+export type SourceSpan = z.infer<typeof SourceSpan>;
+
+/**
+ * Limits the provider-supplied citation used while attributing a secret grant.
+ *
+ * The bound contains the work required to inspect untrusted provider output;
+ * it is not an authorization boundary. The locally parsed grant and its
+ * persisted {@link SourceSpan} provide that authority instead.
+ */
+const CITATION_MAX_LENGTH = 4096;
+
+/**
+ * Validates the exact prompt excerpt a provider supplies for a secret grant.
+ *
+ * A citation is evidence that deterministic attribution can verify during
+ * generation, not evidence replay trusts. Its generous length cap limits an
+ * adversarial response's search work without attempting to solve the separate
+ * absence of a length cap on {@link SecretRef}.
+ */
+export const Citation = z.string().min(1).max(CITATION_MAX_LENGTH).describe(
+  'The exact, verbatim substring of the test prompt — copied character for ' +
+  'character, including whitespace — that shows the @ambercast-secret ' +
+  '{{secrets.X}} grant line authorizing this secret reference. Do not ' +
+  'paraphrase, summarize, or count lines; copy the text exactly as written.',
+);
+
+/**
+ * The provider-supplied verbatim prompt excerpt used to locate one secret
+ * grant during generation.
+ */
+export type Citation = z.infer<typeof Citation>;
+
+/**
  * Validates the bare variable name written by a `capture` step.
  *
  * Capture produces an identifier, whereas consumers use a separate reference
@@ -219,6 +280,14 @@ const PressFields = {
 };
 const FillFields = { target: ElementRef, value: InterpolatableText };
 const FillSecretFields = { target: ElementRef, secretRef: SecretRef };
+// Provider-facing and committed AI steps share their execution contract; only
+// the provenance carried by each secret grant differs. One bundle prevents
+// those common fields from drifting across the two representations.
+const AiStepFields = {
+  ...StepBase,
+  kind: z.literal('ai'),
+  instruction: InterpolatableText,
+};
 // Assertion steps and recorded verification use one field contract so an
 // assertion cannot change meaning when it moves from a plan into a trace.
 const TextVisibleFields = { text: InterpolatableText };
@@ -308,13 +377,17 @@ export type FillAction = z.infer<typeof FillAction>;
  *
  * This dedicated branch is the central structural secret-safety rule: a
  * password cannot masquerade as a secret through a general text field, and a
- * literal or embedded token fails {@link SecretRef} validation.
+ * literal or embedded token fails {@link SecretRef} validation. Its grant
+ * span remains a flat field because the step already has exactly one secret
+ * reference; AI steps need nested pairs to associate each of several
+ * references with its own span.
  */
 export const FillSecretAction = z.strictObject({
   ...StepBase,
   kind: z.literal('action'),
   action: z.literal('fill-secret'),
   ...FillSecretFields,
+  secretGrantSpan: SourceSpan,
 });
 
 /**
@@ -479,6 +552,22 @@ export const CaptureStep = z.strictObject({
 export type CaptureStep = z.infer<typeof CaptureStep>;
 
 /**
+ * Validates one secret grant recorded on a committed AI step.
+ *
+ * Each reference carries the locally derived prompt range that authorized it,
+ * preserving distinct grants that happen to use the same secret reference.
+ */
+export const AiStepSecretGrant = z.strictObject({
+  ref: SecretRef,
+  sourceSpan: SourceSpan,
+});
+
+/**
+ * The persisted reference-and-provenance pair for one AI-step secret grant.
+ */
+export type AiStepSecretGrant = z.infer<typeof AiStepSecretGrant>;
+
+/**
  * Validates an AI-directed step as a pure generation artifact.
  *
  * Keeping execution results outside the plan preserves digest stability. When
@@ -486,14 +575,12 @@ export type CaptureStep = z.infer<typeof CaptureStep>;
  * {@link GroundingDocument}. Secret grants are optional rather than defaulted:
  * omission and an explicit empty list both grant nothing at this boundary, but
  * remain distinct serialized values for deterministic digesting. Canonical
- * ordering, deduplication, and omission policy therefore belong before this
- * schema is used to persist a generated plan, not in validation.
+ * ordering and omission policy therefore belong before this schema is used to
+ * persist a generated plan, not in validation.
  */
 export const AiStep = z.strictObject({
-  ...StepBase,
-  kind: z.literal('ai'),
-  instruction: InterpolatableText,
-  secrets: z.array(SecretRef).optional(),
+  ...AiStepFields,
+  secrets: z.array(AiStepSecretGrant).optional(),
 });
 
 /**
@@ -515,6 +602,97 @@ export const Step = z.discriminatedUnion('kind', [ActionStep, AssertStep, Captur
  * The parsed outer step union narrowed by its `kind` discriminant.
  */
 export type Step = z.infer<typeof Step>;
+
+/**
+ * Validates a provider-authored `fill-secret` action before local attribution.
+ *
+ * Providers supply a verbatim citation rather than a source span because only
+ * local prompt parsing may establish the persisted authorization provenance.
+ */
+export const GeneratedFillSecretAction = z.strictObject({
+  ...StepBase,
+  kind: z.literal('action'),
+  action: z.literal('fill-secret'),
+  ...FillSecretFields,
+  citation: Citation,
+});
+
+/**
+ * The provider-facing `action/fill-secret` branch awaiting local attribution.
+ */
+export type GeneratedFillSecretAction = z.infer<typeof GeneratedFillSecretAction>;
+
+/**
+ * Validates the action portion of a provider-authored step response.
+ *
+ * Non-secret branches already match their committed representations, while
+ * the secret branch preserves its citation until local verification replaces
+ * it with a source span.
+ */
+export const GeneratedActionStep = z.discriminatedUnion('action', [
+  ClickAction,
+  NavigateAction,
+  PressAction,
+  FillAction,
+  GeneratedFillSecretAction,
+]);
+
+/**
+ * The provider-facing action union narrowed by its `action` discriminant.
+ */
+export type GeneratedActionStep = z.infer<typeof GeneratedActionStep>;
+
+/**
+ * Validates one provider-authored AI-step secret grant before local
+ * attribution.
+ *
+ * The provider pairs its reference with the prompt text it copied, allowing
+ * local code to reject an ambiguous or non-grant citation before persistence.
+ */
+export const GeneratedAiStepSecretGrant = z.strictObject({
+  ref: SecretRef,
+  citation: Citation,
+});
+
+/**
+ * The provider-facing reference-and-citation pair for one AI-step grant.
+ */
+export type GeneratedAiStepSecretGrant = z.infer<typeof GeneratedAiStepSecretGrant>;
+
+/**
+ * Validates a provider-authored AI step before local secret-grant attribution.
+ *
+ * The shared AI-step fields remain identical to the committed step, leaving
+ * each secret entry's citation as the only provider-facing provenance.
+ */
+export const GeneratedAiStep = z.strictObject({
+  ...AiStepFields,
+  secrets: z.array(GeneratedAiStepSecretGrant).optional(),
+});
+
+/**
+ * The provider-facing AI-step branch awaiting local attribution.
+ */
+export type GeneratedAiStep = z.infer<typeof GeneratedAiStep>;
+
+/**
+ * Validates one complete provider-authored step before locally deterministic
+ * fields are assembled into a committed plan.
+ *
+ * Assertions and captures require no secret provenance and therefore reuse
+ * their committed shapes without a parallel schema branch.
+ */
+export const GeneratedStep = z.discriminatedUnion('kind', [
+  GeneratedActionStep,
+  AssertStep,
+  CaptureStep,
+  GeneratedAiStep,
+]);
+
+/**
+ * The provider-facing outer step union narrowed by its `kind` discriminant.
+ */
+export type GeneratedStep = z.infer<typeof GeneratedStep>;
 
 /**
  * Validates a recorded `click` trace action.
@@ -831,7 +1009,7 @@ export type PlanDocument = z.infer<typeof PlanDocument>;
  * provider boundary's smaller and more trustworthy responsibility.
  */
 export const GeneratedPlanResponse = z.strictObject({
-  steps: z.array(Step),
+  steps: z.array(GeneratedStep),
   generatorMeta: z.record(z.string(), JsonValue).optional(),
   ambiguities: z.array(JsonValue),
 });
