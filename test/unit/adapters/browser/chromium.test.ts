@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
 import { parseAriaSnapshot } from '#core/ir/aria-snapshot.js';
 import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
 import type { SecretSinkPolicy } from '#core/secrets/sink-policy.js';
@@ -712,7 +713,15 @@ describe('ChromiumBrowserSession.fillSecret()', () => {
       const target = await bindSubmit(session);
       launcher.page.bodyLocator.ariaSnapshotText = CHANGED_SUBMIT_FIXTURE;
 
-      await expect(session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY)).rejects.toThrow('fingerprint');
+      let thrown: unknown;
+      try {
+        await session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY);
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown instanceof Error ? thrown.message : String(thrown)).toContain('fingerprint');
+      expect(thrown).not.toBeInstanceOf(IntegrityViolationError);
       expect(launcher.page.roleLocator.fillValues).toEqual([]);
     });
   });
@@ -739,6 +748,46 @@ describe('ChromiumBrowserSession.fillSecret()', () => {
         await captureRejection(session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY)),
         ALLOWED_POLICY,
       );
+      expect(launcher.page.roleLocator.fillValues).toEqual([]);
+    });
+  });
+
+  it('rejects an origin change that lands during re-verification capture before invoking fill', async () => {
+    await withLaunchedSession({}, async (session, launcher) => {
+      const target = await bindSubmit(session);
+      const snapshot = deferred<string>();
+      const captureStarted = deferred<void>();
+      launcher.page.bodyLocator.ariaSnapshotOverride = () => {
+        captureStarted.resolve(undefined);
+        return snapshot.promise;
+      };
+      const operation = session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY);
+      await captureStarted.promise;
+      expect(launcher.page.bodyLocator.ariaSnapshotCalls).toHaveLength(2);
+      launcher.page.currentUrl = 'https://idp.example.test/login';
+      snapshot.resolve(FIXTURE_ARIA_SNAPSHOT);
+
+      expectSecretSinkOriginViolation(await captureRejection(operation), ALLOWED_POLICY);
+      expect(launcher.page.roleLocator.fillValues).toEqual([]);
+    });
+  });
+
+  it('reclassifies a continuity failure as an origin violation when the origin goes bad during capture', async () => {
+    await withLaunchedSession({}, async (session, launcher) => {
+      const target = await bindSubmit(session);
+      const snapshot = deferred<string>();
+      const captureStarted = deferred<void>();
+      launcher.page.bodyLocator.ariaSnapshotOverride = () => {
+        captureStarted.resolve(undefined);
+        return snapshot.promise;
+      };
+      const operation = session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY);
+      await captureStarted.promise;
+      expect(launcher.page.bodyLocator.ariaSnapshotCalls).toHaveLength(2);
+      launcher.page.currentUrl = 'https://idp.example.test/login';
+      snapshot.resolve(CHANGED_SUBMIT_FIXTURE);
+
+      expectSecretSinkOriginViolation(await captureRejection(operation), ALLOWED_POLICY);
       expect(launcher.page.roleLocator.fillValues).toEqual([]);
     });
   });
