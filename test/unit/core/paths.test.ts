@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { basenamePath, dirnamePath, isAbsolutePath, joinPath, relativeWithin } from '#core/paths.js';
+import {
+  basenamePath,
+  dirnamePath,
+  isAbsolutePath,
+  joinPath,
+  relativeWithin,
+  relativeWithinOrOriginal,
+} from '#core/paths.js';
 
 describe('joinPath', () => {
   it.each([
@@ -203,5 +210,76 @@ describe('relativeWithin', () => {
     ['/suite', '/nested/..'],
   ])('treats malformed root or target paths as non-matching (%j, %j)', (root, target) => {
     expect(relativeWithin(root, target)).toBeUndefined();
+  });
+});
+
+describe('relativeWithinOrOriginal', () => {
+  it.each([
+    ['', '', ''],
+    ['/tests', '/tests', '/tests'],
+    ['/tests', '/tests/ui/case.test.md', 'ui/case.test.md'],
+    ['/tests', '/tests/ ', '/tests/ '],
+    ['suite', 'suite', 'suite'],
+    ['suite', 'suite/case', 'case'],
+    ['', 'suite/case', 'suite/case'],
+    ['/', '/', '/'],
+    ['/', '/suite/case', 'suite/case'],
+  ])('with root %j and target %j, returns %j', (root, target, expected) => {
+    expect(relativeWithinOrOriginal(root, target)).toBe(expected);
+  });
+
+  it.each([
+    ['/tests', '/tests-archive/case'],
+    ['/tests/ambercast', '/tests/ambercast-evil/case.test.md'],
+    ['/tests', 'tests/case'],
+    ['suite', '/suite/case'],
+    ['suite', 'suites/case'],
+    ['suite/case', 'suite'],
+    ['/suite/case', '/suite'],
+    ['/tests', '/other/case'],
+  ])('preserves target %j outside root %j', (root, target) => {
+    expect(relativeWithinOrOriginal(root, target)).toBe(target);
+  });
+
+  it.each([
+    ['.', 'case'],
+    ['..', 'case'],
+    ['./suite', 'suite/case'],
+    ['../suite', 'suite/case'],
+    ['suite/./nested', 'suite/case'],
+    ['suite/..', 'suite/case'],
+    ['suite/.', 'suite/case'],
+    ['suite', './case'],
+    ['suite', '../case'],
+    ['suite', 'suite/./case'],
+    ['suite', 'suite/../case'],
+    ['suite', 'suite/.'],
+    ['suite', 'suite/..'],
+    ['suite/', 'suite/case'],
+    ['suite', 'suite//case'],
+    ['//suite', '/suite/case'],
+    ['/suite/', '/suite/case'],
+    ['/suite//nested', '/suite/case'],
+    ['/.', '/suite/case'],
+    ['/..', '/suite/case'],
+    ['/./suite', '/suite/case'],
+    ['/../suite', '/suite/case'],
+    ['/suite/./nested', '/suite/case'],
+    ['/suite/../nested', '/suite/case'],
+    ['/suite/.', '/suite/case'],
+    ['/suite/..', '/suite/case'],
+    ['/suite', '//suite/case'],
+    ['/suite', '/suite/'],
+    ['/suite', '/suite//case'],
+    ['/suite', '/.'],
+    ['/suite', '/..'],
+    ['/suite', '/./case'],
+    ['/suite', '/../case'],
+    ['/suite', '/nested/./case'],
+    ['/suite', '/nested/../case'],
+    ['/suite', '/nested/.'],
+    ['/suite', '/nested/..'],
+  ])('preserves malformed root or target path %j, %j', (root, target) => {
+    expect(relativeWithinOrOriginal(root, target)).toBe(target);
   });
 });

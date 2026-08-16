@@ -193,6 +193,36 @@ export function relativeWithin(root: string, target: string): string | undefined
   return target.startsWith(`${root}/`) ? target.slice(root.length + 1) : undefined;
 }
 
+/**
+ * Produces a usable relative report identity when possible; otherwise
+ * preserves the original target.
+ *
+ * This remains a sibling of {@link relativeWithin} because the two callers
+ * need different failure policies. General containment checks signal that no
+ * relative path exists with `undefined`, while required identity fields must
+ * retain an original path rather than lose their value.
+ *
+ * @param root - The POSIX-style containment boundary. It need not be
+ *   normalized: malformed inputs and absolute/relative kind mismatches leave
+ *   `target` unchanged.
+ * @param target - The path to make reportable. It need not be normalized or
+ *   non-blank; an already-blank value is preserved unchanged.
+ * @returns A usable relative suffix or the unchanged `target`. A target
+ *   containing a non-whitespace character always produces a result containing
+ *   one; this function preserves validity rather than sanitizing an
+ *   already-invalid target.
+ * @remarks
+ * Report consumers require non-empty identity strings. When a non-blank target
+ * is equal to the root or has a blank contained suffix, preserving the
+ * original target prevents an invalid relative identity. Local validation
+ * keeps this low-level path module independent of the higher report-schema
+ * layer while aligning its relative output with that layer's acceptance rule.
+ */
+export function relativeWithinOrOriginal(root: string, target: string): string {
+  const relative = relativeWithin(root, target);
+  return relative !== undefined && /\S/.test(relative) ? relative : target;
+}
+
 function assertNormalizedPath(path: string): void {
   if (!isNormalizedPath(path)) {
     throw new RangeError('Path must use normalized POSIX-style separators.');

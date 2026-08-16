@@ -20,7 +20,7 @@ import { loadConfig } from '#config/load.js';
 import { ConfigInvalidError } from '#core/errors/config-invalid-error.js';
 import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
 import { AmbercastError, type ExitCode } from '#core/errors/types.js';
-import { isAbsolutePath, joinPath, relativeWithin } from '#core/paths.js';
+import { isAbsolutePath, joinPath, relativeWithin, relativeWithinOrOriginal } from '#core/paths.js';
 import { buildRunReport, type RunReportOutput } from '#usecases/run-report.js';
 import { run, type RunOutcome } from '#usecases/run.js';
 import { createAmbercast } from './create-ambercast.js';
@@ -53,8 +53,10 @@ function runIdFor(startedAt: string, uuid: string): string {
 }
 
 /**
- * Produces a report-safe view with schema-valid durations and portable
- * evidence paths.
+ * Produces a report-safe view with schema-valid durations, portable evidence
+ * paths, and project-root-relative executed `id`, `file`, and `planFile`
+ * identities plus `listed[]` files, retaining the original absolute identity
+ * when relativization is impossible.
  *
  * @remarks
  * The system monotonic clock retains sub-millisecond precision for replay, but
@@ -68,11 +70,24 @@ function runIdFor(startedAt: string, uuid: string): string {
  * but one bad evidence field must not replace a completed replay outcome with
  * a crash report.
  *
- * @param outcome - The completed replay outcome with absolute internal paths.
+ * Executed-result identities are relativized against the project
+ * root: `id`, `file`, and `planFile` each retain their own transformed value,
+ * and listed files receive the same treatment. A plan file follows its test
+ * file's directory, so it shares that identity boundary rather than the run
+ * storage directory. Unlike optional screenshot evidence, these schema-
+ * required identity fields cannot be omitted; a path that cannot be
+ * relativized retains its original absolute value instead.
+ *
+ * @param outcome - The completed replay outcome whose executed identities,
+ *   listed files, and optional screenshots may contain absolute paths.
  * @param projectRoot - The resolved absolute root used to determine reportable
- *   screenshot paths.
- * @returns A copy suitable for the public report contract, with any
- *   uncontained screenshot field omitted.
+ *   executed `id`, `file`, and `planFile` identities, `listed[]` files, and
+ *   screenshot paths. An identity that is not contained by this root keeps
+ *   its original absolute value.
+ * @returns A copy suitable for the public report contract, with executed
+ *   `id`, `file`, and `planFile` identities and `listed[]` files relativized when
+ *   possible; required identities otherwise retain their original absolute
+ *   value, while any uncontained screenshot field is omitted.
  */
 function reportableOutcome(outcome: RunOutcome, projectRoot: string): RunOutcome {
   return {
@@ -81,6 +96,9 @@ function reportableOutcome(outcome: RunOutcome, projectRoot: string): RunOutcome
       ...caseOutcome,
       result: {
         ...caseOutcome.result,
+        id: relativeWithinOrOriginal(projectRoot, caseOutcome.result.id),
+        file: relativeWithinOrOriginal(projectRoot, caseOutcome.result.file),
+        planFile: relativeWithinOrOriginal(projectRoot, caseOutcome.result.planFile),
         durationMs: Number.isFinite(caseOutcome.result.durationMs)
           ? Math.max(0, Math.round(caseOutcome.result.durationMs))
           : 0,
@@ -100,6 +118,10 @@ function reportableOutcome(outcome: RunOutcome, projectRoot: string): RunOutcome
           return { ...step, screenshot };
         }),
       },
+    })),
+    listed: outcome.listed.map((listed) => ({
+      ...listed,
+      file: relativeWithinOrOriginal(projectRoot, listed.file),
     })),
   };
 }
