@@ -224,43 +224,45 @@ function resolveCitation(
 }
 
 /**
- * Revalidates committed secret-grant spans against the current normalized
- * prompt before replay.
+ * Asserts that a committed plan's secret grants remain sound against the
+ * current normalized prompt.
  *
- * This function only reads the plan. It re-extracts grants, checks the
- * reference and both persisted line boundaries for each secret use in step
- * order, and rejects duplicate claims of the same grant. A valid generated
- * plan stores no citation or provider state, so replay has no AI dependency at
- * this trust boundary.
+ * Generation uses this boundary when deciding whether a digest-fresh plan can
+ * be reused, while replay uses it before opening a browser. Both call sites
+ * need the same authorization result even though generation can regenerate an
+ * unsound plan and replay must report the failure. The check only reads the
+ * plan, preserving replay's lack of an AI dependency at this trust boundary.
  *
  * A claim uses the resolved grant's `startLine`, because the supported grammar
  * makes every grant exactly one physical line. Stale-span validation precedes
- * the duplicate check, so stale provenance takes precedence over a duplicate
- * claim. Both failures use `SecretGrantUsageDetails`.
+ * the duplicate check, and the coverage scan follows the complete
+ * step walk. This preserves deterministic precedence from stale provenance to
+ * a duplicate claim to an uncovered grant. Stale and duplicate failures use
+ * `SecretGrantUsageDetails`; an uncovered grant uses its source span because
+ * it has no truthful step identifier.
  *
  * @param plan - The schema-validated committed plan to verify without
  * mutation.
  * @param normalizedTestMd - Canonical current prompt from which grants are
  * re-extracted.
- * @throws {SecretGrantUnattributableError} When a persisted span is stale or
- * one grant span is claimed by more than one step.
+ * @throws {SecretGrantUnattributableError} When a persisted span is stale, one
+ * grant span is claimed by more than one step, or a declared grant remains
+ * unclaimed.
  * @remarks
- * Editing the prompt without regeneration is rejected earlier by the complete
- * prompt digest freshness check. This boundary covers the distinct reachable
- * threat of a hand-edited plan whose digest still matches while a stored span
- * no longer names its reference's grant line.
- *
- * Replay does not reject an uncovered grant. A matching digest makes the
- * prompt and its grant catalog identical to generation, where uncovered
- * grants are fatal; an otherwise valid plan therefore cannot reach replay
- * with that condition unless a plan edit has already changed its usage set.
+ * Prompt edits without regeneration are rejected by the complete prompt digest
+ * check. This independent boundary covers hand-edited plans whose digest still
+ * matches but whose stored uses no longer have valid one-to-one grants.
+ * Attribution proves that a secret use has authorization, not that the field
+ * receiving the secret is semantically intended; that residual judgment stays
+ * with the validated plan and human review.
  */
-export function reattributeSecretGrants(
+export function assertCommittedSecretAttributionSound(
   plan: PlanDocumentType,
   normalizedTestMd: NormalizedTestMd,
 ): void {
+  const grants = extractSecretGrants(normalizedTestMd);
   const grantsByStartLine = new Map(
-    extractSecretGrants(normalizedTestMd).map((grant) => [grant.startLine, grant]),
+    grants.map((grant) => [grant.startLine, grant]),
   );
   const claimed = new Set<number>();
   const verifyGrant = (
@@ -289,6 +291,11 @@ export function reattributeSecretGrants(
         verifyGrant(secret.ref, secret.sourceSpan, step.id);
       }
     }
+  }
+
+  const uncoveredGrant = grants.find((grant) => !claimed.has(grant.startLine));
+  if (uncoveredGrant !== undefined) {
+    throwSecretGrantUncoveredError(uncoveredGrant);
   }
 }
 

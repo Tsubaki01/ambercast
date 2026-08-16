@@ -550,6 +550,27 @@ describe('run', () => {
     expect(browserDriver).not.toHaveBeenCalled();
   });
 
+  it('rejects a fresh plan with an uncovered secret grant before launching a browser', async () => {
+    const { deps, browserDriver, recordingStorage, resolveAiExecutor } = createScenario();
+    const secretRef = '{{secrets.FOO}}';
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `@ambercast-secret ${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const error = outcome.results[0]?.error;
+
+    expect(error).toBeInstanceOf(SecretGrantUnattributableError);
+    if (error instanceof SecretGrantUnattributableError) {
+      expect(error.details).toMatchObject({
+        reason: 'uncovered-grant',
+        secretRef,
+        sourceSpan: { startLine: 1, endLine: 1 },
+      });
+    }
+    expect(browserDriver).not.toHaveBeenCalled();
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['ordinary-text edit that preserves the grant line', true],
     ['removal of the grant line', false],

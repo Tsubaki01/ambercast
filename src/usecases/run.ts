@@ -58,8 +58,8 @@ import type { Clock, EventSink, SecretsProvider } from '#ports/system.js';
 import { OBSERVED_NOTE, type ExecutedRunResult, type Observed, type StepResult } from '#report/schema.js';
 import { z } from 'zod';
 import {
+  assertCommittedSecretAttributionSound,
   detectSecretLiteral,
-  reattributeSecretGrants,
   type SecretDetector,
 } from './generator-secret-policy.js';
 
@@ -2494,10 +2494,11 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
     });
     const plan = await readTrustedPlan(deps.storage, planPath, inputsDigest);
     /*
-     * Re-attributing persisted grant spans before opening a browser prevents a
-     * hand-edited plan from redirecting a secret use after generation.
+     * Re-attributing persisted grant spans before opening a browser ensures
+     * every declared grant is consumed exactly once, rejecting hand-edited
+     * plans that redirect a secret use or leave a grant uncovered.
      */
-    reattributeSecretGrants(plan, normalizedTestMd);
+    assertCommittedSecretAttributionSound(plan, normalizedTestMd);
     planSteps = plan.steps;
     groundingPath = deps.layout.groundingPathFor(file);
     const loadedGrounding = await readUsableGrounding(deps.storage, groundingPath, plan);

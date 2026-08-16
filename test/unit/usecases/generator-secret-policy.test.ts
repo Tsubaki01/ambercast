@@ -5,9 +5,9 @@ import { SecretGrantUnattributableError } from '#core/errors/secret-grant-unattr
 import { SecretLiteralRejectedError } from '#core/errors/secret-literal-rejected-error.js';
 import {
   assertNoLiteralSecrets,
+  assertCommittedSecretAttributionSound,
   attributeSecretGrants,
   normalizeAiStepSecretGrants,
-  reattributeSecretGrants,
   SECRET_GRANT_UNATTRIBUTABLE_HINTS,
 } from '#usecases/generator-secret-policy.js';
 
@@ -323,17 +323,24 @@ describe('attributeSecretGrants', () => {
   });
 });
 
-describe('reattributeSecretGrants', () => {
+describe('assertCommittedSecretAttributionSound', () => {
   it('rejects a hand-edited fill-secret span that no longer identifies the matching grant', () => {
     expectAttributionFailure(
-      () => reattributeSecretGrants(plan([committedFill(FIRST_REF, 4)]), prompt(FIRST_REF)),
+      () => assertCommittedSecretAttributionSound(plan([committedFill(FIRST_REF, 4)]), prompt(FIRST_REF)),
+      { reason: 'stale-grant-span', secretRef: FIRST_REF, stepId: 'fill-password' },
+    );
+  });
+
+  it('reports a stale span before an unrelated uncovered grant', () => {
+    expectAttributionFailure(
+      () => assertCommittedSecretAttributionSound(plan([committedFill(FIRST_REF, 4)]), prompt(FIRST_REF, SECOND_REF)),
       { reason: 'stale-grant-span', secretRef: FIRST_REF, stepId: 'fill-password' },
     );
   });
 
   it('rejects a duplicated persisted grant claim after each span passes staleness validation', () => {
     expectAttributionFailure(
-      () => reattributeSecretGrants(plan([
+      () => assertCommittedSecretAttributionSound(plan([
         committedFill(FIRST_REF, 3, 'first-use'),
         committedAi([{ ref: FIRST_REF, startLine: 3 }], 'second-use'),
       ]), prompt(FIRST_REF)),
@@ -341,15 +348,32 @@ describe('reattributeSecretGrants', () => {
     );
   });
 
-  it('permits a fresh plan whose prompt has an unused grant', () => {
-    expect(() => reattributeSecretGrants(plan([committedFill(FIRST_REF, 3)]), prompt(FIRST_REF, SECOND_REF))).not.toThrow();
+  it('reports a duplicate claim before an unrelated uncovered grant', () => {
+    expectAttributionFailure(
+      () => assertCommittedSecretAttributionSound(plan([
+        committedFill(FIRST_REF, 3, 'first-use'),
+        committedAi([{ ref: FIRST_REF, startLine: 3 }], 'second-use'),
+      ]), prompt(FIRST_REF, SECOND_REF)),
+      { reason: 'multiply-attributed-grant', secretRef: FIRST_REF, stepId: 'second-use' },
+    );
+  });
+
+  it('rejects a fresh plan whose prompt has an unused grant', () => {
+    expectAttributionFailure(
+      () => assertCommittedSecretAttributionSound(plan([committedFill(FIRST_REF, 3)]), prompt(FIRST_REF, SECOND_REF)),
+      {
+        reason: 'uncovered-grant',
+        secretRef: SECOND_REF,
+        sourceSpan: { startLine: 4, endLine: 4 },
+      },
+    );
   });
 
   it('does not mutate the committed plan while checking persisted spans', () => {
     const document = plan([committedFill(FIRST_REF, 3)]);
     const snapshot = structuredClone(document);
 
-    expect(() => reattributeSecretGrants(document, prompt(FIRST_REF))).not.toThrow();
+    expect(() => assertCommittedSecretAttributionSound(document, prompt(FIRST_REF))).not.toThrow();
     expect(document).toStrictEqual(snapshot);
   });
 });

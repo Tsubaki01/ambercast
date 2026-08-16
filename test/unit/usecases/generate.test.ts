@@ -5,6 +5,7 @@ import {
   type GeneratedPlanResponse,
   type GroundingDocument,
   type JsonValueT,
+  type Step,
 } from '#core/ir/schema.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
@@ -248,7 +249,11 @@ async function writePrompt(storage: StorageAdapter, relativePath = 'login.test.m
   return path;
 }
 
-async function createFreshPlan(storage: StorageAdapter, testPath: string): Promise<PlanDocument> {
+async function createFreshPlan(
+  storage: StorageAdapter,
+  testPath: string,
+  steps: readonly Step[] = [],
+): Promise<PlanDocument> {
   const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
   const normalizedTestMd = normalizeTestMd(await storage.readText(testPath));
   const inputsDigest = computeInputsDigest({
@@ -261,16 +266,20 @@ async function createFreshPlan(storage: StorageAdapter, testPath: string): Promi
     schemaVersion: 1,
     source: { inputsDigest },
     targets: TARGETS,
-    steps: [],
+    steps: [...steps],
   };
 
   await storage.writeText(layout.planPathFor(testPath), toCanonicalArtifactText(plan as unknown as JsonValueT));
   return plan;
 }
 
-async function seedFreshArtifacts(storage: StorageAdapter, testPath: string): Promise<void> {
+async function seedFreshArtifacts(
+  storage: StorageAdapter,
+  testPath: string,
+  steps: readonly Step[] = [],
+): Promise<void> {
   const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
-  const plan = await createFreshPlan(storage, testPath);
+  const plan = await createFreshPlan(storage, testPath, steps);
   const grounding: GroundingDocument = { schemaVersion: 1, planDigest: computePlanDigest(plan), entries: {} };
 
   await storage.writeText(layout.groundingPathFor(testPath), toCanonicalArtifactText(grounding));
@@ -354,6 +363,53 @@ describe('generate', () => {
     expect(execute).not.toHaveBeenCalled();
     expect(events.emitted()).toEqual([]);
     expect(recordingStorage.writes).toEqual([]);
+  });
+
+  it('regenerates an otherwise fresh plan with an uncovered secret grant', async () => {
+    const secretRef = FIRST_SECRET_REF;
+    const regeneratedResponse: GeneratedPlanResponse = {
+      steps: [{
+        id: 'fill-password',
+        kind: 'action',
+        action: 'fill-secret',
+        target: PASSWORD_TARGET,
+        secretRef,
+        citation: `@ambercast-secret ${secretRef}`,
+      }],
+      ambiguities: [],
+    };
+    const execute = vi.fn(async () => ({ data: regeneratedResponse, raw: JSON.stringify(regeneratedResponse) }));
+    const { deps, recordingStorage } = createScenario({
+      aiExecutor: createFakeAiExecutor({ execute }),
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `@ambercast-secret ${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath);
+    recordingStorage.reset();
+
+    await expect(generate(deps, DEFAULT_OPTIONS)).resolves.toMatchObject({
+      results: [{ file: testPath, status: 'generated' }],
+    });
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a fresh plan with a fully consumed secret grant without calling AI', async () => {
+    const secretRef = FIRST_SECRET_REF;
+    const { deps, execute, recordingStorage } = createScenario();
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `@ambercast-secret ${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [{
+      id: 'fill-password',
+      kind: 'action',
+      action: 'fill-secret',
+      target: PASSWORD_TARGET,
+      secretRef,
+      secretGrantSpan: { startLine: 1, endLine: 1 },
+    }]);
+    recordingStorage.reset();
+
+    await expect(generate(deps, DEFAULT_OPTIONS)).resolves.toMatchObject({
+      results: [{ file: testPath, status: 'skipped-fresh' }],
+    });
+    expect(execute).not.toHaveBeenCalled();
   });
 
   it('treats a v1-tagged grounding document as stale, rewrites it empty, and keeps the plan fresh', async () => {
