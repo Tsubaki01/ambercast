@@ -330,27 +330,41 @@ class ChromiumBrowserSession implements BrowserSession {
   /**
    * Fills a bound element with a secret after policy and continuity checks.
    *
-   * The origin check precedes binding verification because a real
-   * cross-origin navigation also advances `navigationGeneration()`. Reversing
-   * that order would report the ordinary stale-binding error instead of the
-   * integrity-classified origin violation. Origin failures include policy
-   * diagnostics but never the materialized value.
+   * This checks the live origin before continuity re-verification, then
+   * re-checks it from the continuity-failure catch so an
+   * intervening origin violation takes precedence. When that re-check finds
+   * the origin still sound, the original continuity error is rethrown
+   * unchanged. The catch and the final synchronous checkpoint immediately
+   * before the underlying fill are adjacent: no `await` sits between them, or
+   * between that final checkpoint and the fill. The first checkpoint preserves
+   * fail-fast classification when a cross-origin navigation also makes the
+   * binding stale; the latter two close the JavaScript-visible asynchronous
+   * gap. Origin failures include policy diagnostics but never the materialized
+   * value.
+   *
+   * The final synchronous checkpoint cannot make inspecting the origin and
+   * the renderer's DOM mutation atomic. A navigation may still occur after
+   * Playwright receives the fill and before the renderer executes it; that
+   * residual renderer-process TOCTOU interval is outside this adapter's
+   * observable boundary.
    */
   async fillSecret(
     target: BoundElement,
     value: string,
     policy: SecretSinkPolicy,
   ): Promise<void> {
-    if (!isAllowedSecretSinkOrigin(policy, this.page.url())) {
-      throw new IntegrityViolationError('The current page origin is not allowed to receive this secret.', {
-        secretRef: policy.secretRef,
-        allowedOrigins: policy.allowedOrigins,
-        source: policy.source,
-      });
+    this.assertSecretSinkOrigin(policy);
+
+    let reverified: ReverifiedBinding;
+    try {
+      reverified = await this.reverifyBinding(target);
+    } catch (error) {
+      this.assertSecretSinkOrigin(policy);
+      throw error;
     }
 
-    const { locator } = await this.reverifyBinding(target);
-    await locator.fill(value);
+    this.assertSecretSinkOrigin(policy);
+    await reverified.locator.fill(value);
   }
 
   /**
@@ -504,6 +518,37 @@ class ChromiumBrowserSession implements BrowserSession {
     }
 
     return { kind: 'miss', reason: 'element-not-found' };
+  }
+
+  /**
+   * Confirms that the live page may receive a secret under its resolved policy.
+   *
+   * This centralizes the three origin checkpoints on the secret-fill path:
+   * fail fast before continuity re-verification, reclassify a failed
+   * continuity check if the origin became unsound, and otherwise rethrow that
+   * original continuity error unchanged. The reclassification catch is
+   * adjacent to the final synchronous checkpoint
+   * that guards the underlying fill, with no `await` between them or between
+   * that checkpoint and the fill. Sharing one policy decision keeps those
+   * checkpoints from drifting in their integrity classification or non-secret
+   * diagnostics.
+   *
+   * This remains outside `reverifyBinding` because that general continuity
+   * helper serves non-secret operations too; giving it secret-sink policy
+   * awareness would couple those operations to a concern they do not have.
+   *
+   * @param policy - The resolved policy authorizing the secret's destination.
+   * @throws {IntegrityViolationError} When the current page origin is not
+   *   allowed to receive the policy's secret.
+   */
+  private assertSecretSinkOrigin(policy: SecretSinkPolicy): void {
+    if (!isAllowedSecretSinkOrigin(policy, this.page.url())) {
+      throw new IntegrityViolationError('The current page origin is not allowed to receive this secret.', {
+        secretRef: policy.secretRef,
+        allowedOrigins: policy.allowedOrigins,
+        source: policy.source,
+      });
+    }
   }
 
   /**

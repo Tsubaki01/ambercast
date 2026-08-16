@@ -312,13 +312,17 @@ export interface BrowserSession {
    * @remarks
    * This is the only port method permitted to receive a secret value. The
    * caller resolves `policy` once and supplies it unchanged; implementations
-   * never recompute it. Immediately before the underlying fill, an
-   * implementation must re-check the current page origin against that policy,
+   * never recompute it. Implementations check the current page origin against
+   * that policy at three checkpoints: before continuity re-verification, when
+   * continuity re-verification rejects, and synchronously immediately before
+   * the underlying fill. The first checkpoint preserves the integrity failure
+   * when a navigation changes both origin and generation. After a continuity
+   * failure, the origin check replaces that error only if the origin is now
+   * unsound; otherwise the original continuity error propagates unchanged.
+   * No additional `await` sits between that post-failure origin re-check and
+   * the final pre-fill check, nor between that final check and the fill,
    * applying operation-immediate re-verification to origin just as
-   * `BoundElement` continuity applies it to staleness. The origin check runs
-   * before the continuity re-verification, so a navigation race that changes
-   * both origin and generation remains an origin violation instead of being
-   * masked by the separate stale-binding rejection.
+   * `BoundElement` continuity applies it to staleness.
    *
    * Origin and `BoundElement` continuity are independent layers: the latter
    * remains the ordinary failure documented by {@link resolveGrounded}, while
@@ -326,16 +330,24 @@ export interface BrowserSession {
    * targeted port operations, every implementation uses the classified error
    * required below for this origin-specific path.
    *
+   * This closes the JavaScript-visible asynchronous gap but cannot make origin
+   * inspection and the browser's DOM mutation atomic in the renderer process.
+   * A navigation can still land after the browser receives the fill and before
+   * the renderer executes it; that residual TOCTOU interval is outside what
+   * this port can observe or close.
+   *
    * @param target - The session-local element to receive the secret.
    * @param value - The materialized secret value, which implementations must not expose.
    * @param policy - The already-resolved secret-sink policy for `value`.
    * @returns Resolves after the browser fill completes.
    * @throws A plain, reason-bearing `Error` when `target` fails
-   *   operation-immediate continuity re-verification.
-   * @throws {IntegrityViolationError} When the operation-immediate origin
-   *   check rejects the page. Implementations preserve this exact class so
-   *   replay preserves the integrity failure instead of treating it as a
-   *   behavioral miss eligible for agentic fallback.
+   *   operation-immediate continuity re-verification and the post-failure
+   *   origin re-check finds the origin still sound.
+   * @throws {IntegrityViolationError} When any of the three
+   *   operation-immediate origin checkpoints rejects the page.
+   *   Implementations preserve this exact class so replay preserves the
+   *   integrity failure instead of treating it as a behavioral miss eligible
+   *   for agentic fallback.
    */
   fillSecret(target: BoundElement, value: string, policy: SecretSinkPolicy): Promise<void>;
 
