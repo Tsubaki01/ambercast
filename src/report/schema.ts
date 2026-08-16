@@ -167,10 +167,12 @@ export type Observed = z.infer<typeof Observed>;
  * When `run.ts` produces a failed assertion result, it supplies `expected`
  * and `actual` as the human-readable condition and browser diagnostic. Its
  * best-effort live-session evidence capture may supply redacted `observed`
- * data. Raw text evidence that identifies a resolved secret withholds the
- * screenshot and emits `screenshotOmitted: 'secret-detected'`; otherwise, a
- * successfully captured screenshot has an absolute path. Public report
- * screenshot paths are relative to `ResolvedConfig.projectRoot`.
+ * data. Evidence capture withholds the screenshot and emits
+ * `screenshotOmitted: 'secret-detected'` when its contents are found unsafe
+ * or their safety cannot be confirmed, including a resolved-secret match, a
+ * scan-budget overflow, or a detector exception. Otherwise, a successfully
+ * captured screenshot has an absolute path. Public report screenshot paths
+ * are relative to `ResolvedConfig.projectRoot`.
  *
  * Those are producer and persisted-report guarantees, not validation rules
  * of this schema. `StepResult.parse()` accepts every diagnostic field
