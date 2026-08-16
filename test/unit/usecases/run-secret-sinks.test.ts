@@ -713,7 +713,7 @@ describe('run secret sinks', () => {
     }
     const session = createFakeBrowserSession(liveEntries([SUBMIT], fingerprint.fingerprint), { snapshot });
     const runScenario = createRunScenario(session, runExecutor);
-    const testPath = await writePrompt(runScenario.recordingStorage.storage);
+    const testPath = await writePrompt(runScenario.recordingStorage.storage, PROMPT, false);
     await seedFreshArtifacts(
       runScenario.recordingStorage.storage,
       testPath,

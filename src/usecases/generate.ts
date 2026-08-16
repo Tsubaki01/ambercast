@@ -14,7 +14,7 @@ import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { AmbercastError, type AmbercastError as AmbercastErrorType } from '#core/errors/types.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
-import { normalizeTestMd } from '#core/ir/normalize.js';
+import { normalizeTestMd, type NormalizedTestMd } from '#core/ir/normalize.js';
 import {
   GeneratedPlanResponse,
   GroundingDocument,
@@ -31,6 +31,7 @@ import type { AiExecutor } from '#ports/ai.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { EventSink } from '#ports/system.js';
 import {
+  assertCommittedSecretAttributionSound,
   assertNoLiteralSecrets,
   attributeSecretGrants,
   normalizeAiStepSecretGrants,
@@ -64,14 +65,24 @@ function resolveTarget(
   return { [targetName]: target };
 }
 
-function validFreshPlan(text: string, inputsDigest: string): PlanDocumentType | undefined {
+/** Treats a thrown SecretGrantUnattributableError as not-fresh so generation regenerates instead of propagating it. */
+function validFreshPlan(
+  text: string,
+  inputsDigest: string,
+  normalizedTestMd: NormalizedTestMd,
+): PlanDocumentType | undefined {
   try {
     const parsed = PlanDocument.safeParse(JSON.parse(text));
     if (!parsed.success || parsed.data.source.inputsDigest !== inputsDigest) {
       return undefined;
     }
 
-    return asArtifactText(parsed.data as unknown as JsonValueT) === text ? parsed.data : undefined;
+    if (asArtifactText(parsed.data as unknown as JsonValueT) !== text) {
+      return undefined;
+    }
+
+    assertCommittedSecretAttributionSound(parsed.data, normalizedTestMd);
+    return parsed.data;
   } catch {
     return undefined;
   }
@@ -81,12 +92,13 @@ async function freshPlan(
   storage: StorageAdapter,
   planPath: string,
   inputsDigest: string,
+  normalizedTestMd: NormalizedTestMd,
 ): Promise<PlanDocumentType | undefined> {
   if (!(await storage.exists(planPath))) {
     return undefined;
   }
 
-  return validFreshPlan(await storage.readText(planPath), inputsDigest);
+  return validFreshPlan(await storage.readText(planPath), inputsDigest, normalizedTestMd);
 }
 
 function emptyGrounding(plan: PlanDocumentType): GroundingDocumentType {
@@ -335,7 +347,7 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
 
     let existingPlan: PlanDocumentType | undefined;
     try {
-      existingPlan = await freshPlan(deps.storage, planPath, inputsDigest);
+      existingPlan = await freshPlan(deps.storage, planPath, inputsDigest, normalizedTestMd);
     } catch (error) {
       results.push({ file, status: 'failed', error: fsIoError('The existing plan could not be read.', error) });
       continue;

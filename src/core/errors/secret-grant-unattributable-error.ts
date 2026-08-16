@@ -7,12 +7,13 @@ import type { SourceSpan } from '#core/ir/schema.js';
 import { AmbercastError } from './types.js';
 
 /**
- * Identifies why a secret grant cannot authorize a plan step.
+ * Identifies an unauthorized secret use or a declared grant left unclaimed by any step.
  *
  * Citation failures cover a missing, ambiguous, reference-free, or otherwise
- * unresolved provider excerpt. A duplicate claim can arise during generation
- * or replay, while missing coverage is meaningful only at generation and a
- * stale span only at replay.
+ * unresolved provider excerpt. Duplicate claims and missing coverage are
+ * rejected during generation and when committed plans are validated for fresh
+ * reuse or replay, while a stale span belongs only to committed-plan
+ * validation.
  */
 export type SecretGrantUnattributableReason =
   | 'citation-not-found'
