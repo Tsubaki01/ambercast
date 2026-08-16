@@ -245,6 +245,96 @@ class EvaluateTest(unittest.TestCase):
             self.evaluate(f"git -C {self.main} commit -m message", self.worktree)
         )
 
+    def _assert_ambiguous(self, command, cwd=None):
+        result = self.evaluate(command, cwd)
+        self.assertIsNotNone(result)
+        self.assertIn("too complex to statically classify", result[1])
+        self.assertIn("simple, single-command form", result[1])
+
+    def test_xargs_routed_git_commit_is_blocked(self):
+        self._assert_ambiguous("xargs git commit -m x")
+
+    def test_find_exec_routed_git_commit_is_blocked(self):
+        for command in (
+            "find . -exec git commit -m x ;",
+            "find . -execdir git commit -m x ;",
+        ):
+            with self.subTest(command=command):
+                self._assert_ambiguous(command)
+
+    def test_timeout_routed_git_commit_is_blocked(self):
+        self._assert_ambiguous("timeout 5 git commit -m x")
+
+    def test_opaque_wrapper_chains_with_transparent_prefixes_are_blocked(self):
+        for command in (
+            "sudo find -exec git commit -m x ;",
+            "env X=1 xargs git commit -m x",
+        ):
+            with self.subTest(command=command):
+                self._assert_ambiguous(command)
+
+    def test_opaque_wrappers_without_a_bare_git_token_pass_through(self):
+        # "git" reaches _contains_git's raw substring check either way, but
+        # shlex collapses each quoted phrase into one token containing a
+        # space, which never equals the bare `git` executable token these
+        # wrappers are scanned for.
+        for command in (
+            'xargs echo "git commit"',
+            'find -name "git commit"',
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(self.evaluate(command))
+
+    def test_nohup_is_a_transparent_wrapper(self):
+        # nohup must be classified as an ordinary commit (routed through the
+        # normal branch check), not folded into the opaque-wrapper ambiguous
+        # path -- its wrapped command's position is never in question.
+        result = self.evaluate("nohup git commit -m x")
+        self.assertIsNotNone(result)
+        self.assertIn("commits/pushes on main", result[1])
+        self.assertNotIn("too complex to statically classify", result[1])
+        self.assertIsNone(self.evaluate("nohup git status"))
+
+    def test_quoted_operator_lookalike_option_value_does_not_hide_routed_git(self):
+        # A quoted ";" used as xargs' -I replacement string is, after shlex
+        # strips quoting, indistinguishable in content from a real shell
+        # operator. The scan must not let that stop it before reaching git.
+        self._assert_ambiguous('xargs -I ";" -- git commit -m x')
+
+    def test_chained_opaque_wrappers_are_blocked(self):
+        self._assert_ambiguous("xargs timeout 5 git commit -m x")
+
+    def test_opaque_wrapper_scan_does_not_stop_at_shell_operators(self):
+        # The scan runs to the end of the token stream rather than stopping
+        # at the next operator, so an opaque wrapper's own, unrelated
+        # command followed by a real, separately-triggered git commit is
+        # still caught -- checked on both main (where every classification
+        # blocks, so the distinction would otherwise be invisible) and a
+        # valid issue branch (where a `commit=True` classification would
+        # instead pass, so this is where the trade-off is actually visible).
+        command = "xargs echo hello && git commit -m x"
+        self._assert_ambiguous(command)
+        self._assert_ambiguous(command, self.worktree)
+
+    def test_opaque_wrapper_filename_argument_is_blocked(self):
+        # Accepted cost: the scan cannot distinguish a `git`-named search
+        # target from a routed invocation without the rejected positional
+        # re-lex, so a literal filename search is also blocked.
+        self._assert_ambiguous("find . -name git")
+
+    def test_opaque_wrapper_path_qualified_prefixes_cannot_bypass_detection(self):
+        # Mirrors test_path_qualified_prefixes_cannot_bypass_branch_enforcement:
+        # both the wrapper name and the routed git executable must be
+        # recognized through a path prefix, not just a bare basename, since
+        # OPAQUE_WRAPPER_COMMANDS membership and _is_git_executable both
+        # normalize via _executable_basename.
+        for command in (
+            "/usr/bin/xargs git commit -m x",
+            "xargs /usr/bin/git commit -m x",
+        ):
+            with self.subTest(command=command):
+                self._assert_ambiguous(command)
+
 
 class MainTest(unittest.TestCase):
     def test_non_object_stdin_fails_open(self):
