@@ -5477,6 +5477,7 @@ describe('run credential-literal symmetry', () => {
     const error = outcome.results[0]?.error;
 
     expect(error).toBeInstanceOf(IntegrityViolationError);
+    expect(error?.message).toBe('The AI adapter supplied a materialized value instead of an unresolved reference.');
     expect(error?.details).toBeUndefined();
     expect(JSON.stringify(error?.details ?? {})).not.toContain(secretValue);
     expect(session.operations().filter((operation) => operation.type === 'fill-secret')).toHaveLength(1);
@@ -5509,6 +5510,7 @@ describe('run credential-literal symmetry', () => {
     const error = outcome.results[0]?.error;
 
     expect(error).toBeInstanceOf(IntegrityViolationError);
+    expect(error?.message).toBe('An AI trace contains a materialized secret value.');
     expect(error?.details).toBeUndefined();
     expect(JSON.stringify(error?.details ?? {})).not.toContain(secretValue);
     expect(session.operations()).toEqual([]);
