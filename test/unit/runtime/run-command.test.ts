@@ -117,6 +117,7 @@ function capturedRunner(factory: FactoryCallRecorder): CommandRunner {
 
 afterEach(() => {
   vi.resetAllMocks();
+  vi.doMock('#usecases/run-report.js', () => ({ buildRunReport: mocks.buildRunReport }));
 });
 
 beforeEach(() => {
@@ -141,7 +142,7 @@ describe('runRunCommand', () => {
       listed: [],
       results: [{
         result: {
-          id: 'login',
+          id: '/workspace/tests/login.test.md',
           file: '/workspace/tests/login.test.md',
           planFile: '/workspace/tests/login.ambercast.plan.json',
           status: 'failed' as const,
@@ -158,7 +159,7 @@ describe('runRunCommand', () => {
         },
       }, {
         result: {
-          id: 'settings',
+          id: '/workspace/tests/settings.test.md',
           file: '/workspace/tests/settings.test.md',
           planFile: '/workspace/tests/settings.ambercast.plan.json',
           status: 'passed' as const,
@@ -170,6 +171,9 @@ describe('runRunCommand', () => {
     };
     const persistedResults = outcome.results.map(({ result }) => ({
       ...result,
+      id: result.id.replace('/workspace/', ''),
+      file: result.file.replace('/workspace/', ''),
+      planFile: result.planFile.replace('/workspace/', ''),
       steps: result.steps.map((step) => (
         !('screenshot' in step) || step.screenshot === undefined
           ? step
@@ -204,9 +208,14 @@ describe('runRunCommand', () => {
     expect(mocks.run).toHaveBeenCalledWith(expect.objectContaining({ runId }), expect.anything());
     expect(mocks.buildRunReport).toHaveBeenCalledWith(expect.objectContaining({
       outcome: expect.objectContaining({ results: expect.arrayContaining([expect.objectContaining({
-        result: expect.objectContaining({ steps: expect.arrayContaining([expect.objectContaining({ screenshot: `tests/.runs/${runId}/login/assert-dashboard.png` })]) }),
+        result: expect.objectContaining({
+          id: 'tests/login.test.md',
+          steps: expect.arrayContaining([expect.objectContaining({ screenshot: `tests/.runs/${runId}/login/assert-dashboard.png` })]),
+        }),
       })]) }),
     }));
+    const reportInput = mocks.buildRunReport.mock.calls[0]?.[0];
+    expect(reportInput?.outcome?.results[1]?.result.id).toBe('tests/settings.test.md');
     expect(layout.runReportPathFor).toHaveBeenCalledWith(runId);
     expect(writeText).toHaveBeenCalledWith(`${CONFIG.runsDir}/${runId}/report.json`, JSON.stringify(persistedOutput.envelope));
     const persistedEnvelope = JSON.parse(await storage.readText(`${CONFIG.runsDir}/${runId}/report.json`));
@@ -228,7 +237,7 @@ describe('runRunCommand', () => {
       listed: [],
       results: [{
         result: {
-          id: 'login',
+          id: '/workspace/tests/login.test.md',
           file: '/workspace/tests/login.test.md',
           planFile: '/workspace/tests/login.ambercast.plan.json',
           status: 'failed' as const,
@@ -248,9 +257,9 @@ describe('runRunCommand', () => {
         schemaVersion: '1.0', command: 'run', startedAt: '2026-08-09T00:00:00Z', durationMs: 1,
         summary: { total: 1, passed: 0, failed: 1, errored: 0, skipped: 0 }, errors: [],
         results: [{
-          id: 'login',
-          file: '/workspace/tests/login.test.md',
-          planFile: '/workspace/tests/login.ambercast.plan.json',
+          id: 'tests/login.test.md',
+          file: 'tests/login.test.md',
+          planFile: 'tests/login.ambercast.plan.json',
           status: 'failed',
           durationMs: 12,
           explanation: 'The page did not contain the dashboard.',
@@ -286,6 +295,7 @@ describe('runRunCommand', () => {
       id: 'assert-dashboard', status: 'failed', kind: 'assertion',
       expected: 'Text "Dashboard" is visible.', actual: 'The dashboard is absent.',
     });
+    expect(reportInput?.outcome?.results[0]?.result.id).toBe('tests/login.test.md');
     expect(reportStep).not.toHaveProperty('screenshot');
     expect(mocks.buildRunReport).not.toHaveBeenCalledWith(expect.objectContaining({ error: expect.any(Error) }));
     const persistedEnvelope = JSON.parse(await storage.readText(`${CONFIG.runsDir}/${runId}/report.json`));
@@ -305,7 +315,7 @@ describe('runRunCommand', () => {
       listed: [],
       results: [{
         result: {
-          id: 'login',
+          id: '/workspace/tests/login.test.md',
           file: '/workspace/tests/login.test.md',
           planFile: '/workspace/tests/login.ambercast.plan.json',
           status: 'failed' as const,
@@ -325,7 +335,7 @@ describe('runRunCommand', () => {
         schemaVersion: '1.0', command: 'run', startedAt: '2026-08-09T00:00:00Z', durationMs: 1,
         summary: { total: 1, passed: 0, failed: 1, errored: 0, skipped: 0 }, errors: [],
         results: [{
-          id: 'login', file: '/workspace/tests/login.test.md', planFile: '/workspace/tests/login.ambercast.plan.json',
+          id: 'tests/login.test.md', file: 'tests/login.test.md', planFile: 'tests/login.ambercast.plan.json',
           status: 'failed', durationMs: 12, explanation: 'The page did not contain the dashboard.',
           steps: [{
             id: 'assert-dashboard', type: 'assert', status: 'failed', kind: 'assertion',
@@ -352,6 +362,7 @@ describe('runRunCommand', () => {
     const result = await runRunCommand(input());
 
     const reportInput = mocks.buildRunReport.mock.calls[0]?.[0];
+    expect(reportInput?.outcome?.results[0]?.result.id).toBe('tests/login.test.md');
     expect(reportInput?.outcome?.results[0]?.result.steps[0]).not.toHaveProperty('screenshot');
     expect(writeText).toHaveBeenCalledWith(reportPath, JSON.stringify(persistedOutput.envelope));
     expect(result).toEqual(persistedOutput);
@@ -473,7 +484,18 @@ describe('runRunCommand', () => {
 
     await expect(runRunCommand(input())).resolves.toEqual(persistedOutput);
 
-    expect(mocks.buildRunReport).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ outcome }));
+    const expectedOutcome = {
+      ...outcome,
+      results: outcome.results.map((caseOutcome) => ({
+        ...caseOutcome,
+        result: {
+          ...caseOutcome.result,
+          file: caseOutcome.result.file.replace(`${CONFIG.projectRoot}/`, ''),
+          planFile: caseOutcome.result.planFile.replace(`${CONFIG.projectRoot}/`, ''),
+        },
+      })),
+    };
+    expect(mocks.buildRunReport).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ outcome: expectedOutcome }));
     expect(writeText).toHaveBeenCalledWith(reportPath, JSON.stringify(persistedOutput.envelope));
     await expect(storage.readText(reportPath)).resolves.toBe(JSON.stringify(persistedOutput.envelope));
   });
@@ -787,5 +809,248 @@ describe('runRunCommand', () => {
     expect(mocks.resolveAiProvider).not.toHaveBeenCalled();
     expect(mocks.claudeFactory).not.toHaveBeenCalled();
     expect(mocks.codexFactory).not.toHaveBeenCalled();
+  });
+
+  it('keeps identities outside projectRoot absolute while persisting a completed report', async () => {
+    const storage = createInMemoryStorage();
+    const config = { ...CONFIG, testDir: '/elsewhere/tests' };
+    const reportPath = '/workspace/tests/.runs/report.json';
+    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => reportPath) };
+    const outcome = {
+      noTestsFound: false,
+      listed: [],
+      results: [{
+        result: {
+          id: '/elsewhere/tests/case.test.md',
+          file: '/elsewhere/tests/case.test.md',
+          planFile: '/elsewhere/tests/case.ambercast.plan.json',
+          status: 'passed' as const,
+          durationMs: 4,
+          explanation: 'Replay completed successfully.',
+          steps: [],
+        },
+      }],
+    } satisfies RunOutcome;
+    const output: RunCommandOutput = {
+      exitCode: 0,
+      envelope: {
+        schemaVersion: '1.0', command: 'run', startedAt: '2026-08-09T00:00:00Z', durationMs: 1,
+        summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 }, errors: [],
+        results: [outcome.results[0]!.result], reportPersistence: 'not-attempted',
+      },
+    };
+    const persistedOutput: RunCommandOutput = {
+      ...output,
+      envelope: { ...output.envelope, reportPersistence: 'persisted' },
+    };
+
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(config);
+    mocks.createBrowserDriverResolver.mockReturnValue(createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
+    mocks.createEnvSecretsProvider.mockReturnValue(createFakeSecretsProvider(new Map()));
+    mocks.createNoopEventSink.mockReturnValue(createRecordingEventSink().sink);
+    mocks.createAmbercast.mockReturnValue({ storage, layout, clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 20), discoverTestFiles: vi.fn(async () => []) });
+    mocks.run.mockResolvedValue(outcome);
+    mocks.buildRunReport.mockReturnValue(output);
+
+    await expect(runRunCommand(input())).resolves.toEqual(persistedOutput);
+
+    const reportInput = mocks.buildRunReport.mock.calls[0]?.[0];
+    const reportResult = reportInput?.outcome?.results[0]?.result;
+    expect(reportResult?.id).toBe('/elsewhere/tests/case.test.md');
+    expect(reportResult?.file).toBe('/elsewhere/tests/case.test.md');
+    expect(reportResult?.planFile).toBe('/elsewhere/tests/case.ambercast.plan.json');
+    const persistedEnvelope = JSON.parse(await storage.readText(reportPath));
+    expect(persistedOutput.exitCode).toBe(0);
+    expect(persistedEnvelope.reportPersistence).toBe('persisted');
+    expect(persistedEnvelope.results[0].id).toBe('/elsewhere/tests/case.test.md');
+    expect(persistedEnvelope.results[0].file).toBe('/elsewhere/tests/case.test.md');
+    expect(persistedEnvelope.results[0].planFile).toBe('/elsewhere/tests/case.ambercast.plan.json');
+  });
+
+  it('relativizes only the in-project identities within a mixed outcome', async () => {
+    const storage = createInMemoryStorage();
+    const reportPath = '/workspace/tests/.runs/report.json';
+    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => reportPath) };
+    const outcome = {
+      noTestsFound: false,
+      listed: [],
+      results: [{
+        result: {
+          id: '/workspace/identities/inside.test.md',
+          file: '/workspace/tests/inside.test.md',
+          planFile: '/workspace/plans/inside.ambercast.plan.json',
+          status: 'passed' as const,
+          durationMs: 4,
+          explanation: 'Replay completed successfully.',
+          steps: [],
+        },
+      }, {
+        result: {
+          id: '/elsewhere/identities/outside.test.md',
+          file: '/elsewhere/tests/outside.test.md',
+          planFile: '/elsewhere/plans/outside.ambercast.plan.json',
+          status: 'passed' as const,
+          durationMs: 6,
+          explanation: 'Replay completed successfully.',
+          steps: [],
+        },
+      }],
+    } satisfies RunOutcome;
+    const output = reportOutput(0);
+    const persistedOutput: RunCommandOutput = {
+      ...output,
+      envelope: { ...output.envelope, reportPersistence: 'persisted' },
+    };
+
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.createBrowserDriverResolver.mockReturnValue(createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
+    mocks.createEnvSecretsProvider.mockReturnValue(createFakeSecretsProvider(new Map()));
+    mocks.createNoopEventSink.mockReturnValue(createRecordingEventSink().sink);
+    mocks.createAmbercast.mockReturnValue({ storage, layout, clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 20), discoverTestFiles: vi.fn(async () => []) });
+    mocks.run.mockResolvedValue(outcome);
+    mocks.buildRunReport.mockReturnValue(output);
+
+    await expect(runRunCommand(input())).resolves.toEqual(persistedOutput);
+
+    const reportInput = mocks.buildRunReport.mock.calls[0]?.[0];
+    const inProjectResult = reportInput?.outcome?.results[0]?.result;
+    const outsideProjectResult = reportInput?.outcome?.results[1]?.result;
+    expect(inProjectResult?.id).toBe('identities/inside.test.md');
+    expect(inProjectResult?.file).toBe('tests/inside.test.md');
+    expect(inProjectResult?.planFile).toBe('plans/inside.ambercast.plan.json');
+    expect(outsideProjectResult?.id).toBe('/elsewhere/identities/outside.test.md');
+    expect(outsideProjectResult?.file).toBe('/elsewhere/tests/outside.test.md');
+    expect(outsideProjectResult?.planFile).toBe('/elsewhere/plans/outside.ambercast.plan.json');
+  });
+
+  it('persists transformed executed and listed results from the same outcome', async () => {
+    const storage = createInMemoryStorage();
+    const reportPath = '/workspace/tests/.runs/report.json';
+    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => reportPath) };
+    const outcome = {
+      noTestsFound: false,
+      listed: [{ file: '/workspace/tests/listed.test.md' }],
+      results: [{
+        result: {
+          id: '/workspace/identities/executed.test.md',
+          file: '/workspace/tests/executed.test.md',
+          planFile: '/workspace/plans/executed.ambercast.plan.json',
+          status: 'passed' as const,
+          durationMs: 4,
+          explanation: 'Replay completed successfully.',
+          steps: [],
+        },
+      }],
+    } satisfies RunOutcome;
+
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.createBrowserDriverResolver.mockReturnValue(createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
+    mocks.createEnvSecretsProvider.mockReturnValue(createFakeSecretsProvider(new Map()));
+    mocks.createNoopEventSink.mockReturnValue(createRecordingEventSink().sink);
+    mocks.createAmbercast.mockReturnValue({ storage, layout, clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 20), discoverTestFiles: vi.fn(async () => []) });
+    mocks.run.mockResolvedValue(outcome);
+    vi.doUnmock('#usecases/run-report.js');
+    vi.resetModules();
+    const { runRunCommand: runRunCommandWithRealReport } = await import('#runtime/run-command.js');
+
+    const output = await runRunCommandWithRealReport(input());
+
+    expect(output.exitCode).toBe(0);
+    expect(output.envelope.reportPersistence).toBe('persisted');
+    const persistedEnvelope = JSON.parse(await storage.readText(reportPath));
+    expect(persistedEnvelope.results[0].id).toBe('identities/executed.test.md');
+    expect(persistedEnvelope.results[0].file).toBe('tests/executed.test.md');
+    expect(persistedEnvelope.results[0].planFile).toBe('plans/executed.ambercast.plan.json');
+    expect(persistedEnvelope.results[1].id).toBe('tests/listed.test.md');
+    expect(persistedEnvelope.results[1].file).toBe('tests/listed.test.md');
+  });
+
+  it('preserves an absolute listed fallback while running in list mode', async () => {
+    const storage = createInMemoryStorage();
+    const reportPath = '/workspace/tests/.runs/report.json';
+    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => reportPath) };
+    const outcome = {
+      noTestsFound: false,
+      listed: [{ file: '/workspace/tests/inside.test.md' }, { file: '/elsewhere/tests/outside.test.md' }],
+      results: [],
+    } satisfies RunOutcome;
+
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.createBrowserDriverResolver.mockReturnValue(createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
+    mocks.createEnvSecretsProvider.mockReturnValue(createFakeSecretsProvider(new Map()));
+    mocks.createNoopEventSink.mockReturnValue(createRecordingEventSink().sink);
+    mocks.createAmbercast.mockReturnValue({ storage, layout, clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 20), discoverTestFiles: vi.fn(async () => []) });
+    mocks.run.mockResolvedValue(outcome);
+    vi.doUnmock('#usecases/run-report.js');
+    vi.resetModules();
+    const { runRunCommand: runRunCommandWithRealReport } = await import('#runtime/run-command.js');
+
+    const output = await runRunCommandWithRealReport(input({ list: true }));
+
+    expect(output.exitCode).toBe(0);
+    expect(output.envelope.reportPersistence).toBe('persisted');
+    const persistedEnvelope = JSON.parse(await storage.readText(reportPath));
+    expect(persistedEnvelope.results[0].id).toBe('tests/inside.test.md');
+    expect(persistedEnvelope.results[0].file).toBe('tests/inside.test.md');
+    expect(persistedEnvelope.results[1].id).toBe('/elsewhere/tests/outside.test.md');
+    expect(persistedEnvelope.results[1].file).toBe('/elsewhere/tests/outside.test.md');
+  });
+
+  it('derives case error identities from the transformed executed identity', async () => {
+    const storage = createInMemoryStorage();
+    const reportPath = '/workspace/tests/.runs/report.json';
+    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => reportPath) };
+    const outsideError = new ConfigInvalidError('The outside case configuration is invalid.');
+    const insideError = new ConfigInvalidError('The inside case configuration is invalid.');
+    const outcome = {
+      noTestsFound: false,
+      listed: [],
+      results: [{
+        result: {
+          id: '/elsewhere/tests/outside.test.md',
+          file: '/elsewhere/tests/outside.test.md',
+          planFile: '/elsewhere/tests/outside.ambercast.plan.json',
+          status: 'error' as const,
+          durationMs: 4,
+          explanation: 'The case configuration is invalid.',
+          steps: [],
+        },
+        error: outsideError,
+      }, {
+        result: {
+          id: '/workspace/tests/inside.test.md',
+          file: '/workspace/tests/inside.test.md',
+          planFile: '/workspace/tests/inside.ambercast.plan.json',
+          status: 'error' as const,
+          durationMs: 6,
+          explanation: 'The case configuration is invalid.',
+          steps: [],
+        },
+        error: insideError,
+      }],
+    } satisfies RunOutcome;
+
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.createBrowserDriverResolver.mockReturnValue(createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
+    mocks.createEnvSecretsProvider.mockReturnValue(createFakeSecretsProvider(new Map()));
+    mocks.createNoopEventSink.mockReturnValue(createRecordingEventSink().sink);
+    mocks.createAmbercast.mockReturnValue({ storage, layout, clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 20), discoverTestFiles: vi.fn(async () => []) });
+    mocks.run.mockResolvedValue(outcome);
+    vi.doUnmock('#usecases/run-report.js');
+    vi.resetModules();
+    const { runRunCommand: runRunCommandWithRealReport } = await import('#runtime/run-command.js');
+
+    const output = await runRunCommandWithRealReport(input());
+
+    expect(output.exitCode).toBe(2);
+    expect(output.envelope.reportPersistence).toBe('persisted');
+    const persistedEnvelope = JSON.parse(await storage.readText(reportPath));
+    expect(persistedEnvelope.errors[0].caseId).toBe('/elsewhere/tests/outside.test.md');
+    expect(persistedEnvelope.errors[1].caseId).toBe('tests/inside.test.md');
   });
 });
