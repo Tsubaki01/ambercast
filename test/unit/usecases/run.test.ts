@@ -3274,6 +3274,55 @@ describe('run path-C pre-scan', () => {
     expect(executor.agenticRequests).toEqual([]);
     expect(aiCalls(events)).toEqual([]);
   });
+
+  it.each([
+    ['click', (secretRef: string, target: ElementRef) => trace([
+      { type: 'fill-secret', target: PASSWORD, secretRef },
+      { type: 'click', target },
+    ], [passingText('Dashboard')])],
+    ['press', (secretRef: string, target: ElementRef) => trace([
+      { type: 'fill-secret', target: PASSWORD, secretRef },
+      { type: 'press', target, key: 'Enter' },
+    ], [passingText('Dashboard')])],
+    ['fill-secret', (secretRef: string, target: ElementRef) => trace([
+      { type: 'fill-secret', target: PASSWORD, secretRef },
+      { type: 'fill-secret', target, secretRef },
+    ], [passingText('Dashboard')])],
+    ['element-visible', (secretRef: string, target: ElementRef) => trace([
+      { type: 'fill-secret', target: PASSWORD, secretRef },
+    ], [{ type: 'assert', check: 'element-visible', target }])],
+    ['element-count', (secretRef: string, target: ElementRef) => trace([
+      { type: 'fill-secret', target: PASSWORD, secretRef },
+    ], [{ type: 'assert', check: 'element-count', target, count: 1 }])],
+  ] as const)('rejects a materialized secret in a stored-trace %s target role before replay', async (_description, buildTrace) => {
+    const secretRef = '{{secrets.auth.target_role}}';
+    const secretValue = 'TARGET-ROLE-SECRET-VALUE';
+    const secretRoleTarget: ElementRef = { strategy: 'accessibility', role: secretValue, name: 'Secret-independent target' };
+    const session = createFakeBrowserSession(liveEntries([PASSWORD, secretRoleTarget]));
+    const executor = createFakeAiExecutor();
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep('recorded-ai', [secretRef])],
+      aiGrounding(buildTrace(secretRef, secretRoleTarget)),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const error = outcome.results[0]?.error;
+
+    expect(error).toBeInstanceOf(IntegrityViolationError);
+    expect(error?.message).toBe('An AI trace contains a materialized secret value.');
+    expect(session.operations()).toEqual([]);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(aiCalls(events)).toEqual([]);
+  });
 });
 
 describe('run agentic wrapper state machine', () => {
@@ -4617,6 +4666,140 @@ describe('run failure evidence', () => {
     expect(screenshot).not.toHaveBeenCalled();
   });
 
+  it('omits screenshots for a depth-24 parsed tree that contains a two-character resolved secret', async () => {
+    const secretRef = '{{secrets.deep_tree}}';
+    const rawYaml = [
+      ...Array.from(
+        { length: 23 },
+        (_, index) => `${'  '.repeat(index)}- group "Level ${index}":`,
+      ),
+      `${'  '.repeat(23)}- text: xy`,
+    ].join('\n');
+    const accessibilityTree = parseAriaSnapshot(rawYaml);
+
+    expect(accessibilityTree).not.toBe(SNAPSHOT_INVALID);
+    let deepestNode: JsonValueT = accessibilityTree;
+    for (let level = 0; level < 24; level += 1) {
+      expect(deepestNode).toMatchObject({ children: [expect.anything()] });
+      deepestNode = (deepestNode as unknown as { readonly children: readonly JsonValueT[] }).children[0] as JsonValueT;
+    }
+    expect(deepestNode).toMatchObject({ name: 'xy' });
+
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree, screenshot: new Uint8Array([21]) },
+      accessibilityCapture: { rawYaml },
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, 'xy']])),
+    });
+    const writeBinary = vi.spyOn(recordingStorage.storage, 'writeBinary');
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'fill-secret', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef },
+      { id: 'assert-dashboard', kind: 'assert', check: 'text-visible', text: 'Dashboard' },
+    ], elementGrounding(['fill-secret']));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({ screenshotOmitted: 'secret-detected' });
+    expect(outcome.results[0]?.result.steps.at(-1)).not.toHaveProperty('screenshot');
+    expect(screenshot).not.toHaveBeenCalled();
+    expect(writeBinary).not.toHaveBeenCalled();
+  });
+
+  it('captures a screenshot for a clean depth-24 parsed tree despite a nonmatching resolved secret', async () => {
+    const secretRef = '{{secrets.clean_deep_tree}}';
+    const rawYaml = [
+      ...Array.from(
+        { length: 23 },
+        (_, index) => `${'  '.repeat(index)}- group "Level ${index}":`,
+      ),
+      `${'  '.repeat(23)}- text: clean leaf`,
+    ].join('\n');
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: parseAriaSnapshot(rawYaml), screenshot: new Uint8Array([22]) },
+      accessibilityCapture: { rawYaml },
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+
+    const outcome = await runFailureEvidenceScenario(session, new Map([[secretRef, 'not-present-in-tree']]));
+
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({ screenshot: expect.any(String) });
+    expect(outcome.results[0]?.result.steps.at(-1)).not.toHaveProperty('screenshotOmitted');
+    expect(screenshot).toHaveBeenCalledOnce();
+  });
+
+  it('permits screenshot capture for a cyclic plain-object accessibility tree without a matching secret', async () => {
+    const secretRef = '{{secrets.cyclic_tree}}';
+    const accessibilityTree: { self?: unknown } = {};
+    accessibilityTree.self = accessibilityTree;
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: accessibilityTree as JsonValueT, screenshot: new Uint8Array([23]) },
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+
+    const outcome = await runFailureEvidenceScenario(session, new Map([[secretRef, 'not-present-in-tree']]));
+
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({ screenshot: expect.any(String) });
+    expect(outcome.results[0]?.result.steps.at(-1)).not.toHaveProperty('screenshotOmitted');
+    expect(screenshot).toHaveBeenCalledOnce();
+  });
+
+  it('traverses null-prototype accessibility objects when detecting secrets', async () => {
+    const secretRef = '{{secrets.null_prototype_tree}}';
+    const secretValue = 'NULL-PROTOTYPE-SECRET';
+    const accessibilityTree = Object.create(null) as Record<string, unknown>;
+    accessibilityTree.text = secretValue;
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: accessibilityTree as JsonValueT, screenshot: new Uint8Array([24]) },
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+
+    const outcome = await runFailureEvidenceScenario(session, new Map([[secretRef, secretValue]]));
+
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({ screenshotOmitted: 'secret-detected' });
+    expect(screenshot).not.toHaveBeenCalled();
+  });
+
+  it('excludes secret-bearing non-plain accessibility objects from detection', async () => {
+    const secretRef = '{{secrets.non_plain_tree}}';
+    const secretValue = 'NON-PLAIN-OBJECT-SECRET';
+    class SecretCarrier {
+      readonly text = secretValue;
+    }
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: new SecretCarrier() as unknown as JsonValueT, screenshot: new Uint8Array([25]) },
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+
+    const outcome = await runFailureEvidenceScenario(session, new Map([[secretRef, secretValue]]));
+
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({ screenshot: expect.any(String) });
+    expect(outcome.results[0]?.result.steps.at(-1)).not.toHaveProperty('screenshotOmitted');
+    expect(screenshot).toHaveBeenCalledOnce();
+  });
+
+  it('omits screenshots when the accessibility tree exceeds the JSON scan container budget', async () => {
+    const accessibilityTree: JsonValueT = Array.from({ length: 1_000_000 }, () => ({}));
+    const session = createFakeBrowserSession(new Map(), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree, screenshot: new Uint8Array([26]) },
+    });
+    const screenshot = vi.spyOn(session, 'screenshot');
+
+    const outcome = await runFailureEvidenceScenario(session, new Map());
+
+    expect(outcome.results[0]?.result.steps.at(-1)).toMatchObject({ screenshotOmitted: 'secret-detected' });
+    expect(screenshot).not.toHaveBeenCalled();
+  });
+
   it('omits screenshots when only decoded scalar values contain a quoting-forced backslash secret', async () => {
     const secretRef = '{{secrets.scalar_only}}';
     const secretValue = '#scalar\\secret';
@@ -5402,6 +5585,112 @@ describe('run credential-literal symmetry', () => {
     expect(aiCalls(events)).toEqual([]);
   });
 
+  it.each([
+    [
+      'type',
+      new Map([['{{secrets.trace.type}}', 'click']]),
+      trace([
+        { type: 'fill-secret', target: PASSWORD, secretRef: '{{secrets.trace.type}}' },
+        { type: 'click', target: SUBMIT },
+      ], [passingText('Dashboard')]),
+    ],
+    [
+      'check',
+      new Map([['{{secrets.trace.check}}', 'element-visible']]),
+      trace([
+        { type: 'fill-secret', target: PASSWORD, secretRef: '{{secrets.trace.check}}' },
+      ], [{ type: 'assert', check: 'element-visible', target: SUBMIT }]),
+    ],
+    [
+      'target.strategy',
+      new Map([['{{secrets.trace.strategy}}', 'accessibility']]),
+      trace([
+        { type: 'fill-secret', target: PASSWORD, secretRef: '{{secrets.trace.strategy}}' },
+        { type: 'click', target: SUBMIT },
+      ], [passingText('Dashboard')]),
+    ],
+    [
+      'key',
+      new Map([['{{secrets.trace.key}}', 'Enter']]),
+      trace([
+        { type: 'fill-secret', target: PASSWORD, secretRef: '{{secrets.trace.key}}' },
+        { type: 'press', target: SUBMIT, key: 'Enter' },
+      ], [passingText('Dashboard')]),
+    ],
+    [
+      'secretRef',
+      new Map([
+        ['{{secrets.trace.token}}', 'first-secret-value'],
+        ['{{secrets.trace.tok}}', 'tok'],
+      ]),
+      trace([
+        { type: 'fill-secret', target: PASSWORD, secretRef: '{{secrets.trace.token}}' },
+        { type: 'fill-secret', target: PASSWORD, secretRef: '{{secrets.trace.tok}}' },
+      ], [passingText('Dashboard')]),
+    ],
+  ] as const)('permits incidental resolved-secret matches in stored-trace %s closed vocabulary', async (_path, secretValues, priorTrace) => {
+    const secretRefs = [...secretValues.keys()];
+    const session = createFakeBrowserSession(liveEntries([PASSWORD, SUBMIT]));
+    const executor = createFakeAiExecutor();
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(secretValues),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRefs.join('\n')}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep('recorded-ai', secretRefs)],
+      aiGrounding(priorTrace),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(aiCalls(events)).toEqual([]);
+  });
+
+  it('does not scan object keys while inspecting stored traces', async () => {
+    const secretRef = '{{secrets.trace.object_key}}';
+    const secretValue = 'target';
+    const priorTrace = trace([
+      { type: 'fill-secret', target: PASSWORD, secretRef },
+      { type: 'click', target: SUBMIT },
+    ], [passingText('Dashboard')]);
+    const scannedValues = [
+      'fill-secret', PASSWORD.strategy, PASSWORD.role, PASSWORD.name, secretRef,
+      'click', SUBMIT.strategy, SUBMIT.role, SUBMIT.name,
+      'assert', 'text-visible', 'Dashboard',
+    ];
+    expect(scannedValues.some((value) => value.includes(secretValue))).toBe(false);
+    const session = createFakeBrowserSession(liveEntries([PASSWORD, SUBMIT]));
+    const executor = createFakeAiExecutor();
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep('recorded-ai', [secretRef])],
+      aiGrounding(priorTrace),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(aiCalls(events)).toEqual([]);
+  });
+
   it('does not treat a fill-secret reference name containing its resolved value as materialized in fresh-agentic execution', async () => {
     const secretRef = '{{secrets.auth.tok}}';
     const secretValue = 'tok';
@@ -5813,7 +6102,7 @@ describe('run credential-literal symmetry', () => {
     expect(aiCalls(events)).toEqual([]);
   });
 
-  // This known, orchestrator-and-user-accepted residual gap in the high-entropy-token heuristic is not a bug; the unconditional dataBearingTraceFields/containsResolvedSecret known-resolved-secret scan remains the unaffected hard boundary.
+  // The heuristic intentionally permits values assembled entirely from trusted captured partitions; the separate trace-entry scan is the hard boundary for known resolved secrets.
   it('permits a fresh-agentic fill reassembled from two captured high-entropy-token partitions', async () => {
     const secretShapedValue = 'aB3!dE5@fG7#hI9$jK2%mN4^pQ6&rS8T';
     const firstPartition = secretShapedValue.slice(0, secretShapedValue.length / 2);

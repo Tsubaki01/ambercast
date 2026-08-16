@@ -705,7 +705,7 @@ function preScanTraceEntry(
    * historical trace from reaching either browser execution or an AI adapter as
    * `priorTrace`.
    */
-  if (dataBearingTraceFields(entry).some((field) => containsResolvedSecret(field, context.resolvedSecrets))) {
+  if (traceEntryContainsResolvedSecret(entry, context.resolvedSecrets)) {
     throw new IntegrityViolationError('An AI trace contains a materialized secret value.');
   }
 
@@ -889,52 +889,48 @@ function containsResolvedSecret(
 }
 
 /**
- * Extracts the provider- or case-derived text from one trace entry for the
- * resolved-secret guard.
+ * Names trace-entry value paths whose fixed vocabulary is not case data.
  *
- * The finite field set includes locator names and payload text but excludes
- * the closed `type` and `check` discriminants, locator `strategy` and `role`,
- * and keyboard `key`: they classify a trace entry rather than carrying case
- * data. Scanning that vocabulary could reject a legitimate entry when a short
- * resolved secret happens to equal one of its tokens. A `secretRef` is also
- * excluded because it is an authorized reference identifier rather than a
- * resolved value, and its name may merely contain a secret value.
+ * Every trace field is scanned unless it belongs to this closed
+ * classification vocabulary. `target.role` is deliberately scanned because
+ * it is a free-form ARIA role string that can contain a hand-edited secret.
+ * `target.strategy`, `type`, `check`, and `key` are excluded as fixed
+ * classification vocabulary, while `secretRef` is excluded as an authorized
+ * reference identifier rather than a resolved value.
  *
- * Explicit exhaustive selection makes a new discriminant branch a compile
- * error until its data-bearing fields receive a reviewed decision. A string
- * field added to an existing branch still requires manual review.
- *
- * @param entry - Parsed trace action or assertion whose data-bearing fields are
- * considered by the resolved-secret guard.
- * @returns The strings that may carry provider- or case-derived data.
+ * Closed-vocabulary exclusion does not provide a compile-time exhaustiveness
+ * tripwire for new trace fields. That trade is acceptable because an
+ * unclassified field defaults to scanned, creating a false-positive risk
+ * instead of silently leaking a secret.
  */
-function dataBearingTraceFields(entry: TraceAction | TraceAssert): readonly string[] {
-  const fields: string[] = [];
-  if ('target' in entry) {
-    fields.push(entry.target.name);
-  }
+const TRACE_ENTRY_CLOSED_VOCABULARY_PATHS: ReadonlySet<string> = new Set([
+  'type',
+  'check',
+  'target.strategy',
+  'key',
+  'secretRef',
+]);
 
-  switch (entry.type === 'assert' ? entry.check : entry.type) {
-    case 'click':
-    case 'press':
-    case 'fill-secret':
-    case 'element-visible':
-    case 'element-count':
-      return fields;
-    case 'navigate':
-      fields.push((entry as Extract<TraceAction, { type: 'navigate' }>).url);
-      return fields;
-    case 'fill':
-      fields.push((entry as Extract<TraceAction, { type: 'fill' }>).value);
-      return fields;
-    case 'text-visible':
-    case 'text-equals':
-      fields.push((entry as Extract<TraceAssert, { check: 'text-visible' | 'text-equals' }>).text);
-      return fields;
-    case 'url-matches':
-      fields.push((entry as Extract<TraceAssert, { check: 'url-matches' }>).pattern);
-      return fields;
-  }
+/**
+ * Reports whether a validated trace entry contains a materialized resolved
+ * secret.
+ *
+ * The JSON scan applies the closed-vocabulary exclusions and inspects values
+ * only, so every non-excluded entry field is checked without treating field
+ * names as case data.
+ *
+ * @param entry - Parsed trace action or assertion to inspect.
+ * @param resolvedSecrets - Every secret value observed during the case.
+ * @returns `true` when a scanned entry value contains a resolved secret.
+ */
+function traceEntryContainsResolvedSecret(
+  entry: TraceAction | TraceAssert,
+  resolvedSecrets: ReadonlyMap<string, ReadonlySet<string>>,
+): boolean {
+  return jsonContainsResolvedSecret(entry, resolvedSecrets, {
+    scanObjectKeys: false,
+    excludePaths: TRACE_ENTRY_CLOSED_VOCABULARY_PATHS,
+  });
 }
 
 /**
@@ -1012,7 +1008,7 @@ function assertNoMaterializedLiteral(
   context: DispatchContext,
   resolvedSecrets: ReadonlyMap<string, ReadonlySet<string>>,
 ): void {
-  if (dataBearingTraceFields(entry).some((field) => containsResolvedSecret(field, resolvedSecrets))) {
+  if (traceEntryContainsResolvedSecret(entry, resolvedSecrets)) {
     throw new IntegrityViolationError('The AI adapter supplied a materialized value instead of an unresolved reference.');
   }
 
@@ -1105,8 +1101,28 @@ function templateMaterializedValues(
 }
 
 const UNSUPPORTED_JSON_VALUE_PLACEHOLDER = '[unsupported-value-omitted]';
-// A defensive backstop against accidental deep nesting, not a claim about a specific adversarial threat.
+/*
+ * A defensive backstop against accidental deep nesting, not a claim about a
+ * specific adversarial threat.
+ *
+ * Redaction uses this depth ceiling because it replaces a subtree beyond
+ * the limit with a placeholder, so no secret can leak through that subtree.
+ * `jsonContainsResolvedSecret` deliberately does not share the ceiling: a
+ * detector cannot leave any depth-bounded blind spot when its purpose is to
+ * refuse persistence of a secret.
+ */
 const MAX_REDACTION_DEPTH = 20;
+
+/**
+ * Bounds total container visits while inspecting JSON-shaped input for
+ * resolved secrets.
+ *
+ * This is a traversal budget rather than a depth ceiling, so it bounds
+ * pathological wide shapes as well as deep ones without constraining ordinary
+ * trees. Exceeding it fails closed because an incomplete detector result
+ * cannot safely permit persistence.
+ */
+const MAX_JSON_SCAN_CONTAINERS = 1_000_000;
 
 /**
  * Recursively redacts every string in a JSON-shaped value, including object
@@ -1174,71 +1190,190 @@ function redactJsonStrings(
  * Reports whether a JSON-shaped value retains a resolved secret in a string
  * leaf and, by default, a plain-object key.
  *
- * This mirrors the redaction traversal rather than serializing and searching
- * text: JSON escaping can conceal a raw literal from a serialized scan. Only
- * arrays and plain records are traversed; the plain-object-prototype check
- * structurally excludes non-plain objects from traversal at this persistence
- * boundary. A shared cycle guard and the existing depth ceiling make malformed diagnostic
- * trees safe to inspect, while returning on the first hit avoids examining
- * more of a value that is already unsafe to persist.
+ * This mirrors the redaction traversal instead of serializing and searching
+ * text, because JSON escaping can conceal a raw literal from a serialized
+ * scan. The detector uses an iterative explicit-stack walk, so valid nesting
+ * depth does not create a blind spot. Its total container-visit budget bounds
+ * both wide and deep pathological input: every array or plain record actually
+ * entered increments the counter exactly once after deduplication, while an
+ * already-visited alias or ancestor cycle is not entered and does not count.
+ * An array or plain-record root is the first container visit. The scan returns
+ * `true` when the count is strictly greater than
+ * `MAX_JSON_SCAN_CONTAINERS`, because an incomplete detector result cannot
+ * safely permit persistence. Arrays and plain records are traversed while
+ * non-plain objects are structurally excluded, and the first secret match
+ * ends the walk.
  *
- * @param value - Parsed JSON-shaped tree considered for persistence.
+ * A child whose entry-root-relative dotted path matches `excludePaths` is
+ * never pushed onto the traversal stack, so its value and entire subtree are
+ * pruned. Exclusion is independent of `scanObjectKeys`, which still controls
+ * scanning the key that produced an excluded value. For callers that supply
+ * `excludePaths`, a key containing a literal `.` is ambiguous with a nested
+ * path; none of those callers can expose such a key.
+ *
+ * With `excludePaths`, cycle tracking is ancestor-scoped so an alias reached
+ * through an excluded path cannot suppress a later unexcluded path. Without
+ * it, whole-walk `WeakSet` deduplication avoids revisiting shared structures,
+ * and the walk does not construct or compare path strings.
+ *
+ * @param value - Parsed JSON-shaped input inspected at a secret-safety
+ * boundary, including persistence and trace-entry boundaries.
  * @param resolvedSecrets - Every secret value observed during the case.
- * @param options - Controls whether plain-object keys are scanned. Key
- * scanning remains the default for diagnostic and accessibility trees, whose
- * keys cannot be assumed independent of provider-controlled values. The
- * grounding-persistence boundary disables it because `GroundingDocument`
- * entry keys are authored plan step identifiers, not resolved runtime data.
+ * @param options - Controls plain-object-key scanning and value-only path
+ * exclusions. Key scanning defaults on for diagnostic and accessibility trees
+ * because their keys cannot be assumed independent of provider-controlled
+ * values. The grounding-persistence boundary disables it because
+ * `GroundingDocument` entry keys are authored plan step identifiers, not
+ * resolved runtime data. Trace-entry inspection also disables it because
+ * trace field names are schema vocabulary, not case data.
  * @returns `true` when a supported string value or, unless disabled, object
- * key contains a resolved secret according to `containsResolvedSecret`.
+ * key contains a resolved secret or the scan budget is exceeded.
  */
 function jsonContainsResolvedSecret(
   value: unknown,
   resolvedSecrets: ReadonlyMap<string, ReadonlySet<string>>,
-  options: { readonly scanObjectKeys?: boolean } = {},
+  options: { readonly scanObjectKeys?: boolean; readonly excludePaths?: ReadonlySet<string> } = {},
 ): boolean {
-  const visited = new WeakSet<object>();
+  const excludePaths = options.excludePaths;
   const scanObjectKeys = options.scanObjectKeys ?? true;
+  let containerVisits = 0;
 
-  const scan = (current: unknown, depth: number): boolean => {
-    if (depth > MAX_REDACTION_DEPTH) {
-      return false;
-    }
+  if (excludePaths === undefined) {
+    const visited = new WeakSet<object>();
+    const stack: { readonly node: unknown }[] = [{ node: value }];
 
-    if (typeof current === 'string') {
-      return containsResolvedSecret(current, resolvedSecrets);
-    }
-
-    if (Array.isArray(current)) {
-      if (visited.has(current)) {
-        return false;
-      }
-
-      visited.add(current);
-      return current.some((item) => scan(item, depth + 1));
-    }
-
-    if (
-      current !== null
-      && typeof current === 'object'
-      && (Object.getPrototypeOf(current) === Object.prototype || Object.getPrototypeOf(current) === null)
-    ) {
-      if (visited.has(current)) {
-        return false;
-      }
-
-      visited.add(current);
-      for (const [key, item] of Object.entries(current)) {
-        if ((scanObjectKeys && containsResolvedSecret(key, resolvedSecrets)) || scan(item, depth + 1)) {
+    while (stack.length > 0) {
+      const { node } = stack.pop()!;
+      if (typeof node === 'string') {
+        if (containsResolvedSecret(node, resolvedSecrets)) {
           return true;
+        }
+        continue;
+      }
+
+      if (Array.isArray(node)) {
+        if (visited.has(node)) {
+          continue;
+        }
+
+        visited.add(node);
+        containerVisits += 1;
+        if (containerVisits > MAX_JSON_SCAN_CONTAINERS) {
+          return true;
+        }
+
+        for (let index = node.length - 1; index >= 0; index -= 1) {
+          if (index in node) {
+            stack.push({ node: node[index] });
+          }
+        }
+        continue;
+      }
+
+      if (
+        node !== null
+        && typeof node === 'object'
+        && (Object.getPrototypeOf(node) === Object.prototype || Object.getPrototypeOf(node) === null)
+      ) {
+        if (visited.has(node)) {
+          continue;
+        }
+
+        visited.add(node);
+        containerVisits += 1;
+        if (containerVisits > MAX_JSON_SCAN_CONTAINERS) {
+          return true;
+        }
+
+        const entries = Object.entries(node);
+        for (let index = entries.length - 1; index >= 0; index -= 1) {
+          const [key, item] = entries[index]!;
+          if (scanObjectKeys && containsResolvedSecret(key, resolvedSecrets)) {
+            return true;
+          }
+          stack.push({ node: item });
         }
       }
     }
 
     return false;
-  };
+  }
 
-  return scan(value, 0);
+  const ancestors = new WeakSet<object>();
+  const stack: ({ readonly node: unknown; readonly path: string } | { readonly leave: object })[] = [
+    { node: value, path: '' },
+  ];
+
+  while (stack.length > 0) {
+    const frame = stack.pop()!;
+    if ('leave' in frame) {
+      ancestors.delete(frame.leave);
+      continue;
+    }
+
+    const { node, path } = frame;
+    if (typeof node === 'string') {
+      if (containsResolvedSecret(node, resolvedSecrets)) {
+        return true;
+      }
+      continue;
+    }
+
+    if (Array.isArray(node)) {
+      if (ancestors.has(node)) {
+        continue;
+      }
+
+      ancestors.add(node);
+      containerVisits += 1;
+      if (containerVisits > MAX_JSON_SCAN_CONTAINERS) {
+        return true;
+      }
+
+      stack.push({ leave: node });
+      for (let index = node.length - 1; index >= 0; index -= 1) {
+        if (index in node) {
+          const childPath = path === '' ? String(index) : `${path}.${index}`;
+          if (!excludePaths.has(childPath)) {
+            stack.push({ node: node[index], path: childPath });
+          }
+        }
+      }
+      continue;
+    }
+
+    if (
+      node !== null
+      && typeof node === 'object'
+      && (Object.getPrototypeOf(node) === Object.prototype || Object.getPrototypeOf(node) === null)
+    ) {
+      if (ancestors.has(node)) {
+        continue;
+      }
+
+      ancestors.add(node);
+      containerVisits += 1;
+      if (containerVisits > MAX_JSON_SCAN_CONTAINERS) {
+        return true;
+      }
+
+      stack.push({ leave: node });
+      const entries = Object.entries(node);
+      for (let index = entries.length - 1; index >= 0; index -= 1) {
+        const [key, item] = entries[index]!;
+        if (scanObjectKeys && containsResolvedSecret(key, resolvedSecrets)) {
+          return true;
+        }
+
+        const childPath = path === '' ? key : `${path}.${key}`;
+        if (!excludePaths.has(childPath)) {
+          stack.push({ node: item, path: childPath });
+        }
+      }
+    }
+  }
+
+  return false;
 }
 
 /**
