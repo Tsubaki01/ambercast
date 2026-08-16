@@ -44,6 +44,40 @@ operations, while quoted prose remains data rather than an invocation. A
 Git-bearing command whose shell grammar is too complex for that deliberately
 small lexer is blocked on every branch; guessing would make branch protection
 dependent on syntax the hook cannot reliably model.
+
+Opaque vs. transparent wrappers: `env`, `sudo`, `nice`, `time`, `command`,
+`exec`, and `nohup` are transparent -- their own leading options are skipped
+so the lexer can re-examine whatever command they hand off to (`env` via
+_skip_env; the rest via WRAPPER_COMMANDS/_skip_wrapper). `xargs`, `find`,
+and `timeout` are opaque -- their wrapped command's exact position depends
+on option grammar this lexer does not model (xargs' -I/-L option forms,
+find's -exec/-execdir predicate syntax, timeout's leading DURATION), so
+instead of locating it precisely, any bare `git` token appearing anywhere
+in their remaining arguments is treated as "might route to git" and blocked
+via the same too-complex/ambiguous path used for eval/`$(...)`/`sh -c`
+(OPAQUE_WRAPPER_COMMANDS, _opaque_wrapper_may_route_git). This scan runs to
+the end of the token stream rather than stopping at the next shell
+operator, because a quoted operator-only string used as an option value
+(e.g. xargs' `-I ";"`) is indistinguishable from a real one once shlex has
+stripped quoting -- stopping early would let that ambiguity silently
+defeat detection. The accepted cost of not stopping: an opaque wrapper's
+own, unrelated command followed by a real, separately-triggered `git
+commit` later in the same shell command is also blocked, even on a branch
+where the commit alone would be allowed. A second accepted cost, from not
+locating the wrapped command precisely: `git` appearing as a plain,
+non-invocation argument (e.g. `find . -name git`, matching a file literally
+named `git`) is also blocked. Both trade detection precision for closing a
+real bypass, consistent with this guard's bias toward over-blocking over
+silently missing an invocation.
+
+Residual bypasses that remain out of scope even with opaque-wrapper
+detection: shell functions and aliases that rename or wrap `git`, string-
+concatenation obfuscation of the literal `git` (e.g. `g""it`, `${x}git`),
+and `-C`/`--git-dir` pointing at a different repository -- the last one is a
+deliberate, unrevisited decision, not an oversight (see the resolution
+asymmetry discussed above). This hook is a best-effort lexer, not a security
+boundary: the actual enforcement is GitHub branch protection (pull request
+required, conversations resolved, force-push disabled).
 """
 from __future__ import annotations
 
@@ -65,7 +99,7 @@ GIT_OPTIONS_WITH_VALUE = {
     "--config-env", "--exec-path",
 }
 ENV_OPTIONS_WITH_VALUE = {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}
-WRAPPER_COMMANDS = {"command", "exec", "sudo", "nice", "time"}
+WRAPPER_COMMANDS = {"command", "exec", "sudo", "nice", "time", "nohup"}
 WRAPPER_OPTIONS_WITH_VALUE = {
     "exec": {"-a"},
     "sudo": {
@@ -74,7 +108,16 @@ WRAPPER_OPTIONS_WITH_VALUE = {
         "--chroot", "--chdir",
     },
     "nice": {"-n", "--adjustment"},
+    # nohup has no entry here because none of its options consume a value in
+    # any common implementation (GNU coreutils recognizes only --help and
+    # --version, neither of which takes one; BSD/macOS nohup takes no options
+    # at all), so _skip_wrapper's default empty set already covers it.
 }
+# Wrappers whose own argument grammar this lexer does not model -- see the
+# module docstring's "Opaque vs. transparent wrappers" section for why these
+# are blocked outright via _opaque_wrapper_may_route_git rather than re-lexed
+# like WRAPPER_COMMANDS.
+OPAQUE_WRAPPER_COMMANDS = {"xargs", "find", "timeout"}
 
 
 # The resolver returns both the chosen path and a stable source label. The
@@ -218,6 +261,34 @@ def _git_subcommand(tokens, index):
     return None
 
 
+def _opaque_wrapper_may_route_git(tokens, index):
+    """Whether a bare `git` token appears anywhere after an opaque wrapper.
+
+    This deliberately does not try to locate the wrapper's actual wrapped
+    command -- that would mean modeling each wrapper's option grammar
+    (xargs' -I/-L option forms, find's -exec/-execdir predicate syntax,
+    timeout's leading DURATION), which was rejected as unverifiable and
+    error-prone (see the module docstring). Instead it asks the coarser
+    question "could this wrapper be handing git to whatever it invokes," by
+    checking every remaining token for an exact `git` executable match
+    (_is_git_executable, so `git` embedded in a merged/quoted token like
+    "git commit" never counts).
+
+    The scan runs to the end of the token stream rather than stopping at the
+    next `_is_operator` token. An operator-run detector like `_is_operator`
+    matches on token content alone, because shlex has already discarded
+    quoting by the time `classify()` builds this token list -- so a quoted
+    operator-only string used as an option value (e.g. xargs' `-I ";"`) is
+    indistinguishable from a real unquoted separator. Stopping there would
+    let that ambiguity hide a `git` token that appears after it, silently
+    reopening the bypass this function exists to close. Not stopping trades
+    a wider over-block surface (documented in the module docstring) for
+    closing that gap -- consistent with this guard's bias toward
+    over-blocking over silently missing an invocation.
+    """
+    return any(_is_git_executable(token) for token in tokens[index + 1:])
+
+
 def _is_ambiguous_shell(command, tokens):
     """Recognize constructs whose nested command grammar shlex cannot prove safe."""
     if not _contains_git(command):
@@ -272,6 +343,10 @@ def classify(command):
             if executable in WRAPPER_COMMANDS:
                 index = _skip_wrapper(tokens, index)
                 continue
+            if executable in OPAQUE_WRAPPER_COMMANDS and _opaque_wrapper_may_route_git(
+                tokens, index
+            ):
+                return False, False, False, True
             break
         if index < len(tokens) and _is_operator(tokens[index]):
             command_position = True
