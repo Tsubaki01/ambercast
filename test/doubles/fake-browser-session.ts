@@ -311,6 +311,36 @@ function requireCurrentBinding(state: FakeBrowserSessionState, element: BoundEle
 }
 
 /**
+ * Confirms that the fake's current URL may receive a secret under its policy.
+ *
+ * This shared decision runs before its synchronous continuity check and again
+ * immediately before it records the secret fill.
+ * Those two checkpoints mirror the adapter's fail-fast and final-fill guards
+ * without allowing their integrity classification or policy diagnostics to
+ * diverge.
+ *
+ * The adapter's continuity-failure reclassification is deliberately absent:
+ * `requireCurrentBinding` has no `await` or callback boundary, so nothing can
+ * interleave a `currentUrl` mutation between this check and that synchronous
+ * continuity decision. A catch could therefore never observe a changed origin
+ * verdict, making it untestable dead code rather than useful structural parity.
+ *
+ * @param state - The mutable fake-session state that supplies the current URL.
+ * @param policy - The resolved policy authorizing the secret's destination.
+ * @throws {IntegrityViolationError} When the current page origin is not
+ *   allowed to receive the policy's secret.
+ */
+function assertSecretSinkOrigin(state: FakeBrowserSessionState, policy: SecretSinkPolicy): void {
+  if (!isAllowedSecretSinkOrigin(policy, state.currentUrl)) {
+    throw new IntegrityViolationError('The current page origin is not allowed to receive this secret.', {
+      secretRef: policy.secretRef,
+      allowedOrigins: policy.allowedOrigins,
+      source: policy.source,
+    });
+  }
+}
+
+/**
  * Mints a fake-session handle synchronously for a test that is not exercising
  * asynchronous bind control flow itself.
  *
@@ -453,11 +483,15 @@ export function createFakeBrowserSession(
      * Fills a bound fake element with a materialized secret value.
      *
      * @remarks
-     * The fake uses the adapter's origin-before-continuity ordering so
-     * usecase tests exercise the same race classification. A rejected origin
-     * reports policy diagnostics but never `value`; a real cross-origin
-     * navigation also changes generation, so continuity first would mask that
-     * integrity failure as ordinary staleness.
+     * This mirrors the adapter with an origin check before synchronous
+     * continuity verification and a second one immediately before recording
+     * the fill. The fake intentionally omits
+     * continuity-failure reclassification: `requireCurrentBinding` has no
+     * asynchronous or callback boundary, so no `currentUrl` mutation can
+     * interleave between its two origin verdicts. A rejected origin reports
+     * policy diagnostics but never `value`; the first checkpoint preserves
+     * the integrity failure a cross-origin navigation would otherwise mask as
+     * ordinary staleness.
      *
      * @param target - The fake-session-bound element to receive the secret.
      * @param value - The materialized secret value, which diagnostics must not expose.
@@ -471,15 +505,9 @@ export function createFakeBrowserSession(
       value: string,
       policy: SecretSinkPolicy,
     ): Promise<void> {
-      if (!isAllowedSecretSinkOrigin(policy, state.currentUrl)) {
-        throw new IntegrityViolationError('The current page origin is not allowed to receive this secret.', {
-          secretRef: policy.secretRef,
-          allowedOrigins: policy.allowedOrigins,
-          source: policy.source,
-        });
-      }
-
+      assertSecretSinkOrigin(state, policy);
       requireCurrentBinding(state, target);
+      assertSecretSinkOrigin(state, policy);
       state.roleLocatorCalls += 1;
       state.finalOperationCalls += 1;
       const action = { type: 'fill-secret' as const, target, value, policy };
