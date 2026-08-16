@@ -319,6 +319,11 @@ export interface BrowserSession {
    * when a navigation changes both origin and generation. After a continuity
    * failure, the origin check replaces that error only if the origin is now
    * unsound; otherwise the original continuity error propagates unchanged.
+   * A fully synchronous implementation whose continuity re-verification has no
+   * asynchronous or callback boundary may omit the reclassification checkpoint:
+   * no origin mutation can interleave for its catch to observe, so its pre-check
+   * and final pre-fill check suffice, as in the fake test double in
+   * `test/doubles/fake-browser-session.ts`.
    * No additional `await` sits between that post-failure origin re-check and
    * the final pre-fill check, nor between that final check and the fill,
    * applying operation-immediate re-verification to origin just as
