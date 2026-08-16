@@ -297,7 +297,7 @@ export function computeAccessibilityFingerprint(
   tree: JsonValueT,
   ref: AccessibilityElementRef,
   resolvedSecretValues: Iterable<ReadonlySet<string>>,
-): 
+):
   | { readonly kind: 'ok'; readonly fingerprint: Fingerprint }
   | { readonly kind: 'no-match' }
   | { readonly kind: 'ambiguous-match' }
