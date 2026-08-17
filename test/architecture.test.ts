@@ -1,4 +1,4 @@
-import { readdir } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import * as ts from 'typescript';
@@ -14,6 +14,41 @@ const DIGEST_MODULE_FILE = fileURLToPath(new URL('../src/core/ir/digest.ts', imp
 const PORTS_MODULE_FILE = fileURLToPath(new URL('../src/ports/browser.ts', import.meta.url));
 const REPORT_SCHEMA_MODULE_FILE = fileURLToPath(new URL('../src/report/schema.ts', import.meta.url));
 const RUN_MODULE_FILE = fileURLToPath(new URL('../src/usecases/run.ts', import.meta.url));
+const CHECK_TEST_FILE = fileURLToPath(new URL('./unit/usecases/check.test.ts', import.meta.url));
+const CHECK_MODULE_FILE = fileURLToPath(new URL('../src/usecases/check.ts', import.meta.url));
+const CHECK_COMMAND_MODULE_FILE = fileURLToPath(new URL('../src/runtime/check-command.ts', import.meta.url));
+
+function forbiddenCheckImports(sourceFile: ts.SourceFile): string[] {
+  return sourceFile.statements.flatMap((statement) => {
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) {
+      return [];
+    }
+
+    const specifier = statement.moduleSpecifier.text;
+    const namedBindings = statement.importClause?.namedBindings;
+    const importsEventOrSecretsPort = (specifier === '#ports/system.js' || specifier.endsWith('/ports/system.js'))
+      && namedBindings !== undefined
+      && ts.isNamedImports(namedBindings)
+      && namedBindings.elements.some(({ name }) => name.text === 'EventSink' || name.text === 'SecretsProvider');
+    const forbidden = [
+      'fake-ai-executor',
+      'fake-browser-driver',
+      'fake-ai-action-controller',
+      'fake-browser-session',
+      'fake-secrets-provider',
+      'create-recording-event-sink',
+      'noop-event-sink',
+      'env-secrets-provider',
+    ].some((fragment) => specifier.includes(fragment))
+      || specifier.startsWith('#adapters/ai/')
+      || specifier.startsWith('#adapters/browser/')
+      || specifier.endsWith('/create-ambercast.js')
+      || specifier.endsWith('/resolve-ai-provider.js')
+      || importsEventOrSecretsPort;
+
+    return forbidden ? [specifier] : [];
+  });
+}
 
 async function findTypeScriptFiles(directory: string): Promise<string[]> {
   const entries = await readdir(directory, { withFileTypes: true });
@@ -48,6 +83,41 @@ function exportedType(
 }
 
 describe('architecture guardrails', () => {
+  test('keeps check tests, usecase, and runtime composition free of AI/browser, event, and secrets imports', async () => {
+    const checkFiles = [CHECK_TEST_FILE, CHECK_MODULE_FILE, CHECK_COMMAND_MODULE_FILE];
+    const parsedFiles = await Promise.all(checkFiles.map(async (fileName) => (
+      ts.createSourceFile(fileName, await readFile(fileName, 'utf8'), ts.ScriptTarget.ES2023, true)
+    )));
+
+    expect(parsedFiles.map(forbiddenCheckImports)).toEqual([[], [], []]);
+
+    const syntheticFile = ts.createSourceFile(
+      '/virtual/forbidden-check-import.ts',
+      "import { x } from './fake-ai-executor.js';",
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    expect(forbiddenCheckImports(syntheticFile)).toEqual(['./fake-ai-executor.js']);
+
+    const eventAndSecretsSyntheticFile = ts.createSourceFile(
+      '/virtual/forbidden-check-event-and-secrets-imports.ts',
+      [
+        "import type { EventSink } from '#ports/system.js';",
+        "import { createNoopEventSink } from '#adapters/system/noop-event-sink.js';",
+        "import { createRecordingEventSink } from '../../test/doubles/create-recording-event-sink.js';",
+        "import { createEnvSecretsProvider } from '#adapters/system/env-secrets-provider.js';",
+      ].join('\n'),
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    expect(forbiddenCheckImports(eventAndSecretsSyntheticFile)).toEqual([
+      '#ports/system.js',
+      '#adapters/system/noop-event-sink.js',
+      '../../test/doubles/create-recording-event-sink.js',
+      '#adapters/system/env-secrets-provider.js',
+    ]);
+  });
+
   test('scans the current source tree without finding digest call-site violations', async () => {
     const sourceFiles = await findTypeScriptFiles(SOURCE_ROOT);
     const program = ts.createProgram({

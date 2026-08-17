@@ -1,12 +1,14 @@
 /**
- * Parses CLI arguments, delegates parsed generate and run commands to runtime,
- * and selects the only process-exit boundary in the product.
+ * Parses CLI arguments, delegates parsed generate, run, and check commands to
+ * runtime, and selects the only process-exit boundary in the product.
  *
  * The `generate [files...]` and `run [files...]` subcommands both treat
  * positionals as literal prompt paths, delegating an empty list to configured
  * discovery. Generate parses generation policy and rendering flags; run parses
  * replay policy including path grep, target, headed execution, cache policy,
- * stale handling, provider override, color control, and JSON rendering. The parser accepts
+ * stale handling, provider override, color control, and JSON rendering; check
+ * parses its read-only target, empty-selection, listing, configuration, and
+ * rendering options before runtime dispatch. The parser accepts
  * only the supported provider names, keeping provider selection a runtime
  * concern rather than a usecase option. A bare `--` ends option parsing so a
  * prompt whose literal path begins with `--` remains addressable.
@@ -18,7 +20,7 @@
  * commands or flags, malformed command arguments, and missing option values
  * write plain-text usage to stderr and exit 2 without a report envelope.
  *
- * For either valid command, this layer creates one `AbortController`, aborting
+ * For each valid command, this layer creates one `AbortController`, aborting
  * it when `SIGINT` or `SIGTERM` arrives, and passes its signal with the parsed
  * input to the matching runtime command. Runtime returns an envelope and
  * selected exit code; `--json` writes the `JSON.stringify(envelope)` payload
@@ -34,6 +36,7 @@
  * on the composition side of that boundary.
  */
 import { runGenerateCommand } from '#runtime/generate-command.js';
+import { runCheckCommand } from '#runtime/check-command.js';
 import { runRunCommand } from '#runtime/run-command.js';
 
 interface ParsedGenerateCommand {
@@ -86,7 +89,29 @@ interface ParsedRunCommand {
   readonly color: boolean;
 }
 
-const USAGE = `Usage: ambercast <command> [options]\n\nCommands:\n  generate [files...]  Generate deterministic plans\n  run [files...]       Replay deterministic plans\n\nGenerate options:\n  --strict  --force  --dry-run  --target <name>  --ai <claude|codex>\n  --allow-empty  --list  --json  --config <path>  --no-color\n\nRun options:\n  --grep <pattern>  --target <name>  --headed  --cache-only  --allow-empty  --list\n  --stale <fail>  --json  --no-color\n`;
+interface ParsedCheckCommand {
+  readonly command: 'check';
+  readonly input: {
+    readonly files: readonly string[];
+    readonly target?: string;
+    readonly allowEmpty: boolean;
+    readonly list: boolean;
+    readonly configPathOverride?: string;
+    readonly cwd: string;
+    readonly signal: AbortSignal;
+  };
+  readonly json: boolean;
+  readonly color: boolean;
+}
+
+const USAGE = `Usage: ambercast <command> [options]\n\nCommands:\n  generate [files...]  Generate deterministic plans\n  run [files...]       Replay deterministic plans\n  check [files...]     Check plan freshness\n\nGenerate options:\n  --strict  --force  --dry-run  --target <name>  --ai <claude|codex>\n  --allow-empty  --list  --json  --config <path>  --no-color\n\nRun options:\n  --grep <pattern>  --target <name>  --headed  --cache-only  --allow-empty  --list\n  --stale <fail>  --json  --no-color\n\nCheck options:\n  --target <name>  --allow-empty  --list  --json  --config <path>  --no-color\n`;
+
+/*
+ * Human rendering remains command-agnostic: only known healthy states are
+ * green. An unknown or non-healthy status defaults to failure styling, so a
+ * report vocabulary extension cannot acquire success styling accidentally.
+ */
+const HEALTHY_REPORT_STATUSES = new Set(['generated', 'skipped-fresh', 'listed', 'fresh', 'passed']);
 
 /**
  * Fixed warning that `main()` writes to stderr exactly once when a run
@@ -108,6 +133,19 @@ function colorize(value: string, color: string, enabled: boolean): string {
   return enabled ? `\u001B[${color}m${value}\u001B[0m` : value;
 }
 
+/**
+ * Renders a report-shaped value as compact terminal lines.
+ *
+ * @param envelope - The runtime report or an unexpected non-report value.
+ * @param color - Whether ANSI color sequences are enabled.
+ * @returns Human-readable result and error lines with a final newline when
+ * any line exists.
+ * @remarks
+ * Status styling is data-driven rather than command-specific so a report
+ * vocabulary extension must opt into healthy green styling explicitly. The
+ * renderer also preserves a result's optional `reason`, which makes check
+ * findings actionable without changing the stable JSON envelope.
+ */
 function renderHumanReport(envelope: unknown, color: boolean): string {
   if (envelope === null || typeof envelope !== 'object' || Array.isArray(envelope)) {
     return `${String(envelope)}\n`;
@@ -119,8 +157,9 @@ function renderHumanReport(envelope: unknown, color: boolean): string {
   const lines = results.map((result) => {
     const item = result as Record<string, unknown>;
     const status = String(item.status ?? 'unknown');
-    const statusColor = status === 'failed' ? '31' : status === 'would-generate' ? '33' : '32';
-    return `${colorize(status, statusColor, color)} ${String(item.file ?? item.id ?? '')}`.trimEnd();
+    const statusColor = HEALTHY_REPORT_STATUSES.has(status) ? '32' : status === 'would-generate' ? '33' : '31';
+    const reason = typeof item.reason === 'string' ? `: ${item.reason}` : '';
+    return `${colorize(status, statusColor, color)} ${String(item.file ?? item.id ?? '')}${reason}`.trimEnd();
   });
 
   for (const error of errors) {
@@ -327,6 +366,87 @@ function parseRun(argv: readonly string[], signal: AbortSignal): ParsedRunComman
   };
 }
 
+/**
+ * Parses the `check [files...]` freshness-inspection surface before it crosses
+ * into runtime.
+ *
+ * @param argv - Arguments following the `check` command name.
+ * @param signal - Command-lifetime cancellation propagated to runtime.
+ * @returns Parsed check input and rendering policy, plain-text usage failure,
+ * or the command-local help sentinel.
+ * @remarks
+ * Check exposes only options meaningful to read-only freshness inspection;
+ * generation and replay controls are intentionally absent because it neither
+ * creates plans nor executes them. Its option surface and bare `--` handling
+ * follow the same parser contract as the other commands, keeping literal paths
+ * that begin with `--` addressable.
+ */
+function parseCheck(argv: readonly string[], signal: AbortSignal): ParsedCheckCommand | string {
+  const separator = argv.indexOf('--');
+  if (argv.slice(0, separator === -1 ? undefined : separator).includes('--help')) {
+    return 'help';
+  }
+
+  const files: string[] = [];
+  let target: string | undefined;
+  let allowEmpty = false;
+  let list = false;
+  let json = false;
+  let configPathOverride: string | undefined;
+  let color = true;
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index]!;
+    if (argument === '--') {
+      files.push(...argv.slice(index + 1));
+      break;
+    }
+    if (!argument.startsWith('--')) {
+      files.push(argument);
+      continue;
+    }
+
+    if (argument === '--allow-empty') {
+      allowEmpty = true;
+    } else if (argument === '--list') {
+      list = true;
+    } else if (argument === '--json') {
+      json = true;
+    } else if (argument === '--no-color') {
+      color = false;
+    } else if (argument === '--target' || argument === '--config') {
+      const value = argv[index + 1];
+      if (value === undefined || value.startsWith('--')) {
+        return `Missing value for ${argument}.`;
+      }
+
+      index += 1;
+      if (argument === '--target') {
+        target = value;
+      } else {
+        configPathOverride = value;
+      }
+    } else {
+      return `Unknown check option: ${argument}.`;
+    }
+  }
+
+  return {
+    command: 'check',
+    input: {
+      files,
+      ...(target === undefined ? {} : { target }),
+      allowEmpty,
+      list,
+      ...(configPathOverride === undefined ? {} : { configPathOverride }),
+      cwd: process.cwd(),
+      signal,
+    },
+    json,
+    color,
+  };
+}
+
 export async function main(
   argv: readonly string[] = process.argv.slice(2),
   stdout: NodeJS.WritableStream = process.stdout,
@@ -348,7 +468,7 @@ export async function main(
     process.exitCode = 0;
     return;
   }
-  if (argv[0] !== 'generate' && argv[0] !== 'run') {
+  if (argv[0] !== 'generate' && argv[0] !== 'run' && argv[0] !== 'check') {
     stderr.write(`Unknown command: ${argv[0]}.\n`);
     writeUsage(stderr);
     process.exitCode = 2;
@@ -358,7 +478,9 @@ export async function main(
   const controller = new AbortController();
   const parsed = argv[0] === 'generate'
     ? parseGenerate(argv.slice(1), controller.signal)
-    : parseRun(argv.slice(1), controller.signal);
+    : argv[0] === 'run'
+      ? parseRun(argv.slice(1), controller.signal)
+      : parseCheck(argv.slice(1), controller.signal);
   if (typeof parsed === 'string') {
     if (parsed === 'help') {
       writeUsage(stdout);
@@ -386,7 +508,9 @@ export async function main(
     try {
       const output = parsed.command === 'generate'
         ? await runGenerateCommand(parsed.input)
-        : await runRunCommand(parsed.input);
+        : parsed.command === 'run'
+          ? await runRunCommand(parsed.input)
+          : await runCheckCommand(parsed.input);
       if (
         parsed.command === 'run'
         && output.envelope.command === 'run'
