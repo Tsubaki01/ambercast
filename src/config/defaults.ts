@@ -17,6 +17,7 @@
  */
 
 import type { ResolvedConfig } from '#core/config/schema.js';
+import { GROUNDING_SUFFIX, PLAN_SUFFIX } from '#core/layout/resolve.js';
 
 /**
  * Provides the complete pre-path-resolution configuration for projects that
@@ -32,7 +33,7 @@ export const DEFAULT_RAW_CONFIG = {
   testDir: 'tests/ambercast',
   runsDir: 'tests/ambercast/.runs',
   testMatch: ['**/*.test.md'],
-  testIgnore: ['**/.runs/**', '**/*.ambercast.plan.json', '**/*.ambercast.grounding.json'],
+  testIgnore: ['**/.runs/**', `**/*${PLAN_SUFFIX}`, `**/*${GROUNDING_SUFFIX}`],
   targets: {
     'web-user': {
       baseUrl: 'http://localhost:3000',

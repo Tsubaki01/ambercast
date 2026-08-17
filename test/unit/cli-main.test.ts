@@ -2,11 +2,14 @@ import { Writable } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ReportEnvelope } from '#report/schema.js';
 import type { GenerateCommandInput } from '#runtime/generate-command.js';
+import type { CheckCommandInput } from '#runtime/check-command.js';
 
 const runGenerateCommand = vi.hoisted(() => vi.fn());
 const runRunCommand = vi.hoisted(() => vi.fn());
+const runCheckCommand = vi.hoisted(() => vi.fn());
 vi.mock('#runtime/generate-command.js', () => ({ runGenerateCommand }));
 vi.mock('#runtime/run-command.js', () => ({ runRunCommand }));
+vi.mock('#runtime/check-command.js', () => ({ runCheckCommand }));
 
 import { main, REPORT_PERSISTENCE_FAILED_WARNING } from '../../src/cli/main.js';
 
@@ -44,6 +47,31 @@ const RUN_ENVELOPE = {
   reportPersistence: 'persisted' as const,
 };
 
+const CHECK_ENVELOPE = {
+  schemaVersion: '1.0' as const,
+  command: 'check' as const,
+  startedAt: '2026-08-17T00:00:00Z',
+  durationMs: 0,
+  summary: { total: 2, passed: 1, failed: 1, errored: 0, skipped: 0 },
+  errors: [],
+  results: [
+    {
+      id: 'fresh.test.md',
+      file: 'fresh.test.md',
+      planFile: 'fresh.ambercast.plan.json',
+      status: 'fresh' as const,
+      reason: 'The plan matches the current prompt and target.',
+    },
+    {
+      id: 'stale.test.md',
+      file: 'stale.test.md',
+      planFile: 'stale.ambercast.plan.json',
+      status: 'stale' as const,
+      reason: 'The plan is stale for the current prompt or target.',
+    },
+  ],
+};
+
 let cwdSpy: ReturnType<typeof vi.spyOn> | undefined;
 let initialExitCode: typeof process.exitCode;
 
@@ -58,6 +86,7 @@ afterEach(() => {
   cwdSpy = undefined;
   runGenerateCommand.mockReset();
   runRunCommand.mockReset();
+  runCheckCommand.mockReset();
 });
 
 async function run(argv: readonly string[]) {
@@ -377,5 +406,124 @@ describe('main()', () => {
 
     expect(runOptions).toContain('--allow-empty');
     expect(runOptions).toContain('--list');
+  });
+
+  it('passes check positionals and every supported flag to runtime', async () => {
+    runCheckCommand.mockResolvedValue({ exitCode: 4, envelope: CHECK_ENVELOPE });
+
+    await run([
+      'check',
+      'login.test.md',
+      'checkout.test.md',
+      '--target',
+      'web',
+      '--allow-empty',
+      '--list',
+      '--json',
+      '--config',
+      'ambercast.config.json',
+      '--no-color',
+    ]);
+
+    expect(runCheckCommand).toHaveBeenCalledWith(expect.objectContaining({
+      files: ['login.test.md', 'checkout.test.md'],
+      target: 'web',
+      allowEmpty: true,
+      list: true,
+      configPathOverride: 'ambercast.config.json',
+    }));
+  });
+
+  it('treats option-shaped check paths after -- as literal positionals', async () => {
+    runCheckCommand.mockResolvedValue({ exitCode: 0, envelope: CHECK_ENVELOPE });
+
+    await run(['check', '--', '--literal.test.md']);
+
+    expect(runCheckCommand).toHaveBeenCalledWith(expect.objectContaining({ files: ['--literal.test.md'] }));
+  });
+
+  it('rejects an unknown check flag before runtime composition', async () => {
+    const result = await run(['check', '--unknown']);
+
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('Unknown check option: --unknown.');
+    expect(result.exitCode).toBe(2);
+    expect(runCheckCommand).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    '--strict',
+    '--force',
+    '--dry-run',
+    '--ai',
+    '--grep',
+    '--headed',
+    '--cache-only',
+    '--stale',
+  ] as const)('rejects the generate/run-only %s flag before runtime composition', async (flag) => {
+    const result = await run(['check', flag]);
+
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain(`Unknown check option: ${flag}.`);
+    expect(result.exitCode).toBe(2);
+    expect(runCheckCommand).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['target', ['check', '--target']],
+    ['config', ['check', '--config']],
+  ] as const)('rejects a check %s flag missing its value before runtime composition', async (_name, argv) => {
+    const result = await run(argv);
+
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain(`Missing value for --${_name}.`);
+    expect(result.exitCode).toBe(2);
+    expect(runCheckCommand).not.toHaveBeenCalled();
+  });
+
+  it('short-circuits check help before runtime composition', async () => {
+    const result = await run(['check', '--help']);
+
+    expect(result.stdout).toMatch(/check \[files\.\.\.\].*check plan freshness/i);
+    expect(result.stdout).toContain('Check options:');
+    expect(result.stderr).toBe('');
+    expect(result.exitCode).toBe(0);
+    expect(runCheckCommand).not.toHaveBeenCalled();
+  });
+
+  it('dispatches check to runtime and renders exactly one JSON check envelope', async () => {
+    runCheckCommand.mockResolvedValue({ exitCode: 4, envelope: CHECK_ENVELOPE });
+
+    const result = await run(['check', '--json']);
+
+    expect(runCheckCommand).toHaveBeenCalledOnce();
+    expect(ReportEnvelope.parse(JSON.parse(result.stdout))).toEqual(CHECK_ENVELOPE);
+    expect(result.stderr).toBe('');
+    expect(result.exitCode).toBe(4);
+  });
+
+  it('renders fresh green and non-fresh non-green check rows with their reasons', async () => {
+    runCheckCommand.mockResolvedValue({ exitCode: 4, envelope: CHECK_ENVELOPE });
+
+    const result = await run(['check']);
+
+    expect(result.stdout).toContain('\u001B[32mfresh\u001B[0m fresh.test.md: The plan matches the current prompt and target.');
+    expect(result.stdout).toContain('\u001B[31mstale\u001B[0m stale.test.md: The plan is stale for the current prompt or target.');
+    expect(result.exitCode).toBe(4);
+  });
+
+  it('passes a check runtime exit code through unchanged', async () => {
+    runCheckCommand.mockResolvedValue({ exitCode: 3, envelope: { ...CHECK_ENVELOPE, errors: [{
+      scope: 'case', kind: 'environment', code: 'FS_IO_ERROR', caseId: 'broken.test.md', message: 'read failed',
+    }] } });
+
+    const result = await run(['check', '--no-color']);
+
+    expect(runCheckCommand).toHaveBeenCalledWith(expect.objectContaining({
+      allowEmpty: false,
+      list: false,
+    } satisfies Partial<CheckCommandInput>));
+    expect(result.stdout).not.toContain('\u001B[');
+    expect(result.exitCode).toBe(3);
   });
 });

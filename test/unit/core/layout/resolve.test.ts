@@ -1,13 +1,22 @@
 import { describe, expect, it } from 'vitest';
 import type { LayoutConfig } from '#core/config/schema.js';
 import { ConfigInvalidError } from '#core/errors/config-invalid-error.js';
-import { createLayoutResolver } from '#core/layout/resolve.js';
+import { GROUNDING_SUFFIX, PLAN_SUFFIX, createLayoutResolver } from '#core/layout/resolve.js';
 
 const CONFIG = {
   testDir: '/workspace/tests/ambercast',
   runsDir: '/workspace/.runs',
 } as const satisfies LayoutConfig;
 const RUN_ID = '2026-08-01T090000Z-550e8400-e29b-41d4-a716-446655440000';
+
+describe('companion suffix exports', () => {
+  it('provides the exact suffixes shared by configuration and discovery', () => {
+    expect({ PLAN_SUFFIX, GROUNDING_SUFFIX }).toStrictEqual({
+      PLAN_SUFFIX: '.ambercast.plan.json',
+      GROUNDING_SUFFIX: '.ambercast.grounding.json',
+    });
+  });
+});
 
 describe('createLayoutResolver', () => {
   it('constructs a resolver for a well-formed absolute layout configuration', () => {

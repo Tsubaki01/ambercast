@@ -11,6 +11,7 @@ import {
   type JsonValueT,
 } from '#core/ir/schema.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
+import { check, type CheckDeps, type CheckOptions } from '#usecases/check.js';
 import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/generate.js';
 import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
 import { createFixedClock } from '../../doubles/create-fixed-clock.js';
@@ -55,7 +56,125 @@ const GENERATE_OPTIONS: GenerateOptions = {
   list: false,
 };
 const RUN_OPTIONS: RunOptions = { files: [TEST_PATH], cacheOnly: false, allowEmpty: false, list: false, stale: 'fail' };
+const CHECK_OPTIONS: CheckOptions = { files: [TEST_PATH], allowEmpty: false, list: false };
+
+function checkDeps(storage: ReturnType<typeof createInMemoryStorage>, layout: ReturnType<typeof createLayoutResolver>): CheckDeps {
+  return {
+    storage,
+    layout,
+    discoverTestFiles: async () => [],
+    config: {
+      testDir: TEST_DIR,
+      testMatch: ['**/*.test.md'],
+      testIgnore: ['**/.runs/**'],
+      targets: TARGETS,
+      defaultTarget: 'web',
+    },
+  };
+}
+
 describe('fake vertical slice', () => {
+  it('checks a fresh plan produced by generate with its cold grounding cache', async () => {
+    const storage = createInMemoryStorage();
+    const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
+    await storage.writeText(TEST_PATH, PROMPT);
+    const generateDeps: GenerateDeps = {
+      storage,
+      layout,
+      aiExecutor: createFakeAiExecutor({
+        execute: async () => ({ data: GENERATED_RESPONSE, raw: JSON.stringify(GENERATED_RESPONSE) }),
+      }),
+      events: createRecordingEventSink().sink,
+      discoverTestFiles: async () => [],
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: ['**/.runs/**'],
+        targets: TARGETS,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 100 },
+      },
+    };
+
+    await generate(generateDeps, GENERATE_OPTIONS);
+
+    await expect(check(checkDeps(storage, layout), CHECK_OPTIONS)).resolves.toMatchObject({
+      results: [{ id: TEST_PATH, status: 'fresh' }],
+      errors: [],
+      noTestsFound: false,
+    });
+  });
+
+  it('checks a fresh plan after run updates its grounding cache', async () => {
+    const generatedResponse: GeneratedPlanResponse = {
+      steps: [{ id: 'recorded-ai', kind: 'ai', instruction: 'Reach the dashboard.', secrets: [] }],
+      ambiguities: [],
+    };
+    const storage = createInMemoryStorage();
+    const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
+    await storage.writeText(TEST_PATH, PROMPT);
+    const generateDeps: GenerateDeps = {
+      storage,
+      layout,
+      aiExecutor: createFakeAiExecutor({
+        execute: async () => ({ data: generatedResponse, raw: JSON.stringify(generatedResponse) }),
+      }),
+      events: createRecordingEventSink().sink,
+      discoverTestFiles: async () => [],
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: ['**/.runs/**'],
+        targets: TARGETS,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 100 },
+      },
+    };
+    await generate(generateDeps, GENERATE_OPTIONS);
+
+    const session = createFakeBrowserSession(new Map(), {
+      baseUrl: TARGETS.web.baseUrl,
+      currentUrl: TARGETS.web.baseUrl,
+    });
+    const runDeps: RunDeps = {
+      storage,
+      layout,
+      clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 0),
+      runId: '2026-08-09T000000Z-550e8400-e29b-41d4-a716-446655440000',
+      browserDriver: () => createFakeBrowserDriver(() => session),
+      secrets: createFakeSecretsProvider(new Map()),
+      resolveAiExecutor: async () => createFakeAiExecutor({
+        async executeAgentic(request) {
+          await request.controller.perform({ type: 'navigate', url: '/dashboard' });
+          await request.controller.evaluateAssert({ type: 'assert', check: 'text-visible', text: 'Dashboard' });
+          return { outcome: 'success' };
+        },
+      }),
+      events: createRecordingEventSink().sink,
+      discoverTestFiles: async () => [],
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: ['**/.runs/**'],
+        targets: TARGETS,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 120_000 },
+      },
+    };
+
+    await expect(run(runDeps, RUN_OPTIONS)).resolves.toMatchObject({
+      results: [{ result: { status: 'passed' } }],
+    });
+    expect(GroundingDocument.parse(JSON.parse(await storage.readText(layout.groundingPathFor(TEST_PATH)))).entries)
+      .not.toEqual({});
+
+    await expect(check(checkDeps(storage, layout), CHECK_OPTIONS)).resolves.toMatchObject({
+      results: [{ id: TEST_PATH, status: 'fresh' }],
+      errors: [],
+      noTestsFound: false,
+    });
+  });
+
   it('replays a generated plan from pre-seeded grounding without AI calls', async () => {
     const storage = createInMemoryStorage();
     const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });

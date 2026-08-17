@@ -1,4 +1,4 @@
-import { readdir } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import * as ts from 'typescript';
@@ -14,6 +14,94 @@ const DIGEST_MODULE_FILE = fileURLToPath(new URL('../src/core/ir/digest.ts', imp
 const PORTS_MODULE_FILE = fileURLToPath(new URL('../src/ports/browser.ts', import.meta.url));
 const REPORT_SCHEMA_MODULE_FILE = fileURLToPath(new URL('../src/report/schema.ts', import.meta.url));
 const RUN_MODULE_FILE = fileURLToPath(new URL('../src/usecases/run.ts', import.meta.url));
+const CHECK_TEST_FILE = fileURLToPath(new URL('./unit/usecases/check.test.ts', import.meta.url));
+const CHECK_MODULE_FILE = fileURLToPath(new URL('../src/usecases/check.ts', import.meta.url));
+const CHECK_COMMAND_MODULE_FILE = fileURLToPath(new URL('../src/runtime/check-command.ts', import.meta.url));
+
+function forbiddenCheckImports(sourceFile: ts.SourceFile): string[] {
+  const forbiddenSpecifiers: string[] = [];
+
+  function scanSpecifier(
+    moduleSpecifier: ts.Expression | undefined,
+    bindings: ts.NamedImports | ts.NamespaceImport | ts.NamedExports | ts.NamespaceExport | undefined,
+  ): void {
+    if (moduleSpecifier === undefined || !ts.isStringLiteral(moduleSpecifier)) {
+      return;
+    }
+
+    const specifier = moduleSpecifier.text;
+    const importsEventOrSecretsPort = isForbiddenSystemPortBinding(specifier, bindings);
+    const forbidden = isAiOrBrowserPortSpecifier(specifier)
+      || [
+        'fake-ai-executor',
+        'fake-browser-driver',
+        'fake-ai-action-controller',
+        'fake-browser-session',
+        'fake-secrets-provider',
+        'create-recording-event-sink',
+        'noop-event-sink',
+        'env-secrets-provider',
+      ].some((fragment) => specifier.includes(fragment))
+      || specifier.startsWith('#adapters/ai/')
+      || specifier.startsWith('#adapters/browser/')
+      || specifier.endsWith('/create-ambercast.js')
+      || specifier.endsWith('/resolve-ai-provider.js')
+      || importsEventOrSecretsPort;
+
+    if (forbidden) {
+      forbiddenSpecifiers.push(specifier);
+    }
+  }
+
+  function visit(node: ts.Node): void {
+    if (ts.isImportDeclaration(node)) {
+      scanSpecifier(node.moduleSpecifier, node.importClause?.namedBindings);
+    } else if (ts.isExportDeclaration(node)) {
+      scanSpecifier(node.moduleSpecifier, node.exportClause);
+    } else if (
+      ts.isCallExpression(node)
+      && node.expression.kind === ts.SyntaxKind.ImportKeyword
+    ) {
+      scanSpecifier(node.arguments[0], undefined);
+    }
+
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return forbiddenSpecifiers;
+}
+
+function isAiOrBrowserPortSpecifier(specifier: string): boolean {
+  return ['ai', 'browser'].some((port) => (
+    specifier === `#ports/${port}.js` || specifier.endsWith(`/ports/${port}.js`)
+  ));
+}
+
+function isForbiddenSystemPortBinding(
+  specifier: string,
+  bindings: ts.NamedImports | ts.NamespaceImport | ts.NamedExports | ts.NamespaceExport | undefined,
+): boolean {
+  if (
+    (specifier !== '#ports/system.js' && !specifier.endsWith('/ports/system.js'))
+    || bindings === undefined
+  ) {
+    return false;
+  }
+
+  if (ts.isNamespaceImport(bindings) || ts.isNamespaceExport(bindings)) {
+    return true;
+  }
+
+  if (!ts.isNamedImports(bindings) && !ts.isNamedExports(bindings)) {
+    return false;
+  }
+
+  return bindings.elements.some(({ name, propertyName }) => {
+    const importedName = propertyName?.text ?? name.text;
+    return importedName === 'EventSink' || importedName === 'SecretsProvider';
+  });
+}
 
 async function findTypeScriptFiles(directory: string): Promise<string[]> {
   const entries = await readdir(directory, { withFileTypes: true });
@@ -48,6 +136,79 @@ function exportedType(
 }
 
 describe('architecture guardrails', () => {
+  test('keeps check tests, usecase, and runtime composition free of AI/browser, event, and secrets imports', async () => {
+    const checkFiles = [CHECK_TEST_FILE, CHECK_MODULE_FILE, CHECK_COMMAND_MODULE_FILE];
+    const parsedFiles = await Promise.all(checkFiles.map(async (fileName) => (
+      ts.createSourceFile(fileName, await readFile(fileName, 'utf8'), ts.ScriptTarget.ES2023, true)
+    )));
+
+    expect(parsedFiles.map(forbiddenCheckImports)).toEqual([[], [], []]);
+
+    const syntheticFile = ts.createSourceFile(
+      '/virtual/forbidden-check-import.ts',
+      "import { x } from './fake-ai-executor.js';",
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    expect(forbiddenCheckImports(syntheticFile)).toEqual(['./fake-ai-executor.js']);
+
+    const eventAndSecretsSyntheticFile = ts.createSourceFile(
+      '/virtual/forbidden-check-event-and-secrets-imports.ts',
+      [
+        "import type { EventSink } from '#ports/system.js';",
+        "import { createNoopEventSink } from '#adapters/system/noop-event-sink.js';",
+        "import { createRecordingEventSink } from '../../test/doubles/create-recording-event-sink.js';",
+        "import { createEnvSecretsProvider } from '#adapters/system/env-secrets-provider.js';",
+      ].join('\n'),
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    expect(forbiddenCheckImports(eventAndSecretsSyntheticFile)).toEqual([
+      '#ports/system.js',
+      '#adapters/system/noop-event-sink.js',
+      '../../test/doubles/create-recording-event-sink.js',
+      '#adapters/system/env-secrets-provider.js',
+    ]);
+
+    const directAiAndBrowserPortsSyntheticFile = ts.createSourceFile(
+      '/virtual/forbidden-check-ai-and-browser-ports.ts',
+      [
+        "import type { AiExecutor } from '#ports/ai.js';",
+        "import type { BrowserDriver } from '#ports/browser.js';",
+      ].join('\n'),
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    expect(forbiddenCheckImports(directAiAndBrowserPortsSyntheticFile)).toEqual([
+      '#ports/ai.js',
+      '#ports/browser.js',
+    ]);
+
+    const systemNamespaceSyntheticFile = ts.createSourceFile(
+      '/virtual/forbidden-check-system-namespace.ts',
+      "import * as System from '#ports/system.js';",
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    expect(forbiddenCheckImports(systemNamespaceSyntheticFile)).toEqual(['#ports/system.js']);
+
+    const systemReExportSyntheticFile = ts.createSourceFile(
+      '/virtual/forbidden-check-system-re-export.ts',
+      "export { EventSink } from '#ports/system.js';",
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    expect(forbiddenCheckImports(systemReExportSyntheticFile)).toEqual(['#ports/system.js']);
+
+    const dynamicAdapterImportSyntheticFile = ts.createSourceFile(
+      '/virtual/forbidden-check-dynamic-adapter-import.ts',
+      "async function load() { return import('#adapters/ai/registry.js'); }",
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    expect(forbiddenCheckImports(dynamicAdapterImportSyntheticFile)).toEqual(['#adapters/ai/registry.js']);
+  });
+
   test('scans the current source tree without finding digest call-site violations', async () => {
     const sourceFiles = await findTypeScriptFiles(SOURCE_ROOT);
     const program = ts.createProgram({
