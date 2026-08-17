@@ -3344,6 +3344,70 @@ describe('run path-C pre-scan', () => {
     expect(resolveAiExecutor).not.toHaveBeenCalled();
     expect(aiCalls(events)).toEqual([]);
   });
+
+  /*
+   * `assertTrustedRunReferences` is reached from both `materializeTraceAction`
+   * and `materializeTraceAssert`, which back path C's replay and path B's
+   * fresh-agentic materialization alike (#157). Path C's malformed and
+   * ungranted rows above pre-scan a whole historical trace and so also prove
+   * an ordering guarantee ("before any browser or executor operation") that
+   * does not apply to path B, where each `perform`/`evaluateAssert` call is
+   * validated independently at the moment it is issued — so one row per
+   * failure mode is sufficient here. The two rows are spread across both
+   * call sites the validator is reached from (`navigate` via `perform`,
+   * `text-visible` via `evaluateAssert`) so both wirings are exercised
+   * without adding a third row.
+   *
+   * Neither row involves secret resolution, so neither needs a priming
+   * `fill-secret` call, and `session.operations()` stays empty in both —
+   * the rejection happens during materialization, before any browser call.
+   */
+  it.each([
+    [
+      'a malformed run reference in a navigate action',
+      async (request: AiAgenticRequest) => {
+        await request.controller.perform({ type: 'navigate', url: '/users/{{run.unclosed' });
+      },
+      'An AI trace contains a malformed run reference.',
+      undefined,
+    ],
+    [
+      'an ungranted run reference in a text-visible assertion',
+      async (request: AiAgenticRequest) => {
+        await request.controller.evaluateAssert({ type: 'assert', check: 'text-visible', text: 'Welcome {{run.ungranted}}' });
+      },
+      'An AI trace references a run value that this step is not allowed to use.',
+      { runRef: 'ungranted' },
+    ],
+  ] as const)('rejects %s before it reaches the browser', async (_description, performOffendingCall, expectedMessage, expectedDetails) => {
+    const session = createFakeBrowserSession(new Map());
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await performOffendingCall(request);
+        return { outcome: 'success' };
+      },
+    });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()]);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const error = outcome.results[0]?.error;
+
+    expect(error).toBeInstanceOf(IntegrityViolationError);
+    expect(error?.message).toBe(expectedMessage);
+    if (expectedDetails === undefined) {
+      expect(error?.details).toBeUndefined();
+    } else {
+      expect(error?.details).toEqual(expectedDetails);
+    }
+    expect(session.operations()).toEqual([]);
+    expect(resolveAiExecutor).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('run agentic wrapper state machine', () => {
@@ -5675,6 +5739,100 @@ describe('run credential-literal symmetry', () => {
     expect(aiCalls(events)).toEqual([]);
   });
 
+  /*
+   * The same `TRACE_ENTRY_CLOSED_VOCABULARY_PATHS` exclusion backs both call
+   * sites of `traceEntryContainsResolvedSecret`, so a resolved secret that
+   * happens to equal a `type`/`check`/`target.strategy`/`key`/`secretRef`
+   * literal must not be misread as a leaked secret on path B either (#157).
+   *
+   * Every row ends with `snapshotForResolution()` rather than a passing
+   * trailing assertion. `finalize()` only persists a new grounding entry
+   * after a passing, trailing assertion; the grounding-persistence boundary's
+   * own `jsonContainsResolvedSecret` call has no closed-vocabulary exclusion
+   * (unlike the trace-entry scan), so a passing row would be correctly waved
+   * through the check this test targets and then incorrectly rejected by the
+   * unrelated, unexcluded persistence check — defeating the test. Ending in a
+   * snapshot keeps the journal unpersisted, isolating the trace-entry-level
+   * contract under test.
+   *
+   * The `secretRef` row resolves its two secrets in the reverse order from
+   * the stored-trace version: path B has no whole-trace pre-resolution pass,
+   * so the shorter secret (`'tok'`) must already be resolved by an earlier
+   * `fill-secret` call before the entry whose own `secretRef` field text
+   * contains it as a substring (`'{{secrets.trace.token}}'`) is scanned —
+   * otherwise the row would pass even without the exclusion.
+   */
+  it.each([
+    [
+      'type',
+      new Map([['{{secrets.trace.type}}', 'click']]),
+      async (request: AiAgenticRequest, secretRefs: readonly string[]) => {
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: secretRefs[0]! });
+        await request.controller.perform({ type: 'click', target: SUBMIT });
+      },
+    ],
+    [
+      'check',
+      new Map([['{{secrets.trace.check}}', 'element-visible']]),
+      async (request: AiAgenticRequest, secretRefs: readonly string[]) => {
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: secretRefs[0]! });
+        await request.controller.evaluateAssert({ type: 'assert', check: 'element-visible', target: SUBMIT });
+      },
+    ],
+    [
+      'target.strategy',
+      new Map([['{{secrets.trace.strategy}}', 'accessibility']]),
+      async (request: AiAgenticRequest, secretRefs: readonly string[]) => {
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: secretRefs[0]! });
+        await request.controller.perform({ type: 'click', target: SUBMIT });
+      },
+    ],
+    [
+      'key',
+      new Map([['{{secrets.trace.key}}', 'Enter']]),
+      async (request: AiAgenticRequest, secretRefs: readonly string[]) => {
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: secretRefs[0]! });
+        await request.controller.perform({ type: 'press', target: SUBMIT, key: 'Enter' });
+      },
+    ],
+    [
+      'secretRef',
+      new Map([
+        ['{{secrets.trace.tok}}', 'tok'],
+        ['{{secrets.trace.token}}', 'first-secret-value'],
+      ]),
+      async (request: AiAgenticRequest, secretRefs: readonly string[]) => {
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: secretRefs[0]! });
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: secretRefs[1]! });
+      },
+    ],
+  ] as const)('permits incidental resolved-secret matches in fresh-agentic %s closed vocabulary', async (_path, secretValues, performOffendingCalls) => {
+    const secretRefs = [...secretValues.keys()];
+    const session = createFakeBrowserSession(liveEntries([PASSWORD, SUBMIT]));
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await performOffendingCalls(request, secretRefs);
+        await request.controller.snapshotForResolution();
+        return { outcome: 'success' };
+      },
+    });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(secretValues),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRefs.join('\n')}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep('recorded-ai', secretRefs)]);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(resolveAiExecutor).toHaveBeenCalledTimes(1);
+    expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'recorded-ai' }]);
+  });
+
   it('does not scan object keys while inspecting stored traces', async () => {
     const secretRef = '{{secrets.trace.object_key}}';
     const secretValue = 'target';
@@ -5791,6 +5949,101 @@ describe('run credential-literal symmetry', () => {
     expect(error?.details).toBeUndefined();
     expect(JSON.stringify(error?.details ?? {})).not.toContain(secretValue);
     expect(session.operations().filter((operation) => operation.type === 'fill-secret')).toHaveLength(1);
+  });
+
+  /*
+   * `target.role` is scanned like any other trace field — it is not in
+   * `TRACE_ENTRY_CLOSED_VOCABULARY_PATHS` — so a resolved secret echoed into
+   * an ARIA role must be rejected the same way on both replay paths, because
+   * `traceEntryContainsResolvedSecret` backs `preScanTraceEntry` (path C) and
+   * `assertNoMaterializedLiteral` (path B) alike (#157).
+   *
+   * Unlike path C, which pre-scans a whole historical trace before any
+   * browser operation, path B has no such pre-pass: the secret must already
+   * be resolved by an earlier `fill-secret` call before the role-echoing
+   * action can even be attempted, so every row primes `resolvedSecrets` with
+   * one `fill-secret` first. That priming call is itself a real session
+   * operation, so a plain `session.operations()` toEqual([]) assertion
+   * (path C's shape) would not hold here; each row instead carries the
+   * operation-type its own offending call would have produced, plus the
+   * count expected to have completed before the rejection, and the shared
+   * assertion body filters on that rather than hard-coding per-row logic.
+   */
+  it.each([
+    [
+      'click',
+      (secretRef: string, target: ElementRef) => async (request: AiAgenticRequest) => {
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef });
+        await request.controller.perform({ type: 'click', target });
+      },
+      'perform',
+      0,
+    ],
+    [
+      'press',
+      (secretRef: string, target: ElementRef) => async (request: AiAgenticRequest) => {
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef });
+        await request.controller.perform({ type: 'press', target, key: 'Enter' });
+      },
+      'perform',
+      0,
+    ],
+    [
+      'fill-secret',
+      (secretRef: string, target: ElementRef) => async (request: AiAgenticRequest) => {
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef });
+        await request.controller.perform({ type: 'fill-secret', target, secretRef });
+      },
+      'fill-secret',
+      1,
+    ],
+    [
+      'element-visible',
+      (secretRef: string, target: ElementRef) => async (request: AiAgenticRequest) => {
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef });
+        await request.controller.evaluateAssert({ type: 'assert', check: 'element-visible', target });
+      },
+      'evaluate-assert',
+      0,
+    ],
+    [
+      'element-count',
+      (secretRef: string, target: ElementRef) => async (request: AiAgenticRequest) => {
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef });
+        await request.controller.evaluateAssert({ type: 'assert', check: 'element-count', target, count: 1 });
+      },
+      'evaluate-assert',
+      0,
+    ],
+  ] as const)('rejects a materialized secret in a fresh-agentic %s target role', async (_description, buildActions, operationType, expectedCount) => {
+    const secretRef = '{{secrets.auth.target_role}}';
+    const secretValue = 'TARGET-ROLE-SECRET-VALUE';
+    const secretRoleTarget: ElementRef = { strategy: 'accessibility', role: secretValue, name: 'Secret-independent target' };
+    const session = createFakeBrowserSession(liveEntries([PASSWORD, secretRoleTarget]));
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await buildActions(secretRef, secretRoleTarget)(request);
+        return { outcome: 'success' };
+      },
+    });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep('recorded-ai', [secretRef])]);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const error = outcome.results[0]?.error;
+
+    expect(error).toBeInstanceOf(IntegrityViolationError);
+    expect(error?.message).toBe('The AI adapter supplied a materialized value instead of an unresolved reference.');
+    expect(error?.details).toBeUndefined();
+    expect(JSON.stringify(error?.details ?? {})).not.toContain(secretValue);
+    expect(session.operations().filter((operation) => operation.type === operationType)).toHaveLength(expectedCount);
+    expect(resolveAiExecutor).toHaveBeenCalledTimes(1);
   });
 
   it('rejects a resolved secret echoed in a stored fill-secret target name before replay', async () => {
