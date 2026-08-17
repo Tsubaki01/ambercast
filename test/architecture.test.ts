@@ -19,34 +19,87 @@ const CHECK_MODULE_FILE = fileURLToPath(new URL('../src/usecases/check.ts', impo
 const CHECK_COMMAND_MODULE_FILE = fileURLToPath(new URL('../src/runtime/check-command.ts', import.meta.url));
 
 function forbiddenCheckImports(sourceFile: ts.SourceFile): string[] {
-  return sourceFile.statements.flatMap((statement) => {
-    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) {
-      return [];
+  const forbiddenSpecifiers: string[] = [];
+
+  function scanSpecifier(
+    moduleSpecifier: ts.Expression | undefined,
+    bindings: ts.NamedImports | ts.NamespaceImport | ts.NamedExports | ts.NamespaceExport | undefined,
+  ): void {
+    if (moduleSpecifier === undefined || !ts.isStringLiteral(moduleSpecifier)) {
+      return;
     }
 
-    const specifier = statement.moduleSpecifier.text;
-    const namedBindings = statement.importClause?.namedBindings;
-    const importsEventOrSecretsPort = (specifier === '#ports/system.js' || specifier.endsWith('/ports/system.js'))
-      && namedBindings !== undefined
-      && ts.isNamedImports(namedBindings)
-      && namedBindings.elements.some(({ name }) => name.text === 'EventSink' || name.text === 'SecretsProvider');
-    const forbidden = [
-      'fake-ai-executor',
-      'fake-browser-driver',
-      'fake-ai-action-controller',
-      'fake-browser-session',
-      'fake-secrets-provider',
-      'create-recording-event-sink',
-      'noop-event-sink',
-      'env-secrets-provider',
-    ].some((fragment) => specifier.includes(fragment))
+    const specifier = moduleSpecifier.text;
+    const importsEventOrSecretsPort = isForbiddenSystemPortBinding(specifier, bindings);
+    const forbidden = isAiOrBrowserPortSpecifier(specifier)
+      || [
+        'fake-ai-executor',
+        'fake-browser-driver',
+        'fake-ai-action-controller',
+        'fake-browser-session',
+        'fake-secrets-provider',
+        'create-recording-event-sink',
+        'noop-event-sink',
+        'env-secrets-provider',
+      ].some((fragment) => specifier.includes(fragment))
       || specifier.startsWith('#adapters/ai/')
       || specifier.startsWith('#adapters/browser/')
       || specifier.endsWith('/create-ambercast.js')
       || specifier.endsWith('/resolve-ai-provider.js')
       || importsEventOrSecretsPort;
 
-    return forbidden ? [specifier] : [];
+    if (forbidden) {
+      forbiddenSpecifiers.push(specifier);
+    }
+  }
+
+  function visit(node: ts.Node): void {
+    if (ts.isImportDeclaration(node)) {
+      scanSpecifier(node.moduleSpecifier, node.importClause?.namedBindings);
+    } else if (ts.isExportDeclaration(node)) {
+      scanSpecifier(node.moduleSpecifier, node.exportClause);
+    } else if (
+      ts.isCallExpression(node)
+      && node.expression.kind === ts.SyntaxKind.ImportKeyword
+    ) {
+      scanSpecifier(node.arguments[0], undefined);
+    }
+
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return forbiddenSpecifiers;
+}
+
+function isAiOrBrowserPortSpecifier(specifier: string): boolean {
+  return ['ai', 'browser'].some((port) => (
+    specifier === `#ports/${port}.js` || specifier.endsWith(`/ports/${port}.js`)
+  ));
+}
+
+function isForbiddenSystemPortBinding(
+  specifier: string,
+  bindings: ts.NamedImports | ts.NamespaceImport | ts.NamedExports | ts.NamespaceExport | undefined,
+): boolean {
+  if (
+    (specifier !== '#ports/system.js' && !specifier.endsWith('/ports/system.js'))
+    || bindings === undefined
+  ) {
+    return false;
+  }
+
+  if (ts.isNamespaceImport(bindings) || ts.isNamespaceExport(bindings)) {
+    return true;
+  }
+
+  if (!ts.isNamedImports(bindings) && !ts.isNamedExports(bindings)) {
+    return false;
+  }
+
+  return bindings.elements.some(({ name, propertyName }) => {
+    const importedName = propertyName?.text ?? name.text;
+    return importedName === 'EventSink' || importedName === 'SecretsProvider';
   });
 }
 
@@ -116,6 +169,44 @@ describe('architecture guardrails', () => {
       '../../test/doubles/create-recording-event-sink.js',
       '#adapters/system/env-secrets-provider.js',
     ]);
+
+    const directAiAndBrowserPortsSyntheticFile = ts.createSourceFile(
+      '/virtual/forbidden-check-ai-and-browser-ports.ts',
+      [
+        "import type { AiExecutor } from '#ports/ai.js';",
+        "import type { BrowserDriver } from '#ports/browser.js';",
+      ].join('\n'),
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    expect(forbiddenCheckImports(directAiAndBrowserPortsSyntheticFile)).toEqual([
+      '#ports/ai.js',
+      '#ports/browser.js',
+    ]);
+
+    const systemNamespaceSyntheticFile = ts.createSourceFile(
+      '/virtual/forbidden-check-system-namespace.ts',
+      "import * as System from '#ports/system.js';",
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    expect(forbiddenCheckImports(systemNamespaceSyntheticFile)).toEqual(['#ports/system.js']);
+
+    const systemReExportSyntheticFile = ts.createSourceFile(
+      '/virtual/forbidden-check-system-re-export.ts',
+      "export { EventSink } from '#ports/system.js';",
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    expect(forbiddenCheckImports(systemReExportSyntheticFile)).toEqual(['#ports/system.js']);
+
+    const dynamicAdapterImportSyntheticFile = ts.createSourceFile(
+      '/virtual/forbidden-check-dynamic-adapter-import.ts',
+      "async function load() { return import('#adapters/ai/registry.js'); }",
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    expect(forbiddenCheckImports(dynamicAdapterImportSyntheticFile)).toEqual(['#adapters/ai/registry.js']);
   });
 
   test('scans the current source tree without finding digest call-site violations', async () => {

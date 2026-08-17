@@ -17,7 +17,7 @@ import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest } from '#core/ir/digest.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import { PlanDocument, type JsonValueT, type TargetDefinition } from '#core/ir/schema.js';
-import type { LayoutResolver } from '#core/layout/resolve.js';
+import { GROUNDING_SUFFIX, PLAN_SUFFIX, type LayoutResolver } from '#core/layout/resolve.js';
 import { joinPath } from '#core/paths.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { CheckResult } from '#report/schema.js';
@@ -279,12 +279,12 @@ export async function check(deps: CheckDeps, options: CheckOptions): Promise<Che
   const artifactIgnore = artifactTestIgnore(deps.config.testIgnore);
   const planPaths = (await deps.discoverTestFiles({
     testDir: deps.config.testDir,
-    testMatch: ['**/*.ambercast.plan.json'],
+    testMatch: [`**/*${PLAN_SUFFIX}`],
     testIgnore: artifactIgnore,
   })).map((path) => joinPath(deps.config.testDir, path));
   const groundingPaths = (await deps.discoverTestFiles({
     testDir: deps.config.testDir,
-    testMatch: ['**/*.ambercast.grounding.json'],
+    testMatch: [`**/*${GROUNDING_SUFFIX}`],
     testIgnore: artifactIgnore,
   })).map((path) => joinPath(deps.config.testDir, path));
   const orphanFindings: CheckFileOutcome[] = [];
@@ -310,7 +310,7 @@ export async function check(deps: CheckDeps, options: CheckOptions): Promise<Che
         file: testPath,
         planFile: deps.layout.planPathFor(testPath),
         status: 'orphaned-grounding',
-        reason: `No corresponding test file exists for the test at ${groundingPath}.`,
+        reason: `No corresponding test file exists for the grounding artifact at ${groundingPath}.`,
       });
     }
   }
@@ -366,8 +366,8 @@ function resolveTarget(
  */
 function artifactTestIgnore(testIgnore: readonly string[]): readonly string[] {
   const selfIgnore = new Set([
-    '**/*.ambercast.plan.json',
-    '**/*.ambercast.grounding.json',
+    `**/*${PLAN_SUFFIX}`,
+    `**/*${GROUNDING_SUFFIX}`,
   ]);
 
   return testIgnore.filter((pattern) => !selfIgnore.has(pattern));

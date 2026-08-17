@@ -276,7 +276,7 @@ describe('check', () => {
     }));
 
     await expect(check(deps, { ...OPTIONS, files: [testPath] })).resolves.toMatchObject({
-      results: [{ id: testPath, status: 'stale', reason: expect.stringMatching(/canonical/i) }],
+      results: [{ id: testPath, status: 'stale', reason: 'The plan cannot be canonically verified.' }],
       errors: [],
     });
   });
@@ -319,7 +319,7 @@ describe('check', () => {
         file: orphanPath,
         planFile: layout.planPathFor(orphanPath),
         status: 'orphaned-grounding',
-        reason: expect.stringContaining(groundingPath),
+        reason: `No corresponding test file exists for the grounding artifact at ${groundingPath}.`,
       }],
     });
   });

@@ -16,8 +16,8 @@ import { ConfigInvalidError } from '#core/errors/config-invalid-error.js';
 import { basenamePath, dirnamePath, isAbsolutePath, joinPath, relativeWithin } from '#core/paths.js';
 
 const TEST_SUFFIX = '.test.md';
-const PLAN_SUFFIX = '.ambercast.plan.json';
-const GROUNDING_SUFFIX = '.ambercast.grounding.json';
+export const PLAN_SUFFIX = '.ambercast.plan.json';
+export const GROUNDING_SUFFIX = '.ambercast.grounding.json';
 const RUN_ID_PATTERN = /^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$/;
 
 /**
