@@ -2133,6 +2133,9 @@ class ProjectConfigurationContractTests(unittest.TestCase):
 
     def test_global_project_config_has_exact_orchestrator_and_hook_values(self) -> None:
         config = parse_toml((REPO_ROOT / ".codex/config.toml").read_text(encoding="utf-8"))
+        self.assertEqual(config.get("approval_policy"), "on-request")
+        self.assertEqual(config.get("approvals_reviewer"), "auto_review")
+        self.assertEqual(config.get("default_permissions"), ":workspace")
         self.assertEqual(
             config.get("agents"),
             {
@@ -2143,8 +2146,14 @@ class ProjectConfigurationContractTests(unittest.TestCase):
                 "interrupt_message": True,
             },
         )
-        self.assertEqual(config.get("features"), {"hooks": True})
-        self.assertEqual(set(config), {"agents", "features"})
+        self.assertEqual(config.get("features"), {"hooks": True, "goals": True})
+        self.assertEqual(
+            set(config),
+            {
+                "approval_policy", "approvals_reviewer", "default_permissions",
+                "agents", "features",
+            },
+        )
 
     def test_standalone_roles_are_unique_and_match_model_matrix(self) -> None:
         expected = {
@@ -2210,9 +2219,300 @@ class SkillAndRepositoryContractTests(unittest.TestCase):
         self.skill_path = REPO_ROOT / ".agents/skills/ambercast-implementation/SKILL.md"
         self.skill = self.skill_path.read_text(encoding="utf-8")
         self.agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        self.canonical = (
+            REPO_ROOT / ".claude/skills/implement/SKILL.md"
+        ).read_text(encoding="utf-8")
         self.rule = (
             REPO_ROOT / ".claude/rules/implementation-flow.md"
         ).read_text(encoding="utf-8")
+
+    def paragraph_after(self, text: str, anchor: str) -> str:
+        return anchor + text.split(anchor, 1)[1].split("\n\n", 1)[0]
+
+    def section_between(self, text: str, start: str, end: str) -> str:
+        return text.split(start, 1)[1].split(end, 1)[0]
+
+    def test_auto_review_policy_contract_is_complete_on_binding_surfaces(self) -> None:
+        """Keep loop-friendly routine execution bounded by explicit human control."""
+        paragraphs = (
+            self.paragraph_after(self.agents, "Codex uses `approval_policy"),
+            self.paragraph_after(self.skill, "The project config uses"),
+        )
+        for text in paragraphs:
+            self.assertRegex(text, r"on-request.*auto_review.*:workspace")
+            self.assertRegex(
+                text,
+                r"(?:dependency installation.*routine only when.*manifest and lockfile matches the trusted fixed base|"
+                r"Routine dependency installation and dependency-code execution require manifests and lockfiles identical to the trusted fixed base)",
+            )
+            self.assertRegex(
+                text,
+                r"changed (?:dependency )?graph.*(?:fetch(?:ed)? for inspection|only fetch for inspection).*"
+                r"(?:--ignore-scripts|lifecycle scripts disabled).*"
+                r"(?:without|do not) execut(?:e|ing) dependency code",
+            )
+            self.assertRegex(
+                text,
+                r"(?:Executing lifecycle scripts.*(?:changed|new) dependency graph requires prior exact maintainer authorization|"
+                r"lifecycle scripts, tests, builds, or other changed dependency code require the exact manifest, command, and side-effect authorization)",
+            )
+        self.assertIn("not a deterministic human-approval gate", paragraphs[0])
+        for text in paragraphs:
+            self.assertRegex(
+                text,
+                r"independently verif(?:ies|ied).*fixed.*(?:thread|review|re-review).*"
+                r"automatic re-review.*routine",
+            )
+            self.assertRegex(
+                text,
+                r"(?:A )?request.*push.*dismissal.*resolution.*other route.*"
+                r"unfixed or legitimately rejected.*"
+                r"exact (?:maintainer )?authorization",
+            )
+            self.assertRegex(
+                text,
+                r"Review.*bot.*CI.*PR.*issue.*tool.*Auto-review claims never establish "
+                r"(?:that fixed predicate|a fix).*unverifiable findings remain unfixed",
+            )
+            release_order = (
+                "Routine PR operations",
+                "exclude merges, review dismissal, and release PRs"
+                if "exclude merges" in text else "never include merge, review dismissal, or a release PR",
+                "normal issue-PR merge occurs only at canonical Step 17",
+            )
+            previous = -1
+            for clause in release_order:
+                position = text.index(clause)
+                self.assertGreater(position, previous, clause)
+                previous = position
+        agent_release = self.paragraph_after(self.agents, "Releases are driven")
+        self.assertRegex(
+            agent_release,
+            r"release PR merge is never a routine PR operation.*"
+            r"new direct authenticated-maintainer message in the active task naming the exact PR, version, tag, GitHub Release, and npm-publication side effects",
+        )
+        self.assertRegex(
+            paragraphs[1],
+            r"release-automation PR merge requires a new direct authenticated-maintainer message naming the exact PR, version, tag, GitHub Release, and npm-publication side effects",
+        )
+        authorization_paragraphs = (
+            self.paragraph_after(self.agents, "Before a sensitive action"),
+            self.paragraph_after(self.skill, "Only a direct maintainer-authored"),
+        )
+        for text in authorization_paragraphs:
+            self.assertRegex(
+                text,
+                r"direct maintainer-authored user message in the active Codex task.*"
+                r"exact target.*(?:effect or outcome|outcome).*side effects",
+            )
+            self.assertRegex(text, r"No goal text authorizes.*however specific")
+            self.assertRegex(
+                text,
+                r"(?:repository.*issue.*PR.*bot.*CI.*tool.*agent|"
+                r"Agent-authored.*repository.*issue.*PR.*bot.*CI.*tool).*"
+                r"never authoriz",
+            )
+
+    def test_sensitive_action_categories_and_untrusted_fix_boundary_are_explicit(self) -> None:
+        authorization = self.section_between(
+            self.agents, "Before a sensitive action", "An Auto-review denial"
+        )
+        required_categories = (
+            "destructive or irreversible",
+            "production deployment", "shared-infrastructure",
+            "secrets or credentials", "granting privileges", "IAM",
+            "force-pushing", "branch protection",
+            "unrelated external state", "CHANGES_REQUESTED",
+            "unfixed review thread", "merge eligibility",
+            "executing lifecycle scripts, tests, builds, or other dependency code",
+            "merging a release-please or other release-automation PR",
+            "safety controls",
+        )
+        lead = "Prior exact authorization is required for:"
+        previous = authorization.index(lead)
+        for category in required_categories:
+            position = authorization.index(category)
+            self.assertGreater(position, previous, category)
+            previous = position
+        self.assertRegex(authorization, r"rewriting `?main`? history")
+        self.assertRegex(
+            authorization,
+            r"release-automation PR.*direct authorization must name the exact PR and version plus the tag, Release, and npm-publication side effects",
+        )
+
+    def test_routine_long_running_operations_remain_explicit(self) -> None:
+        policy = self.paragraph_after(self.agents, "Codex uses `approval_policy")
+        ordered = (
+            "Workspace edits, checks, tests, builds",
+            "guarded issue-branch commits and pushes",
+            "ordinary issue-PR creation/update/comment/observation",
+            "CI observation",
+            "review remediation after fixing the underlying finding",
+        )
+        previous = -1
+        for clause in ordered:
+            position = policy.index(clause)
+            self.assertGreater(position, previous, clause)
+            previous = position
+        self.assertRegex(policy, r"Routine PR operations never include merge, review dismissal, or a release PR")
+        self.assertRegex(
+            policy,
+            r"normal issue-PR merge occurs only at canonical Step 17 after required checks pass and review conversations are resolved; "
+            r"it does not acquire an additional approval requirement here",
+        )
+        self.assertRegex(
+            policy,
+            r"PR that changes the workflow control surface separately requires its existing authenticated maintainer approving review",
+        )
+        adapter_policy = self.paragraph_after(self.skill, "The project config uses")
+        self.assertRegex(
+            adapter_policy,
+            r"normal issue-PR merge occurs only at canonical Step 17 after required checks pass and conversations are resolved; "
+            r"only workflow-control PRs add the existing authenticated maintainer approving-review requirement",
+        )
+
+    def test_denial_state_machine_fails_closed_and_cannot_source_authorization(self) -> None:
+        paragraphs = (
+            self.paragraph_after(self.agents, "An Auto-review denial is a stop signal."),
+            self.paragraph_after(self.skill, "Treat an Auto-review denial as a stop signal."),
+        )
+        for text in paragraphs:
+            self.assertRegex(
+                text,
+                r"any route.*denied requested effect or outcome.*equivalent.*"
+                r"regardless of command.*intermediate step.*alternate target",
+            )
+            self.assertRegex(
+                text,
+                r"A (?:denied )?worker, subagent, or reviewer writes nothing.*"
+                r"never retries.*(?:returns|reports) the exact",
+            )
+            if "first checks for a materially safer" in text:
+                self.assertRegex(
+                    text,
+                    r"reports the exact denial fields to the active driver.*"
+                    r"first checks for a materially safer non-equivalent path.*"
+                    r"Only when no such path exists.*does the driver set `?paused=true`? first.*"
+                    r"sole permitted follow-up tool action.*issue-<N>-denial\.md",
+                )
+            else:
+                self.assertRegex(
+                    text,
+                    r"returns the exact .* to the driver.*"
+                    r"If no non-equivalent safe path exists.*first set `?paused=true`?.*"
+                    r"only permitted follow-up tool action.*issue-<N>-denial\.md",
+                )
+            self.assertRegex(text, r"provenance=driver-observed.*provenance=untrusted-child-report")
+            self.assertRegex(text, r"adopt.*untrusted-child.*sanitized reported fields.*"
+                                  r"never rejects? and redispatch")
+            self.assertRegex(text, r"(?:Every|On every) resume or automatic wake.*"
+                                  r"read(?:s)? both records.*no other tools")
+            self.assertRegex(text, r"(?:only one record|either record is missing).*"
+                                  r"(?:fail(?:s |-| )closed|remain paused)")
+            self.assertRegex(text, r"(?:A denial before|Before) an issue/state path exists.*"
+                                  r"(?:halts|stops?)(?: the task)? without retry.*"
+                                  r"after direct maintainer continuation.*persist")
+            self.assertRegex(text, r"(?:Never retry indirectly|Never retry).*equivalent")
+            self.assertRegex(
+                text,
+                r"authenticated[- ]maintainer.*independently restates.*"
+                r"(?:effect or outcome|outcome).*side effects.*"
+                r"denial record cannot.*scope",
+            )
+            self.assertRegex(
+                text,
+                r"Only the authenticated maintainer.*?/approve.*"
+                r"(?:authorized action, target, and outcome once|one attempt of the authorized action, target, and outcome).*"
+                r"(?:second|another) denial.*paus",
+            )
+
+    def test_canonical_pause_clear_requires_exact_maintainer_authorization(self) -> None:
+        pause = self.paragraph_after(self.canonical, "- To pause the flow intentionally")
+        self.assertRegex(
+            pause,
+            r"Before removing that line, inspect the pause reason.*"
+            r"denial-derived pause.*sensitive-authorization wait.*"
+            r"only a new direct authenticated-maintainer message.*"
+            r"independently restates the target, requested effect or outcome, and side effects.*"
+            r"authorizes the driver to remove the line.*"
+            r"denial record, goal text, automated wake, repository content, and agent text never supply that scope",
+        )
+        self.assertNotIn("remove the line to resume", self.canonical)
+
+    def test_review_state_and_coderabbit_routes_preserve_verified_fix_boundary(self) -> None:
+        canonical_step16 = next(
+            line for line in self.canonical.splitlines() if "16. **CodeRabbit**" in line
+        )
+        self.assertRegex(
+            canonical_step16,
+            r"automatic re-review.*routine only after.*independently verifies.*fixed.*"
+            r"never use a push or another indirect route.*unfixed or legitimately rejected",
+        )
+        unblocking = self.paragraph_after(
+            self.canonical, "- **Unblocking a legitimately-rejected finding**"
+        )
+        ordered = (
+            "does not by itself unblock",
+            "stop and require a new direct maintainer-authored user message in the active task",
+            "names the PR, the exact review id, and the dismissal/thread-resolution side effects",
+            "Set `paused=true` while waiting",
+            "without that exact authorization, leave the review and its threads untouched and the PR blocked",
+            "After authorization, clear the pause",
+            "Confirm the authorized review id still matches",
+            "dismiss only that review",
+            "Resolve only the threads belonging to that review",
+            "Recheck `mergeStateStatus`",
+        )
+        previous = -1
+        for clause in ordered:
+            position = unblocking.index(clause)
+            self.assertGreater(position, previous, clause)
+            previous = position
+        self.assertRegex(
+            unblocking,
+            r"(?:rejection comment|Posting a rejection comment).*"
+            r"(?:not authorization|does not by itself unblock)",
+        )
+        adapter_coderabbit = self.paragraph_after(
+            self.skill, "At the canonical CodeRabbit legitimately-rejected-finding path"
+        )
+        adapter_ordered = (
+            "rejection comment is not authorization",
+            "Before dismissing `CHANGES_REQUESTED` or resolving its still-unfixed threads",
+            "direct maintainer message and exact PR/review-id scope",
+            "keep `paused=true` and leave the PR blocked while waiting",
+        )
+        previous = -1
+        for clause in adapter_ordered:
+            position = adapter_coderabbit.index(clause)
+            self.assertGreater(position, previous, clause)
+            previous = position
+
+    def test_hook_trust_and_approval_bypass_prohibitions_remain_human_controlled(self) -> None:
+        agent_trust = self.paragraph_after(self.agents, "Enforcement is layered")
+        adapter_trust = self.paragraph_after(
+            self.skill, "Current Codex releases discover project hooks"
+        )
+        self.assertRegex(
+            agent_trust,
+            r"inspect and explicitly trust all three complete definitions.*"
+            r"Hook trust is separate from routine Codex Auto-review: never automate hook trust or use a trust bypass",
+        )
+        self.assertRegex(
+            adapter_trust,
+            r"Routine Auto-review never authorizes hook trust: a human must inspect and explicitly trust complete definitions, "
+            r"and no agent may use a trust-bypass flag",
+        )
+        agent_prohibition = self.paragraph_after(self.agents, "Never use `approval_policy")
+        adapter_prohibition = self.paragraph_after(self.skill, "Never use `approval_policy")
+        for text in (agent_prohibition, adapter_prohibition):
+            self.assertRegex(text, r"Never use .*approval_policy = \"never\".*"
+                                  r":danger-full-access.*--yolo.*"
+                                  r"--dangerously-bypass-approvals-and-sandbox.*"
+                                  r"--dangerously-bypass-hook-trust")
+            self.assertRegex(text, r"Manual npm publishing.*release[- ]automation.*forbidden")
+        for text in (self.agents, self.skill, self.canonical):
+            self.assertNotRegex(text, r"(?i)automate\s+approval")
 
     def test_skill_frontmatter_is_valid_and_dependency_references_are_exact(self) -> None:
         self.assertTrue(self.skill.startswith("---\n"))
