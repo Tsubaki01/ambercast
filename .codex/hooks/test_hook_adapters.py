@@ -48,10 +48,21 @@ GIT_GUARD = load("guard_git.py")
 PHASE_GUARD = load("guard_phase.py")
 STOP_GUARD = load("guard_stop.py")
 
+GIT_ENV = {
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_SYSTEM": os.devnull,
+    "GIT_TERMINAL_PROMPT": "0",
+}
+
 
 def git(cwd: pathlib.Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["git", *args], cwd=cwd, check=check, capture_output=True, text=True
+        ["git", *args],
+        cwd=cwd,
+        check=check,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **GIT_ENV},
     )
 
 
@@ -110,7 +121,7 @@ class AdapterRepositoryCase(unittest.TestCase):
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         shared_path = shared or self.root / ".claude/hooks" / adapter
-        process_env = os.environ.copy()
+        process_env = {**os.environ, **GIT_ENV}
         process_env.pop("AMBERCAST_GUARD_STOP", None)
         process_env.update(env or {})
         return subprocess.run(
