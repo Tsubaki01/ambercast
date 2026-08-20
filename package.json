@@ -54,6 +54,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "lint:deps": "depcruise --config .dependency-cruiser.mjs src",
+    "test:agent-hooks": "python3 -m unittest discover -s .claude/hooks -p 'test_*.py' && python3 -m unittest discover -s .codex/hooks -p 'test_*.py'",
     "test:contract:ai": "vitest run --config vitest.config.contract-ai.ts",
     "test:contract:browser": "vitest run --config vitest.config.contract-browser.ts",
     "pretest": "npm run build",

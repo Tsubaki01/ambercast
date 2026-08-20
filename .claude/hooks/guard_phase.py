@@ -10,6 +10,11 @@ Rules (exit 2 blocks the edit):
 - src/ and test edits require `step05_plan_revised=done` (plan reviewed & revised)
 - test edits additionally require `step08_docs_review=done` (docs-first reviewed)
 
+Branch evidence deliberately distinguishes a detached worktree from unavailable
+policy evidence. The shared Claude boundary remains fail-open, while the Codex
+adapter observes policy probes and blocks when evidence is ambiguous. Evidence
+required to establish repository ownership or recovery state cannot be empty.
+
 Files outside src/ and tests are never blocked.
 """
 from __future__ import annotations
@@ -58,7 +63,7 @@ def evaluate(path: str, data: dict) -> tuple[int, str] | None:
         return None
 
     in_src = rel.startswith("src" + os.sep) or rel.startswith("bin" + os.sep)
-    in_tests = rel.startswith("tests" + os.sep) or bool(
+    in_tests = rel.startswith(("test" + os.sep, "tests" + os.sep)) or bool(
         re.search(r"\.(test|spec)\.[cm]?[jt]sx?$", rel)
     )
     if not (in_src or in_tests):
@@ -71,19 +76,19 @@ def evaluate(path: str, data: dict) -> tuple[int, str] | None:
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    if git_dir_check.returncode != 0:
+    if git_dir_check.returncode != 0 or not git_dir_check.stdout.strip():
         return None
 
     try:
         res = subprocess.run(
-            ["git", "-C", proj, "symbolic-ref", "--short", "HEAD"],
+            ["git", "-C", proj, "symbolic-ref", "--quiet", "--short", "HEAD"],
             capture_output=True, text=True, timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    if res.returncode == 0:
+    if res.returncode == 0 and res.stdout.strip():
         branch = res.stdout.strip()
-    else:
+    elif res.returncode == 1 and not res.stdout.strip():
         # Detached HEAD. Mid-rebase (gh stack rebase/sync) the flow is still on
         # a stack layer — recover the branch being rebased; otherwise block.
         # Resolve the git dir through git itself: in linked worktrees .git is a
@@ -95,7 +100,9 @@ def evaluate(path: str, data: dict) -> tuple[int, str] | None:
             )
         except (OSError, subprocess.SubprocessError):
             return None
-        gitdir = gitdir_res.stdout.strip() if gitdir_res.returncode == 0 else ""
+        if gitdir_res.returncode != 0 or not gitdir_res.stdout.strip():
+            return None
+        gitdir = gitdir_res.stdout.strip()
         branch = ""
         if gitdir:
             for d in ("rebase-merge", "rebase-apply"):
@@ -111,6 +118,8 @@ def evaluate(path: str, data: dict) -> tuple[int, str] | None:
                 "BLOCKED: detached HEAD outside a rebase — source/test edits are "
                 "only allowed on an issues/<N> branch. See /implement.",
             )
+    else:
+        return None
 
     m = re.fullmatch(r"issues/([0-9]+)(?:-[a-z0-9]+)*", branch)
     if not m:
