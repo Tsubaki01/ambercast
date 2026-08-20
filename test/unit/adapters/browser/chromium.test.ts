@@ -508,6 +508,49 @@ function deferred<T>(): { readonly promise: Promise<T>; resolve(value: T): void 
   };
 }
 
+function safelySerializeErrorSurface(error: unknown): string {
+  const seen = new WeakSet<object>();
+  const maxDepth = 8;
+  const maxProperties = 64;
+
+  function visit(value: unknown, depth: number): unknown {
+    if (typeof value === 'bigint') {
+      return value.toString();
+    }
+    if (typeof value !== 'object' || value === null) {
+      return value;
+    }
+    if (seen.has(value)) {
+      return '[Circular]';
+    }
+    if (depth >= maxDepth) {
+      return '[Maximum depth]';
+    }
+    seen.add(value);
+
+    const surface: Record<string, unknown> = value instanceof Error
+      ? { message: value.message, name: value.name }
+      : {};
+    const properties = Object.getOwnPropertyNames(value);
+    for (const property of properties.slice(0, maxProperties)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, property);
+      surface[property] = descriptor !== undefined && 'value' in descriptor
+        ? visit(descriptor.value, depth + 1)
+        : '[Accessor property]';
+    }
+    if (properties.length > maxProperties) {
+      surface['[Truncated properties]'] = properties.length - maxProperties;
+    }
+    return surface;
+  }
+
+  try {
+    return JSON.stringify(visit(error, 0)) ?? String(error);
+  } catch {
+    return '[Unserializable error surface]';
+  }
+}
+
 function captureConsoleOutput() {
   const spies = [
     vi.spyOn(console, 'debug').mockImplementation(() => undefined),
@@ -519,7 +562,7 @@ function captureConsoleOutput() {
 
   return {
     expectSecretFree(error: unknown, additionalForbidden: readonly string[] = []): void {
-      const errorText = `${String(error)} ${JSON.stringify(error)}`;
+      const errorText = `${String(error)} ${safelySerializeErrorSurface(error)}`;
       for (const forbidden of [MATERIALIZED_SECRET, ...additionalForbidden]) {
         expect(errorText).not.toContain(forbidden);
         expect(JSON.stringify(spies.flatMap((spy) => spy.mock.calls))).not.toContain(forbidden);

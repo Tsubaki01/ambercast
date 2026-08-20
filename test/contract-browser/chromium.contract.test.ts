@@ -143,6 +143,44 @@ type MutableOperationObservation = {
 
 const operationObservations = new WeakMap<BrowserSession, MutableOperationObservation>();
 
+type CleanupTask = () => Promise<void> | void;
+
+// Cleanup must not erase the operation outcome that explains why a browser
+// contract failed. Run every cleanup task and retain both causes when they fail.
+async function runWithCleanup<T>(
+  operation: () => Promise<T>,
+  cleanupTasks: readonly CleanupTask[],
+): Promise<T> {
+  const operationOutcome = await Promise.resolve().then(operation).then(
+    (value) => ({ status: 'fulfilled', value }) as const,
+    (reason: unknown) => ({ status: 'rejected', reason }) as const,
+  );
+  const cleanupOutcomes = await Promise.allSettled(
+    cleanupTasks.map(async (cleanup) => cleanup()),
+  );
+  const cleanupFailures = cleanupOutcomes.flatMap((outcome) => (
+    outcome.status === 'rejected' ? [outcome.reason] : []
+  ));
+
+  if (operationOutcome.status === 'rejected') {
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(
+        [operationOutcome.reason, ...cleanupFailures],
+        'The browser contract operation and its cleanup both failed.',
+      );
+    }
+    throw operationOutcome.reason;
+  }
+  if (cleanupFailures.length === 1) {
+    throw cleanupFailures[0];
+  }
+  if (cleanupFailures.length > 1) {
+    throw new AggregateError(cleanupFailures, 'Multiple browser contract cleanup tasks failed.');
+  }
+
+  return operationOutcome.value;
+}
+
 function observeLocator(
   locator: PlaywrightLocator,
   observation: MutableOperationObservation,
@@ -270,9 +308,7 @@ async function installProductionOperationObservation(
 ): Promise<() => void> {
   const probeBrowser = await chromium.launch();
   let probeHandle: PlaywrightPhysicalHandle | undefined;
-  let locatorPrototype: MutableLocatorPrototype;
-  let physicalHandlePrototype: MutablePhysicalHandlePrototype;
-  try {
+  const [locatorPrototype, physicalHandlePrototype] = await runWithCleanup(async () => {
     const probeContext = await probeBrowser.newContext();
     const probePage = await probeContext.newPage();
     await probePage.goto(fixtureUrl);
@@ -281,18 +317,14 @@ async function installProductionOperationObservation(
       exact: true,
     });
     probeHandle = await probeLocator.elementHandle();
-    locatorPrototype = Object.getPrototypeOf(probeLocator) as MutableLocatorPrototype;
-    physicalHandlePrototype = Object.getPrototypeOf(probeHandle) as MutablePhysicalHandlePrototype;
-  } finally {
-    const cleanup = await Promise.allSettled([
-      probeHandle?.dispose(),
-      probeBrowser.close(),
-    ]);
-    const failure = cleanup.find((result) => result.status === 'rejected');
-    if (failure?.status === 'rejected') {
-      throw failure.reason;
-    }
-  }
+    return [
+      Object.getPrototypeOf(probeLocator) as MutableLocatorPrototype,
+      Object.getPrototypeOf(probeHandle) as MutablePhysicalHandlePrototype,
+    ] as const;
+  }, [
+    () => probeHandle?.dispose(),
+    () => probeBrowser.close(),
+  ]);
 
   const originalElementHandle = locatorPrototype.elementHandle;
   const originalFirst = locatorPrototype.first;
@@ -895,7 +927,7 @@ describe('Chromium secret-fill target pinning', () => {
     let restoreObservation: (() => void) | undefined;
     let session: BrowserSession | undefined;
 
-    try {
+    await runWithCleanup(async () => {
       restoreObservation = await installProductionOperationObservation(
         fixture.successUrl,
         observation,
@@ -989,18 +1021,14 @@ describe('Chromium secret-fill target pinning', () => {
         productionRejected: true,
         strictAcquisitionCalls: 2,
       });
-    } finally {
-      observation.active = false;
-      restoreObservation?.();
-      const cleanup = await Promise.allSettled([
-        session?.close(),
-        fixture.close(),
-      ]);
-      const failure = cleanup.find((result) => result.status === 'rejected');
-      if (failure?.status === 'rejected') {
-        throw failure.reason;
-      }
-    }
+    }, [
+      () => {
+        observation.active = false;
+        restoreObservation?.();
+      },
+      () => session?.close(),
+      () => fixture.close(),
+    ]);
   });
 
   it('uses one production-edge acquisition, physical fill, and disposal on success', async () => {
@@ -1015,7 +1043,7 @@ describe('Chromium secret-fill target pinning', () => {
     };
     let session: BrowserSession | undefined;
 
-    try {
+    await runWithCleanup(async () => {
       const target: TargetDefinition = {
         baseUrl: fixture.successUrl,
         browser: 'chromium',
@@ -1046,16 +1074,10 @@ describe('Chromium secret-fill target pinning', () => {
         physicalFillCalls: 1,
         strictAcquisitionCalls: 1,
       });
-    } finally {
-      const cleanup = await Promise.allSettled([
-        session?.close(),
-        fixture.close(),
-      ]);
-      const failure = cleanup.find((result) => result.status === 'rejected');
-      if (failure?.status === 'rejected') {
-        throw failure.reason;
-      }
-    }
+    }, [
+      () => session?.close(),
+      () => fixture.close(),
+    ]);
   });
 
   it('does not let a Locator navigation retry fill the same-named input on a disallowed origin', async () => {
@@ -1063,7 +1085,7 @@ describe('Chromium secret-fill target pinning', () => {
     let rawBrowser: PlaywrightBrowser | undefined;
     let session: BrowserSession | undefined;
 
-    try {
+    await runWithCleanup(async () => {
       rawBrowser = await chromium.launch();
       const rawContext = await rawBrowser.newContext();
       const rawPage = await rawContext.newPage();
@@ -1132,16 +1154,10 @@ describe('Chromium secret-fill target pinning', () => {
         productionErrorStringIsSecretFree: true,
         productionRejected: true,
       });
-    } finally {
-      const cleanup = await Promise.allSettled([
-        session?.close(),
-        rawBrowser?.close(),
-        fixture.close(),
-      ]);
-      const failure = cleanup.find((result) => result.status === 'rejected');
-      if (failure?.status === 'rejected') {
-        throw failure.reason;
-      }
-    }
+    }, [
+      () => session?.close(),
+      () => rawBrowser?.close(),
+      () => fixture.close(),
+    ]);
   });
 });
