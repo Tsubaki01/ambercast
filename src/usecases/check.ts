@@ -204,7 +204,7 @@ export async function check(deps: CheckDeps, options: CheckOptions): Promise<Che
     const targetSelection = explicitSelection ?? resolveTarget({
       targets: deps.config.targets,
       defaultTarget: deps.config.defaultTarget,
-      explicitTarget: options.target,
+      explicitTarget: undefined,
     });
     if (targetSelection instanceof TargetUnresolvedError) {
       throw targetSelection;
