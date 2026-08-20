@@ -108,6 +108,53 @@ class StepQueriesTest(unittest.TestCase):
         self.assertFalse(guard_stop.is_paused("issue=13\n"))
 
 
+class CurrentBranchProbeTest(unittest.TestCase):
+    def setUp(self):
+        self.root = "/tmp/ambercast-symbolic-root"
+        self.expected = [
+            "git", "-C", self.root, "symbolic-ref",
+            "--quiet", "--short", "HEAD",
+        ]
+
+    def probe(self, outcome):
+        if isinstance(outcome, BaseException):
+            side_effect = outcome
+            return_value = None
+        else:
+            side_effect = None
+            return_value = outcome
+        with patch(
+            "guard_stop.subprocess.run",
+            side_effect=side_effect,
+            return_value=return_value,
+        ) as run:
+            branch = guard_stop.current_branch(self.root)
+        run.assert_called_once_with(self.expected, capture_output=True, timeout=5)
+        return branch
+
+    def test_rc0_requires_a_nonempty_branch(self):
+        attached = subprocess.CompletedProcess(self.expected, 0, b"issues/13\n", b"")
+        empty = subprocess.CompletedProcess(self.expected, 0, b"", b"")
+        self.assertEqual(self.probe(attached), "issues/13")
+        self.assertIsNone(self.probe(empty))
+
+    def test_rc1_with_empty_stdout_is_the_only_detached_outcome(self):
+        detached = subprocess.CompletedProcess(self.expected, 1, b"", b"")
+        self.assertIsNone(self.probe(detached))
+
+    def test_every_other_rc_exception_or_nonempty_failure_has_no_branch(self):
+        outcomes = [
+            subprocess.CompletedProcess(self.expected, 1, b"issues/13\n", b""),
+            subprocess.CompletedProcess(self.expected, 2, b"", b""),
+            subprocess.CompletedProcess(self.expected, 128, b"main\n", b""),
+            subprocess.TimeoutExpired(self.expected, 5),
+            OSError("git unavailable"),
+        ]
+        for outcome in outcomes:
+            with self.subTest(outcome=type(outcome).__name__, value=outcome):
+                self.assertIsNone(self.probe(outcome))
+
+
 class EvaluateTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -128,6 +175,44 @@ class EvaluateTest(unittest.TestCase):
 
     def test_missing_state_file_allows_stop(self):
         self.assertIsNone(guard_stop.evaluate(str(self.proj), "issues/13"))
+
+    def test_symlinked_impl_parent_cannot_persist_incomplete_flow_state(self):
+        with tempfile.TemporaryDirectory() as outside_raw:
+            outside = Path(outside_raw)
+            state = outside / "issue-13.state"
+            state.write_text(ISSUE13_PARTIAL, encoding="utf-8")
+            (self.proj / ".claude").mkdir()
+            os.symlink(outside, self.proj / ".claude" / "impl")
+            before = {path.name: path.read_bytes() for path in outside.iterdir()}
+
+            self.assertIsNone(guard_stop.evaluate(str(self.proj), "issues/13"))
+
+            after = {path.name: path.read_bytes() for path in outside.iterdir()}
+            self.assertEqual(after, before)
+            self.assertNotIn(".guard-stop-issue-13.json", after)
+
+    def test_symlinked_impl_parent_cannot_remove_paused_or_completed_sidecar(self):
+        for state_text in (ISSUE13_PARTIAL + "paused=true\n", ALL_DONE):
+            with self.subTest(state=state_text):
+                with tempfile.TemporaryDirectory() as outside_raw:
+                    outside = Path(outside_raw)
+                    (outside / "issue-13.state").write_text(
+                        state_text, encoding="utf-8"
+                    )
+                    side = outside / ".guard-stop-issue-13.json"
+                    side.write_text('{"precious": true}', encoding="utf-8")
+                    impl = self.proj / ".claude" / "impl"
+                    impl.parent.mkdir(exist_ok=True)
+                    os.symlink(outside, impl)
+                    try:
+                        self.assertIsNone(
+                            guard_stop.evaluate(str(self.proj), "issues/13")
+                        )
+                        self.assertEqual(
+                            side.read_text(encoding="utf-8"), '{"precious": true}'
+                        )
+                    finally:
+                        impl.unlink()
 
     def test_paused_allows_stop(self):
         write_state(self.proj, "13", ISSUE13_PARTIAL + "paused=true\n")

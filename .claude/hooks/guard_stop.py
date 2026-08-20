@@ -30,6 +30,11 @@ Scope and escape hatches:
   recorded. Claude Code's own consecutive-block cap
   (CLAUDE_CODE_STOP_HOOK_BLOCK_CAP) remains the outer backstop.
 - kill switch: AMBERCAST_GUARD_STOP=0 disables the hook entirely
+
+Branch evidence deliberately distinguishes detached state from unavailable policy
+evidence. The shared Claude boundary remains fail-open, while the Codex adapter
+observes policy probes and terminates safely when evidence is ambiguous. Evidence
+required to establish repository progress cannot be empty.
 """
 import glob
 import hashlib
@@ -163,6 +168,27 @@ def sidecar_path(proj, issue):
     return os.path.join(proj, ".claude", "impl", f".guard-stop-issue-{issue}.json")
 
 
+def verified_impl_directory(proj):
+    """Return the physical implementation-state directory when it is safe.
+
+    State and stall bookkeeping share this parent, so accepting a symlink at
+    the boundary would redirect reads, atomic replacements, and cleanup outside
+    the worktree. A missing directory retains the ordinary no-state behavior;
+    an existing path must resolve to its literal directory beneath the physical
+    repository root.
+    """
+    root = os.path.realpath(proj)
+    impl = os.path.join(root, ".claude", "impl")
+    if not os.path.lexists(impl):
+        return None
+    if os.path.islink(impl) or not os.path.isdir(impl):
+        raise ValueError("invalid implementation state directory")
+    physical = os.path.realpath(impl)
+    if physical != impl or os.path.commonpath((root, physical)) != root:
+        raise ValueError("invalid implementation state directory")
+    return impl
+
+
 def _hash_file(h, path):
     """Add file content, or an empty marker when the artifact is unavailable."""
     try:
@@ -201,7 +227,7 @@ def _git_stdout(proj, args):
         )
     except (OSError, subprocess.SubprocessError):
         return b""
-    return res.stdout
+    return res.stdout if res.returncode == 0 else b""
 
 
 def _hash_git(h, proj):
@@ -296,14 +322,21 @@ def evaluate(proj, branch, session_id=""):
     if issue is None:
         return None
 
-    state_path = os.path.join(proj, ".claude", "impl", f"issue-{issue}.state")
+    try:
+        impl = verified_impl_directory(proj)
+    except (OSError, ValueError):
+        return None
+    if impl is None:
+        return None
+
+    state_path = os.path.join(impl, f"issue-{issue}.state")
     try:
         with open(state_path, encoding="utf-8", errors="replace") as f:
             state = f.read()
     except OSError:
         return None
 
-    side = sidecar_path(proj, issue)
+    side = os.path.join(impl, f".guard-stop-issue-{issue}.json")
 
     if is_paused(state):
         _remove_sidecar(side)
@@ -358,9 +391,20 @@ def evaluate(proj, branch, session_id=""):
 
 def current_branch(proj):
     """Return the symbolic branch for a worktree, allowing detached HEAD to pass."""
-    out = _git_stdout(proj, ["symbolic-ref", "--short", "HEAD"])
-    branch = out.decode(errors="replace").strip()
-    return branch or None
+    try:
+        result = subprocess.run(
+            ["git", "-C", proj, "symbolic-ref", "--quiet", "--short", "HEAD"],
+            capture_output=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    branch = result.stdout.decode(errors="replace").strip()
+    if result.returncode == 0 and branch:
+        return branch
+    if result.returncode == 1 and not branch:
+        return None
+    return None
 
 
 def main():

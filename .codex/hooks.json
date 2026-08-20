@@ -1,0 +1,41 @@
+{
+  "description": "Ambercast implementation-flow enforcement for Codex.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I -S -c 'import hashlib,os,stat,subprocess,sys\ndef fail(message):\n sys.stderr.write(message + \"\\n\")\n raise SystemExit(2)\ndef read_once(path):\n with open(path,\"rb\") as stream:\n  return stream.read()\ntry:\n result = subprocess.run([\"git\",\"rev-parse\",\"--show-toplevel\"],capture_output=True,text=True,timeout=5)\n if result.returncode != 0 or not result.stdout.strip():\n  fail(\"BLOCKED: Ambercast hook root could not be verified.\")\n root = os.path.realpath(result.stdout.strip())\n expected,*members = sys.argv[1:]\n if len(members) != 2:\n  fail(\"BLOCKED: Ambercast hook bundle integrity could not be verified.\")\n raw = [os.path.join(root,member) for member in members]\n physical = [os.path.realpath(path) for path in raw]\n valid = all(os.path.commonpath((root,path)) == root and os.path.realpath(os.path.dirname(source)) == os.path.dirname(source) and not os.path.islink(source) and stat.S_ISREG(os.lstat(source).st_mode) and os.access(source,os.R_OK) for source,path in zip(raw,physical))\n if not valid:\n  fail(\"BLOCKED: Ambercast hook bundle integrity could not be verified.\")\n sources = [read_once(path) for path in physical]\n digest = hashlib.sha256()\n for member,source in zip(members,sources):\n  digest.update(member.encode(\"utf-8\")); digest.update(b\"\\0\"); digest.update(source); digest.update(b\"\\0\")\n if digest.hexdigest() != expected:\n  fail(\"BLOCKED: Ambercast hook bundle digest mismatch.\")\n scope = {\"__name__\":\"__main__\",\"__file__\":physical[0],\"__ambercast_verified_root__\":root,\"__ambercast_shared_path__\":physical[1],\"__ambercast_shared_bytes__\":sources[1]}\n exec(compile(sources[0],physical[0],\"exec\"),scope)\nexcept SystemExit:\n raise\nexcept Exception:\n fail(\"BLOCKED: Ambercast hook bundle integrity could not be verified.\")' 036a1b5250f14b55f7f229f3779925fc17ede1d5f117bd4b01d61c4677b2c3f9 .codex/hooks/guard_git.py .claude/hooks/guard_git.py",
+            "timeout": 40,
+            "statusMessage": "Checking Ambercast branch policy"
+          }
+        ]
+      },
+      {
+        "matcher": "^(apply_patch|Edit|Write)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I -S -c 'import hashlib,os,stat,subprocess,sys\ndef fail(message):\n sys.stderr.write(message + \"\\n\")\n raise SystemExit(2)\ndef read_once(path):\n with open(path,\"rb\") as stream:\n  return stream.read()\ntry:\n result = subprocess.run([\"git\",\"rev-parse\",\"--show-toplevel\"],capture_output=True,text=True,timeout=5)\n if result.returncode != 0 or not result.stdout.strip():\n  fail(\"BLOCKED: Ambercast hook root could not be verified.\")\n root = os.path.realpath(result.stdout.strip())\n expected,*members = sys.argv[1:]\n if len(members) != 2:\n  fail(\"BLOCKED: Ambercast hook bundle integrity could not be verified.\")\n raw = [os.path.join(root,member) for member in members]\n physical = [os.path.realpath(path) for path in raw]\n valid = all(os.path.commonpath((root,path)) == root and os.path.realpath(os.path.dirname(source)) == os.path.dirname(source) and not os.path.islink(source) and stat.S_ISREG(os.lstat(source).st_mode) and os.access(source,os.R_OK) for source,path in zip(raw,physical))\n if not valid:\n  fail(\"BLOCKED: Ambercast hook bundle integrity could not be verified.\")\n sources = [read_once(path) for path in physical]\n digest = hashlib.sha256()\n for member,source in zip(members,sources):\n  digest.update(member.encode(\"utf-8\")); digest.update(b\"\\0\"); digest.update(source); digest.update(b\"\\0\")\n if digest.hexdigest() != expected:\n  fail(\"BLOCKED: Ambercast hook bundle digest mismatch.\")\n scope = {\"__name__\":\"__main__\",\"__file__\":physical[0],\"__ambercast_verified_root__\":root,\"__ambercast_shared_path__\":physical[1],\"__ambercast_shared_bytes__\":sources[1]}\n exec(compile(sources[0],physical[0],\"exec\"),scope)\nexcept SystemExit:\n raise\nexcept Exception:\n fail(\"BLOCKED: Ambercast hook bundle integrity could not be verified.\")' c2879b2121d5af210341c66b9bcd0842f8fb2d22fb5aa96a9770e4fcb1cc98b4 .codex/hooks/guard_phase.py .claude/hooks/guard_phase.py",
+            "timeout": 40,
+            "statusMessage": "Checking Ambercast implementation phase"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I -S -c 'import hashlib,json,os,stat,subprocess,sys\ndef fail(message):\n print(json.dumps({\"continue\":False,\"systemMessage\":message},separators=(\",\",\":\")))\n raise SystemExit(0)\ndef read_once(path):\n with open(path,\"rb\") as stream:\n  return stream.read()\ntry:\n result = subprocess.run([\"git\",\"rev-parse\",\"--show-toplevel\"],capture_output=True,text=True,timeout=5)\n if result.returncode != 0 or not result.stdout.strip():\n  fail(\"Ambercast Stop hook root could not be verified.\")\n root = os.path.realpath(result.stdout.strip())\n expected,*members = sys.argv[1:]\n if len(members) != 2:\n  fail(\"Ambercast Stop hook bundle integrity could not be verified.\")\n raw = [os.path.join(root,member) for member in members]\n physical = [os.path.realpath(path) for path in raw]\n valid = all(os.path.commonpath((root,path)) == root and os.path.realpath(os.path.dirname(source)) == os.path.dirname(source) and not os.path.islink(source) and stat.S_ISREG(os.lstat(source).st_mode) and os.access(source,os.R_OK) for source,path in zip(raw,physical))\n if not valid:\n  fail(\"Ambercast Stop hook bundle integrity could not be verified.\")\n sources = [read_once(path) for path in physical]\n digest = hashlib.sha256()\n for member,source in zip(members,sources):\n  digest.update(member.encode(\"utf-8\")); digest.update(b\"\\0\"); digest.update(source); digest.update(b\"\\0\")\n if digest.hexdigest() != expected:\n  fail(\"Ambercast Stop hook bundle digest mismatch.\")\n scope = {\"__name__\":\"__main__\",\"__file__\":physical[0],\"__ambercast_verified_root__\":root,\"__ambercast_shared_path__\":physical[1],\"__ambercast_shared_bytes__\":sources[1]}\n exec(compile(sources[0],physical[0],\"exec\"),scope)\nexcept SystemExit:\n raise\nexcept Exception:\n fail(\"Ambercast Stop hook bundle integrity could not be verified.\")' 45cd97510ccd682ed5b11e3e78d844c347a8a60d225c9c668b277703dd111508 .codex/hooks/guard_stop.py .claude/hooks/guard_stop.py",
+            "timeout": 40,
+            "statusMessage": "Checking Ambercast flow completion"
+          }
+        ]
+      }
+    ]
+  }
+}

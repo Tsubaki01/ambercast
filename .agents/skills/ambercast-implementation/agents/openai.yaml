@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ambercast Implementation"
+  short_description: "Run Ambercast’s 17-step flow with Codex as orchestrator"
+  default_prompt: "Implement this Ambercast change through the mandatory cross-model workflow."

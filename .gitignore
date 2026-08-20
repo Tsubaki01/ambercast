@@ -2,7 +2,7 @@ node_modules/
 dist/
 *.tgz
 
-# local AI agent state (shared config IS committed: AGENTS.md, CLAUDE.md, .claude/settings.json)
+# local AI agent state (shared Claude/Codex config is committed)
 .claude/settings.local.json
 .claude/logs/
 .claude/todos/
