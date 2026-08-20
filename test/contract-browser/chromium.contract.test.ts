@@ -155,12 +155,14 @@ async function runWithCleanup<T>(
     (value) => ({ status: 'fulfilled', value }) as const,
     (reason: unknown) => ({ status: 'rejected', reason }) as const,
   );
-  const cleanupOutcomes = await Promise.allSettled(
-    cleanupTasks.map(async (cleanup) => cleanup()),
-  );
-  const cleanupFailures = cleanupOutcomes.flatMap((outcome) => (
-    outcome.status === 'rejected' ? [outcome.reason] : []
-  ));
+  const cleanupFailures: unknown[] = [];
+  for (const cleanup of cleanupTasks) {
+    try {
+      await cleanup();
+    } catch (error) {
+      cleanupFailures.push(error);
+    }
+  }
 
   if (operationOutcome.status === 'rejected') {
     if (cleanupFailures.length > 0) {
@@ -712,6 +714,7 @@ async function createSecretRaceFixture(): Promise<SecretRaceFixture> {
     <script>
       const input = document.querySelector('input');
       // This marker makes navigation a consequence of Playwright selecting the in-flight action target.
+      // It is an undocumented internal marker verified against Playwright 1.62.1; upgrades must revalidate it.
       input.addEventListener('__playwright_mark_target__', () => {
         input.disabled = false;
         input.focus();
