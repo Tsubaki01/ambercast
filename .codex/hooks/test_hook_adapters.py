@@ -55,6 +55,14 @@ GIT_ENV = {
 }
 
 
+def sanitized_git_env(source: dict[str, str]) -> dict[str, str]:
+    sanitized = {
+        key: value for key, value in source.items() if not key.startswith("GIT_")
+    }
+    sanitized.update(GIT_ENV)
+    return sanitized
+
+
 def git(cwd: pathlib.Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args],
@@ -62,7 +70,7 @@ def git(cwd: pathlib.Path, *args: str, check: bool = True) -> subprocess.Complet
         check=check,
         capture_output=True,
         text=True,
-        env={**os.environ, **GIT_ENV},
+        env=sanitized_git_env(dict(os.environ)),
     )
 
 
@@ -121,9 +129,10 @@ class AdapterRepositoryCase(unittest.TestCase):
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         shared_path = shared or self.root / ".claude/hooks" / adapter
-        process_env = {**os.environ, **GIT_ENV}
+        process_env = dict(os.environ)
         process_env.pop("AMBERCAST_GUARD_STOP", None)
         process_env.update(env or {})
+        process_env = sanitized_git_env(process_env)
         return subprocess.run(
             [
                 sys.executable,
@@ -149,6 +158,29 @@ class AdapterRepositoryCase(unittest.TestCase):
         **kwargs: object,
     ) -> subprocess.CompletedProcess[str]:
         return self.run_raw(adapter, json.dumps(payload), **kwargs)
+
+
+class GitEnvironmentTests(unittest.TestCase):
+    def test_sanitizer_removes_git_redirects_and_preserves_non_git_controls(self) -> None:
+        source = {
+            "PATH": "/bin",
+            "AMBERCAST_GUARD_STOP": "0",
+            "GIT_DIR": "/outside/repository",
+            "GIT_INDEX_FILE": "/outside/index",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "user.name",
+            "GIT_CONFIG_VALUE_0": "injected",
+            **GIT_ENV,
+        }
+
+        result = sanitized_git_env(source)
+
+        self.assertEqual(result["PATH"], "/bin")
+        self.assertEqual(result["AMBERCAST_GUARD_STOP"], "0")
+        self.assertEqual(
+            {key: value for key, value in result.items() if key.startswith("GIT_")},
+            GIT_ENV,
+        )
 
 
 class GitAdapterTests(AdapterRepositoryCase):
