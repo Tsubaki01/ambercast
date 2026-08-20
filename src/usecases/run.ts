@@ -549,7 +549,11 @@ function recordResolvedSecret(registry: Map<string, Set<string>>, ref: string, v
  * not a complete data-flow proof: an aliased indirection or a call through a
  * differently typed value could evade it. Taking only the session-shaped
  * dependency keeps the dispatcher independent of the broader dispatch
- * context, whose remaining state it never needs.
+ * context, whose remaining state it never needs. The dispatcher deliberately
+ * leaves browser rejections unchanged: stored-trace replay applies its
+ * secret-specific fail-closed rule only to rejection of the materialized
+ * `fill-secret` operation being invoked, while fresh agentic execution retains
+ * its existing controller semantics.
  *
  * @param materialized - An ordinary action or the private secret-fill action.
  * @param session - The browser session that owns the corresponding port methods.
@@ -809,11 +813,20 @@ function preScanTrace(trace: z.infer<typeof TraceRecord>, context: DispatchConte
  * Replays a trusted trace in journal order and returns whether the browser
  * confirmed every recorded observation.
  *
- * A false assertion is an expected behavioral miss. An ordinary browser
- * rejection, including a compute-mode bind miss from trace materialization,
- * propagates as a plain error. Its caller treats that error as a replay miss
- * and continues to the existing agentic fallback; integrity, secret, and
- * case-abort failures retain their classified control flow instead.
+ * A false assertion is an expected behavioral miss. Ordinary browser
+ * rejections, including compute-mode bind misses from trace materialization,
+ * propagate so the caller can continue to the existing agentic fallback.
+ * An unclassified rejection from invoking the current materialized
+ * `fill-secret` operation, however, becomes a static `CaseAbort` at this
+ * replay boundary. Invocation is the no-retry boundary because the browser
+ * write may already have happened; AI re-drive could issue a second write
+ * against a different target or origin. If that same invocation instead
+ * throws a classified `IntegrityViolationError` or `SecretUnresolvedError`,
+ * the classification takes precedence and its exact type propagates unchanged.
+ * The rule is scoped to that operation: a successful secret fill does not
+ * change how a later ordinary action rejection is handled. The abort neither
+ * examines the browser's message nor retains the materialized value, and
+ * placing this rule here leaves fresh agentic dispatch unchanged.
  */
 async function replayTrace(
   trace: z.infer<typeof TraceRecord>,
@@ -829,10 +842,25 @@ async function replayTrace(
       continue;
     }
 
-    await performMaterializedAction(
-      await materializeTraceAction(entry, context, secretRefs),
-      context.session,
-    );
+    const materialized = await materializeTraceAction(entry, context, secretRefs);
+    if (materialized.type !== 'fill-secret') {
+      await performMaterializedAction(materialized, context.session);
+      continue;
+    }
+
+    try {
+      await performMaterializedAction(materialized, context.session);
+    } catch (error) {
+      if (
+        error instanceof IntegrityViolationError
+        || error instanceof SecretUnresolvedError
+        || error instanceof CaseAbort
+      ) {
+        throw error;
+      }
+
+      throw new CaseAbort('The replayed secret fill did not complete.');
+    }
   }
 
   for (const assertion of trace.verification) {

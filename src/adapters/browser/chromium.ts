@@ -10,14 +10,20 @@
  * launch options, context creation, and cleanup unexercised. The complete seam
  * lets unit tests drive that sequence without starting a browser.
  *
- * Element operations never positionally narrow a role/name locator. Binding
- * establishes exactly one current candidate, and each use rechecks the
- * session-private bind record, navigation generation, and accessibility
- * fingerprint before constructing that candidate's locator. A navigation or
- * in-place mutation can still land after that check but before Playwright
- * receives the call; the ARIA snapshot API cannot expose a DOM handle that
- * would close that interval. Rejecting stale evidence immediately before the
- * call is the deliberately conservative mitigation.
+ * Ordinary element operations retain Locator semantics after binding has
+ * rechecked the session-private record, navigation generation, and
+ * accessibility fingerprint. Secret writes need a stronger boundary because
+ * a late Locator resolution could otherwise select a same-named element in a
+ * document reached after the sink-origin decision. The secret path strictly
+ * acquires one adapter-private physical element after continuity, rejects a
+ * navigation-generation change caused during acquisition, and makes
+ * the final live-origin decision immediately before filling that same object.
+ * Each call owns and releases its physical element independently. Reusing one
+ * would bypass that later call's continuity, generation, and origin checks and
+ * could retain an element from a document the session has already left.
+ * Cleanup failures cannot replace either a primary rejection or a successful
+ * fill. This closes cross-document retargeting while accepting only the
+ * narrower renderer-internal interval after the pinned operation is accepted.
  */
 
 import type {
@@ -50,12 +56,28 @@ type PlaywrightPage = import('playwright-core').Page;
 type PlaywrightRole = Parameters<PlaywrightPage['getByRole']>[0];
 
 /**
+ * The invocation-scoped physical operations required by secret writes.
+ *
+ * @remarks
+ * Limiting this adapter-private seam to filling and deterministic disposal
+ * keeps raw Playwright objects, DOM evaluation, and serializable element state
+ * from crossing the secret boundary.
+ */
+interface PlaywrightElementHandle {
+  fill(value: string): Promise<void>;
+  dispose(): Promise<void>;
+}
+
+/**
  * The locator operations Chromium replay needs from Playwright.
  *
  * @remarks
  * This is deliberately a structural subset rather than a re-export of a
  * Playwright type. A real Playwright locator and a plain hermetic test fake
  * can both supply it, while adapter callers remain independent of Playwright.
+ * Physical acquisition resolves the exact Locator under strictness once, and
+ * only the secret path consumes that result, so pinning and disposal remain
+ * adapter-private mechanics rather than browser-port capabilities.
  */
 export interface PlaywrightLocatorHandle {
   click(): Promise<void>;
@@ -66,6 +88,7 @@ export interface PlaywrightLocatorHandle {
   inputValue(): Promise<string>;
   count(): Promise<number>;
   ariaSnapshot(): Promise<string>;
+  elementHandle(): Promise<PlaywrightElementHandle>;
 }
 
 /**
@@ -167,6 +190,30 @@ function adaptLocator(locator: PlaywrightLocator): PlaywrightLocatorHandle {
     inputValue: () => locator.inputValue(),
     count: () => locator.count(),
     ariaSnapshot: () => locator.ariaSnapshot(),
+    elementHandle: async () => {
+      const element = await locator.elementHandle();
+      if (element === null) {
+        throw new Error('Strict element acquisition found no matching element.');
+      }
+
+      return {
+        async fill(value): Promise<void> {
+          try {
+            await element.fill(value);
+          } catch {
+            /*
+             * Playwright retains the supplied value in its physical-fill call
+             * log. Collapse that integration diagnostic here without
+             * inspecting it or attaching it as a cause. The session still
+             * propagates this structural rejection unchanged; fake-identity
+             * tests prove `fillSecret` adds no classification of its own.
+             */
+            throw new Error('The fixed browser target could not be filled.');
+          }
+        },
+        dispose: () => element.dispose(),
+      };
+    },
   };
 }
 
@@ -254,6 +301,7 @@ type PrivateBindRecord = {
 };
 
 type ReverifiedBinding = {
+  readonly generation: number;
   readonly locator: PlaywrightLocatorHandle;
   readonly ref: ElementRef;
 };
@@ -330,23 +378,37 @@ class ChromiumBrowserSession implements BrowserSession {
   /**
    * Fills a bound element with a secret after policy and continuity checks.
    *
-   * This checks the live origin before continuity re-verification, then
-   * re-checks it from the continuity-failure catch so an
-   * intervening origin violation takes precedence. When that re-check finds
-   * the origin still sound, the original continuity error is rethrown
-   * unchanged. The catch and the final synchronous checkpoint immediately
-   * before the underlying fill are adjacent: no `await` sits between them, or
-   * between that final checkpoint and the fill. The first checkpoint preserves
-   * fail-fast classification when a cross-origin navigation also makes the
-   * binding stale; the latter two close the JavaScript-visible asynchronous
-   * gap. Origin failures include policy diagnostics but never the materialized
-   * value.
+   * The path first validates the live origin before awaiting continuity or
+   * acquisition. That fail-fast checkpoint preserves integrity classification
+   * when an already-disallowed navigation has also made the binding stale,
+   * rather than allowing the stale-binding error to win.
    *
-   * The final synchronous checkpoint cannot make inspecting the origin and
-   * the renderer's DOM mutation atomic. A navigation may still occur after
-   * Playwright receives the fill and before the renderer executes it; that
-   * residual renderer-process TOCTOU interval is outside this adapter's
-   * observable boundary.
+   * Unlike ordinary Locator-backed actions, the secret path must not retain a
+   * late-binding target after its last origin decision. The implementation
+   * strictly acquires one physical element only after continuity succeeds,
+   * then verifies that navigation generation still matches the generation
+   * bracketed by the fresh accessibility capture. This extra comparison
+   * rejects acquisition that retried into a new, otherwise allowed document.
+   *
+   * Continuity, acquisition, and the post-acquisition generation check share
+   * one failure-classification region. If any rejects, a live origin check
+   * replaces that rejection only when policy now denies the page; otherwise
+   * the original rejection propagates unchanged. After successful acquisition,
+   * the final live-origin check is followed immediately by `fill` on that
+   * exact object, with no `await` or Locator resolution between them.
+   *
+   * The acquired object is adapter-private and scoped to one invocation. A
+   * later call acquires afresh because reusing this object would let it bypass
+   * that call's continuity, generation, and origin checks and could retain an
+   * element from a document already left. The object is disposed after
+   * success and after every post-acquisition failure, but only after the
+   * primary outcome has been classified. Disposal failures are suppressed so
+   * cleanup cannot mask a security decision, leak browser text into
+   * diagnostics, or turn an accepted fill into a failure. Origin diagnostics
+   * never include the materialized value. A navigation accepted only after
+   * the pinned fill begins can detach that object but cannot retarget it; the
+   * remaining renderer-internal interval is outside this adapter's observable
+   * boundary.
    */
   async fillSecret(
     target: BoundElement,
@@ -355,16 +417,28 @@ class ChromiumBrowserSession implements BrowserSession {
   ): Promise<void> {
     this.assertSecretSinkOrigin(policy);
 
-    let reverified: ReverifiedBinding;
+    let acquired: PlaywrightElementHandle | undefined;
     try {
-      reverified = await this.reverifyBinding(target);
-    } catch (error) {
-      this.assertSecretSinkOrigin(policy);
-      throw error;
-    }
+      try {
+        const reverified = await this.reverifyBinding(target);
+        acquired = await reverified.locator.elementHandle();
+        if (this.page.navigationGeneration() !== reverified.generation) {
+          throw new Error('Bound element navigation generation changed during physical acquisition.');
+        }
+      } catch (error) {
+        this.assertSecretSinkOrigin(policy);
+        throw error;
+      }
 
-    this.assertSecretSinkOrigin(policy);
-    await reverified.locator.fill(value);
+      this.assertSecretSinkOrigin(policy);
+      await acquired.fill(value);
+    } finally {
+      try {
+        await acquired?.dispose();
+      } catch {
+        // Cleanup never changes or exposes the primary operation outcome.
+      }
+    }
   }
 
   /**
@@ -524,14 +598,13 @@ class ChromiumBrowserSession implements BrowserSession {
    * Confirms that the live page may receive a secret under its resolved policy.
    *
    * This centralizes the three origin checkpoints on the secret-fill path:
-   * fail fast before continuity re-verification, reclassify a failed
-   * continuity check if the origin became unsound, and otherwise rethrow that
-   * original continuity error unchanged. The reclassification catch is
-   * adjacent to the final synchronous checkpoint
-   * that guards the underlying fill, with no `await` between them or between
-   * that checkpoint and the fill. Sharing one policy decision keeps those
-   * checkpoints from drifting in their integrity classification or non-secret
-   * diagnostics.
+   * fail fast before continuity work, reclassify a failed continuity,
+   * physical-acquisition, or post-acquisition generation-validation phase if
+   * the origin became unsound, and guard the already-acquired element
+   * immediately before its fill. When the reclassification check finds the
+   * origin still sound, the original failure retains precedence. Sharing one
+   * policy decision keeps the checkpoints aligned in their integrity
+   * classification and secret-free diagnostics.
    *
    * This remains outside `reverifyBinding` because that general continuity
    * helper serves non-secret operations too; giving it secret-sink policy
@@ -559,6 +632,10 @@ class ChromiumBrowserSession implements BrowserSession {
    * generation across one fresh capture and still resolve its own recorded
    * fingerprint. The returned locator is built only after those checks from
    * the private reference, preserving the handle's session-local identity.
+   * The result also exposes the generation proven by that capture so the
+   * secret-only caller can detect navigation that occurs while it strictly
+   * acquires its physical element. Other callers retain ordinary Locator
+   * behavior and do not inherit secret-sink policy concerns.
    */
   private async reverifyBinding(target: BoundElement): Promise<ReverifiedBinding> {
     const record = this.#bindings.get(target);
@@ -579,6 +656,7 @@ class ChromiumBrowserSession implements BrowserSession {
     }
 
     return {
+      generation: after,
       locator: this.page.getByRole(record.ref.role, {
         name: record.ref.name,
         exact: true,

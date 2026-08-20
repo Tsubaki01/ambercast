@@ -1813,6 +1813,425 @@ describe('run agentic fallback pipeline', () => {
     );
   });
 
+  it('issue 167 aborts a rejected replayed fill-secret without AI retry or persisted diagnostics', async () => {
+    const secretRef = '{{secrets.ISSUE_167_REPLAY_ABORT}}';
+    const secretValue = 'ISSUE_167_REPLAY_ABORT_VALUE';
+    const browserDiagnostic = 'ISSUE_167_BROWSER_DIAGNOSTIC_SENTINEL';
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      onFillSecret() {
+        throw new Error(browserDiagnostic);
+      },
+    });
+    const executeAgentic = vi.fn(async (request: AiAgenticRequest) => {
+      await request.controller.evaluateAssert(passingText('Fallback must not run'));
+      return { outcome: 'success' as const };
+    });
+    const executor = createFakeAiExecutor({ executeAgentic });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep('recorded-ai', [secretRef])],
+      aiGrounding(trace(
+        [
+          { type: 'fill-secret', target: PASSWORD, secretRef },
+          { type: 'navigate', url: '/must-not-run' },
+        ],
+        [passingText('Cached dashboard')],
+      )),
+    );
+    const planPath = `${TEST_DIR}/login.ambercast.plan.json`;
+    const groundingPath = `${TEST_DIR}/login.ambercast.grounding.json`;
+    const planBefore = await recordingStorage.storage.readText(planPath);
+    const groundingBefore = await recordingStorage.storage.readText(groundingPath);
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const report = buildRunReport({
+      startedAt: '2026-08-20T00:00:00Z',
+      durationMs: 0,
+      options: { allowEmpty: false, list: false },
+      outcome,
+    });
+    const planAfter = await recordingStorage.storage.readText(planPath);
+    const groundingAfter = await recordingStorage.storage.readText(groundingPath);
+
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(outcome.results[0]?.result).toMatchObject({
+      status: 'error',
+      explanation: 'The replayed secret fill did not complete.',
+      steps: [{ id: 'recorded-ai', status: 'error', kind: 'environment' }],
+    });
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(executeAgentic).not.toHaveBeenCalled();
+    expect(executor.agenticRequests).toEqual([]);
+    expect(aiCalls(events)).toEqual([]);
+    expect(events.emitted()).toEqual([{ type: 'step-start', stepId: 'recorded-ai' }]);
+    expect(session.operations().filter((operation) => operation.type === 'fill-secret')).toEqual([
+      {
+        type: 'fill-secret',
+        target: boundTarget(PASSWORD, FINGERPRINT),
+        value: secretValue,
+        policy: baseUrlSecretPolicy(secretRef, TARGETS.web),
+      },
+    ]);
+    expect(session.operations().filter((operation) => (
+      operation.type === 'perform' && operation.action.type === 'navigate'
+    ))).toEqual([]);
+    expect(recordingStorage.writes).toEqual([]);
+    expect(planAfter).toBe(planBefore);
+    expect(groundingAfter).toBe(groundingBefore);
+
+    const retainedSurfaces = JSON.stringify({
+      result: outcome.results[0]?.result,
+      error: outcome.results[0]?.error,
+      events: events.emitted(),
+      report,
+      persisted: { plan: planAfter, grounding: groundingAfter, writes: recordingStorage.writes },
+    });
+    expect(retainedSurfaces).not.toContain(secretValue);
+    expect(retainedSurfaces).not.toContain(browserDiagnostic);
+  });
+
+  it('issue 167 preserves a classified replayed fill-secret rejection without AI fallback', async () => {
+    const secretRef = '{{secrets.ISSUE_167_CLASSIFIED}}';
+    const secretValue = 'ISSUE_167_CLASSIFIED_VALUE';
+    const message = 'The current page origin is not allowed to receive this secret.';
+    const details = {
+      secretRef,
+      allowedOrigins: ['https://example.test'],
+      source: 'target-base-url' as const,
+    };
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      onFillSecret() {
+        throw new IntegrityViolationError(message, details);
+      },
+    });
+    const executeAgentic = vi.fn(async () => ({ outcome: 'success' as const }));
+    const executor = createFakeAiExecutor({ executeAgentic });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep('recorded-ai', [secretRef])],
+      aiGrounding(trace(
+        [{ type: 'fill-secret', target: PASSWORD, secretRef }],
+        [passingText('Cached dashboard')],
+      )),
+    );
+    const groundingBefore = await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`);
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const report = buildRunReport({
+      startedAt: '2026-08-20T00:00:00Z',
+      durationMs: 0,
+      options: { allowEmpty: false, list: false },
+      outcome,
+    });
+    const error = outcome.results[0]?.error;
+
+    expect(error).toBeInstanceOf(IntegrityViolationError);
+    expect(error).toMatchObject({
+      kind: 'integrity-violation',
+      exitCode: 4,
+      message,
+      details,
+    });
+    expect(outcome.results[0]?.result).toMatchObject({
+      status: 'error',
+      explanation: message,
+      steps: [{ id: 'recorded-ai', status: 'error', kind: 'environment' }],
+    });
+    expect(report.envelope.errors).toEqual([
+      expect.objectContaining({ kind: 'usage', code: 'INTEGRITY_VIOLATION', message }),
+    ]);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(executeAgentic).not.toHaveBeenCalled();
+    expect(aiCalls(events)).toEqual([]);
+    expect(recordingStorage.writes).toEqual([]);
+    expect(await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`)).toBe(groundingBefore);
+    expect(JSON.stringify({ outcome, report, events: events.emitted() })).not.toContain(secretValue);
+  });
+
+  it('issue 167 preserves the exact post-materialization SecretUnresolvedError without AI fallback', async () => {
+    const secretRef = '{{secrets.ISSUE_167_POST_MATERIALIZATION_UNRESOLVED}}';
+    const secretValue = 'ISSUE_167_POST_MATERIALIZATION_UNRESOLVED_VALUE';
+    const message = 'The referenced secret became unavailable at browser invocation.';
+    const details = { secretRef };
+    const classifiedError = new SecretUnresolvedError(message, details);
+    let errorAtCaseRedactionBoundary: unknown;
+    let constructorReads = 0;
+    Object.defineProperty(classifiedError, 'constructor', {
+      configurable: true,
+      get() {
+        constructorReads += 1;
+        errorAtCaseRedactionBoundary = classifiedError;
+        return SecretUnresolvedError;
+      },
+    });
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      onFillSecret() {
+        throw classifiedError;
+      },
+    });
+    const executeAgentic = vi.fn(async () => ({ outcome: 'success' as const }));
+    const executor = createFakeAiExecutor({ executeAgentic });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep('recorded-ai', [secretRef])],
+      aiGrounding(trace(
+        [
+          { type: 'fill-secret', target: PASSWORD, secretRef },
+          { type: 'navigate', url: '/must-not-run-after-classified-error' },
+        ],
+        [passingText('Cached dashboard')],
+      )),
+    );
+    const planPath = `${TEST_DIR}/login.ambercast.plan.json`;
+    const groundingPath = `${TEST_DIR}/login.ambercast.grounding.json`;
+    const planBefore = await recordingStorage.storage.readText(planPath);
+    const groundingBefore = await recordingStorage.storage.readText(groundingPath);
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const report = buildRunReport({
+      startedAt: '2026-08-20T00:00:00Z',
+      durationMs: 0,
+      options: { allowEmpty: false, list: false },
+      outcome,
+    });
+    const planAfter = await recordingStorage.storage.readText(planPath);
+    const groundingAfter = await recordingStorage.storage.readText(groundingPath);
+    const error = outcome.results[0]?.error;
+
+    // Replay preserves identity up to the mandatory case-output redaction, which
+    // then reconstructs classified errors so retained diagnostics cannot leak.
+    expect(errorAtCaseRedactionBoundary).toBe(classifiedError);
+    expect(constructorReads).toBe(1);
+    expect(error).not.toBe(classifiedError);
+    expect(error).toBeInstanceOf(SecretUnresolvedError);
+    expect(error).toMatchObject({
+      kind: 'secret-unresolved',
+      exitCode: 2,
+      message,
+      details,
+    });
+    expect(outcome.results[0]?.result).toMatchObject({
+      status: 'error',
+      explanation: message,
+      steps: [{ id: 'recorded-ai', status: 'error', kind: 'environment' }],
+    });
+    expect(report.exitCode).toBe(2);
+    expect(report.envelope.errors).toEqual([
+      expect.objectContaining({ kind: 'usage', code: 'SECRET_UNRESOLVED', message }),
+    ]);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(executeAgentic).not.toHaveBeenCalled();
+    expect(executor.agenticRequests).toEqual([]);
+    expect(aiCalls(events)).toEqual([]);
+    expect(events.emitted()).toEqual([{ type: 'step-start', stepId: 'recorded-ai' }]);
+    expect(session.operations().filter((operation) => operation.type === 'fill-secret')).toEqual([
+      {
+        type: 'fill-secret',
+        target: boundTarget(PASSWORD, FINGERPRINT),
+        value: secretValue,
+        policy: baseUrlSecretPolicy(secretRef, TARGETS.web),
+      },
+    ]);
+    expect(session.operations().filter((operation) => (
+      operation.type === 'perform' && operation.action.type === 'navigate'
+    ))).toEqual([]);
+    expect(recordingStorage.writes).toEqual([]);
+    expect(planAfter).toBe(planBefore);
+    expect(groundingAfter).toBe(groundingBefore);
+
+    const retainedSurfaces = JSON.stringify({
+      outcome,
+      report,
+      events: events.emitted(),
+      persisted: { plan: planAfter, grounding: groundingAfter, writes: recordingStorage.writes },
+    });
+    expect(retainedSurfaces).not.toContain(secretValue);
+  });
+
+  it('issue 167 keeps fallback for an ordinary trace rejection after a successful fill-secret', async () => {
+    const secretRef = '{{secrets.ISSUE_167_LATER_FALLBACK}}';
+    const secretValue = 'ISSUE_167_LATER_FALLBACK_VALUE';
+    const priorTrace = trace(
+      [
+        { type: 'fill-secret', target: PASSWORD, secretRef },
+        { type: 'navigate', url: '/cached-route' },
+      ],
+      [passingText('Cached dashboard')],
+    );
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      onPerform(action) {
+        if (action.type === 'navigate' && action.url === '/cached-route') {
+          throw new Error('The ordinary cached navigation failed.');
+        }
+      },
+    });
+    const executeAgentic = vi.fn(async (request: AiAgenticRequest) => {
+      await request.controller.evaluateAssert(passingText('Recovered dashboard'));
+      return { outcome: 'success' as const };
+    });
+    const executor = createFakeAiExecutor({ executeAgentic });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep('recorded-ai', [secretRef])],
+      aiGrounding(priorTrace),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(resolveAiExecutor).toHaveBeenCalledTimes(1);
+    expect(executeAgentic).toHaveBeenCalledTimes(1);
+    expect(executor.agenticRequests).toHaveLength(1);
+    expect(executor.agenticRequests[0]?.priorTrace).toEqual(priorTrace);
+    expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'recorded-ai' }]);
+    expect(session.operations().filter((operation) => operation.type === 'fill-secret')).toHaveLength(1);
+    expect(session.operations()).toContainEqual({
+      type: 'perform',
+      action: { type: 'navigate', url: '/cached-route' },
+    });
+    expect(session.operations().filter((operation) => operation.type === 'evaluate-assert')).toEqual([
+      {
+        type: 'evaluate-assert',
+        check: { check: 'text-visible', text: 'Recovered dashboard' },
+      },
+    ]);
+  });
+
+  it('issue 167 keeps fallback for a fill-secret target miss before browser invocation', async () => {
+    const secretRef = '{{secrets.ISSUE_167_BIND_MISS}}';
+    const secretValue = 'ISSUE_167_BIND_MISS_VALUE';
+    const priorTrace = trace(
+      [{ type: 'fill-secret', target: PASSWORD, secretRef }],
+      [passingText('Cached dashboard')],
+    );
+    const session = createFakeBrowserSession(new Map());
+    const fillSecret = vi.spyOn(session, 'fillSecret');
+    const executeAgentic = vi.fn(async (request: AiAgenticRequest) => {
+      await request.controller.evaluateAssert(passingText('Recovered after bind miss'));
+      return { outcome: 'success' as const };
+    });
+    const executor = createFakeAiExecutor({ executeAgentic });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep('recorded-ai', [secretRef])],
+      aiGrounding(priorTrace),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(fillSecret).not.toHaveBeenCalled();
+    expect(resolveAiExecutor).toHaveBeenCalledTimes(1);
+    expect(executeAgentic).toHaveBeenCalledTimes(1);
+    expect(executor.agenticRequests[0]?.priorTrace).toEqual(priorTrace);
+    expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'recorded-ai' }]);
+    expect(session.operations()).toContainEqual({
+      type: 'resolve-grounded',
+      target: PASSWORD,
+      query: expect.objectContaining({ mode: 'compute' }),
+    });
+    expect(session.operations().filter((operation) => operation.type === 'fill-secret')).toEqual([]);
+  });
+
+  it('issue 167 leaves a fresh-agentic fill-secret rejection at the controller boundary', async () => {
+    const secretRef = '{{secrets.ISSUE_167_FRESH_AGENTIC}}';
+    const secretValue = 'ISSUE_167_FRESH_AGENTIC_VALUE';
+    const browserMessage = `Fresh agentic browser rejected ${secretValue}.`;
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      onFillSecret() {
+        throw new Error(browserMessage);
+      },
+    });
+    let controllerRejection: unknown;
+    const executeAgentic = vi.fn(async (request: AiAgenticRequest) => {
+      try {
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef });
+      } catch (error) {
+        controllerRejection = error;
+        return { outcome: 'failure' as const };
+      }
+      throw new Error('The fresh-agentic browser rejection was not delivered to the executor.');
+    });
+    const executor = createFakeAiExecutor({ executeAgentic });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep('recorded-ai', [secretRef])],
+    );
+    const groundingBefore = await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`);
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(controllerRejection).toBeInstanceOf(Error);
+    expect((controllerRejection as Error).message).toBe(`Fresh agentic browser rejected ${secretRef}.`);
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(outcome.results[0]?.result).toMatchObject({
+      status: 'error',
+      explanation: 'The AI-directed interaction did not complete successfully.',
+      steps: [{ id: 'recorded-ai', status: 'error', kind: 'environment' }],
+    });
+    expect(resolveAiExecutor).toHaveBeenCalledTimes(1);
+    expect(executeAgentic).toHaveBeenCalledTimes(1);
+    expect(executor.agenticRequests).toHaveLength(1);
+    expect(executor.agenticRequests[0]).not.toHaveProperty('priorTrace');
+    expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'recorded-ai' }]);
+    expect(recordingStorage.writes).toEqual([]);
+    expect(await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`)).toBe(groundingBefore);
+    expect(JSON.stringify({ outcome, events: events.emitted() })).not.toContain(secretValue);
+    expect(JSON.stringify({ outcome, events: events.emitted() })).not.toContain(browserMessage);
+  });
+
   it('rejects a cross-origin fresh agentic navigate before it reaches the browser', async () => {
     const session = createFakeBrowserSession(new Map());
     const executor = createFakeAiExecutor({

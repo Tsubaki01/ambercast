@@ -119,6 +119,38 @@ interface FakeLocatorOptions {
   readonly ariaSnapshot?: string;
 }
 
+class FakePlaywrightElementHandle {
+  fillFailure: Error | undefined;
+  fillOverride: (() => Promise<void>) | undefined;
+  disposeFailure: Error | undefined;
+  readonly fillValues: string[] = [];
+  readonly disposeCalls: undefined[] = [];
+
+  constructor(
+    readonly identity: string,
+    private readonly operationLog: string[],
+  ) {}
+
+  async fill(value: string): Promise<void> {
+    this.operationLog.push(`element:${this.identity}.fill`);
+    this.fillValues.push(value);
+    if (this.fillFailure !== undefined) {
+      throw this.fillFailure;
+    }
+    if (this.fillOverride !== undefined) {
+      await this.fillOverride();
+    }
+  }
+
+  async dispose(): Promise<void> {
+    this.operationLog.push(`element:${this.identity}.dispose`);
+    this.disposeCalls.push(undefined);
+    if (this.disposeFailure !== undefined) {
+      throw this.disposeFailure;
+    }
+  }
+}
+
 class FakePlaywrightLocator implements PlaywrightLocatorHandle {
   visible: boolean;
   text: string;
@@ -136,8 +168,14 @@ class FakePlaywrightLocator implements PlaywrightLocatorHandle {
   readonly inputValueCalls: undefined[] = [];
   readonly countCalls: undefined[] = [];
   readonly ariaSnapshotCalls: undefined[] = [];
+  readonly elementHandleCalls: undefined[] = [];
+  readonly acquiredElementHandles: FakePlaywrightElementHandle[] = [];
   readonly pressedKeys: string[] = [];
   ariaSnapshotOverride: (() => Promise<string>) | undefined;
+  elementHandleOverride: (() => Promise<FakePlaywrightElementHandle>) | undefined;
+  operationLabel = 'locator';
+  operationLog: string[] = [];
+  private nextElementIdentity = 1;
 
   constructor(options: FakeLocatorOptions = {}) {
     this.visible = options.visible ?? true;
@@ -160,6 +198,7 @@ class FakePlaywrightLocator implements PlaywrightLocatorHandle {
   }
 
   async fill(value: string): Promise<void> {
+    this.operationLog.push(`${this.operationLabel}.fill`);
     this.fillValues.push(value);
     if (this.fillFailure !== undefined) {
       throw this.fillFailure;
@@ -194,11 +233,22 @@ class FakePlaywrightLocator implements PlaywrightLocatorHandle {
   }
 
   async ariaSnapshot(): Promise<string> {
+    this.operationLog.push(`${this.operationLabel}.ariaSnapshot`);
     this.ariaSnapshotCalls.push(undefined);
     if (this.ariaSnapshotOverride !== undefined) {
       return this.ariaSnapshotOverride();
     }
     return this.ariaSnapshotText;
+  }
+
+  async elementHandle(): Promise<FakePlaywrightElementHandle> {
+    this.operationLog.push(`${this.operationLabel}.elementHandle`);
+    this.elementHandleCalls.push(undefined);
+    const element = this.elementHandleOverride === undefined
+      ? new FakePlaywrightElementHandle(String(this.nextElementIdentity++), this.operationLog)
+      : await this.elementHandleOverride();
+    this.acquiredElementHandles.push(element);
+    return element;
   }
 }
 
@@ -226,6 +276,7 @@ class FakePlaywrightPage implements PlaywrightPageHandle {
   readonly locatorCalls: string[] = [];
   readonly urlCalls: undefined[] = [];
   readonly screenshotCalls: undefined[] = [];
+  readonly operationLog: string[] = [];
   readonly roleLocator: FakePlaywrightLocator;
   readonly textLocator: FakePlaywrightLocator;
   readonly bodyLocator: FakePlaywrightLocator;
@@ -236,6 +287,12 @@ class FakePlaywrightPage implements PlaywrightPageHandle {
     this.roleLocator = options.roleLocator ?? new FakePlaywrightLocator();
     this.textLocator = options.textLocator ?? new FakePlaywrightLocator();
     this.bodyLocator = new FakePlaywrightLocator({ ariaSnapshot: options.ariaSnapshot ?? FIXTURE_ARIA_SNAPSHOT });
+    this.roleLocator.operationLabel = 'roleLocator';
+    this.roleLocator.operationLog = this.operationLog;
+    this.textLocator.operationLabel = 'textLocator';
+    this.textLocator.operationLog = this.operationLog;
+    this.bodyLocator.operationLabel = 'bodyLocator';
+    this.bodyLocator.operationLog = this.operationLog;
     this.screenshotBytes = options.screenshot ?? FIXTURE_SCREENSHOT;
   }
 
@@ -251,6 +308,7 @@ class FakePlaywrightPage implements PlaywrightPageHandle {
   }
 
   navigationGeneration(): number {
+    this.operationLog.push('page.navigationGeneration');
     return this.generation;
   }
 
@@ -271,6 +329,7 @@ class FakePlaywrightPage implements PlaywrightPageHandle {
     role: string,
     options: { readonly name: string; readonly exact: true },
   ): PlaywrightLocatorHandle {
+    this.operationLog.push('page.getByRole');
     this.roleCalls.push({ role, options });
     return this.roleLocator;
   }
@@ -284,11 +343,13 @@ class FakePlaywrightPage implements PlaywrightPageHandle {
   }
 
   locator(selector: string): PlaywrightLocatorHandle {
+    this.operationLog.push(`page.locator:${selector}`);
     this.locatorCalls.push(selector);
     return selector === 'body' ? this.bodyLocator : this.textLocator;
   }
 
   url(): string {
+    this.operationLog.push('page.url');
     this.urlCalls.push(undefined);
     return this.currentUrl;
   }
@@ -443,6 +504,32 @@ function deferred<T>(): { readonly promise: Promise<T>; resolve(value: T): void 
         throw new Error('The deferred promise resolver was not initialized.');
       }
       resolve(value);
+    },
+  };
+}
+
+function captureConsoleOutput() {
+  const spies = [
+    vi.spyOn(console, 'debug').mockImplementation(() => undefined),
+    vi.spyOn(console, 'error').mockImplementation(() => undefined),
+    vi.spyOn(console, 'info').mockImplementation(() => undefined),
+    vi.spyOn(console, 'log').mockImplementation(() => undefined),
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined),
+  ];
+
+  return {
+    expectSecretFree(error: unknown, additionalForbidden: readonly string[] = []): void {
+      const errorText = `${String(error)} ${JSON.stringify(error)}`;
+      for (const forbidden of [MATERIALIZED_SECRET, ...additionalForbidden]) {
+        expect(errorText).not.toContain(forbidden);
+        expect(JSON.stringify(spies.flatMap((spy) => spy.mock.calls))).not.toContain(forbidden);
+      }
+      expect(spies.flatMap((spy) => spy.mock.calls)).toEqual([]);
+    },
+    restore(): void {
+      for (const spy of spies) {
+        spy.mockRestore();
+      }
     },
   };
 }
@@ -608,13 +695,60 @@ describe('ChromiumBrowserSession.perform()', () => {
 });
 
 describe('ChromiumBrowserSession.fillSecret()', () => {
-  it('maps a permitted secret fill to a direct exact accessibility role locator without positional narrowing', async () => {
+  it('acquires one physical element and fills that exact object immediately after the final origin check', async () => {
     await withLaunchedSession({}, async (session, launcher) => {
       const target = await bindSubmit(session);
+      const pinned = new FakePlaywrightElementHandle('pinned', launcher.page.operationLog);
+      const laterReplacement = new FakePlaywrightElementHandle('replacement', launcher.page.operationLog);
+      let acquisitionCount = 0;
+      launcher.page.roleLocator.elementHandleOverride = async () => (
+        acquisitionCount++ === 0 ? pinned : laterReplacement
+      );
+      launcher.page.operationLog.length = 0;
+
       await expect(session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY)).resolves.toBeUndefined();
 
       expectExactSubmitLookup(launcher);
-      expect(launcher.page.roleLocator.fillValues).toEqual([MATERIALIZED_SECRET]);
+      expect(launcher.page.roleLocator.elementHandleCalls).toHaveLength(1);
+      expect(launcher.page.roleLocator.fillValues).toEqual([]);
+      expect(pinned.fillValues).toEqual([MATERIALIZED_SECRET]);
+      expect(laterReplacement.fillValues).toEqual([]);
+      expect(pinned.disposeCalls).toHaveLength(1);
+      expect(launcher.page.operationLog).toEqual([
+        'page.url',
+        'page.navigationGeneration',
+        'page.locator:body',
+        'bodyLocator.ariaSnapshot',
+        'page.navigationGeneration',
+        'page.getByRole',
+        'roleLocator.elementHandle',
+        'page.navigationGeneration',
+        'page.url',
+        'element:pinned.fill',
+        'element:pinned.dispose',
+      ]);
+    });
+  });
+
+  it('disposes the physical element only after its pending fill settles', async () => {
+    await withLaunchedSession({}, async (session, launcher) => {
+      const target = await bindSubmit(session);
+      const fillSettlement = deferred<void>();
+      const pinned = new FakePlaywrightElementHandle('pending-fill', launcher.page.operationLog);
+      pinned.fillOverride = () => fillSettlement.promise;
+      launcher.page.roleLocator.elementHandleOverride = async () => pinned;
+
+      const operation = session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY);
+
+      await vi.waitFor(() => {
+        expect(pinned.fillValues).toEqual([MATERIALIZED_SECRET]);
+      });
+      expect(pinned.disposeCalls).toHaveLength(0);
+
+      fillSettlement.resolve(undefined);
+
+      await expect(operation).resolves.toBeUndefined();
+      expect(pinned.disposeCalls).toHaveLength(1);
     });
   });
 
@@ -643,40 +777,104 @@ describe('ChromiumBrowserSession.fillSecret()', () => {
     }
   });
 
-  it('does not log or expose a resolved secret when Playwright rejects a fill', async () => {
+  it('propagates a detached physical-element fill rejection without reacquiring or leaking the secret', async () => {
     const failure = new Error('input is detached');
-    const consoleSpies = [
-      vi.spyOn(console, 'debug').mockImplementation(() => undefined),
-      vi.spyOn(console, 'error').mockImplementation(() => undefined),
-      vi.spyOn(console, 'info').mockImplementation(() => undefined),
-      vi.spyOn(console, 'log').mockImplementation(() => undefined),
-      vi.spyOn(console, 'warn').mockImplementation(() => undefined),
-    ];
+    const cleanupSentinel = 'dispose browser sentinel';
+    const consoleCapture = captureConsoleOutput();
 
     try {
       await withLaunchedSession({}, async (session, launcher) => {
-        launcher.page.roleLocator.fillFailure = failure;
         const target = await bindSubmit(session);
+        const pinned = new FakePlaywrightElementHandle('detached', launcher.page.operationLog);
+        pinned.fillFailure = failure;
+        pinned.disposeFailure = new Error(cleanupSentinel);
+        launcher.page.roleLocator.elementHandleOverride = async () => pinned;
 
-        let thrown: unknown;
-        try {
-          await session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY);
-        } catch (error) {
-          thrown = error;
-        }
+        const thrown = await captureRejection(
+          session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY),
+        );
 
         expect(thrown).toBe(failure);
-        expect(thrown instanceof Error ? thrown.message : String(thrown)).not.toContain(MATERIALIZED_SECRET);
-        expect(consoleSpies.flatMap((spy) => spy.mock.calls)).toEqual([]);
+        expect(launcher.page.roleLocator.elementHandleCalls).toHaveLength(1);
+        expect(launcher.page.roleLocator.fillValues).toEqual([]);
+        expect(pinned.fillValues).toEqual([MATERIALIZED_SECRET]);
+        expect(pinned.disposeCalls).toHaveLength(1);
+        consoleCapture.expectSecretFree(thrown, [cleanupSentinel]);
       });
     } finally {
-      for (const spy of consoleSpies) {
-        spy.mockRestore();
-      }
+      consoleCapture.restore();
     }
   });
 
-  it('rejects a disallowed current origin before invoking Playwright fill', async () => {
+  it('preserves a fixed-target fill rejection when its invocation changes the live origin', async () => {
+    const failure = new Error('fixed target fill failed');
+    const consoleCapture = captureConsoleOutput();
+
+    try {
+      await withLaunchedSession({}, async (session, launcher) => {
+        const target = await bindSubmit(session);
+        const pinned = new FakePlaywrightElementHandle('origin-changing-fill', launcher.page.operationLog);
+        pinned.fillOverride = async () => {
+          launcher.page.currentUrl = 'https://idp.example.test/login';
+          launcher.page.operationLog.push('element:origin-changing-fill.rejected');
+          throw failure;
+        };
+        launcher.page.roleLocator.elementHandleOverride = async () => pinned;
+
+        const thrown = await captureRejection(
+          session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY),
+        );
+
+        expect(thrown).toBe(failure);
+        expect(thrown).not.toBeInstanceOf(IntegrityViolationError);
+        expect(launcher.page.roleLocator.elementHandleCalls).toHaveLength(1);
+        expect(launcher.page.roleLocator.acquiredElementHandles).toEqual([pinned]);
+        expect(launcher.page.roleLocator.fillValues).toEqual([]);
+        expect(pinned.fillValues).toEqual([MATERIALIZED_SECRET]);
+        expect(pinned.disposeCalls).toHaveLength(1);
+
+        const fillInvocation = launcher.page.operationLog.indexOf('element:origin-changing-fill.fill');
+        expect(fillInvocation).toBeGreaterThanOrEqual(0);
+        expect(launcher.page.operationLog.slice(fillInvocation)).toEqual([
+          'element:origin-changing-fill.fill',
+          'element:origin-changing-fill.rejected',
+          'element:origin-changing-fill.dispose',
+        ]);
+        consoleCapture.expectSecretFree(thrown);
+      });
+    } finally {
+      consoleCapture.restore();
+    }
+  });
+
+  it.each([
+    ['zero matches', new Error('strict element acquisition found no matching element')],
+    ['multiple matches', new Error('strict element acquisition found multiple matching elements')],
+  ] as const)('propagates a %s acquisition rejection without filling or retrying', async (_scenario, failure) => {
+    const consoleCapture = captureConsoleOutput();
+    try {
+      await withLaunchedSession({}, async (session, launcher) => {
+        const target = await bindSubmit(session);
+        launcher.page.roleLocator.elementHandleOverride = async () => {
+          throw failure;
+        };
+
+        const thrown = await captureRejection(
+          session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY),
+        );
+
+        expect(thrown).toBe(failure);
+        expect(launcher.page.roleLocator.elementHandleCalls).toHaveLength(1);
+        expect(launcher.page.roleLocator.acquiredElementHandles).toEqual([]);
+        expect(launcher.page.roleLocator.fillValues).toEqual([]);
+        consoleCapture.expectSecretFree(thrown);
+      });
+    } finally {
+      consoleCapture.restore();
+    }
+  });
+
+  it('rejects a disallowed current origin before acquiring a physical element', async () => {
     await withLaunchedSession({ currentUrl: 'https://idp.example.test/login' }, async (session, launcher) => {
       const target = await bindSubmit(session);
 
@@ -684,6 +882,7 @@ describe('ChromiumBrowserSession.fillSecret()', () => {
         await captureRejection(session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY)),
         ALLOWED_POLICY,
       );
+      expect(launcher.page.roleLocator.elementHandleCalls).toHaveLength(0);
       expect(launcher.page.roleLocator.fillValues).toEqual([]);
     });
   });
@@ -694,6 +893,7 @@ describe('ChromiumBrowserSession.fillSecret()', () => {
 
       await expect(session.fillSecret(fabricated, MATERIALIZED_SECRET, ALLOWED_POLICY)).rejects.toThrow('provenance');
       expect(launcher.page.roleCalls).toEqual([]);
+      expect(launcher.page.roleLocator.elementHandleCalls).toHaveLength(0);
       expect(launcher.page.roleLocator.fillValues).toEqual([]);
     });
   });
@@ -704,6 +904,7 @@ describe('ChromiumBrowserSession.fillSecret()', () => {
       await session.perform({ type: 'navigate', url: '/still-example' });
 
       await expect(session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY)).rejects.toThrow('navigation');
+      expect(launcher.page.roleLocator.elementHandleCalls).toHaveLength(0);
       expect(launcher.page.roleLocator.fillValues).toEqual([]);
     });
   });
@@ -722,6 +923,7 @@ describe('ChromiumBrowserSession.fillSecret()', () => {
 
       expect(thrown instanceof Error ? thrown.message : String(thrown)).toContain('fingerprint');
       expect(thrown).not.toBeInstanceOf(IntegrityViolationError);
+      expect(launcher.page.roleLocator.elementHandleCalls).toHaveLength(0);
       expect(launcher.page.roleLocator.fillValues).toEqual([]);
     });
   });
@@ -735,6 +937,7 @@ describe('ChromiumBrowserSession.fillSecret()', () => {
         await captureRejection(session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY)),
         ALLOWED_POLICY,
       );
+      expect(launcher.page.roleLocator.elementHandleCalls).toHaveLength(0);
       expect(launcher.page.roleLocator.fillValues).toEqual([]);
     });
   });
@@ -748,6 +951,7 @@ describe('ChromiumBrowserSession.fillSecret()', () => {
         await captureRejection(session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY)),
         ALLOWED_POLICY,
       );
+      expect(launcher.page.roleLocator.elementHandleCalls).toHaveLength(0);
       expect(launcher.page.roleLocator.fillValues).toEqual([]);
     });
   });
@@ -768,7 +972,12 @@ describe('ChromiumBrowserSession.fillSecret()', () => {
       snapshot.resolve(FIXTURE_ARIA_SNAPSHOT);
 
       expectSecretSinkOriginViolation(await captureRejection(operation), ALLOWED_POLICY);
+      expect(launcher.page.roleLocator.elementHandleCalls).toHaveLength(1);
+      const [acquired] = launcher.page.roleLocator.acquiredElementHandles;
+      expect(acquired).toBeDefined();
+      expect(acquired?.fillValues).toEqual([]);
       expect(launcher.page.roleLocator.fillValues).toEqual([]);
+      expect(acquired?.disposeCalls).toHaveLength(1);
     });
   });
 
@@ -788,8 +997,175 @@ describe('ChromiumBrowserSession.fillSecret()', () => {
       snapshot.resolve(CHANGED_SUBMIT_FIXTURE);
 
       expectSecretSinkOriginViolation(await captureRejection(operation), ALLOWED_POLICY);
+      expect(launcher.page.roleLocator.elementHandleCalls).toHaveLength(0);
       expect(launcher.page.roleLocator.fillValues).toEqual([]);
     });
+  });
+
+  it('rejects and disposes an acquired element when acquisition crosses an allowed-origin navigation', async () => {
+    const consoleCapture = captureConsoleOutput();
+    try {
+      await withLaunchedSession({}, async (session, launcher) => {
+        const target = await bindSubmit(session);
+        const acquired = new FakePlaywrightElementHandle('allowed-navigation', launcher.page.operationLog);
+        launcher.page.roleLocator.elementHandleOverride = async () => {
+          launcher.page.simulateMainFrameNavigation();
+          launcher.page.currentUrl = 'https://example.test/replaced';
+          return acquired;
+        };
+
+        const thrown = await captureRejection(
+          session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY),
+        );
+
+        expect(thrown).toBeInstanceOf(Error);
+        expect(thrown).not.toBeInstanceOf(IntegrityViolationError);
+        expect(thrown instanceof Error ? thrown.message : '').toContain('navigation');
+        expect(launcher.page.roleLocator.elementHandleCalls).toHaveLength(1);
+        expect(launcher.page.roleLocator.fillValues).toEqual([]);
+        expect(acquired.fillValues).toEqual([]);
+        expect(acquired.disposeCalls).toHaveLength(1);
+        consoleCapture.expectSecretFree(thrown);
+      });
+    } finally {
+      consoleCapture.restore();
+    }
+  });
+
+  it('reclassifies a rejecting acquisition after disallowed-origin navigation without retrying', async () => {
+    const acquisitionFailure = new Error('strict acquisition was interrupted by navigation');
+    const consoleCapture = captureConsoleOutput();
+    try {
+      await withLaunchedSession({}, async (session, launcher) => {
+        const target = await bindSubmit(session);
+        launcher.page.roleLocator.elementHandleOverride = async () => {
+          launcher.page.simulateMainFrameNavigation();
+          launcher.page.currentUrl = 'https://idp.example.test/login';
+          throw acquisitionFailure;
+        };
+
+        const thrown = await captureRejection(
+          session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY),
+        );
+
+        expectSecretSinkOriginViolation(thrown, ALLOWED_POLICY);
+        expect(launcher.page.roleLocator.elementHandleCalls).toHaveLength(1);
+        expect(launcher.page.roleLocator.acquiredElementHandles).toEqual([]);
+        expect(launcher.page.roleLocator.fillValues).toEqual([]);
+        consoleCapture.expectSecretFree(thrown);
+      });
+    } finally {
+      consoleCapture.restore();
+    }
+  });
+
+  it('preserves integrity precedence and suppresses cleanup text after a disallowed generation swap', async () => {
+    const cleanupSentinel = 'classified cleanup browser sentinel';
+    const consoleCapture = captureConsoleOutput();
+    try {
+      await withLaunchedSession({}, async (session, launcher) => {
+        const target = await bindSubmit(session);
+        const acquired = new FakePlaywrightElementHandle('disallowed-navigation', launcher.page.operationLog);
+        acquired.disposeFailure = new Error(cleanupSentinel);
+        launcher.page.roleLocator.elementHandleOverride = async () => {
+          launcher.page.simulateMainFrameNavigation();
+          launcher.page.currentUrl = 'https://idp.example.test/login';
+          return acquired;
+        };
+
+        const thrown = await captureRejection(
+          session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY),
+        );
+
+        expectSecretSinkOriginViolation(thrown, ALLOWED_POLICY);
+        expect(launcher.page.roleLocator.elementHandleCalls).toHaveLength(1);
+        expect(launcher.page.roleLocator.fillValues).toEqual([]);
+        expect(acquired.fillValues).toEqual([]);
+        expect(acquired.disposeCalls).toHaveLength(1);
+        consoleCapture.expectSecretFree(thrown, [cleanupSentinel]);
+      });
+    } finally {
+      consoleCapture.restore();
+    }
+  });
+
+  it('rejects the final live origin after acquisition and disposes the unfilled element', async () => {
+    const consoleCapture = captureConsoleOutput();
+    try {
+      await withLaunchedSession({}, async (session, launcher) => {
+        const target = await bindSubmit(session);
+        const acquired = new FakePlaywrightElementHandle('final-origin', launcher.page.operationLog);
+        launcher.page.roleLocator.elementHandleOverride = async () => {
+          launcher.page.currentUrl = 'https://idp.example.test/login';
+          return acquired;
+        };
+
+        const thrown = await captureRejection(
+          session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY),
+        );
+
+        expectSecretSinkOriginViolation(thrown, ALLOWED_POLICY);
+        expect(launcher.page.roleLocator.elementHandleCalls).toHaveLength(1);
+        expect(launcher.page.roleLocator.fillValues).toEqual([]);
+        expect(acquired.fillValues).toEqual([]);
+        expect(acquired.disposeCalls).toHaveLength(1);
+        consoleCapture.expectSecretFree(thrown);
+      });
+    } finally {
+      consoleCapture.restore();
+    }
+  });
+
+  it('acquires and disposes a fresh physical element for every call on one binding', async () => {
+    await withLaunchedSession({}, async (session, launcher) => {
+      const target = await bindSubmit(session);
+      const first = new FakePlaywrightElementHandle('first-call', launcher.page.operationLog);
+      const second = new FakePlaywrightElementHandle('second-call', launcher.page.operationLog);
+      const handles = [first, second];
+      launcher.page.roleLocator.elementHandleOverride = async () => {
+        const next = handles.shift();
+        if (next === undefined) {
+          throw new Error('The test supplied too few physical elements.');
+        }
+        return next;
+      };
+
+      await expect(session.fillSecret(target, 'first secret', ALLOWED_POLICY)).resolves.toBeUndefined();
+      await expect(session.fillSecret(target, 'second secret', ALLOWED_POLICY)).resolves.toBeUndefined();
+
+      expect(launcher.page.bodyLocator.ariaSnapshotCalls).toHaveLength(3);
+      expect(launcher.page.roleLocator.elementHandleCalls).toHaveLength(2);
+      expect(launcher.page.roleLocator.fillValues).toEqual([]);
+      expect(first.fillValues).toEqual(['first secret']);
+      expect(second.fillValues).toEqual(['second secret']);
+      expect(first.disposeCalls).toHaveLength(1);
+      expect(second.disposeCalls).toHaveLength(1);
+    });
+  });
+
+  it('suppresses a disposal rejection after a successful fixed-target fill', async () => {
+    const cleanupSentinel = 'successful cleanup browser sentinel';
+    const consoleCapture = captureConsoleOutput();
+    try {
+      await withLaunchedSession({}, async (session, launcher) => {
+        const target = await bindSubmit(session);
+        const acquired = new FakePlaywrightElementHandle('cleanup-after-success', launcher.page.operationLog);
+        acquired.disposeFailure = new Error(cleanupSentinel);
+        launcher.page.roleLocator.elementHandleOverride = async () => acquired;
+
+        await expect(
+          session.fillSecret(target, MATERIALIZED_SECRET, ALLOWED_POLICY),
+        ).resolves.toBeUndefined();
+
+        expect(launcher.page.roleLocator.elementHandleCalls).toHaveLength(1);
+        expect(launcher.page.roleLocator.fillValues).toEqual([]);
+        expect(acquired.fillValues).toEqual([MATERIALIZED_SECRET]);
+        expect(acquired.disposeCalls).toHaveLength(1);
+        consoleCapture.expectSecretFree(undefined, [cleanupSentinel]);
+      });
+    } finally {
+      consoleCapture.restore();
+    }
   });
 });
 
