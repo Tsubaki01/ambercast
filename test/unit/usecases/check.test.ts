@@ -1,6 +1,7 @@
 import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { DEFAULT_RAW_CONFIG } from '#config/defaults.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
+import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
@@ -109,6 +110,18 @@ function createScenario(overrides: Partial<CheckDeps> = {}) {
   };
 
   return { storage, layout, deps };
+}
+
+async function captureTargetFailure(operation: Promise<unknown>): Promise<TargetUnresolvedError> {
+  const error = await operation.then(
+    () => undefined,
+    (reason: unknown) => reason,
+  );
+  expect(error).toBeInstanceOf(TargetUnresolvedError);
+  if (!(error instanceof TargetUnresolvedError)) {
+    throw new Error('Expected check to reject with TargetUnresolvedError.');
+  }
+  return error;
 }
 
 describe('check', () => {
@@ -442,27 +455,57 @@ describe('check', () => {
     });
   });
 
-  it('throws for an unresolved explicit target with a non-empty selection', async () => {
+  it.each([
+    ['a non-empty literal selection', [`${TEST_DIR}/login.test.md`]],
+    ['an empty selection', []],
+  ] as const)('throws the shared exact error for an invalid explicit target with %s', async (
+    _selection,
+    files,
+  ) => {
     const { deps } = createScenario();
 
-    await expect(check(deps, { ...OPTIONS, files: [`${TEST_DIR}/login.test.md`], target: 'missing' }))
-      .rejects.toMatchObject({ kind: 'target-unresolved' });
-  });
+    const error = await captureTargetFailure(check(deps, {
+      ...OPTIONS,
+      files,
+      target: 'missing',
+    }));
 
-  it('throws for an unresolved explicit target with an empty selection', async () => {
-    const { deps } = createScenario();
-
-    await expect(check(deps, { ...OPTIONS, target: 'missing' })).rejects.toMatchObject({ kind: 'target-unresolved' });
+    expect(error).toMatchObject({
+      kind: 'target-unresolved',
+      exitCode: 2,
+      message: 'The requested target is not configured.',
+    });
+    expect(error.details).toEqual({ target: 'missing' });
   });
 
   it.each([
     ['an empty selection', []],
     ['a non-empty selection', [`${TEST_DIR}/login.test.md`]],
-  ] as const)('rejects the inherited constructor target for %s', async (_selection, files) => {
-    const { deps } = createScenario({ config: createConfig({ targets: {} }) });
+  ] as const)('rejects the inherited constructor target for %s without default fallback', async (
+    _selection,
+    files,
+  ) => {
+    const discoverTestFiles = vi.fn<CheckDeps['discoverTestFiles']>(createDiscovery());
+    const config = createConfig();
+    expect(Object.hasOwn(config.targets, 'web')).toBe(true);
+    expect(config.defaultTarget).toBe('web');
+    expect(Object.hasOwn(config.targets, 'constructor')).toBe(false);
+    expect(config.targets.constructor).toBe(Object.prototype.constructor);
+    const { deps } = createScenario({ config, discoverTestFiles });
 
-    await expect(check(deps, { ...OPTIONS, files, target: 'constructor' }))
-      .rejects.toMatchObject({ kind: 'target-unresolved' });
+    const error = await captureTargetFailure(check(deps, {
+      ...OPTIONS,
+      files,
+      target: 'constructor',
+    }));
+
+    expect(error).toMatchObject({
+      kind: 'target-unresolved',
+      exitCode: 2,
+      message: 'The requested target is not configured.',
+    });
+    expect(error.details).toEqual({ target: 'constructor' });
+    expect(discoverTestFiles).not.toHaveBeenCalled();
   });
 
   it('validates an explicit target before test discovery can reject', async () => {
@@ -471,14 +514,29 @@ describe('check', () => {
     });
     const { deps } = createScenario({ discoverTestFiles });
 
-    await expect(check(deps, { ...OPTIONS, target: 'missing' }))
-      .rejects.toMatchObject({ kind: 'target-unresolved' });
+    const error = await captureTargetFailure(check(deps, { ...OPTIONS, target: 'missing' }));
+
+    expect(error).toMatchObject({
+      kind: 'target-unresolved',
+      exitCode: 2,
+      message: 'The requested target is not configured.',
+    });
+    expect(error.details).toEqual({ target: 'missing' });
     expect(discoverTestFiles).not.toHaveBeenCalled();
   });
 
-  it('throws for an unresolved implicit target with a non-empty selection', async () => {
+  it.each([
+    ['literal selection', [`${TEST_DIR}/login.test.md`], createDiscovery()],
+    ['discovery-derived selection', [], createDiscovery(['login.test.md'])],
+  ] as const)('throws the shared ambiguity error for a non-empty %s', async (
+    _selection,
+    files,
+    discovery,
+  ) => {
     const { defaultTarget: _defaultTarget, ...ambiguousConfig } = createConfig();
-    const { deps } = createScenario({
+    const discoverTestFiles = vi.fn<CheckDeps['discoverTestFiles']>(discovery);
+    const { storage, deps } = createScenario({
+      discoverTestFiles,
       config: {
         ...ambiguousConfig,
         targets: {
@@ -487,9 +545,71 @@ describe('check', () => {
         },
       },
     });
+    const exists = vi.spyOn(storage, 'exists');
+    const readText = vi.spyOn(storage, 'readText');
 
-    await expect(check(deps, { ...OPTIONS, files: [`${TEST_DIR}/login.test.md`] }))
-      .rejects.toMatchObject({ kind: 'target-unresolved' });
+    const error = await captureTargetFailure(check(deps, { ...OPTIONS, files }));
+
+    expect(error).toMatchObject({
+      kind: 'target-unresolved',
+      exitCode: 2,
+      message: 'A target could not be selected from the configured targets.',
+    });
+    expect(error.details).toEqual({ target: '(default)', targetNames: ['admin', 'web'] });
+    expect(discoverTestFiles).toHaveBeenCalledTimes(files.length === 0 ? 1 : 0);
+    expect(exists).not.toHaveBeenCalled();
+    expect(readText).not.toHaveBeenCalled();
+  });
+
+  it('uses a sole implicit target for freshness when defaultTarget is absent', async () => {
+    const testPath = `${TEST_DIR}/implicit.test.md`;
+    const soleTargets = {
+      replacement: { baseUrl: 'https://replacement.example.test', browser: 'chromium' as const },
+    };
+    const { defaultTarget: _defaultTarget, ...configWithoutDefault } = createConfig();
+    const { storage, layout, deps } = createScenario({
+      config: { ...configWithoutDefault, targets: soleTargets },
+    });
+    await storage.writeText(testPath, PROMPT);
+    await writePlan(storage, layout, testPath, freshPlan(PROMPT, soleTargets));
+
+    await expect(check(deps, { ...OPTIONS, files: [testPath] })).resolves.toMatchObject({
+      results: [{ id: testPath, status: 'fresh' }],
+      errors: [],
+    });
+  });
+
+  it.each([
+    ['the configured default', undefined, 'web'],
+    ['an explicit override', 'admin', 'admin'],
+  ] as const)('uses %s as the only freshness target', async (
+    _selection,
+    target,
+    expectedName,
+  ) => {
+    const testPath = `${TEST_DIR}/${expectedName}.test.md`;
+    const targets = {
+      web: TARGETS.web,
+      admin: { baseUrl: 'https://admin.example.test', browser: 'chromium' as const },
+    };
+    const { storage, layout, deps } = createScenario({
+      config: createConfig({ targets, defaultTarget: 'web' }),
+    });
+    await storage.writeText(testPath, PROMPT);
+    await writePlan(
+      storage,
+      layout,
+      testPath,
+      freshPlan(PROMPT, { [expectedName]: targets[expectedName] }),
+    );
+
+    await expect(check(deps, {
+      ...OPTIONS,
+      files: [testPath],
+      ...(target === undefined ? {} : { target }),
+    })).resolves.toMatchObject({
+      results: [{ id: testPath, status: 'fresh' }],
+    });
   });
 
   it('skips unresolved implicit target resolution for an orphan-only scan', async () => {
