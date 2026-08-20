@@ -42,6 +42,7 @@ import {
 import type { LayoutResolver } from '#core/layout/resolve.js';
 import { joinPath, relativeWithin } from '#core/paths.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
+import { resolveTarget } from '#core/target/resolve.js';
 import type { AiActionController, AiExecutor } from '#ports/ai.js';
 import type {
   AssertCheck,
@@ -208,20 +209,6 @@ class CaseAbort extends Error {}
 
 function fsIoError(message: string, cause: unknown): FsIoError {
   return new FsIoError(message, undefined, { cause });
-}
-
-function resolveTarget(
-  config: RunDeps['config'],
-  options: RunOptions,
-): Readonly<Record<string, TargetDefinition>> | TargetUnresolvedError {
-  const targetName = options.target ?? config.defaultTarget;
-  const target = targetName === undefined ? undefined : config.targets[targetName];
-
-  if (targetName === undefined || target === undefined) {
-    return new TargetUnresolvedError('The requested replay target is not configured.', { target: targetName ?? '(default)' });
-  }
-
-  return { [targetName]: target };
 }
 
 function emptyGrounding(plan: PlanDocumentType): GroundingDocumentType {
@@ -2208,11 +2195,13 @@ function grepMatches(grep: RegExp, path: string, testDir: string): boolean {
  *
  * @remarks
  * A caller may give literal prompt paths or let the use case ask the injected
- * discovery seam for them. Target selection is also batch-wide because it
- * participates in the plan's input digest: selecting a different configured
- * target must fail as stale rather than replaying a plan against a silently
- * different browser target. Empty-selection acceptance remains report policy,
- * while list mode is the sole selection policy that prevents case execution.
+ * discovery seam for them. The shared core target policy is batch-wide because
+ * its one selected definition participates in the plan's input digest and is
+ * the only definition allowed to choose browser behavior. Selecting a
+ * different configured target must fail as stale rather than replaying a plan
+ * against a silently different browser target. Empty-selection acceptance
+ * remains report policy, while list mode is the sole selection policy that
+ * prevents case execution.
  */
 export interface RunOptions {
   /** Literal prompt paths, or an empty list to use configured discovery. */
@@ -2227,7 +2216,7 @@ export interface RunOptions {
    */
   readonly grep?: RegExp;
 
-  /** Optional configured target name whose definition contributes to freshness. */
+  /** Optional explicit target name; an invalid name never falls back. */
   readonly target?: string;
 
   /** Whether grounding misses and trace misses must fail without an AI fallback. */
@@ -2429,6 +2418,14 @@ export type RunListedFile = { readonly file: string };
  * or stale cache falls back to empty grounding rather than invalidating the
  * trusted plan.
  *
+ * The shared core resolver applies the same explicit, validated-default, and
+ * sole-own-target policy as generation and freshness inspection. Its
+ * one-entry result limits both digest input and browser authority to the same
+ * target. A classified selection failure stops the current case before digest
+ * computation, plan inspection, provider resolution, or browser launch, then
+ * remains captured by that case so later cases keep run's existing per-file
+ * isolation.
+ *
  * Deterministic steps materialize run and secret values only immediately
  * before browser operations. Agentic instructions, provider-visible context,
  * and committed traces retain unresolved references; trusted trace replay
@@ -2508,10 +2505,15 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
       throw fsIoError('The test prompt could not be read.', error);
     }
 
-    const resolvedTargets = resolveTarget(deps.config, options);
-    if (resolvedTargets instanceof TargetUnresolvedError) {
-      throw resolvedTargets;
+    const targetSelection = resolveTarget({
+      targets: deps.config.targets,
+      defaultTarget: deps.config.defaultTarget,
+      explicitTarget: options.target,
+    });
+    if (targetSelection instanceof TargetUnresolvedError) {
+      throw targetSelection;
     }
+    const resolvedTargets = targetSelection.definitions;
 
     const normalizedTestMd = normalizeTestMd(testMd);
     const inputsDigest = computeInputsDigest({
@@ -2531,14 +2533,7 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
     groundingPath = deps.layout.groundingPathFor(file);
     const loadedGrounding = await readUsableGrounding(deps.storage, groundingPath, plan);
     grounding = loadedGrounding;
-    const [targetName] = Object.keys(resolvedTargets);
-    const target = targetName === undefined ? undefined : resolvedTargets[targetName];
-
-    // `resolveTarget` establishes this record, but preserving this guard keeps
-    // the browser boundary closed if a future target representation changes.
-    if (target === undefined) {
-      throw new TargetUnresolvedError('The requested replay target is not configured.');
-    }
+    const target = targetSelection.definition;
 
     try {
       session = await deps.browserDriver(target.browser).launch(target);

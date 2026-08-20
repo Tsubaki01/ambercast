@@ -667,6 +667,256 @@ describe('run', () => {
     expect(browserDriver).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    [
+      'an invalid explicit target',
+      {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets: TARGETS,
+        defaultTarget: 'web',
+        ai: { provider: 'codex' as const, timeoutMs: 120_000 },
+      },
+      { target: 'missing' },
+      'The requested target is not configured.',
+      { target: 'missing' },
+    ],
+    [
+      'an ambiguous implicit target',
+      {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets: MULTI_TARGETS,
+        ai: { provider: 'codex' as const, timeoutMs: 120_000 },
+      },
+      {},
+      'A target could not be selected from the configured targets.',
+      { target: '(default)', targetNames: ['staging', 'web'] },
+    ],
+  ] as const)('keeps two ordered case failures for %s without downstream work', async (
+    _description,
+    config,
+    optionOverride,
+    message,
+    details,
+  ) => {
+    const { deps, browserDriver, recordingStorage, resolveAiExecutor } = createScenario({
+      config,
+      discoverTestFiles: async () => ['first.test.md', 'second.test.md'],
+    });
+    const firstPath = await writePrompt(recordingStorage.storage, 'first.test.md', 'first');
+    const secondPath = await writePrompt(recordingStorage.storage, 'second.test.md', 'second');
+    recordingStorage.reads.length = 0;
+    recordingStorage.exists.length = 0;
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, { ...DEFAULT_OPTIONS, ...optionOverride });
+
+    expect(outcome.results.map(({ result }) => ({ file: result.file, status: result.status }))).toEqual([
+      { file: firstPath, status: 'error' },
+      { file: secondPath, status: 'error' },
+    ]);
+    for (const caseOutcome of outcome.results) {
+      expect(caseOutcome.error).toBeInstanceOf(TargetUnresolvedError);
+      expect(caseOutcome.error).toMatchObject({
+        kind: 'target-unresolved',
+        exitCode: 2,
+        message,
+        details,
+      });
+      expect(caseOutcome.error?.details).toEqual(details);
+    }
+    expect(recordingStorage.reads).toEqual([firstPath, secondPath]);
+    expect(recordingStorage.exists).toEqual([]);
+    expect(recordingStorage.writes).toEqual([]);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(browserDriver).not.toHaveBeenCalled();
+  });
+
+  it('rejects an inherited explicit target without falling back to a valid own default', async () => {
+    const inheritedName = 'inherited-replay';
+    const inheritedDefinition = {
+      baseUrl: 'https://inherited.example.test',
+      browser: 'chromium' as const,
+    };
+    const prototype = Object.fromEntries([[inheritedName, inheritedDefinition]]);
+    const targets = Object.assign(
+      Object.create(prototype) as Record<string, Readonly<typeof inheritedDefinition>>,
+      { web: TARGETS.web },
+    ) as RunDeps['config']['targets'];
+    expect(Object.hasOwn(targets, 'web')).toBe(true);
+    expect(Object.hasOwn(targets, inheritedName)).toBe(false);
+    expect(targets[inheritedName]).toBe(inheritedDefinition);
+
+    const { deps, browserDriver, events, recordingStorage, resolveAiExecutor } = createScenario({
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 120_000 },
+      },
+      discoverTestFiles: async () => ['first.test.md', 'second.test.md'],
+    });
+    const firstPath = await writePrompt(recordingStorage.storage, 'first.test.md', 'first');
+    const secondPath = await writePrompt(recordingStorage.storage, 'second.test.md', 'second');
+    recordingStorage.reads.length = 0;
+    recordingStorage.exists.length = 0;
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, { ...DEFAULT_OPTIONS, target: inheritedName });
+
+    expect(outcome.results.map(({ result }) => ({ file: result.file, status: result.status }))).toEqual([
+      { file: firstPath, status: 'error' },
+      { file: secondPath, status: 'error' },
+    ]);
+    for (const caseOutcome of outcome.results) {
+      expect(caseOutcome.error).toBeInstanceOf(TargetUnresolvedError);
+      expect(caseOutcome.error).toMatchObject({
+        kind: 'target-unresolved',
+        exitCode: 2,
+        message: 'The requested target is not configured.',
+      });
+      expect(caseOutcome.error?.details).toEqual({ target: inheritedName });
+    }
+    expect(recordingStorage.reads).toEqual([firstPath, secondPath]);
+    expect(recordingStorage.exists).toEqual([]);
+    expect(recordingStorage.writes).toEqual([]);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(browserDriver).not.toHaveBeenCalled();
+    expect(events.emitted()).toEqual([]);
+  });
+
+  it('replays a fresh plan through the sole implicit target and launches its exact definition', async () => {
+    const soleDefinition = {
+      baseUrl: 'https://replacement.example.test',
+      browser: 'chromium' as const,
+    };
+    const soleTargets = { replacement: soleDefinition };
+    const session = createFakeBrowserSession(new Map());
+    const launch = vi.fn<BrowserDriver['launch']>(async () => session);
+    const driver: BrowserDriver = { engine: 'chromium', launch };
+    const browserDriver = vi.fn<(engine: BrowserEngine) => BrowserDriver>(() => driver);
+    const { deps, recordingStorage } = createScenario({
+      browserDriver,
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets: soleTargets,
+        ai: { provider: 'codex', timeoutMs: 120_000 },
+      },
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [], {}, soleTargets);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(launch).toHaveBeenCalledOnce();
+    expect(launch.mock.calls[0]?.[0]).toBe(soleDefinition);
+  });
+
+  it.each([
+    ['the configured default', undefined, 'web'],
+    ['an explicit override', 'staging', 'staging'],
+  ] as const)('launches the exact definition selected by %s', async (
+    _selection,
+    target,
+    expectedName,
+  ) => {
+    const session = createFakeBrowserSession(new Map());
+    const launch = vi.fn<BrowserDriver['launch']>(async () => session);
+    const driver: BrowserDriver = { engine: 'chromium', launch };
+    const browserDriver = vi.fn<(engine: BrowserEngine) => BrowserDriver>(() => driver);
+    const { deps, recordingStorage } = createScenario({
+      browserDriver,
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets: MULTI_TARGETS,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 120_000 },
+      },
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    const expectedDefinition = MULTI_TARGETS[expectedName];
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [],
+      {},
+      { [expectedName]: expectedDefinition },
+    );
+
+    const outcome = await run(deps, {
+      ...DEFAULT_OPTIONS,
+      ...(target === undefined ? {} : { target }),
+    });
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(launch.mock.calls[0]?.[0]).toBe(expectedDefinition);
+  });
+
+  it('treats a selected target change as stale while ignoring an unrelated target change', async () => {
+    const selectedChanged = {
+      web: { baseUrl: 'https://changed.example.test', browser: 'chromium' as const },
+      staging: MULTI_TARGETS.staging,
+    };
+    const changedScenario = createScenario({
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets: selectedChanged,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 120_000 },
+      },
+    });
+    const changedPath = await writePrompt(changedScenario.recordingStorage.storage);
+    await createFreshPlan(changedScenario.recordingStorage.storage, changedPath, [], { web: TARGETS.web });
+
+    const changedOutcome = await run(changedScenario.deps, DEFAULT_OPTIONS);
+
+    expect(changedOutcome.results[0]?.error).toBeInstanceOf(StaleIrError);
+    expect(changedScenario.browserDriver).not.toHaveBeenCalled();
+
+    const unrelatedChanged = {
+      web: TARGETS.web,
+      staging: { baseUrl: 'https://changed-staging.example.test', browser: 'chromium' as const },
+    };
+    const unrelatedScenario = createScenario({
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets: unrelatedChanged,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 120_000 },
+      },
+    });
+    const unrelatedPath = await writePrompt(unrelatedScenario.recordingStorage.storage);
+    await seedFreshArtifacts(
+      unrelatedScenario.recordingStorage.storage,
+      unrelatedPath,
+      [],
+      {},
+      { web: TARGETS.web },
+    );
+
+    const unrelatedOutcome = await run(unrelatedScenario.deps, DEFAULT_OPTIONS);
+
+    expect(unrelatedOutcome.results[0]?.result.status).toBe('passed');
+    expect(unrelatedOutcome.results[0]?.error).toBeUndefined();
+    expect(unrelatedScenario.browserDriver).toHaveBeenCalledOnce();
+  });
+
   it('reports a source prompt read failure as a pre-dispatch filesystem error', async () => {
     const { deps, browserDriver, recordingStorage } = createScenario();
     await writePrompt(recordingStorage.storage);

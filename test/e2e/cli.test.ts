@@ -5,14 +5,18 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
+import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
-import type { JsonValueT } from '#core/ir/schema.js';
+import { computeInputsDigest } from '#core/ir/digest.js';
+import { normalizeTestMd } from '#core/ir/normalize.js';
+import type { JsonValueT, PlanDocument } from '#core/ir/schema.js';
 import { ReportEnvelope } from '#report/schema.js';
 
 const execFileAsync = promisify(execFile);
 const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
 const binPath = fileURLToPath(new URL('../../bin/ambercast.js', import.meta.url));
 const temporaryDirectories: string[] = [];
+const FIXTURE_PROMPT = '# Fixture test\n';
 
 interface CliResult {
   readonly stdout: string;
@@ -38,8 +42,38 @@ async function fixtureProject(): Promise<string> {
     $schema: 'https://ambercast.dev/schema/config.json', testDir: 'tests', runsDir: 'tests/.runs',
     targets: { web: { baseUrl: 'https://example.test', browser: 'chromium' } }, defaultTarget: 'web', ai: { provider: 'codex' },
   }));
-  await writeFile(join(directory, 'tests', 'test.test.md'), '# Fixture test\n');
+  await writeFile(join(directory, 'tests', 'test.test.md'), FIXTURE_PROMPT);
   return directory;
+}
+
+async function writeSoleTargetConfigAndFreshPlan(project: string): Promise<void> {
+  const targetDefinitions = {
+    replacement: { baseUrl: 'https://replacement.example.test', browser: 'chromium' as const },
+  };
+  await writeFile(join(project, 'ambercast.config.json'), JSON.stringify({
+    $schema: 'https://ambercast.dev/schema/config.json',
+    testDir: 'tests',
+    runsDir: 'tests/.runs',
+    targets: targetDefinitions,
+    ai: { provider: 'codex' },
+  }));
+  const plan: PlanDocument = {
+    schemaVersion: 1,
+    source: {
+      inputsDigest: computeInputsDigest({
+        normalizedTestMd: normalizeTestMd(FIXTURE_PROMPT),
+        schemaVersion: 1,
+        generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
+        targetDefinitions,
+      }),
+    },
+    targets: targetDefinitions,
+    steps: [],
+  };
+  await writeFile(
+    join(project, 'tests', 'test.ambercast.plan.json'),
+    toCanonicalArtifactText(plan as unknown as JsonValueT),
+  );
 }
 
 async function writeStalePlan(project: string): Promise<void> {
@@ -96,6 +130,46 @@ describe('bin/ambercast.js (e2e)', () => {
     const envelope = JSON.parse(result.stdout);
     expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
     expect(envelope.results).toEqual([expect.objectContaining({ file: expect.stringContaining('test.test.md'), status: 'listed' })]);
+  });
+
+  it.each(['generate', 'run', 'check'] as const)(
+    'reports an invalid explicit target through %s as TARGET_UNRESOLVED with exit 2',
+    async (command) => {
+      const project = await fixtureProject();
+
+      const result = await runCli([command, '--target', 'missing', '--json'], project);
+
+      expect(result.exitCode).toBe(2);
+      expect(result.stderr).toBe('');
+      const envelope = JSON.parse(result.stdout);
+      expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
+      expect(envelope.command).toBe(command);
+      expect(envelope.errors).toEqual([
+        expect.objectContaining({ code: 'TARGET_UNRESOLVED' }),
+      ]);
+    },
+  );
+
+  it('loads one replacement target without inheriting the built-in default and checks a fresh plan', async () => {
+    const project = await fixtureProject();
+    await writeSoleTargetConfigAndFreshPlan(project);
+    const rawConfig = JSON.parse(await readFile(join(project, 'ambercast.config.json'), 'utf8'));
+
+    expect(Object.hasOwn(rawConfig, 'defaultTarget')).toBe(false);
+    expect(Object.keys(rawConfig.targets)).toEqual(['replacement']);
+
+    const result = await runCli(['check', '--json'], project);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe('');
+    const envelope = JSON.parse(result.stdout);
+    expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
+    expect(envelope).toMatchObject({
+      command: 'check',
+      summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 },
+      results: [{ status: 'fresh' }],
+      errors: [],
+    });
   });
 
   it('lists a matched run file as a JSON report row without replaying its missing plan', async () => {

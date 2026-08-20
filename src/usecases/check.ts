@@ -16,9 +16,10 @@ import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest } from '#core/ir/digest.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
-import { PlanDocument, type JsonValueT, type TargetDefinition } from '#core/ir/schema.js';
+import { PlanDocument, type JsonValueT } from '#core/ir/schema.js';
 import { GROUNDING_SUFFIX, PLAN_SUFFIX, type LayoutResolver } from '#core/layout/resolve.js';
 import { joinPath } from '#core/paths.js';
+import { resolveTarget } from '#core/target/resolve.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { CheckResult } from '#report/schema.js';
 
@@ -29,7 +30,7 @@ export interface CheckOptions {
   /** Already-absolute literal test paths supplied by runtime, or an empty list to use configured test discovery. */
   readonly files: readonly string[];
 
-  /** Optional configured target name whose definition participates in freshness. */
+  /** Optional explicit target name; an invalid name never falls back. */
   readonly target?: string;
 
   /** Whether a genuinely empty inspection may succeed. */
@@ -151,17 +152,21 @@ export interface CheckOutcome {
  * @returns Ordered freshness findings, case-scoped I/O failures, and the
  * zero-match fact needed by report exit policy.
  * @throws {TargetUnresolvedError} When an explicit target is not configured,
- * or when a non-empty implicit selection cannot resolve a target.
+ * or when the selected-file set is non-empty and no target can be selected
+ * implicitly.
  * @throws A rejection from `discoverTestFiles` during test selection, plan
  * orphan scanning, or grounding orphan scanning propagates without
  * reclassification.
  * @remarks
- * An explicit target is a caller-supplied validity requirement, so it resolves
- * before selection. Implicit resolution remains deferred until a selected
- * prompt needs digest inputs, allowing an orphan-only inspection to avoid an
- * unrelated default-target ambiguity. Selected files are sequential so
- * cancellation stops newly scheduled work while a case-scoped storage failure
- * leaves later selections inspectable.
+ * The shared core resolver treats an explicit target as a caller-supplied
+ * validity requirement, so an invalid explicit name resolves before discovery
+ * and throws its classified failure at this command boundary without fallback.
+ * When the selected-file set is non-empty, implicit selection runs once before
+ * per-file work and applies the loader-validated default followed by the sole
+ * enumerable own target. With zero selected files, that resolution is skipped,
+ * allowing an orphan-only scan to avoid an unrelated target ambiguity.
+ * Selected files are sequential so cancellation stops newly scheduled work
+ * while a case-scoped storage failure leaves later selections inspectable.
  *
  * Freshness accepts only canonical plans whose digest reflects the normalized
  * prompt and the resolved target. Grounding content is deliberately excluded:
@@ -173,11 +178,15 @@ export interface CheckOutcome {
  * zero-match inspections.
  */
 export async function check(deps: CheckDeps, options: CheckOptions): Promise<CheckOutcome> {
-  const explicitTargets = options.target === undefined
+  const explicitSelection = options.target === undefined
     ? undefined
-    : resolveTarget(deps.config, options);
-  if (explicitTargets instanceof TargetUnresolvedError) {
-    throw explicitTargets;
+    : resolveTarget({
+      targets: deps.config.targets,
+      defaultTarget: deps.config.defaultTarget,
+      explicitTarget: options.target,
+    });
+  if (explicitSelection instanceof TargetUnresolvedError) {
+    throw explicitSelection;
   }
 
   const selectedTestFiles = options.files.length === 0
@@ -192,9 +201,13 @@ export async function check(deps: CheckDeps, options: CheckOptions): Promise<Che
   const errors: CheckFileError[] = [];
 
   if (selectedTestFiles.length > 0) {
-    const resolvedTargets = explicitTargets ?? resolveTarget(deps.config, options);
-    if (resolvedTargets instanceof TargetUnresolvedError) {
-      throw resolvedTargets;
+    const targetSelection = explicitSelection ?? resolveTarget({
+      targets: deps.config.targets,
+      defaultTarget: deps.config.defaultTarget,
+      explicitTarget: options.target,
+    });
+    if (targetSelection instanceof TargetUnresolvedError) {
+      throw targetSelection;
     }
 
     for (const file of selectedTestFiles) {
@@ -264,7 +277,7 @@ export async function check(deps: CheckDeps, options: CheckOptions): Promise<Che
         normalizedTestMd: normalizeTestMd(testMd),
         schemaVersion: 1,
         generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
-        targetDefinitions: resolvedTargets,
+        targetDefinitions: targetSelection.definitions,
       });
       results.push({
         ...identity,
@@ -320,36 +333,6 @@ export async function check(deps: CheckDeps, options: CheckOptions): Promise<Che
     errors,
     noTestsFound: selectedTestFiles.length === 0 && orphanFindings.length === 0,
   };
-}
-
-/**
- * Resolves the target definition permitted to contribute to plan freshness.
- *
- * @param config - The target-bearing subset of resolved configuration.
- * @param options - The optional caller-selected target.
- * @returns A single target-definition record or a classified unresolved-target
- * error for the caller to handle at the command's resolution boundary.
- * @remarks
- * A one-entry record prevents unrelated configured targets from changing a
- * plan digest. Callers resolve explicit targets before selection because they
- * are a user-input validity boundary; absent explicit targets resolve only
- * when selected work needs one, avoiding an orphan-only report failing on an
- * unrelated default-target ambiguity.
- */
-function resolveTarget(
-  config: CheckDeps['config'],
-  options: CheckOptions,
-): Readonly<Record<string, TargetDefinition>> | TargetUnresolvedError {
-  const targetName = options.target ?? config.defaultTarget;
-
-  if (targetName === undefined || !Object.hasOwn(config.targets, targetName)) {
-    return new TargetUnresolvedError(
-      'The requested check target is not configured.',
-      { target: targetName ?? '(default)' },
-    );
-  }
-
-  return { [targetName]: config.targets[targetName]! };
 }
 
 /**
