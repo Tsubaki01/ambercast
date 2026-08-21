@@ -26,7 +26,7 @@ Artifacts live next to it: `.claude/impl/issue-<N>-plan.md` and `.claude/impl/is
 
 ## Reviews (steps 4, 8, 10, 12)
 
-Reviews are independent: performed by OpenAI Codex CLI per the user-level codex-delegation rules (reviewer model: `gpt-5.6-sol`; load the codex-delegation skill before invoking `codex exec`). If Codex is unavailable in your environment, use an equally independent reviewer agent with a fresh context. Save every review verdict as a Markdown file under `.claude/impl/issue-<N>-reviews/`. Address every finding or record an explicit, reasoned rejection — silence is not an option.
+Reviews are independent: performed by OpenAI Codex CLI per the user-level codex-delegation rules (reviewer models: `gpt-5.6-sol` for the single-shot judgment reviews at steps 4 and 12, `gpt-5.6-terra` at medium effort for the interim reviews at steps 8 and 10; load the codex-delegation skill before invoking `codex exec`). If Codex is unavailable in your environment, use an equally independent reviewer agent with a fresh context. Save every review verdict as a Markdown file under `.claude/impl/issue-<N>-reviews/`. Address every finding or record an explicit, reasoned rejection — silence is not an option.
 
 ## GAP protocol (Codex delegation, steps 6–11)
 
