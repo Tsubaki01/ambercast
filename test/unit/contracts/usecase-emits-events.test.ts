@@ -73,12 +73,12 @@ registerUsecaseEmitsEventsContract([
       const events = createRecordingEventSink();
       const inputsDigest = computeInputsDigest({
         normalizedTestMd: normalizeTestMd(PROMPT),
-        schemaVersion: 1,
+        schemaVersion: 2,
         generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
         targetDefinitions: TARGETS,
       });
       const plan = PlanDocument.parse({
-        schemaVersion: 1,
+        schemaVersion: 2,
         source: { inputsDigest },
         targets: TARGETS,
         steps: [{ id: 'navigate-home', kind: 'action', action: 'navigate', url: '/' }],

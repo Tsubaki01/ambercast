@@ -56,6 +56,20 @@ const DIGEST_A = 'a'.repeat(64);
 const DIGEST_B = 'b'.repeat(64);
 const TARGET = { strategy: 'accessibility', role: 'button', name: 'Submit' };
 const TARGET_DEFINITION = { baseUrl: 'https://example.test', browser: 'chromium' };
+const INSTRUCTION_COVERAGE = [{
+  id: 'settings-open',
+  kind: 'success',
+  sourceSpan: { startLine: 1, startColumn: 1, endLine: 1, endColumn: 14 },
+}] as const;
+const GENERATED_INSTRUCTION_COVERAGE = [{
+  id: 'settings-open',
+  kind: 'success',
+  citation: 'Open settings',
+}] as const;
+const VERIFICATION_INTENT = [{
+  criterionId: 'settings-open',
+  assertion: { type: 'assert', check: 'text-visible', text: 'Settings' },
+}] as const;
 
 function expectAccepted(schema: SchemaUnderTest, value: unknown): void {
   expect(schema.safeParse(value).success).toBe(true);
@@ -74,7 +88,7 @@ function expectZodAndJsonSchemaVerdict(schema: SchemaUnderTest, value: unknown, 
 
 function plan(steps: unknown[], targets: Record<string, unknown> = { app: TARGET_DEFINITION }): Record<string, unknown> {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     source: { inputsDigest: DIGEST_A },
     targets,
     steps,
@@ -461,7 +475,12 @@ describe('AssertStep', () => {
 describe('CaptureStep and AiStep', () => {
   it('accepts capture and AI steps through their concrete and outer schemas', () => {
     const capture = { id: 'capture-welcome', kind: 'capture', target: TARGET, variable: 'welcomeText' };
-    const ai = { id: 'find-settings', kind: 'ai', instruction: 'Open settings' };
+    const ai = {
+      id: 'find-settings',
+      kind: 'ai',
+      instruction: 'Open settings',
+      instructionCoverage: INSTRUCTION_COVERAGE,
+    };
 
     expectAccepted(CaptureStep, capture);
     expectAccepted(AiStep, ai);
@@ -504,12 +523,21 @@ describe('CaptureStep and AiStep', () => {
   });
 
   it('accepts unicode and run interpolation in AI instructions', () => {
-    expectAccepted(AiStep, { id: 'ai-unicode', kind: 'ai', instruction: '設定を開く: {{run.username}}' });
+    expectAccepted(AiStep, {
+      id: 'ai-unicode',
+      kind: 'ai',
+      instruction: '設定を開く: {{run.username}}',
+      instructionCoverage: INSTRUCTION_COVERAGE,
+    });
   });
 
   it('preserves omitted and explicitly empty AI secret grants as distinct serialized values', () => {
-    const omitted = AiStep.parse({ id: 'find-settings', kind: 'ai', instruction: 'Open settings' });
-    const explicitlyEmpty = AiStep.parse({ id: 'find-settings', kind: 'ai', instruction: 'Open settings', secrets: [] });
+    const omitted = AiStep.parse({
+      id: 'find-settings', kind: 'ai', instruction: 'Open settings', instructionCoverage: INSTRUCTION_COVERAGE,
+    });
+    const explicitlyEmpty = AiStep.parse({
+      id: 'find-settings', kind: 'ai', instruction: 'Open settings', instructionCoverage: INSTRUCTION_COVERAGE, secrets: [],
+    });
     const omittedText = toCanonicalArtifactText(omitted as JsonValueT);
     const explicitlyEmptyText = toCanonicalArtifactText(explicitlyEmpty as JsonValueT);
 
@@ -525,6 +553,7 @@ describe('CaptureStep and AiStep', () => {
       id: 'find-settings',
       kind: 'ai',
       instruction: 'Open settings',
+      instructionCoverage: INSTRUCTION_COVERAGE,
       secrets: [
         { ref: '{{secrets.app.token}}', sourceSpan: { startLine: 4, endLine: 4 } },
         { ref: '{{secrets.app.password}}', sourceSpan: { startLine: 6, endLine: 6 } },
@@ -535,6 +564,7 @@ describe('CaptureStep and AiStep', () => {
       id: 'find-settings',
       kind: 'ai',
       instruction: 'Open settings',
+      instructionCoverage: INSTRUCTION_COVERAGE,
       secrets: ['{{secrets.app.token}}', '{{secret.app.password}}'],
     });
   });
@@ -544,6 +574,7 @@ describe('CaptureStep and AiStep', () => {
       id: 'find-settings',
       kind: 'ai',
       instruction: 'Open settings',
+      instructionCoverage: INSTRUCTION_COVERAGE,
       secrets: [
         { ref: '{{secrets.app.token}}', sourceSpan: { startLine: 4, endLine: 4 } },
         { ref: '{{secrets.app.token}}', sourceSpan: { startLine: 9, endLine: 9 } },
@@ -553,6 +584,7 @@ describe('CaptureStep and AiStep', () => {
       id: 'find-settings',
       kind: 'ai',
       instruction: 'Open settings',
+      instructionCoverage: INSTRUCTION_COVERAGE,
       secrets: ['{{secrets.app.token}}'],
     });
     expectRejected(FillSecretAction, {
@@ -588,6 +620,8 @@ describe('provider-facing secret-grant schemas', () => {
       ref: '{{secrets.app.password}}',
       citation: '@ambercast-secret {{secrets.app.password}}',
     }],
+    instructionCoverage: GENERATED_INSTRUCTION_COVERAGE,
+    verificationIntent: VERIFICATION_INTENT,
   };
 
   it('accepts citation-bearing generated secret steps through every provider schema', () => {
@@ -630,6 +664,7 @@ describe('provider-facing secret-grant schemas', () => {
       id: 'complete-sign-in',
       kind: 'ai',
       instruction: 'Complete sign-in.',
+      instructionCoverage: INSTRUCTION_COVERAGE,
       secrets: [
         { ref: '{{secrets.app.password}}', sourceSpan: { startLine: 6, endLine: 6 } },
         { ref: '{{secrets.app.password}}', sourceSpan: { startLine: 8, endLine: 8 } },
@@ -752,6 +787,11 @@ describe('TraceAction, TraceAssert, TraceEntry, and TraceRecord', () => {
     expectRejected(TraceAssert, value);
   });
 
+  it('rejects the unbounded minimum-only element-count zero shape while accepting exact zero', () => {
+    expectRejected(TraceAssert, { type: 'assert', check: 'element-count', target: TARGET, min: 0 });
+    expectAccepted(TraceAssert, { type: 'assert', check: 'element-count', target: TARGET, count: 0 });
+  });
+
   it('rejects secret markers in trace assertion text and patterns while allowing run interpolation', () => {
     expectAccepted(TraceAssert, { type: 'assert', check: 'text-visible', text: 'Welcome, {{run.username}}' });
     expectAccepted(TraceAssert, { type: 'assert', check: 'text-equals', target: TARGET, text: 'Hello {{run.username}}' });
@@ -788,6 +828,26 @@ describe('TraceAction, TraceAssert, TraceEntry, and TraceRecord', () => {
     expectAccepted(TraceRecord, { events: [action, assertion], verification: [assertion] });
     expectRejected(TraceRecord, { events: [action], verification: [action] });
   });
+
+  it('keeps verification coverage additive while strictly validating its own keys and indices', () => {
+    const verification = { type: 'assert', check: 'text-visible', text: 'Welcome' };
+
+    expectAccepted(TraceRecord, { events: [], verification: [verification] });
+    expectAccepted(TraceRecord, {
+      events: [],
+      verification: [verification],
+      verificationCoverage: { welcome: 0, constructor: 0 },
+    });
+    expectRejected(TraceRecord, {
+      events: [], verification: [verification], verificationCoverage: { welcome: -1 },
+    });
+    expectRejected(TraceRecord, {
+      events: [], verification: [verification], verificationCoverage: { welcome: 1.5 },
+    });
+    expectRejected(TraceRecord, {
+      events: [], verification: [verification], verificationCoverage: { '1': 0 },
+    });
+  });
 });
 
 describe('PlanDocument', () => {
@@ -796,7 +856,12 @@ describe('PlanDocument', () => {
       { id: 'open-home', kind: 'action', action: 'navigate', url: 'https://example.test' },
       { id: 'welcome-visible', kind: 'assert', check: 'text-visible', text: 'Welcome' },
       { id: 'capture-welcome', kind: 'capture', target: TARGET, variable: 'welcomeText' },
-      { id: 'continue-with-ai', kind: 'ai', instruction: 'Continue after {{run.welcomeText}}' },
+      {
+        id: 'continue-with-ai',
+        kind: 'ai',
+        instruction: 'Continue after {{run.welcomeText}}',
+        instructionCoverage: INSTRUCTION_COVERAGE,
+      },
     ]));
   });
 
@@ -824,11 +889,70 @@ describe('PlanDocument', () => {
   });
 
   it('rejects wrong document fields and unknown properties at plan and target nesting levels', () => {
-    expectRejected(PlanDocument, { ...plan([]), schemaVersion: '1' });
+    expectRejected(PlanDocument, { ...plan([]), schemaVersion: '2' });
     expectRejected(PlanDocument, { ...plan([]), source: { inputsDigest: 'A'.repeat(64) } });
     expectRejected(PlanDocument, { ...plan([]), generatorMeta: { unsupported: undefined } });
     expectRejected(PlanDocument, { ...plan([]), unexpected: true });
     expectRejected(PlanDocument, plan([], { app: { ...TARGET_DEFINITION, unexpected: true } }));
+  });
+
+  it('accepts only Plan schema version 2 while Grounding remains schema version 1', () => {
+    expectAccepted(PlanDocument, plan([]));
+    expectRejected(PlanDocument, { ...plan([]), schemaVersion: 1 });
+    expectAccepted(GroundingDocument, { schemaVersion: 1, planDigest: DIGEST_B, entries: {} });
+    expectRejected(GroundingDocument, { schemaVersion: 2, planDigest: DIGEST_B, entries: {} });
+  });
+
+  it('requires non-empty committed coverage with precise strict source spans on every AI step', () => {
+    expectRejected(AiStep, { id: 'missing', kind: 'ai', instruction: 'Open settings' });
+    expectRejected(AiStep, {
+      id: 'empty', kind: 'ai', instruction: 'Open settings', instructionCoverage: [],
+    });
+    expectAccepted(AiStep, {
+      id: 'covered', kind: 'ai', instruction: 'Open settings', instructionCoverage: INSTRUCTION_COVERAGE,
+    });
+    for (const instructionCoverage of [
+      [{ id: 'bad id', kind: 'success', sourceSpan: INSTRUCTION_COVERAGE[0].sourceSpan }],
+      [{ id: 'ready', kind: 'terminal', sourceSpan: INSTRUCTION_COVERAGE[0].sourceSpan }],
+      [{ id: 'ready', kind: 'success', sourceSpan: { startLine: 0, startColumn: 1, endLine: 1, endColumn: 2 } }],
+      [{ id: 'ready', kind: 'success', sourceSpan: { ...INSTRUCTION_COVERAGE[0].sourceSpan, unexpected: true } }],
+      [{ ...INSTRUCTION_COVERAGE[0], citation: 'Open settings' }],
+    ]) {
+      expectRejected(AiStep, {
+        id: 'invalid', kind: 'ai', instruction: 'Open settings', instructionCoverage,
+      });
+    }
+  });
+
+  it('requires provider citations and a full transient intent while rejecting committed fields', () => {
+    const generated = {
+      id: 'covered',
+      kind: 'ai',
+      instruction: 'Open settings',
+      instructionCoverage: GENERATED_INSTRUCTION_COVERAGE,
+      verificationIntent: VERIFICATION_INTENT,
+    };
+    expectAccepted(GeneratedAiStep, generated);
+    expectRejected(GeneratedAiStep, { ...generated, instructionCoverage: undefined });
+    expectRejected(GeneratedAiStep, { ...generated, verificationIntent: undefined });
+    expectRejected(GeneratedAiStep, { ...generated, instructionCoverage: [] });
+    expectRejected(GeneratedAiStep, { ...generated, verificationIntent: [] });
+    expectRejected(GeneratedAiStep, {
+      ...generated,
+      instructionCoverage: INSTRUCTION_COVERAGE,
+    });
+    expectRejected(GeneratedAiStep, {
+      ...generated,
+      verificationIntent: [{ ...VERIFICATION_INTENT[0], unexpected: true }],
+    });
+    expectAccepted(GeneratedAiStep, {
+      ...generated,
+      instructionCoverage: [{ ...GENERATED_INSTRUCTION_COVERAGE[0], citation: 'a'.repeat(4_096) }],
+    });
+    expectRejected(GeneratedAiStep, {
+      ...generated,
+      instructionCoverage: [{ ...GENERATED_INSTRUCTION_COVERAGE[0], citation: 'a'.repeat(4_097) }],
+    });
   });
 });
 

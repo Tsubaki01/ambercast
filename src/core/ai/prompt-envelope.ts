@@ -28,24 +28,114 @@ const PLACEHOLDERS = Object.freeze({
   context: '{{ambercast.context}}',
 });
 
+/**
+ * Static injection-isolation policy shared by generator and agentic prompts.
+ *
+ * Both renderers consume these reviewed bytes so injection framing cannot
+ * drift between generation and live recovery.
+ */
+export const COMMON_PROMPT_POLICY_TEMPLATE = staticGrammar();
+
+/**
+ * Generator-only instruction-coverage and transient-intent policy bytes.
+ *
+ * These bytes combine with {@link COMMON_PROMPT_POLICY_TEMPLATE} to form the
+ * complete generator fingerprint. Changing either part therefore changes
+ * `inputsDigest` and makes existing Plan-v2 artifacts stale.
+ */
+export const GENERATOR_INSTRUCTION_COVERAGE_POLICY_TEMPLATE = `For every AI step, copy a unique verbatim citation for each success or action criterion into instructionCoverage. Provide verificationIntent with one complete terminal assertion for every success criterion. Citations and verificationIntent are attribution inputs and are not committed to the plan.`;
+
+/**
+ * Agentic-only criterion-tagging policy bytes.
+ *
+ * @remarks
+ * This policy is deliberately excluded from the generator fingerprint because
+ * it cannot change committed Plan semantics. The residual risk is operational:
+ * wording changes affect live recovery behavior, so they still require code
+ * review and contract tests even though they do not stale existing plans.
+ * Local journal and covered-trace validation remain authoritative if agentic
+ * output ignores or misinterprets the wording.
+ */
+export const AGENTIC_INSTRUCTION_COVERAGE_POLICY_TEMPLATE = `Evaluate terminal assertions with the matching trusted success criterion identifier. Action criteria guide interaction but cannot identify terminal proof.`;
+
+/**
+ * Prefixes one generation task with the exact fingerprinted coverage policy.
+ *
+ * The same composer feeds both the static fingerprint skeleton and every live
+ * generation request, so delimiter or policy-byte drift cannot make freshness
+ * provenance describe a different prompt from the provider input.
+ */
+export function buildGeneratorTask(task: string): string {
+  return `${GENERATOR_INSTRUCTION_COVERAGE_POLICY_TEMPLATE.trim()}\n\n${task}`;
+}
+
+function agenticTaskSlot(task: string): string {
+  return `${AGENTIC_INSTRUCTION_COVERAGE_POLICY_TEMPLATE.trim()}\n\n${task}`;
+}
+
+/**
+ * The fingerprinted generator policy partition.
+ *
+ * This value composes only common framing and generator-only coverage policy;
+ * agentic-only bytes are excluded by construction.
+ */
+export const GENERATOR_PROMPT_TEMPLATE = staticGrammar(buildGeneratorTask(PLACEHOLDERS.task));
+
+/**
+ * The nonfingerprinted agentic policy partition.
+ *
+ * This value composes common framing with agentic-only criterion-tag
+ * instructions without changing Plan freshness.
+ */
+export const AGENTIC_PROMPT_TEMPLATE = staticGrammar(agenticTaskSlot(PLACEHOLDERS.task));
+
+/**
+ * Renders common framing plus fingerprinted generator-only policy.
+ *
+ * @param task - Structured generation instructions.
+ * @param context - Optional caller data isolated from authority-bearing text.
+ * @returns The complete Plan-generating prompt envelope.
+ */
+export function buildGeneratorPromptEnvelope(
+  task: string,
+  context?: unknown,
+): string {
+  return buildPromptEnvelope(buildGeneratorTask(task), context);
+}
+
+/**
+ * Renders common framing plus nonfingerprinted agentic-only policy.
+ *
+ * @param task - Browser-directed instruction from a trusted Plan step.
+ * @param context - Trusted metadata and separately nested untrusted evidence.
+ * @returns The complete live agentic prompt envelope.
+ */
+export function buildAgenticPromptEnvelope(
+  task: string,
+  context?: unknown,
+): string {
+  return buildPromptEnvelope(agenticTaskSlot(task), context);
+}
+
 function compose(task: string, context: string): string {
   return `${STATIC_PARTS.framing}${STATIC_PARTS.taskHeader}${task}${STATIC_PARTS.contextHeader}${context}`;
 }
 
-function staticGrammar(): string {
+function staticGrammar(taskSlot: string = PLACEHOLDERS.task): string {
   const fencedContext = `${STATIC_PARTS.jsonFenceOpen}${PLACEHOLDERS.context}${STATIC_PARTS.jsonFenceClose}`;
 
   return [
-    compose(PLACEHOLDERS.task, STATIC_PARTS.absentContext),
-    compose(PLACEHOLDERS.task, fencedContext),
+    compose(taskSlot, STATIC_PARTS.absentContext),
+    compose(taskSlot, fencedContext),
   ].join('');
 }
 
 /**
- * The complete static grammar whose bytes determine generator-template
- * freshness.
+ * Shared injection-isolated grammar. Generator freshness uses
+ * {@link GENERATOR_PROMPT_TEMPLATE}, whose partition excludes agentic-only
+ * policy bytes.
  */
-export const PROMPT_ENVELOPE_TEMPLATE = staticGrammar();
+export const PROMPT_ENVELOPE_TEMPLATE = GENERATOR_PROMPT_TEMPLATE;
 
 /**
  * Renders one injection-isolated prompt envelope.
@@ -76,10 +166,10 @@ export function buildPromptEnvelope(task: string, context?: unknown): string {
 }
 
 /**
- * Gets the SHA-256 fingerprint of the complete static prompt grammar.
+ * Gets the SHA-256 fingerprint of common plus generator-only static policy.
  *
  * @returns A lowercase digest that participates in plan-input freshness.
  */
 export function promptTemplateFingerprint(): string {
-  return createHash('sha256').update(PROMPT_ENVELOPE_TEMPLATE).digest('hex');
+  return createHash('sha256').update(GENERATOR_PROMPT_TEMPLATE).digest('hex');
 }

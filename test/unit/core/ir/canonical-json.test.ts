@@ -4,7 +4,7 @@ import {
   toCanonicalArtifactText,
   toCanonicalDigestBytes,
 } from '../../../../src/core/ir/canonical-json.js';
-import { PlanDocument } from '../../../../src/core/ir/schema.js';
+import { JsonValue, PlanDocument } from '../../../../src/core/ir/schema.js';
 import type { JsonValueT, Step } from '../../../../src/core/ir/schema.js';
 import { normalizeAiStepSecretGrants } from '../../../../src/usecases/generator-secret-policy.js';
 
@@ -160,7 +160,7 @@ describe('canonical JSON serialization', () => {
 
   it('canonically serializes committed secret provenance alongside ordinary plan data', () => {
     const plan = PlanDocument.parse({
-      schemaVersion: 1,
+      schemaVersion: 2,
       source: { inputsDigest: 'a'.repeat(64) },
       targets: { web: { baseUrl: 'https://example.test', browser: 'chromium' } },
       steps: [{
@@ -174,6 +174,11 @@ describe('canonical JSON serialization', () => {
         id: 'verify-account',
         kind: 'ai',
         instruction: 'Verify the signed-in account.',
+        instructionCoverage: [{
+          id: 'account-verified',
+          kind: 'success',
+          sourceSpan: { startLine: 10, startColumn: 1, endLine: 10, endColumn: 30 },
+        }],
         secrets: [{
           ref: '{{secrets.account.password}}',
           sourceSpan: { startLine: 6, endLine: 6 },
@@ -184,11 +189,11 @@ describe('canonical JSON serialization', () => {
       }],
     });
 
-    expect(digestText(asJsonValue(plan))).toBe('{"schemaVersion":1,"source":{"inputsDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"steps":[{"action":"fill-secret","id":"fill-password","kind":"action","secretGrantSpan":{"endLine":4,"startLine":4},"secretRef":"{{secrets.account.password}}","target":{"name":"Password","role":"textbox","strategy":"accessibility"}},{"id":"verify-account","instruction":"Verify the signed-in account.","kind":"ai","secrets":[{"ref":"{{secrets.account.password}}","sourceSpan":{"endLine":6,"startLine":6}},{"ref":"{{secrets.account.password}}","sourceSpan":{"endLine":8,"startLine":8}}]}],"targets":{"web":{"baseUrl":"https://example.test","browser":"chromium"}}}');
+    expect(digestText(asJsonValue(plan))).toBe('{"schemaVersion":2,"source":{"inputsDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"steps":[{"action":"fill-secret","id":"fill-password","kind":"action","secretGrantSpan":{"endLine":4,"startLine":4},"secretRef":"{{secrets.account.password}}","target":{"name":"Password","role":"textbox","strategy":"accessibility"}},{"id":"verify-account","instruction":"Verify the signed-in account.","instructionCoverage":[{"id":"account-verified","kind":"success","sourceSpan":{"endColumn":30,"endLine":10,"startColumn":1,"startLine":10}}],"kind":"ai","secrets":[{"ref":"{{secrets.account.password}}","sourceSpan":{"endLine":6,"startLine":6}},{"ref":"{{secrets.account.password}}","sourceSpan":{"endLine":8,"startLine":8}}]}],"targets":{"web":{"baseUrl":"https://example.test","browser":"chromium"}}}');
 
     expect(toCanonicalArtifactText(asJsonValue(plan))).toBe([
       '{',
-      '  "schemaVersion": 1,',
+      '  "schemaVersion": 2,',
       '  "source": {',
       '    "inputsDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"',
       '  },',
@@ -211,6 +216,18 @@ describe('canonical JSON serialization', () => {
       '    {',
       '      "id": "verify-account",',
       '      "instruction": "Verify the signed-in account.",',
+      '      "instructionCoverage": [',
+      '        {',
+      '          "id": "account-verified",',
+      '          "kind": "success",',
+      '          "sourceSpan": {',
+      '            "endColumn": 30,',
+      '            "endLine": 10,',
+      '            "startColumn": 1,',
+      '            "startLine": 10',
+      '          }',
+      '        }',
+      '      ],',
       '      "kind": "ai",',
       '      "secrets": [',
       '        {',
@@ -252,20 +269,32 @@ describe('canonical JSON serialization', () => {
       ref: '{{secrets.account.token}}',
       sourceSpan: { startLine: 6, endLine: 6 },
     }];
-    const first = normalizeAiStepSecretGrants([{
+    const firstSteps: Step[] = [{
       id: 'complete-sign-in',
       kind: 'ai',
       instruction: 'Complete sign-in.',
+      instructionCoverage: [{
+        id: 'signed-in',
+        kind: 'success',
+        sourceSpan: { startLine: 1, startColumn: 1, endLine: 1, endColumn: 10 },
+      }],
       secrets: grants,
-    }]);
-    const second = normalizeAiStepSecretGrants([{
+    }];
+    const secondSteps: Step[] = [{
       id: 'complete-sign-in',
       kind: 'ai',
       instruction: 'Complete sign-in.',
+      instructionCoverage: [{
+        id: 'signed-in',
+        kind: 'success',
+        sourceSpan: { startLine: 1, startColumn: 1, endLine: 1, endColumn: 10 },
+      }],
       secrets: [...grants].reverse(),
-    }]);
+    }];
+    const first = normalizeAiStepSecretGrants(firstSteps);
+    const second = normalizeAiStepSecretGrants(secondSteps);
 
-    expect(toCanonicalArtifactText(first as unknown as JsonValueT))
-      .toBe(toCanonicalArtifactText(second as unknown as JsonValueT));
+    expect(toCanonicalArtifactText(JsonValue.parse(first)))
+      .toBe(toCanonicalArtifactText(JsonValue.parse(second)));
   });
 });

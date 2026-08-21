@@ -35,12 +35,13 @@ import {
   type TraceRecord,
 } from '#core/ir/schema.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
-import type { AiAgenticRequest } from '#ports/ai.js';
+import type { AiAgenticRequest, InstructionCoveredAiAgenticRequest } from '#ports/ai.js';
 import type { BrowserDriver, BrowserEngine, BrowserSession, PerformableAction } from '#ports/browser.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { Clock, RunEvent } from '#ports/system.js';
 import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/generate.js';
 import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
+import { validateCommittedInstructionCoverage } from '#usecases/instruction-coverage-policy.js';
 import { buildRunReport } from '#usecases/run-report.js';
 import { OBSERVED_NOTE, RunResult } from '#report/schema.js';
 import { baseUrlSecretPolicy } from '../../doubles/base-url-secret-policy.js';
@@ -68,6 +69,11 @@ const MULTI_TARGETS = {
   staging: { baseUrl: 'https://staging.example.test', browser: 'chromium' },
 } as const;
 const PROMPT = '# Sign in\n\nWhen I submit valid credentials, I reach the dashboard.\n';
+const DEFAULT_INSTRUCTION_COVERAGE = [{
+  id: 'dashboard-reached',
+  kind: 'success' as const,
+  sourceSpan: { startLine: 3, startColumn: 1, endLine: 3, endColumn: 56 },
+}] as const;
 const FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v2', hash: 'a'.repeat(64) };
 const DIFFERENT_FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v2', hash: 'b'.repeat(64) };
 const EMAIL: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Email' };
@@ -262,16 +268,16 @@ async function createFreshPlan(
   const normalizedTestMd = normalizeTestMd(await storage.readText(testPath));
   const inputsDigest = computeInputsDigest({
     normalizedTestMd,
-    schemaVersion: 1,
+    schemaVersion: 2,
     generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
     targetDefinitions,
   });
-  const plan: PlanDocument = {
-    schemaVersion: 1,
+  const plan = {
+    schemaVersion: 2,
     source: { inputsDigest },
     targets: targetDefinitions,
     steps: committedSteps,
-  };
+  } as unknown as PlanDocument;
   const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
 
   await storage.writeText(layout.planPathFor(testPath), toCanonicalArtifactText(plan as unknown as JsonValueT));
@@ -297,8 +303,16 @@ async function seedFreshArtifacts(
   return plan;
 }
 
-function trace(events: readonly TraceEntry[], verification: readonly TraceAssert[]): TraceRecord {
+function legacyTrace(events: readonly TraceEntry[], verification: readonly TraceAssert[]): TraceRecord {
   return { events: [...events], verification: [...verification] };
+}
+
+function coveredTrace(
+  events: readonly TraceEntry[],
+  verification: readonly TraceAssert[],
+  verificationCoverage: Readonly<Record<string, number>> = { 'dashboard-reached': 0 },
+): TraceRecord {
+  return { events: [...events], verification: [...verification], verificationCoverage } as TraceRecord;
 }
 
 function aiGrounding(traceRecord: TraceRecord): GroundingDocument['entries'] {
@@ -307,6 +321,14 @@ function aiGrounding(traceRecord: TraceRecord): GroundingDocument['entries'] {
 
 function passingText(text: string): TraceAssert {
   return { type: 'assert', check: 'text-visible', text };
+}
+
+function evaluateTerminalAssert(
+  request: InstructionCoveredAiAgenticRequest,
+  assertion: TraceAssert,
+  criterionId = 'dashboard-reached',
+) {
+  return request.controller.evaluateAssert(assertion, criterionId);
 }
 
 function aiCalls(events: ReturnType<typeof createRecordingEventSink>): readonly Extract<RunEvent, { type: 'ai-call' }>[] {
@@ -363,9 +385,10 @@ function aiStep(id = 'recorded-ai', secrets?: readonly string[]): TestStep {
     id,
     kind: 'ai' as const,
     instruction: 'Complete the sign-in flow and verify the dashboard.',
+    instructionCoverage: DEFAULT_INSTRUCTION_COVERAGE,
   };
 
-  return secrets === undefined ? base : { ...base, secrets: [...secrets] };
+  return (secrets === undefined ? base : { ...base, secrets: [...secrets] }) as unknown as TestStep;
 }
 
 function configWithAiTimeout(timeoutMs: number): RunDeps['config'] {
@@ -472,6 +495,16 @@ async function runFailureEvidenceScenario(
 }
 
 describe('run', () => {
+  it('keeps the shared run success-span fixture locally re-extractable', () => {
+    expect(validateCommittedInstructionCoverage(
+      DEFAULT_INSTRUCTION_COVERAGE,
+      normalizeTestMd(PROMPT),
+    )).toEqual({
+      success: true,
+      data: [expect.objectContaining({ text: 'When I submit valid credentials, I reach the dashboard.' })],
+    });
+  });
+
   it('reports a missing plan as exit-4 failure before resolving a browser driver', async () => {
     const { deps, browserDriver, recordingStorage } = createScenario();
     await writePrompt(recordingStorage.storage);
@@ -494,7 +527,7 @@ describe('run', () => {
       await storage.writeText(`${TEST_DIR}/login.ambercast.plan.json`, '{ malformed');
     }],
     ['schema-invalid JSON', async (storage: StorageAdapter) => {
-      await storage.writeText(`${TEST_DIR}/login.ambercast.plan.json`, JSON.stringify({ schemaVersion: 1, steps: [{ id: 'missing-kind' }] }));
+      await storage.writeText(`${TEST_DIR}/login.ambercast.plan.json`, JSON.stringify({ schemaVersion: 2, steps: [{ id: 'missing-kind' }] }));
     }],
   ] as const)('reports %s as an integrity violation before resolving a browser driver', async (_description, arrangePlan) => {
     const { deps, browserDriver, recordingStorage } = createScenario();
@@ -632,7 +665,7 @@ describe('run', () => {
       ],
       {
         ...elementGrounding(['fill-password']),
-        ...aiGrounding(trace([], [passingText('Dashboard')])),
+        ...aiGrounding(coveredTrace([], [passingText('Dashboard')])),
       },
     );
 
@@ -1402,7 +1435,7 @@ describe('run', () => {
         recordingStorage.storage,
         testPath,
         [aiStep('recorded-ai', [SECRET_REF])],
-        aiGrounding(trace([{ type: 'fill-secret', target: PASSWORD, secretRef: SECRET_REF }], [passingText('Dashboard')])),
+        aiGrounding(coveredTrace([{ type: 'fill-secret', target: PASSWORD, secretRef: SECRET_REF }], [passingText('Dashboard')])),
       );
 
       const outcome = await run(deps, DEFAULT_OPTIONS);
@@ -1590,7 +1623,12 @@ describe('run', () => {
     const testPath = await writePrompt(recordingStorage.storage);
     const steps: TestStep[] = [
       { id: 'before-ai', kind: 'action', action: 'navigate', url: '/before' },
-      { id: 'recorded-ai', kind: 'ai', instruction: 'Open the account settings.' },
+      {
+        id: 'recorded-ai',
+        kind: 'ai',
+        instruction: 'Open the account settings.',
+        instructionCoverage: DEFAULT_INSTRUCTION_COVERAGE,
+      } as unknown as TestStep,
       { id: 'after-ai', kind: 'action', action: 'navigate', url: '/after' },
     ];
     await seedFreshArtifacts(recordingStorage.storage, testPath, steps);
@@ -1955,7 +1993,7 @@ describe('run agentic fallback pipeline', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'navigate', url: '/dashboard' });
-        await request.controller.evaluateAssert(passingText('Dashboard'));
+        await request.controller.evaluateAssert(passingText('Dashboard'), 'dashboard-reached');
         return { outcome: 'success' };
       },
     });
@@ -1970,7 +2008,7 @@ describe('run agentic fallback pipeline', () => {
 
     const coldStart = await run(deps, DEFAULT_OPTIONS);
 
-    const expectedTrace = trace(
+    const expectedTrace = coveredTrace(
       [{ type: 'navigate', url: '/dashboard' }],
       [passingText('Dashboard')],
     );
@@ -2033,7 +2071,7 @@ describe('run agentic fallback pipeline', () => {
       ],
       {
         ...elementGrounding(['capture-token']),
-        ...aiGrounding(trace(
+        ...aiGrounding(coveredTrace(
           [{ type: 'fill', target: EMAIL, value: 'token: {{run.token}}' }],
           [passingText('Dashboard')],
         )),
@@ -2088,7 +2126,7 @@ describe('run agentic fallback pipeline', () => {
       recordingStorage.storage,
       testPath,
       [aiStep('recorded-ai', [secretRef])],
-      aiGrounding(trace(
+      aiGrounding(coveredTrace(
         [
           { type: 'fill-secret', target: PASSWORD, secretRef },
           { type: 'navigate', url: '/must-not-run' },
@@ -2176,7 +2214,7 @@ describe('run agentic fallback pipeline', () => {
       recordingStorage.storage,
       testPath,
       [aiStep('recorded-ai', [secretRef])],
-      aiGrounding(trace(
+      aiGrounding(coveredTrace(
         [{ type: 'fill-secret', target: PASSWORD, secretRef }],
         [passingText('Cached dashboard')],
       )),
@@ -2250,7 +2288,7 @@ describe('run agentic fallback pipeline', () => {
       recordingStorage.storage,
       testPath,
       [aiStep('recorded-ai', [secretRef])],
-      aiGrounding(trace(
+      aiGrounding(coveredTrace(
         [
           { type: 'fill-secret', target: PASSWORD, secretRef },
           { type: 'navigate', url: '/must-not-run-after-classified-error' },
@@ -2328,7 +2366,7 @@ describe('run agentic fallback pipeline', () => {
   it('issue 167 keeps fallback for an ordinary trace rejection after a successful fill-secret', async () => {
     const secretRef = '{{secrets.ISSUE_167_LATER_FALLBACK}}';
     const secretValue = 'ISSUE_167_LATER_FALLBACK_VALUE';
-    const priorTrace = trace(
+    const priorTrace = coveredTrace(
       [
         { type: 'fill-secret', target: PASSWORD, secretRef },
         { type: 'navigate', url: '/cached-route' },
@@ -2342,8 +2380,8 @@ describe('run agentic fallback pipeline', () => {
         }
       },
     });
-    const executeAgentic = vi.fn(async (request: AiAgenticRequest) => {
-      await request.controller.evaluateAssert(passingText('Recovered dashboard'));
+    const executeAgentic = vi.fn(async (request: InstructionCoveredAiAgenticRequest) => {
+      await request.controller.evaluateAssert(passingText('Recovered dashboard'), 'dashboard-reached');
       return { outcome: 'success' as const };
     });
     const executor = createFakeAiExecutor({ executeAgentic });
@@ -2367,7 +2405,7 @@ describe('run agentic fallback pipeline', () => {
     expect(resolveAiExecutor).toHaveBeenCalledTimes(1);
     expect(executeAgentic).toHaveBeenCalledTimes(1);
     expect(executor.agenticRequests).toHaveLength(1);
-    expect(executor.agenticRequests[0]?.priorTrace).toEqual(priorTrace);
+    expect(executor.agenticRequests[0]).not.toHaveProperty('priorTrace');
     expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'recorded-ai' }]);
     expect(session.operations().filter((operation) => operation.type === 'fill-secret')).toHaveLength(1);
     expect(session.operations()).toContainEqual({
@@ -2385,14 +2423,14 @@ describe('run agentic fallback pipeline', () => {
   it('issue 167 keeps fallback for a fill-secret target miss before browser invocation', async () => {
     const secretRef = '{{secrets.ISSUE_167_BIND_MISS}}';
     const secretValue = 'ISSUE_167_BIND_MISS_VALUE';
-    const priorTrace = trace(
+    const priorTrace = coveredTrace(
       [{ type: 'fill-secret', target: PASSWORD, secretRef }],
       [passingText('Cached dashboard')],
     );
     const session = createFakeBrowserSession(new Map());
     const fillSecret = vi.spyOn(session, 'fillSecret');
-    const executeAgentic = vi.fn(async (request: AiAgenticRequest) => {
-      await request.controller.evaluateAssert(passingText('Recovered after bind miss'));
+    const executeAgentic = vi.fn(async (request: InstructionCoveredAiAgenticRequest) => {
+      await request.controller.evaluateAssert(passingText('Recovered after bind miss'), 'dashboard-reached');
       return { outcome: 'success' as const };
     });
     const executor = createFakeAiExecutor({ executeAgentic });
@@ -2416,7 +2454,7 @@ describe('run agentic fallback pipeline', () => {
     expect(fillSecret).not.toHaveBeenCalled();
     expect(resolveAiExecutor).toHaveBeenCalledTimes(1);
     expect(executeAgentic).toHaveBeenCalledTimes(1);
-    expect(executor.agenticRequests[0]?.priorTrace).toEqual(priorTrace);
+    expect(executor.agenticRequests[0]).not.toHaveProperty('priorTrace');
     expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'recorded-ai' }]);
     expect(session.operations()).toContainEqual({
       type: 'resolve-grounded',
@@ -2504,8 +2542,8 @@ describe('run agentic fallback pipeline', () => {
     expect(session.operations()).toEqual([]);
   });
 
-  it('uses exactly one agentic fallback for a behavioral trace miss and passes the unresolved prior trace', async () => {
-    const priorTrace = trace(
+  it('uses exactly one agentic fallback for a covered behavioral trace miss without provider recovery context', async () => {
+    const priorTrace = coveredTrace(
       [{ type: 'navigate', url: '/cached-route' }],
       [passingText('Cached dashboard')],
     );
@@ -2516,7 +2554,7 @@ describe('run agentic fallback pipeline', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'press', target: SUBMIT, key: 'Enter' });
-        await request.controller.evaluateAssert(passingText('Refreshed dashboard'));
+        await request.controller.evaluateAssert(passingText('Refreshed dashboard'), 'dashboard-reached');
         return { outcome: 'success' };
       },
     });
@@ -2532,7 +2570,7 @@ describe('run agentic fallback pipeline', () => {
     expect(outcome.results[0]?.result).toMatchObject({ status: 'passed' });
     expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'recorded-ai' }]);
     expect(executor.agenticRequests).toHaveLength(1);
-    expect(executor.agenticRequests[0]?.priorTrace).toEqual(priorTrace);
+    expect(executor.agenticRequests[0]).not.toHaveProperty('priorTrace');
     expect(session.operations()).toEqual([
       { type: 'perform', action: { type: 'navigate', url: '/cached-route' } },
       { type: 'evaluate-assert', check: { check: 'text-visible', text: 'Cached dashboard' } },
@@ -2564,7 +2602,7 @@ describe('run agentic fallback pipeline', () => {
       vi.spyOn(session, 'evaluateAssert').mockRejectedValueOnce(new Error('browser evaluation failed'));
     }],
   ] as const)('treats %s as a behavioral path-C miss rather than an integrity failure', async (_description, arrange) => {
-    const priorTrace = trace([{ type: 'navigate', url: '/cached' }], [passingText('Cached')]);
+    const priorTrace = coveredTrace([{ type: 'navigate', url: '/cached' }], [passingText('Cached')]);
     const session = createFakeBrowserSession(new Map(), { assertOutcomes: [
       { passed: false, message: 'Cached assertion failed.' },
       { passed: true },
@@ -2572,7 +2610,7 @@ describe('run agentic fallback pipeline', () => {
     arrange(session);
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
-        await request.controller.evaluateAssert(passingText('Recovered'));
+        await request.controller.evaluateAssert(passingText('Recovered'), 'dashboard-reached');
         return { outcome: 'success' };
       },
     });
@@ -2587,11 +2625,11 @@ describe('run agentic fallback pipeline', () => {
 
     expect(outcome.results[0]?.result.status).toBe('passed');
     expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'recorded-ai' }]);
-    expect(executor.agenticRequests[0]?.priorTrace).toEqual(priorTrace);
+    expect(executor.agenticRequests[0]).not.toHaveProperty('priorTrace');
   });
 
   it('continues from a replay compute-bind miss into fresh agentic execution through the same bind primitive', async () => {
-    const priorTrace = trace([{ type: 'click', target: SUBMIT }], [passingText('Cached dashboard')]);
+    const priorTrace = coveredTrace([{ type: 'click', target: SUBMIT }], [passingText('Cached dashboard')]);
     const session = createFakeBrowserSession(liveEntries([SUBMIT]));
     const originalResolveGrounded = session.resolveGrounded.bind(session);
     const resolveGrounded = vi.spyOn(session, 'resolveGrounded')
@@ -2600,7 +2638,7 @@ describe('run agentic fallback pipeline', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'click', target: SUBMIT });
-        await request.controller.evaluateAssert(passingText('Refreshed dashboard'));
+        await request.controller.evaluateAssert(passingText('Refreshed dashboard'), 'dashboard-reached');
         return { outcome: 'success' };
       },
     });
@@ -2615,7 +2653,7 @@ describe('run agentic fallback pipeline', () => {
 
     expect(outcome.results[0]?.result.status).toBe('passed');
     expect(executor.agenticRequests).toHaveLength(1);
-    expect(executor.agenticRequests[0]?.priorTrace).toEqual(priorTrace);
+    expect(executor.agenticRequests[0]).not.toHaveProperty('priorTrace');
     expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'recorded-ai' }]);
     expect(resolveGrounded).toHaveBeenCalledTimes(2);
     expect(resolveGrounded.mock.calls.map(([, query]) => (query as unknown as { readonly mode: string }).mode)).toEqual([
@@ -2694,7 +2732,7 @@ describe('run agentic fallback pipeline', () => {
       recordingStorage.storage,
       testPath,
       [aiStep()],
-      aiGrounding(trace([{ type: 'navigate', url: '/cached' }], [passingText('Cached')])),
+      aiGrounding(coveredTrace([{ type: 'navigate', url: '/cached' }], [passingText('Cached')])),
     );
 
     const outcome = await run(deps, DEFAULT_OPTIONS);
@@ -2723,7 +2761,7 @@ describe('run agentic fallback pipeline', () => {
       recordingStorage.storage,
       testPath,
       [aiStep()],
-      aiGrounding(trace([], [passingText('Cached dashboard')])),
+      aiGrounding(coveredTrace([], [passingText('Cached dashboard')])),
     );
 
     const outcome = await run(deps, { ...DEFAULT_OPTIONS, cacheOnly: true });
@@ -3630,7 +3668,7 @@ describe('run path-C pre-scan', () => {
       recordingStorage.storage,
       testPath,
       [aiStep()],
-      aiGrounding(trace(
+      aiGrounding(legacyTrace(
         [
           { type: 'click', target: SUBMIT },
           { type: 'navigate', url: '/users/{{run.never-captured}}' },
@@ -3651,7 +3689,7 @@ describe('run path-C pre-scan', () => {
   it.each([
     [
       'an ungranted secret reference in events after a valid action',
-      trace(
+      legacyTrace(
         [
           { type: 'navigate', url: '/valid-first' },
           { type: 'fill-secret', target: PASSWORD, secretRef: '{{secrets.other.password}}' },
@@ -3661,7 +3699,7 @@ describe('run path-C pre-scan', () => {
     ],
     [
       'an ungranted run reference in events after a valid action',
-      trace(
+      legacyTrace(
         [
           { type: 'navigate', url: '/valid-first' },
           { type: 'navigate', url: '/users/{{run.ungranted}}' },
@@ -3671,7 +3709,7 @@ describe('run path-C pre-scan', () => {
     ],
     [
       'a malformed run reference in events after a valid action',
-      trace(
+      legacyTrace(
         [
           { type: 'navigate', url: '/valid-first' },
           { type: 'navigate', url: '/users/{{run.unclosed' },
@@ -3681,14 +3719,14 @@ describe('run path-C pre-scan', () => {
     ],
     [
       'an ungranted run reference in verification after a valid assertion',
-      trace(
+      legacyTrace(
         [{ type: 'navigate', url: '/valid-first' }],
         [passingText('Verified'), passingText('User {{run.ungranted}}')],
       ),
     ],
     [
       'a malformed run reference in verification after a valid assertion',
-      trace(
+      legacyTrace(
         [{ type: 'navigate', url: '/valid-first' }],
         [passingText('Verified'), passingText('User {{run.unclosed')],
       ),
@@ -3727,7 +3765,7 @@ describe('run path-C pre-scan', () => {
       recordingStorage.storage,
       testPath,
       [aiStep()],
-      aiGrounding(trace(
+      aiGrounding(legacyTrace(
         [
           { type: 'navigate', url: '/valid-first' },
           { type: 'navigate', url: 'https://evil.test/phish' },
@@ -3757,7 +3795,7 @@ describe('run path-C pre-scan', () => {
       recordingStorage.storage,
       testPath,
       [aiStep()],
-      aiGrounding(trace(
+      aiGrounding(legacyTrace(
         [
           { type: 'navigate', url: '/valid-first' },
           { type: 'navigate', url: 'blob:https://example.test/guard-test' },
@@ -3789,7 +3827,7 @@ describe('run path-C pre-scan', () => {
       recordingStorage.storage,
       testPath,
       [aiStep()],
-      aiGrounding(trace(
+      aiGrounding(legacyTrace(
         [
           { type: 'navigate', url: '/valid-first' },
           { type: 'navigate', url: 'data:text/html,opaque-origin' },
@@ -3817,7 +3855,7 @@ describe('run path-C pre-scan', () => {
       resolveAiExecutor,
     });
     const testPath = await writePrompt(recordingStorage.storage);
-    const priorTrace = trace(
+    const priorTrace = legacyTrace(
       [{ type: 'navigate', url: '/valid-first' }, { type: 'navigate', url: '/users/{{run.later}}' }],
       [passingText('Verified')],
     );
@@ -3849,7 +3887,7 @@ describe('run path-C pre-scan', () => {
       recordingStorage.storage,
       testPath,
       [aiStep('recorded-ai', [secretRef])],
-      aiGrounding(trace([{ type: 'fill-secret', target: PASSWORD, secretRef }], [passingText('Verified')])),
+      aiGrounding(coveredTrace([{ type: 'fill-secret', target: PASSWORD, secretRef }], [passingText('Verified')])),
     );
 
     const outcome = await run(deps, DEFAULT_OPTIONS);
@@ -3862,36 +3900,36 @@ describe('run path-C pre-scan', () => {
   });
 
   it.each([
-    ['navigate URL before fill-secret', (secretRef: string, secretValue: string) => trace(
+    ['navigate URL before fill-secret', (secretRef: string, secretValue: string) => legacyTrace(
       [
         { type: 'navigate', url: `/account/${secretValue}/settings` },
         { type: 'fill-secret', target: PASSWORD, secretRef },
       ],
       [passingText('Dashboard')],
     )],
-    ['navigate URL', (secretRef: string, secretValue: string) => trace(
+    ['navigate URL', (secretRef: string, secretValue: string) => legacyTrace(
       [
         { type: 'fill-secret', target: PASSWORD, secretRef },
         { type: 'navigate', url: `/account/${secretValue}/settings` },
       ],
       [passingText('Dashboard')],
     )],
-    ['fill value', (secretRef: string, secretValue: string) => trace(
+    ['fill value', (secretRef: string, secretValue: string) => legacyTrace(
       [
         { type: 'fill-secret', target: PASSWORD, secretRef },
         { type: 'fill', target: EMAIL, value: `token=${secretValue}` },
       ],
       [passingText('Dashboard')],
     )],
-    ['assertion text', (secretRef: string, secretValue: string) => trace(
+    ['assertion text', (secretRef: string, secretValue: string) => legacyTrace(
       [{ type: 'fill-secret', target: PASSWORD, secretRef }],
       [{ type: 'assert', check: 'text-visible', text: `Welcome ${secretValue}.` }],
     )],
-    ['assertion text equals', (secretRef: string, secretValue: string) => trace(
+    ['assertion text equals', (secretRef: string, secretValue: string) => legacyTrace(
       [{ type: 'fill-secret', target: PASSWORD, secretRef }],
       [{ type: 'assert', check: 'text-equals', target: PASSWORD, text: `Welcome ${secretValue}.` }],
     )],
-    ['assertion URL pattern', (secretRef: string, secretValue: string) => trace(
+    ['assertion URL pattern', (secretRef: string, secretValue: string) => legacyTrace(
       [{ type: 'fill-secret', target: PASSWORD, secretRef }],
       [{ type: 'assert', check: 'url-matches', pattern: `/account/${secretValue}/.*` }],
     )],
@@ -3926,7 +3964,7 @@ describe('run path-C pre-scan', () => {
   it('rejects an unsafe trace before a replay miss could hand it to an AI adapter as priorTrace', async () => {
     const secretRef = '{{secrets.AMBERCAST_SECRET_DUMMY}}';
     const secretValue = 'sk-AMBERCAST_SECRET_DUMMY';
-    const priorTrace = trace(
+    const priorTrace = legacyTrace(
       [
         { type: 'fill-secret', target: PASSWORD, secretRef },
         { type: 'navigate', url: `/account/${secretValue}/settings` },
@@ -3966,22 +4004,22 @@ describe('run path-C pre-scan', () => {
   });
 
   it.each([
-    ['click', (secretRef: string, target: ElementRef) => trace([
+    ['click', (secretRef: string, target: ElementRef) => legacyTrace([
       { type: 'fill-secret', target: PASSWORD, secretRef },
       { type: 'click', target },
     ], [passingText('Dashboard')])],
-    ['press', (secretRef: string, target: ElementRef) => trace([
+    ['press', (secretRef: string, target: ElementRef) => legacyTrace([
       { type: 'fill-secret', target: PASSWORD, secretRef },
       { type: 'press', target, key: 'Enter' },
     ], [passingText('Dashboard')])],
-    ['fill-secret', (secretRef: string, target: ElementRef) => trace([
+    ['fill-secret', (secretRef: string, target: ElementRef) => legacyTrace([
       { type: 'fill-secret', target: PASSWORD, secretRef },
       { type: 'fill-secret', target, secretRef },
     ], [passingText('Dashboard')])],
-    ['element-visible', (secretRef: string, target: ElementRef) => trace([
+    ['element-visible', (secretRef: string, target: ElementRef) => legacyTrace([
       { type: 'fill-secret', target: PASSWORD, secretRef },
     ], [{ type: 'assert', check: 'element-visible', target }])],
-    ['element-count', (secretRef: string, target: ElementRef) => trace([
+    ['element-count', (secretRef: string, target: ElementRef) => legacyTrace([
       { type: 'fill-secret', target: PASSWORD, secretRef },
     ], [{ type: 'assert', check: 'element-count', target, count: 1 }])],
   ] as const)('rejects a materialized secret in a stored-trace %s target role before replay', async (_description, buildTrace) => {
@@ -4085,7 +4123,7 @@ describe('run agentic wrapper state machine', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'navigate', url: '/settings' });
-        await request.controller.evaluateAssert(passingText('Settings'));
+        await request.controller.evaluateAssert(passingText('Settings'), 'dashboard-reached');
         return { outcome: 'success' };
       },
     });
@@ -4100,7 +4138,7 @@ describe('run agentic wrapper state machine', () => {
       results: [{ result: { status: 'passed' } }],
     });
 
-    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual(aiGrounding(trace(
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual(aiGrounding(coveredTrace(
       [{ type: 'navigate', url: '/settings' }],
       [passingText('Settings')],
     )));
@@ -4111,8 +4149,8 @@ describe('run agentic wrapper state machine', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'navigate', url: '/dashboard' });
-        await request.controller.evaluateAssert(passingText('Dashboard'));
-        await request.controller.evaluateAssert(passingText('Signed in as Ari'));
+        await request.controller.evaluateAssert(passingText('Dashboard'), 'credentials-submitted');
+        await request.controller.evaluateAssert(passingText('Signed in as Ari'), 'dashboard-reached');
         return { outcome: 'success' };
       },
     });
@@ -4121,32 +4159,64 @@ describe('run agentic wrapper state machine', () => {
       resolveAiExecutor: async () => executor,
     });
     const testPath = await writePrompt(recordingStorage.storage);
-    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()]);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [{
+      id: 'recorded-ai',
+      kind: 'ai',
+      instruction: 'Complete sign-in and reach the dashboard.',
+      instructionCoverage: [
+        {
+          id: 'credentials-submitted',
+          kind: 'success',
+          sourceSpan: { startLine: 3, startColumn: 1, endLine: 3, endColumn: 32 },
+        },
+        {
+          id: 'dashboard-reached',
+          kind: 'success',
+          sourceSpan: { startLine: 3, startColumn: 34, endLine: 3, endColumn: 56 },
+        },
+      ],
+    } as unknown as TestStep]);
 
     const outcome = await run(deps, DEFAULT_OPTIONS);
 
     expect(outcome.results[0]?.result.status).toBe('passed');
-    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual(aiGrounding(trace(
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual(aiGrounding(coveredTrace(
       [{ type: 'navigate', url: '/dashboard' }],
       [passingText('Dashboard'), passingText('Signed in as Ari')],
+      { 'credentials-submitted': 0, 'dashboard-reached': 1 },
     )));
   });
 
   it.each([
-    ['a snapshot', async (request: AiAgenticRequest) => request.controller.snapshotForResolution(), [{ passed: true }, { passed: true }] as const],
+    [
+      'an action',
+      async (request: AiAgenticRequest) => request.controller.perform({ type: 'press', target: SUBMIT, key: 'Enter' }),
+      [{ passed: true }, { passed: true }] as const,
+      [
+        { type: 'navigate', url: '/dashboard' },
+        passingText('Earlier dashboard'),
+        { type: 'press', target: SUBMIT, key: 'Enter' },
+      ] as const,
+    ],
+    [
+      'a snapshot',
+      async (request: AiAgenticRequest) => request.controller.snapshotForResolution(),
+      [{ passed: true }, { passed: true }] as const,
+      [{ type: 'navigate', url: '/dashboard' }, passingText('Earlier dashboard')] as const,
+    ],
     ['a failed assertion', async (request: AiAgenticRequest) => request.controller.evaluateAssert(passingText('Intermediate miss')), [
       { passed: true },
       { passed: false, message: 'Intermediate miss.' },
       { passed: true },
-    ] as const],
-  ] as const)('resets a passed-assert run after %s and retains only the later terminal assertion as verification', async (_description, interrupt, assertOutcomes) => {
-    const session = createFakeBrowserSession(new Map(), { assertOutcomes });
+    ] as const, [{ type: 'navigate', url: '/dashboard' }, passingText('Earlier dashboard')] as const],
+  ] as const)('resets a passed-assert run after %s and retains only the later terminal assertion as verification', async (_description, interrupt, assertOutcomes, expectedEvents) => {
+    const session = createFakeBrowserSession(liveEntries([SUBMIT], FINGERPRINT), { assertOutcomes });
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'navigate', url: '/dashboard' });
         await request.controller.evaluateAssert(passingText('Earlier dashboard'));
         await interrupt(request);
-        await request.controller.evaluateAssert(passingText('Terminal dashboard'));
+        await request.controller.evaluateAssert(passingText('Terminal dashboard'), 'dashboard-reached');
         return { outcome: 'success' };
       },
     });
@@ -4160,11 +4230,8 @@ describe('run agentic wrapper state machine', () => {
     const outcome = await run(deps, DEFAULT_OPTIONS);
 
     expect(outcome.results[0]?.result.status).toBe('passed');
-    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual(aiGrounding(trace(
-      [
-        { type: 'navigate', url: '/dashboard' },
-        passingText('Earlier dashboard'),
-      ],
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual(aiGrounding(coveredTrace(
+      expectedEvents,
       [passingText('Terminal dashboard')],
     )));
   });
@@ -4241,7 +4308,7 @@ describe('run agentic wrapper state machine', () => {
       { passed: false, message: 'Fresh miss.' },
     ] as const],
   ] as const)('deletes a stale replay trace when fallback ends with %s and no new replayable trace', async (_description, terminalObservation, assertOutcomes) => {
-    const staleTrace = trace([], [passingText('Cached trace')]);
+    const staleTrace = legacyTrace([], [passingText('Cached trace')]);
     const session = createFakeBrowserSession(new Map(), { assertOutcomes });
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
@@ -4265,7 +4332,7 @@ describe('run agentic wrapper state machine', () => {
   });
 
   it('overwrites a behavioral-miss trace with fresh terminal verification rather than merging journals', async () => {
-    const staleTrace = trace([{ type: 'navigate', url: '/stale' }], [passingText('Stale')]);
+    const staleTrace = coveredTrace([{ type: 'navigate', url: '/stale' }], [passingText('Stale')]);
     const session = createFakeBrowserSession(new Map(), { assertOutcomes: [
       { passed: false, message: 'Stale trace missed.' },
       { passed: true },
@@ -4273,7 +4340,7 @@ describe('run agentic wrapper state machine', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'navigate', url: '/fresh' });
-        await request.controller.evaluateAssert(passingText('Fresh'));
+        await request.controller.evaluateAssert(passingText('Fresh'), 'dashboard-reached');
         return { outcome: 'success' };
       },
     });
@@ -4286,7 +4353,7 @@ describe('run agentic wrapper state machine', () => {
 
     await expect(run(deps, DEFAULT_OPTIONS)).resolves.toMatchObject({ results: [{ result: { status: 'passed' } }] });
 
-    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual(aiGrounding(trace(
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual(aiGrounding(coveredTrace(
       [{ type: 'navigate', url: '/fresh' }],
       [passingText('Fresh')],
     )));
@@ -4302,7 +4369,7 @@ describe('run agentic wrapper state machine', () => {
       return { outcome: 'success' as const };
     }],
   ] as const)('discards partial journal observations and leaves prior grounding untouched after %s', async (_description, finish) => {
-    const staleTrace = trace([], [passingText('Cached trace')]);
+    const staleTrace = coveredTrace([], [passingText('Cached trace')]);
     const abortController = new AbortController();
     const session = createFakeBrowserSession(new Map(), { assertOutcomes: [
       { passed: false, message: 'Cached trace missed.' },
@@ -4584,13 +4651,13 @@ describe('run deterministic redaction boundary', () => {
         if (agenticInvocation === 0) {
           agenticInvocation += 1;
           await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef });
-          await request.controller.evaluateAssert(passingText('First AI pipeline verification'));
+          await evaluateTerminalAssert(request, passingText('First AI pipeline verification'));
           return { outcome: 'success' };
         }
 
         if (agenticInvocation === 1) {
           agenticInvocation += 1;
-          const outcome = await request.controller.evaluateAssert(passingText('Second AI pipeline diagnostic'));
+          const outcome = await evaluateTerminalAssert(request, passingText('Second AI pipeline diagnostic'));
           secondPipelineDiagnostic = outcome.message;
           return { outcome: 'success' };
         }
@@ -4640,7 +4707,7 @@ describe('run deterministic redaction boundary', () => {
     ], {
       'replay-secret-trace': {
         kind: 'ai',
-        trace: trace(
+        trace: coveredTrace(
           [{ type: 'fill-secret', target: PASSWORD, secretRef }],
           [passingText('Cached trace verification')],
         ),
@@ -4734,7 +4801,7 @@ describe('run agentic materialization boundary', () => {
     const successfulExecutor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef });
-        const assertion = await request.controller.evaluateAssert({
+        const assertion = await evaluateTerminalAssert(request, {
           type: 'assert',
           check: 'text-visible',
           text: '{{run.token}}',
@@ -4765,7 +4832,11 @@ describe('run agentic materialization boundary', () => {
 
     expect((await readGrounding(successful.recordingStorage.storage, successfulPath)).entries['recorded-ai']).toMatchObject({
       kind: 'ai',
-      trace: { events: [{ type: 'fill-secret', secretRef }], verification: [passingText('{{run.token}}')] },
+      trace: {
+        events: [{ type: 'fill-secret', secretRef }],
+        verification: [passingText('{{run.token}}')],
+        verificationCoverage: { 'dashboard-reached': 0 },
+      },
     });
     expect(adapterMessage).toBe(`Observed ${secretRef} beside {{run.token}}.`);
     expect(successfulOutcome.results[0]?.result).toMatchObject({
@@ -4903,7 +4974,7 @@ describe('run agentic materialization boundary', () => {
       async executeAgentic(request) {
         await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef });
         await request.controller.perform({ type: 'fill', target: EMAIL, value: candidate });
-        await request.controller.evaluateAssert(passingText('Dashboard'));
+        await evaluateTerminalAssert(request, passingText('Dashboard'));
         return { outcome: 'success' };
       },
     });
@@ -4957,7 +5028,8 @@ describe('run agentic materialization boundary', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await script(request, runValue);
-        await request.controller.evaluateAssert(passingText('Dashboard'));
+        await request.controller.perform({ type: 'navigate', url: '/dashboard' });
+        await evaluateTerminalAssert(request, passingText('Dashboard'));
         return { outcome: 'success' };
       },
     });
@@ -4997,7 +5069,7 @@ describe('run agentic materialization boundary', () => {
         if (secretValue !== undefined) {
           await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef });
         }
-        const outcome = await request.controller.evaluateAssert(passingText('Visible'));
+        const outcome = await evaluateTerminalAssert(request, passingText('Visible'));
         adapterMessage = outcome.message;
         return { outcome: 'success' };
       },
@@ -5045,7 +5117,7 @@ describe('run agentic materialization boundary', () => {
       async executeAgentic(request) {
         await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: tiedSecretRef });
         await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: longSecretRef });
-        const outcome = await request.controller.evaluateAssert(passingText('Visible'));
+        const outcome = await evaluateTerminalAssert(request, passingText('Visible'));
         adapterMessage = outcome.message;
         return { outcome: 'success' };
       },
@@ -5080,7 +5152,7 @@ describe('run per-case grounding flush and dispatch wiring', () => {
     const session = createFakeBrowserSession(new Map());
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
-        await request.controller.evaluateAssert(passingText('Dashboard'));
+        await evaluateTerminalAssert(request, passingText('Dashboard'));
         return { outcome: 'success' };
       },
     });
@@ -5114,7 +5186,7 @@ describe('run per-case grounding flush and dispatch wiring', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef });
-        await request.controller.evaluateAssert(passingText('Dashboard'));
+        await evaluateTerminalAssert(request, passingText('Dashboard'));
         return { outcome: 'success' };
       },
     });
@@ -5162,7 +5234,7 @@ describe('run per-case grounding flush and dispatch wiring', () => {
     });
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
-        await request.controller.evaluateAssert(passingText('Dashboard'));
+        await evaluateTerminalAssert(request, passingText('Dashboard'));
         return { outcome: 'success' };
       },
     });
@@ -5201,7 +5273,7 @@ describe('run per-case grounding flush and dispatch wiring', () => {
     });
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
-        await request.controller.evaluateAssert(passingText('Dashboard'));
+        await evaluateTerminalAssert(request, passingText('Dashboard'));
         return { outcome: 'success' };
       },
     });
@@ -5218,7 +5290,7 @@ describe('run per-case grounding flush and dispatch wiring', () => {
     const outcome = await run(deps, DEFAULT_OPTIONS);
 
     expect(outcome.results[0]?.result.status).toBe('error');
-    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual(aiGrounding(trace(
+    expect((await readGrounding(recordingStorage.storage, testPath)).entries).toEqual(aiGrounding(coveredTrace(
       [],
       [passingText('Dashboard')],
     )));
@@ -5237,7 +5309,7 @@ describe('run per-case grounding flush and dispatch wiring', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         expect(request.allowedRunRefs).toEqual(['name']);
-        await request.controller.evaluateAssert({ type: 'assert', check: 'text-visible', text: '{{run.name}}' });
+        await evaluateTerminalAssert(request, { type: 'assert', check: 'text-visible', text: '{{run.name}}' });
         return { outcome: 'success' };
       },
       execute: () => ({ data: { confirmed: true }, raw: '{"confirmed":true}' }),
@@ -5285,11 +5357,11 @@ describe('run failure evidence', () => {
 
     try {
       await storage.writeText(testPath, PROMPT);
-      const plan: PlanDocument = {
-        schemaVersion: 1,
+      const plan = {
+        schemaVersion: 2,
         source: {
           inputsDigest: computeInputsDigest({
-            normalizedTestMd: normalizeTestMd(PROMPT), schemaVersion: 1,
+            normalizedTestMd: normalizeTestMd(PROMPT), schemaVersion: 2,
             generatorPromptTemplateFingerprint: promptTemplateFingerprint(), targetDefinitions: TARGETS,
           }),
         },
@@ -5298,7 +5370,7 @@ describe('run failure evidence', () => {
           { id: 'assert-dashboard', kind: 'assert', check: 'text-visible', text: 'Dashboard' },
           { id: 'later-step', kind: 'action', action: 'navigate', url: '/later' },
         ],
-      };
+      } as unknown as PlanDocument;
       await storage.writeText(layout.planPathFor(testPath), toCanonicalArtifactText(plan as unknown as JsonValueT));
       await storage.writeText(layout.groundingPathFor(testPath), toCanonicalArtifactText({
         schemaVersion: 1, planDigest: computePlanDigest(plan), entries: {},
@@ -6100,7 +6172,7 @@ describe('run credential-literal symmetry', () => {
       recordingStorage.storage,
       testPath,
       [aiStep()],
-      aiGrounding(trace([{ type: 'fill', target: EMAIL, value }], [passingText('Dashboard')])),
+      aiGrounding(legacyTrace([{ type: 'fill', target: EMAIL, value }], [passingText('Dashboard')])),
     );
 
     const outcome = await run(deps, DEFAULT_OPTIONS);
@@ -6137,7 +6209,8 @@ describe('run credential-literal symmetry', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await script(request, credentialShapedTarget, literal);
-        await request.controller.evaluateAssert(passingText('Dashboard'));
+        await request.controller.perform({ type: 'navigate', url: '/dashboard' });
+        await evaluateTerminalAssert(request, passingText('Dashboard'));
         return { outcome: 'success' };
       },
     });
@@ -6155,23 +6228,23 @@ describe('run credential-literal symmetry', () => {
   });
 
   it.each([
-    ['navigate URL', (target: ElementRef, literal: string) => trace(
+    ['navigate URL', (target: ElementRef, literal: string) => coveredTrace(
       [{ type: 'navigate', url: literal }],
       [passingText('Dashboard')],
     )],
-    ['text-visible assertion text', (_target: ElementRef, literal: string) => trace(
+    ['text-visible assertion text', (_target: ElementRef, literal: string) => coveredTrace(
       [],
       [{ type: 'assert', check: 'text-visible', text: literal }],
     )],
-    ['text-equals assertion text', (target: ElementRef, literal: string) => trace(
+    ['text-equals assertion text', (target: ElementRef, literal: string) => coveredTrace(
       [],
       [{ type: 'assert', check: 'text-equals', target, text: literal }],
     )],
-    ['URL-match assertion pattern', (_target: ElementRef, literal: string) => trace(
-      [],
+    ['URL-match assertion pattern', (_target: ElementRef, literal: string) => coveredTrace(
       [{ type: 'assert', check: 'url-matches', pattern: literal }],
+      [passingText('Dashboard')],
     )],
-    ['fill target name', (target: ElementRef) => trace(
+    ['fill target name', (target: ElementRef) => coveredTrace(
       [{ type: 'fill', target, value: 'ordinary fill value' }],
       [passingText('Dashboard')],
     )],
@@ -6244,7 +6317,7 @@ describe('run credential-literal symmetry', () => {
       recordingStorage.storage,
       testPath,
       [aiStep('recorded-ai', [secretRef])],
-      aiGrounding(trace([
+      aiGrounding(legacyTrace([
         { type: 'fill-secret', target: PASSWORD, secretRef },
         { type: 'fill', target: EMAIL, value: secretValue },
       ], [passingText('Dashboard')])),
@@ -6299,11 +6372,11 @@ describe('run credential-literal symmetry', () => {
   });
 
   it.each([
-    ['click', (target: ElementRef) => trace([
+    ['click', (target: ElementRef) => legacyTrace([
       { type: 'fill-secret', target: PASSWORD, secretRef: '{{secrets.auth.target_name}}' },
       { type: 'click', target },
     ], [passingText('Dashboard')])],
-    ['press', (target: ElementRef) => trace([
+    ['press', (target: ElementRef) => legacyTrace([
       { type: 'fill-secret', target: PASSWORD, secretRef: '{{secrets.auth.target_name}}' },
       { type: 'press', target, key: 'Enter' },
     ], [passingText('Dashboard')])],
@@ -6343,7 +6416,7 @@ describe('run credential-literal symmetry', () => {
     [
       'type',
       new Map([['{{secrets.trace.type}}', 'click']]),
-      trace([
+      coveredTrace([
         { type: 'fill-secret', target: PASSWORD, secretRef: '{{secrets.trace.type}}' },
         { type: 'click', target: SUBMIT },
       ], [passingText('Dashboard')]),
@@ -6351,14 +6424,14 @@ describe('run credential-literal symmetry', () => {
     [
       'check',
       new Map([['{{secrets.trace.check}}', 'element-visible']]),
-      trace([
+      coveredTrace([
         { type: 'fill-secret', target: PASSWORD, secretRef: '{{secrets.trace.check}}' },
       ], [{ type: 'assert', check: 'element-visible', target: SUBMIT }]),
     ],
     [
       'target.strategy',
       new Map([['{{secrets.trace.strategy}}', 'accessibility']]),
-      trace([
+      coveredTrace([
         { type: 'fill-secret', target: PASSWORD, secretRef: '{{secrets.trace.strategy}}' },
         { type: 'click', target: SUBMIT },
       ], [passingText('Dashboard')]),
@@ -6366,7 +6439,7 @@ describe('run credential-literal symmetry', () => {
     [
       'key',
       new Map([['{{secrets.trace.key}}', 'Enter']]),
-      trace([
+      coveredTrace([
         { type: 'fill-secret', target: PASSWORD, secretRef: '{{secrets.trace.key}}' },
         { type: 'press', target: SUBMIT, key: 'Enter' },
       ], [passingText('Dashboard')]),
@@ -6377,7 +6450,7 @@ describe('run credential-literal symmetry', () => {
         ['{{secrets.trace.token}}', 'first-secret-value'],
         ['{{secrets.trace.tok}}', 'tok'],
       ]),
-      trace([
+      coveredTrace([
         { type: 'fill-secret', target: PASSWORD, secretRef: '{{secrets.trace.token}}' },
         { type: 'fill-secret', target: PASSWORD, secretRef: '{{secrets.trace.tok}}' },
       ], [passingText('Dashboard')]),
@@ -6505,7 +6578,7 @@ describe('run credential-literal symmetry', () => {
   it('does not scan object keys while inspecting stored traces', async () => {
     const secretRef = '{{secrets.trace.object_key}}';
     const secretValue = 'target';
-    const priorTrace = trace([
+    const priorTrace = coveredTrace([
       { type: 'fill-secret', target: PASSWORD, secretRef },
       { type: 'click', target: SUBMIT },
     ], [passingText('Dashboard')]);
@@ -6579,7 +6652,7 @@ describe('run credential-literal symmetry', () => {
       recordingStorage.storage,
       testPath,
       [aiStep('recorded-ai', [secretRef])],
-      aiGrounding(trace([
+      aiGrounding(coveredTrace([
         { type: 'fill-secret', target: PASSWORD, secretRef },
       ], [passingText('Dashboard')])),
     );
@@ -6732,7 +6805,7 @@ describe('run credential-literal symmetry', () => {
       recordingStorage.storage,
       testPath,
       [aiStep('recorded-ai', [secretRef])],
-      aiGrounding(trace([
+      aiGrounding(legacyTrace([
         { type: 'fill-secret', target: PASSWORD, secretRef },
         { type: 'fill-secret', target: secretNamedTarget, secretRef },
       ], [passingText('Dashboard')])),
@@ -6803,7 +6876,7 @@ describe('run credential-literal symmetry', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'fill', target: PASSWORD, value: `welcome-${runValue}` });
-        await request.controller.evaluateAssert(passingText('Dashboard'));
+        await evaluateTerminalAssert(request, passingText('Dashboard'));
         return { outcome: 'success' };
       },
     });
@@ -6840,7 +6913,7 @@ describe('run credential-literal symmetry', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'fill', target: PASSWORD, value: `welcome-${capturedToken}` });
-        await request.controller.evaluateAssert(passingText('Dashboard'));
+        await evaluateTerminalAssert(request, passingText('Dashboard'));
         return { outcome: 'success' };
       },
     });
@@ -6887,7 +6960,7 @@ describe('run credential-literal symmetry', () => {
       ],
       {
         ...elementGrounding(['capture-token']),
-        ...aiGrounding(trace([
+        ...aiGrounding(coveredTrace([
           { type: 'fill', target: PASSWORD, value: `welcome-${runValue}` },
         ], [passingText('Dashboard')])),
       },
@@ -6962,7 +7035,7 @@ describe('run credential-literal symmetry', () => {
       ],
       {
         ...elementGrounding(['capture-token']),
-        ...aiGrounding(trace([
+        ...aiGrounding(legacyTrace([
           { type: 'fill', target: PASSWORD, value: `${literal}-${runValue}` },
         ], [passingText('Dashboard')])),
       },
@@ -7031,7 +7104,7 @@ describe('run credential-literal symmetry', () => {
       ],
       {
         ...elementGrounding(['capture-token']),
-        ...aiGrounding(trace([
+        ...aiGrounding(legacyTrace([
           { type: 'fill', target: PASSWORD, value: `${capturedValue}${fabricatedValue}` },
         ], [passingText('Dashboard')])),
       },
@@ -7059,7 +7132,7 @@ describe('run credential-literal symmetry', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'fill', target: PASSWORD, value: secretShapedValue });
-        await request.controller.evaluateAssert(passingText('Dashboard'));
+        await evaluateTerminalAssert(request, passingText('Dashboard'));
         return { outcome: 'success' };
       },
     });

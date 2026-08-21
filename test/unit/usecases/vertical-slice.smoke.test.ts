@@ -9,8 +9,10 @@ import {
   type Fingerprint,
   type GeneratedPlanResponse,
   type JsonValueT,
+  type TraceAssert,
 } from '#core/ir/schema.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
+import type { AiActionController } from '#ports/ai.js';
 import { check, type CheckDeps, type CheckOptions } from '#usecases/check.js';
 import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/generate.js';
 import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
@@ -57,6 +59,17 @@ const GENERATE_OPTIONS: GenerateOptions = {
 };
 const RUN_OPTIONS: RunOptions = { files: [TEST_PATH], cacheOnly: false, allowEmpty: false, list: false, stale: 'fail' };
 const CHECK_OPTIONS: CheckOptions = { files: [TEST_PATH], allowEmpty: false, list: false };
+const SUCCESS_CITATION = 'When I submit valid credentials, I reach the dashboard.';
+const SUCCESS_INTENT = {
+  criterionId: 'dashboard-reached',
+  assertion: { type: 'assert' as const, check: 'text-visible' as const, text: 'Dashboard' },
+};
+
+async function evaluateTerminal(controller: AiActionController, assertion: TraceAssert): Promise<unknown> {
+  return (controller as unknown as {
+    evaluateAssert(check: TraceAssert, criterionId?: string): Promise<unknown>;
+  }).evaluateAssert(assertion, SUCCESS_INTENT.criterionId);
+}
 
 function checkDeps(storage: ReturnType<typeof createInMemoryStorage>, layout: ReturnType<typeof createLayoutResolver>): CheckDeps {
   return {
@@ -106,10 +119,17 @@ describe('fake vertical slice', () => {
   });
 
   it('checks a fresh plan after run updates its grounding cache', async () => {
-    const generatedResponse: GeneratedPlanResponse = {
-      steps: [{ id: 'recorded-ai', kind: 'ai', instruction: 'Reach the dashboard.', secrets: [] }],
+    const generatedResponse = {
+      steps: [{
+        id: 'recorded-ai',
+        kind: 'ai',
+        instruction: 'Reach the dashboard.',
+        secrets: [],
+        instructionCoverage: [{ id: SUCCESS_INTENT.criterionId, kind: 'success', citation: SUCCESS_CITATION }],
+        verificationIntent: [SUCCESS_INTENT],
+      }],
       ambiguities: [],
-    };
+    } as unknown as GeneratedPlanResponse;
     const storage = createInMemoryStorage();
     const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
     await storage.writeText(TEST_PATH, PROMPT);
@@ -146,7 +166,7 @@ describe('fake vertical slice', () => {
       resolveAiExecutor: async () => createFakeAiExecutor({
         async executeAgentic(request) {
           await request.controller.perform({ type: 'navigate', url: '/dashboard' });
-          await request.controller.evaluateAssert({ type: 'assert', check: 'text-visible', text: 'Dashboard' });
+          await evaluateTerminal(request.controller, { type: 'assert', check: 'text-visible', text: 'Dashboard' });
           return { outcome: 'success' };
         },
       }),
@@ -280,15 +300,17 @@ describe('fake vertical slice', () => {
   it('replays a generated AI-step secret grant from pre-seeded grounding without AI calls', async () => {
     const secretRef = '{{secrets.LOGIN_PASSWORD}}';
     const secretTarget: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Password' };
-    const generatedResponse: GeneratedPlanResponse = {
+    const generatedResponse = {
       steps: [{
         id: 'complete-sign-in',
         kind: 'ai',
         instruction: 'Complete sign-in.',
         secrets: [{ ref: secretRef, citation: `@ambercast-secret ${secretRef}` }],
+        instructionCoverage: [{ id: SUCCESS_INTENT.criterionId, kind: 'success', citation: SUCCESS_CITATION }],
+        verificationIntent: [SUCCESS_INTENT],
       }],
       ambiguities: [],
-    };
+    } as unknown as GeneratedPlanResponse;
     const storage = createInMemoryStorage();
     const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
     const execute = vi.fn(async () => ({ data: generatedResponse, raw: JSON.stringify(generatedResponse) }));
@@ -328,6 +350,7 @@ describe('fake vertical slice', () => {
           trace: {
             events: [{ type: 'fill-secret', target: secretTarget, secretRef }],
             verification: [{ type: 'assert', check: 'text-visible', text: 'Dashboard' }],
+            verificationCoverage: { [SUCCESS_INTENT.criterionId]: 0 },
           },
         },
       },
@@ -388,15 +411,17 @@ describe('fake vertical slice', () => {
   // A cold-start miss through path B is intentionally outside this vertical-slice test's scope.
   it('rejects a generated AI-step secret grant that the prompt never declares', async () => {
     const undeclaredSecretRef = '{{secrets.LOGIN_PASSWORD}}';
-    const generatedResponse: GeneratedPlanResponse = {
+    const generatedResponse = {
       steps: [{
         id: 'complete-sign-in',
         kind: 'ai',
         instruction: 'Complete sign-in.',
         secrets: [{ ref: undeclaredSecretRef, citation: `@ambercast-secret ${undeclaredSecretRef}` }],
+        instructionCoverage: [{ id: SUCCESS_INTENT.criterionId, kind: 'success', citation: SUCCESS_CITATION }],
+        verificationIntent: [SUCCESS_INTENT],
       }],
       ambiguities: [],
-    };
+    } as unknown as GeneratedPlanResponse;
     const storage = createInMemoryStorage();
     const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
     await storage.writeText(TEST_PATH, PROMPT);

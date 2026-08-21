@@ -2,7 +2,7 @@
   "document": "plan",
   "expected": "invalid",
   "value": {
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "source": { "inputsDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
     "targets": {},
     "steps": [{ "id": "find-submit", "kind": "action", "action": "click", "target": { "strategy": "css", "selector": "#submit" } }]

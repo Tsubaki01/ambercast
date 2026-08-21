@@ -13,7 +13,7 @@ import { AmbercastError, type AmbercastError as AmbercastErrorType } from '#core
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
-import { normalizeTestMd } from '#core/ir/normalize.js';
+import { normalizeTestMd, type NormalizedTestMd } from '#core/ir/normalize.js';
 import { isSnapshotInvalid } from '#core/ir/aria-snapshot.js';
 import {
   isAllowedSecretSinkOrigin,
@@ -21,7 +21,9 @@ import {
   type SecretSinkPolicy,
 } from '#core/secrets/sink-policy.js';
 import {
+  GROUNDING_SCHEMA_VERSION,
   GroundingDocument,
+  PLAN_SCHEMA_VERSION,
   PlanDocument,
   RunRef,
   TraceAction,
@@ -33,17 +35,25 @@ import {
   type ElementRef,
   type GroundingEntry,
   type GroundingDocument as GroundingDocumentType,
+  type GroundingDocumentWithCoverageStorage,
+  type InstructionCoveredPlanDocument,
   type JsonValueT,
   type PlanDocument as PlanDocumentType,
   type RunVariableName,
   type Step,
+  type StepId,
   type TargetDefinition,
+  type TraceRecordWithCoverageStorage,
 } from '#core/ir/schema.js';
 import type { LayoutResolver } from '#core/layout/resolve.js';
 import { joinPath, relativeWithin } from '#core/paths.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { resolveTarget } from '#core/target/resolve.js';
-import type { AiActionController, AiExecutor } from '#ports/ai.js';
+import type {
+  InstructionCoverageAiActionController,
+  InstructionCoveredAiExecutor,
+  PreScannedTraceRecord,
+} from '#ports/ai.js';
 import type {
   AssertCheck,
   AssertOutcome,
@@ -63,6 +73,14 @@ import {
   detectSecretLiteral,
   type SecretDetector,
 } from './generator-secret-policy.js';
+import type {
+  CoveredTraceRecord,
+  TrustedInstructionCriterion,
+} from './instruction-coverage-policy.js';
+import {
+  classifyPreScannedTraceCoverage,
+  validateCommittedInstructionCoverage,
+} from './instruction-coverage-policy.js';
 
 /**
  * Execution evidence while a case is still in progress.
@@ -130,13 +148,60 @@ interface DispatchContext {
    */
   readonly resolvedSecrets: Map<string, Set<string>>;
   readonly allowedRunRefs: ReadonlySet<RunVariableName>;
-  readonly resolveAiExecutor: () => Promise<AiExecutor>;
+  readonly instructionCoverageByStepId: ReadonlyMap<StepId, readonly TrustedInstructionCriterion[]>;
+  readonly resolveAiExecutor: () => Promise<InstructionCoveredAiExecutor>;
   readonly cacheOnly: boolean;
   readonly events: EventSink;
   readonly updateGroundingEntry: (stepId: Step['id'], entry: GroundingEntry) => void;
   readonly deleteGroundingEntry: (stepId: Step['id']) => void;
   readonly resolvedVias: Map<Step['id'], ResolutionVia>;
   readonly aiTimeoutMs: number;
+  readonly signal?: AbortSignal;
+}
+
+type TraceTrustContext = Pick<
+  DispatchContext,
+  'target' | 'secrets' | 'resolvedSecrets' | 'allowedRunRefs'
+> & {
+  readonly runState: ReadonlyMap<RunVariableName, string>;
+  readonly deferHighEntropyFillCheck?: boolean;
+  readonly skipSecretPriming?: boolean;
+  readonly rejectCapturedRunLiterals?: boolean;
+};
+
+type TraceReplayMaterializationContext = Pick<
+  DispatchContext,
+  'session' | 'target' | 'secrets' | 'resolvedSecrets' | 'allowedRunRefs'
+> & { readonly runState: ReadonlyMap<RunVariableName, string> };
+
+/**
+ * Capabilities available to covered deterministic replay.
+ *
+ * @remarks
+ * The surface deliberately omits AI execution and resolution. A validated
+ * covered trace therefore cannot trigger an AI call by construction; browser
+ * and local run-value capabilities are sufficient for replay.
+ */
+export interface CoveredTraceReplayContext {
+  /** Live browser session used only after local coverage validation. */
+  readonly session: BrowserSession;
+
+  /** Live resolved target used for navigation and secret-sink checks. */
+  readonly target: TargetDefinition;
+
+  /** Captured case values available for trusted interpolation. */
+  readonly runState: ReadonlyMap<RunVariableName, string>;
+
+  /** Secrets provider retained behind the existing sink policy. */
+  readonly secrets: SecretsProvider;
+
+  /** Values already resolved for whole-trace taint rejection. */
+  readonly resolvedSecrets: Map<string, Set<string>>;
+
+  /** Run variables authorized by the containing plan. */
+  readonly allowedRunRefs: ReadonlySet<RunVariableName>;
+
+  /** Caller cancellation observed between deterministic replay entries. */
   readonly signal?: AbortSignal;
 }
 
@@ -206,15 +271,75 @@ async function callAiExecutor<T>(
  * case-level explanation.
  */
 class CaseAbort extends Error {}
+class AgenticCoverageAbort extends CaseAbort {}
+class TraceProviderExposureIntegrityError extends IntegrityViolationError {}
 
 function fsIoError(message: string, cause: unknown): FsIoError {
   return new FsIoError(message, undefined, { cause });
 }
 
 function emptyGrounding(plan: PlanDocumentType): GroundingDocumentType {
-  return { schemaVersion: 1, planDigest: computePlanDigest(plan), entries: {} };
+  return { schemaVersion: GROUNDING_SCHEMA_VERSION, planDigest: computePlanDigest(plan), entries: {} };
 }
 
+/** Trusted Plan-v2 data and locally re-extracted criterion projections. */
+export interface TrustedInstructionCoveredPlan {
+  /** Strict canonical Plan-v2 document whose committed spans are valid. */
+  readonly plan: InstructionCoveredPlanDocument;
+
+  /** Trusted criteria keyed by schema-validated Plan step IDs. */
+  readonly instructionCoverageByStepId: ReadonlyMap<
+    StepId,
+    readonly TrustedInstructionCriterion[]
+  >;
+}
+
+/**
+ * Loads a Plan-v2 artifact through every execution trust boundary.
+ *
+ * @param storage - Read capability for the committed Plan artifact.
+ * @param planPath - Exact companion path selected for this prompt.
+ * @param inputsDigest - Expected digest for Plan version, prompt, and target.
+ * @param normalizedTestMd - Canonical prompt used to re-extract every span.
+ * @returns The trusted Plan plus step-keyed local criterion projections.
+ * @remarks
+ * Strict schema, canonical bytes, digest equality, and committed instruction
+ * coverage all complete before grounding inspection, browser launch, or AI
+ * resolution. Invalid source coordinates or whitespace-only re-extraction are
+ * integrity failures rather than authority-bearing metadata.
+ */
+export async function readTrustedInstructionCoveredPlan(
+  storage: StorageAdapter,
+  planPath: string,
+  inputsDigest: string,
+  normalizedTestMd: NormalizedTestMd,
+): Promise<TrustedInstructionCoveredPlan> {
+  const plan = await readTrustedPlan(storage, planPath, inputsDigest);
+  const instructionCoverageByStepId = new Map<StepId, readonly TrustedInstructionCriterion[]>();
+  for (const step of plan.steps) {
+    if (step.kind !== 'ai') continue;
+    const result = validateCommittedInstructionCoverage(step.instructionCoverage, normalizedTestMd);
+    if (!result.success) {
+      throw new IntegrityViolationError('The generated plan contains invalid instruction coverage or source spans.', {
+        planPath,
+        issues: result.issues,
+      });
+    }
+    instructionCoverageByStepId.set(step.id, result.data);
+  }
+  return { plan, instructionCoverageByStepId };
+}
+
+/**
+ * Loads the only Plan version that may reach execution trust boundaries.
+ *
+ * @remarks
+ * The instruction-coverage implementation makes strict Plan-v2 parsing,
+ * canonical bytes, input digest, and committed prompt-span re-extraction one
+ * ordered gate before browser launch or AI resolution. Plan v1 fails schema or
+ * freshness and is never migrated during run. Grounding remains version 1 and
+ * is classified independently because its nested trace extension is additive.
+ */
 async function readTrustedPlan(
   storage: StorageAdapter,
   planPath: string,
@@ -271,6 +396,246 @@ async function readTrustedPlan(
   return parsed.data;
 }
 
+/**
+ * Result of inspecting raw grounding before any trace becomes recoverable.
+ *
+ * @remarks
+ * A miss covers absent files, invalid JSON, stale provenance, and unrelated
+ * coverage-absent schema failure. A current-provenance document with an own
+ * `entries[rawKey].trace.verificationCoverage` path is a hard claim,
+ * independently of whether that entry's `kind` is valid. Raw entry keys are
+ * not filtered through the StepId grammar before claim recognition;
+ * `coverageClaimStepIds` contains StepId values only after the entire document
+ * passes strict validation. Structural or canonical claim failure becomes an
+ * integrity failure rather than a cache miss. Successful branches expose only
+ * a strict parsed document, never a trace recovered from a shallow or raw
+ * object.
+ */
+export type GroundingCoverageSourceInspection =
+  | { readonly kind: 'cache-miss' }
+  | {
+    readonly kind: 'strict-grounding';
+    readonly document: GroundingDocumentWithCoverageStorage;
+    readonly coverageClaimStepIds: readonly StepId[];
+  }
+  | {
+    readonly kind: 'integrity-failure';
+    readonly reason: 'coverage-structure-invalid' | 'coverage-canonical-invalid';
+  };
+
+type RawJsonNode =
+  | { readonly kind: 'object'; readonly entries: readonly (readonly [string, RawJsonNode])[] }
+  | { readonly kind: 'array'; readonly items: readonly RawJsonNode[] }
+  | { readonly kind: 'scalar' };
+
+/**
+ * Parses JSON without collapsing repeated object members.
+ *
+ * JSON.parse remains the runtime schema input, while this narrow reader keeps
+ * every raw member occurrence long enough to recognize an exact-path coverage
+ * claim that a later duplicate key could otherwise hide. It assigns no trust
+ * to values and exposes only object structure needed by the staged loader.
+ */
+class DuplicatePreservingJsonReader {
+  #offset = 0;
+
+  constructor(private readonly source: string) {}
+
+  parse(): RawJsonNode {
+    const value = this.#parseValue();
+    this.#skipWhitespace();
+    if (this.#offset !== this.source.length) throw new SyntaxError('Unexpected trailing JSON data.');
+    return value;
+  }
+
+  #skipWhitespace(): void {
+    while (/\s/u.test(this.source[this.#offset] ?? '')) this.#offset += 1;
+  }
+
+  #parseValue(): RawJsonNode {
+    this.#skipWhitespace();
+    switch (this.source[this.#offset]) {
+      case '{':
+        return this.#parseObject();
+      case '[':
+        return this.#parseArray();
+      case '"':
+        this.#parseString();
+        return { kind: 'scalar' };
+      default:
+        this.#parseScalar();
+        return { kind: 'scalar' };
+    }
+  }
+
+  #parseObject(): RawJsonNode {
+    this.#offset += 1;
+    const entries: Array<readonly [string, RawJsonNode]> = [];
+    this.#skipWhitespace();
+    if (this.source[this.#offset] === '}') {
+      this.#offset += 1;
+      return { kind: 'object', entries };
+    }
+    while (true) {
+      this.#skipWhitespace();
+      const key = this.#parseString();
+      this.#skipWhitespace();
+      if (this.source[this.#offset] !== ':') throw new SyntaxError('Expected a JSON member separator.');
+      this.#offset += 1;
+      entries.push([key, this.#parseValue()]);
+      this.#skipWhitespace();
+      const delimiter = this.source[this.#offset];
+      if (delimiter === '}') {
+        this.#offset += 1;
+        return { kind: 'object', entries };
+      }
+      if (delimiter !== ',') throw new SyntaxError('Expected another JSON object member.');
+      this.#offset += 1;
+    }
+  }
+
+  #parseArray(): RawJsonNode {
+    this.#offset += 1;
+    const items: RawJsonNode[] = [];
+    this.#skipWhitespace();
+    if (this.source[this.#offset] === ']') {
+      this.#offset += 1;
+      return { kind: 'array', items };
+    }
+    while (true) {
+      items.push(this.#parseValue());
+      this.#skipWhitespace();
+      const delimiter = this.source[this.#offset];
+      if (delimiter === ']') {
+        this.#offset += 1;
+        return { kind: 'array', items };
+      }
+      if (delimiter !== ',') throw new SyntaxError('Expected another JSON array item.');
+      this.#offset += 1;
+    }
+  }
+
+  #parseString(): string {
+    const start = this.#offset;
+    if (this.source[this.#offset] !== '"') throw new SyntaxError('Expected a JSON string.');
+    this.#offset += 1;
+    while (this.#offset < this.source.length) {
+      const character = this.source[this.#offset];
+      if (character === '\\') {
+        this.#offset += 2;
+        continue;
+      }
+      this.#offset += 1;
+      if (character === '"') {
+        return JSON.parse(this.source.slice(start, this.#offset)) as string;
+      }
+    }
+    throw new SyntaxError('Unterminated JSON string.');
+  }
+
+  #parseScalar(): void {
+    const start = this.#offset;
+    while (this.#offset < this.source.length && !/[\s,\]}]/u.test(this.source[this.#offset]!)) {
+      this.#offset += 1;
+    }
+    if (start === this.#offset) throw new SyntaxError('Expected a JSON value.');
+    JSON.parse(this.source.slice(start, this.#offset));
+  }
+}
+
+function rawGroundingHasCoverageClaim(sourceText: string): boolean {
+  const root = new DuplicatePreservingJsonReader(sourceText).parse();
+  if (root.kind !== 'object') return false;
+  for (const [rootKey, entries] of root.entries) {
+    if (rootKey !== 'entries' || entries.kind !== 'object') continue;
+    for (const [, entry] of entries.entries) {
+      if (entry.kind !== 'object') continue;
+      for (const [entryKey, trace] of entry.entries) {
+        if (entryKey !== 'trace' || trace.kind !== 'object') continue;
+        if (trace.entries.some(([traceKey]) => traceKey === 'verificationCoverage')) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Classifies raw grounding using staged provenance and coverage checks.
+ *
+ * @param sourceText - Exact artifact bytes read from storage.
+ * @param expectedPlanDigest - Digest of the already trusted current plan.
+ * @returns A miss, strict document class, or fail-closed coverage claim.
+ * @remarks
+ * The staged loader parses JSON and shallow-checks Grounding version 1 plus the
+ * expected plan digest. Before strict parsing, a duplicate-preserving reader
+ * enumerates every raw member occurrence under `entries` without StepId
+ * grammar filtering. For each entry object, it follows only an own `trace`
+ * object occurrence and then its own `verificationCoverage` property at
+ * `entries[rawKey].trace.verificationCoverage`. A claim exists even when
+ * `kind` is missing, non-string, or wrong; strict parsing owns both kind and
+ * key validation. The traversal never recursively scans arbitrary values, so
+ * an unrelated nested property cannot manufacture a claim. In a mixed
+ * document, any exact-path claim makes subsequent strict or canonical failure
+ * an integrity error even when other entries are legacy or valid.
+ *
+ * Strict success returns a Grounding-v1 coverage-aware projection and the
+ * validated step IDs whose traces own coverage. An empty ID list represents a
+ * strict legacy document; a non-empty list may coexist with legacy entries and
+ * each trace is classified independently after pre-scan. Present coverage also
+ * requires exact canonical bytes. Prototype inheritance never establishes
+ * presence, duplicate raw keys cannot survive canonical equality, and no
+ * branch returns an unvalidated raw trace. Once current provenance is
+ * established, a duplicate-preserving reader failure is itself an integrity
+ * failure because the loader can no longer prove that a hidden exact-path
+ * coverage claim is absent.
+ */
+export function inspectGroundingCoverageSource(
+  sourceText: string,
+  expectedPlanDigest: string,
+): GroundingCoverageSourceInspection {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(sourceText);
+  } catch {
+    return { kind: 'cache-miss' };
+  }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return { kind: 'cache-miss' };
+  const root = raw as Record<string, unknown>;
+  if (root.schemaVersion !== GROUNDING_SCHEMA_VERSION || root.planDigest !== expectedPlanDigest) {
+    return { kind: 'cache-miss' };
+  }
+  let hasClaim: boolean;
+  try {
+    hasClaim = rawGroundingHasCoverageClaim(sourceText);
+  } catch {
+    return { kind: 'integrity-failure', reason: 'coverage-structure-invalid' };
+  }
+  const parsed = GroundingDocument.safeParse(raw);
+  if (!parsed.success) {
+    return hasClaim
+      ? { kind: 'integrity-failure', reason: 'coverage-structure-invalid' }
+      : { kind: 'cache-miss' };
+  }
+  if (hasClaim && toCanonicalArtifactText(parsed.data as unknown as JsonValueT) !== sourceText) {
+    return { kind: 'integrity-failure', reason: 'coverage-canonical-invalid' };
+  }
+  const coverageClaimStepIds = Object.entries(parsed.data.entries)
+    .filter(([, entry]) => entry.kind === 'ai' && Object.hasOwn(entry.trace, 'verificationCoverage'))
+    .map(([stepId]) => stepId);
+  return { kind: 'strict-grounding', document: parsed.data, coverageClaimStepIds };
+}
+
+/**
+ * Applies the general recoverable-cache rule for grounding without a trusted
+ * current-provenance coverage claim.
+ *
+ * @remarks
+ * The instruction-coverage loader supersedes this unconditional fallback for
+ * current-provenance exact-path claims by routing them through
+ * {@link inspectGroundingCoverageSource}. Malformed or noncanonical claimed
+ * coverage therefore fails integrity instead of entering this function's
+ * empty-grounding recovery path.
+ */
 async function readUsableGrounding(
   storage: StorageAdapter,
   groundingPath: string,
@@ -279,13 +644,19 @@ async function readUsableGrounding(
   const empty = emptyGrounding(plan);
 
   try {
-    if (!(await storage.exists(groundingPath))) {
-      return empty;
+    if (!(await storage.exists(groundingPath))) return empty;
+    const inspection = inspectGroundingCoverageSource(
+      await storage.readText(groundingPath),
+      empty.planDigest,
+    );
+    if (inspection.kind === 'integrity-failure') {
+      throw new IntegrityViolationError('The grounding cache contains invalid or noncanonical instruction coverage.', {
+        reason: inspection.reason,
+      });
     }
-
-    const parsed = GroundingDocument.safeParse(JSON.parse(await storage.readText(groundingPath)));
-    return parsed.success && parsed.data.planDigest === empty.planDigest ? parsed.data : empty;
-  } catch {
+    return inspection.kind === 'strict-grounding' ? inspection.document : empty;
+  } catch (error) {
+    if (error instanceof IntegrityViolationError) throw error;
     // Grounding is a cache. A cache that cannot establish provenance is a miss,
     // while the separately trusted plan remains safe to replay.
     return empty;
@@ -355,7 +726,7 @@ function materializeStep(
  * or unavailable references as integrity violations instead of allowing a
  * provider or stale trace to select an arbitrary browser value.
  */
-function assertTrustedRunReferences(value: string, context: DispatchContext): void {
+function assertTrustedRunReferences(value: string, context: TraceTrustContext): void {
   let cursor = 0;
 
   while (true) {
@@ -396,10 +767,9 @@ function assertTrustedRunReferences(value: string, context: DispatchContext): vo
  *
  * The prior validation makes a missing map value unreachable in ordinary
  * execution, but the second check keeps this trust boundary fail-closed if
- * case state changes between validation and replacement in a future async
- * integration.
+ * case state changes between validation and replacement.
  */
-function materializeTrustedRunText(value: string, context: DispatchContext): string {
+function materializeTrustedRunText(value: string, context: TraceTrustContext): string {
   assertTrustedRunReferences(value, context);
 
   return value.replace(RUN_REFERENCE_PATTERN, (_reference, path: string) => {
@@ -491,7 +861,7 @@ function assertSameOriginNavigation(url: string, baseUrl: string): void {
  * @throws {IntegrityViolationError} When the current origin is not allowed.
  */
 async function assertAllowedSecretSinkOrigin(
-  context: DispatchContext,
+  context: TraceReplayMaterializationContext,
   secretRef: string,
 ): Promise<SecretSinkPolicy> {
   const policy = resolveSecretSinkPolicy(context.target, secretRef);
@@ -577,7 +947,7 @@ async function performMaterializedAction(
  */
 async function materializeTraceAction(
   action: TraceAction,
-  context: DispatchContext,
+  context: TraceReplayMaterializationContext,
   secretRefs: ReadonlySet<string>,
 ): Promise<MaterializedAction> {
   switch (action.type) {
@@ -638,7 +1008,7 @@ async function materializeTraceAction(
  */
 async function materializeTraceAssert(
   check: TraceAssert,
-  context: DispatchContext,
+  context: TraceReplayMaterializationContext,
 ): Promise<AssertCheck> {
   switch (check.check) {
     case 'text-visible':
@@ -658,7 +1028,10 @@ async function materializeTraceAssert(
   }
 }
 
-async function bindTraceTarget(target: ElementRef, context: DispatchContext): Promise<BoundElement> {
+async function bindTraceTarget(
+  target: ElementRef,
+  context: TraceReplayMaterializationContext,
+): Promise<BoundElement> {
   const resolved = await context.session.resolveGrounded(target, {
     mode: 'compute',
     resolvedSecrets: [...context.resolvedSecrets.values()],
@@ -687,8 +1060,23 @@ async function bindTraceTarget(target: ElementRef, context: DispatchContext): Pr
  */
 function preScanTraceEntry(
   entry: TraceAction | TraceAssert,
-  context: DispatchContext,
+  context: TraceTrustContext,
 ): void {
+  const rejectSecretReference = (value: unknown, key?: string): void => {
+    if (key === 'secretRef') return;
+    if (typeof value === 'string') {
+      if (value.includes('{{secrets.')) {
+        throw new IntegrityViolationError('An AI trace contains a secret reference outside an authorized secret field.');
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) rejectSecretReference(item);
+    } else if (typeof value === 'object' && value !== null) {
+      for (const [childKey, child] of Object.entries(value)) rejectSecretReference(child, childKey);
+    }
+  };
+  rejectSecretReference(entry);
   /*
    * `preScanTrace` primes the resolved-secret registry from the complete trace
    * before this validation pass, making each inspection independent of journal
@@ -699,6 +1087,13 @@ function preScanTraceEntry(
   if (traceEntryContainsResolvedSecret(entry, context.resolvedSecrets)) {
     throw new IntegrityViolationError('An AI trace contains a materialized secret value.');
   }
+  const containsCapturedRunValue = context.rejectCapturedRunLiterals
+    && traceEntryContainsCapturedRunValue(entry, context.runState);
+  const rejectCapturedRunValue = (): void => {
+    if (containsCapturedRunValue) {
+      throw new TraceProviderExposureIntegrityError('An AI trace contains a materialized captured run value.');
+    }
+  };
 
   switch (entry.type === 'assert' ? entry.check : entry.type) {
     case 'navigate': {
@@ -709,30 +1104,38 @@ function preScanTraceEntry(
        * unsafe navigation cannot let an earlier valid action execute.
        */
       assertSameOriginNavigation(materializeTrustedRunText(url, context), context.target.baseUrl);
+      rejectCapturedRunValue();
       return;
     }
     case 'fill': {
       const value = (entry as Extract<TraceAction, { type: 'fill' }>).value;
       assertTrustedRunReferences(value, context);
-      assertNoCredentialShapedFillValue(value, context.runState);
+      if (!(context.deferHighEntropyFillCheck && detectSecretLiteral(value) === 'high-entropy-token')) {
+        assertNoCredentialShapedFillValue(value, context.runState);
+      }
+      rejectCapturedRunValue();
       return;
     }
     case 'text-visible': {
       const text = (entry as Extract<TraceAssert, { check: 'text-visible' }>).text;
       assertTrustedRunReferences(text, context);
+      rejectCapturedRunValue();
       return;
     }
     case 'text-equals': {
       const text = (entry as Extract<TraceAssert, { check: 'text-equals' }>).text;
       assertTrustedRunReferences(text, context);
+      rejectCapturedRunValue();
       return;
     }
     case 'url-matches': {
       const pattern = (entry as Extract<TraceAssert, { check: 'url-matches' }>).pattern;
       assertTrustedRunReferences(pattern, context);
+      rejectCapturedRunValue();
       return;
     }
     default:
+      rejectCapturedRunValue();
       return;
   }
 }
@@ -746,7 +1149,7 @@ function preScanTraceEntry(
  * run, while intentionally avoiding redundant zod validation of entries that
  * cannot survive `readUsableGrounding` with an invalid static shape.
  */
-function preScanTrace(trace: z.infer<typeof TraceRecord>, context: DispatchContext, secretRefs: ReadonlySet<string>): void {
+function preScanTrace(trace: z.infer<typeof TraceRecord>, context: TraceTrustContext, secretRefs: ReadonlySet<string>): void {
   /*
    * The first pass resolves every granted `fill-secret` reference in both trace
    * lists and retains its value in `context.resolvedSecrets`. Priming the full
@@ -769,6 +1172,14 @@ function preScanTrace(trace: z.infer<typeof TraceRecord>, context: DispatchConte
       throw new IntegrityViolationError('An AI trace references a secret that this step is not allowed to use.', {
         secretRef: entry.secretRef,
       });
+    }
+
+    if (context.skipSecretPriming) {
+      return;
+    }
+
+    if (context.resolvedSecrets.has(entry.secretRef)) {
+      return;
     }
 
     const value = context.secrets.resolve(entry.secretRef);
@@ -797,6 +1208,32 @@ function preScanTrace(trace: z.infer<typeof TraceRecord>, context: DispatchConte
 }
 
 /**
+ * Completes the full safety scan and records only that trust transition.
+ *
+ * @param trace - Strict storage trace whose coverage presence is not yet trusted.
+ * @param context - Current case authority used by the complete trace scan.
+ * @param secretRefs - Secret references granted by the containing AI step.
+ * @returns The same trace branded as fully pre-scanned, without changing its
+ * coverage classification.
+ * @remarks
+ * Pre-scan validates static entries, secret grants, run references, navigation,
+ * and materialized-secret exclusion. It cannot prove whether optional coverage
+ * is absent or semantically valid. The instruction-coverage policy consumes
+ * this branded value in a separate second stage and alone narrows it to
+ * `SafeLegacyTraceRecord` or `CoveredTraceRecord`. No pre-scan caller may cast
+ * a present-coverage trace to legacy evidence or expose it as provider
+ * `priorTrace` before that classification.
+ */
+export function preScanTraceForInstructionCoverage(
+  trace: TraceRecordWithCoverageStorage,
+  context: TraceTrustContext,
+  secretRefs: ReadonlySet<string>,
+): PreScannedTraceRecord<TraceRecordWithCoverageStorage> {
+  preScanTrace(trace, context, secretRefs);
+  return trace as PreScannedTraceRecord<TraceRecordWithCoverageStorage>;
+}
+
+/**
  * Replays a trusted trace in journal order and returns whether the browser
  * confirmed every recorded observation.
  *
@@ -814,13 +1251,17 @@ function preScanTrace(trace: z.infer<typeof TraceRecord>, context: DispatchConte
  * change how a later ordinary action rejection is handled. The abort neither
  * examines the browser's message nor retains the materialized value, and
  * placing this rule here leaves fresh agentic dispatch unchanged.
+ * Cancellation is observed before every event and terminal verification, so
+ * an abort raised by one browser operation prevents the next journal entry
+ * from reaching materialization or the browser.
  */
-async function replayTrace(
-  trace: z.infer<typeof TraceRecord>,
-  context: DispatchContext,
+export async function replayCoveredTraceWithoutAi(
+  trace: CoveredTraceRecord,
+  context: CoveredTraceReplayContext,
   secretRefs: ReadonlySet<string>,
 ): Promise<boolean> {
   for (const entry of trace.events) {
+    context.signal?.throwIfAborted();
     if (entry.type === 'assert') {
       const outcome = await context.session.evaluateAssert(await materializeTraceAssert(entry, context));
       if (!outcome.passed) {
@@ -851,6 +1292,7 @@ async function replayTrace(
   }
 
   for (const assertion of trace.verification) {
+    context.signal?.throwIfAborted();
     const outcome = await context.session.evaluateAssert(await materializeTraceAssert(assertion, context));
     if (!outcome.passed) {
       return false;
@@ -946,6 +1388,40 @@ function traceEntryContainsResolvedSecret(
     scanObjectKeys: false,
     excludePaths: TRACE_ENTRY_CLOSED_VOCABULARY_PATHS,
   });
+}
+
+/**
+ * Reports whether a provider-visible trace field contains a current captured
+ * value instead of its stable run reference.
+ *
+ * The scan uses the same closed-vocabulary exclusions as secret taint checks,
+ * so locators and all other free-form strings remain protected while fixed
+ * discriminants do not become false matches. Preflight placeholder values are
+ * excluded because they are the required unresolved representation, not
+ * captured application data.
+ */
+function traceEntryContainsCapturedRunValue(
+  entry: TraceAction | TraceAssert,
+  runState: ReadonlyMap<RunVariableName, string>,
+): boolean {
+  const capturedValues: string[] = [];
+  for (const [name, value] of runState) {
+    if (value !== '' && value !== `{{run.${name}}}`) capturedValues.push(value);
+  }
+  const visited = new WeakSet<object>();
+  const inspect = (value: unknown, path: string): boolean => {
+    if (typeof value === 'string') return capturedValues.some((captured) => value.includes(captured));
+    if (value === null || typeof value !== 'object' || visited.has(value)) return false;
+    visited.add(value);
+    if (Array.isArray(value)) {
+      return value.some((item, index) => inspect(item, path === '' ? String(index) : `${path}.${index}`));
+    }
+    return Object.entries(value).some(([key, item]) => {
+      const childPath = path === '' ? key : `${path}.${key}`;
+      return !TRACE_ENTRY_CLOSED_VOCABULARY_PATHS.has(childPath) && inspect(item, childPath);
+    });
+  };
+  return inspect(entry, '');
 }
 
 /**
@@ -1474,6 +1950,45 @@ function templateAssertOutcome(
 type LastAgenticObservation = 'none' | 'perform' | 'snapshot' | 'failed-assert' | 'passed-assert';
 
 /**
+ * Nonserializable journal metadata for one evaluated assertion.
+ *
+ * @remarks
+ * The optional criterion tag accompanies the observation in memory and never
+ * becomes part of {@link TraceAssert}. Passing assertions extend the trailing
+ * terminal run with their tags; an action, snapshot, or failed assertion
+ * resets that run. Finalization accepts new grounding only when every trailing
+ * assertion has exactly one success ID and the resulting map is an exact
+ * step-local bijection. It constructs events, verification, and coverage as
+ * one candidate and performs no write if any part is invalid.
+ */
+export interface AgenticJournalAssertionObservation {
+  /** Unresolved assertion that remains safe to serialize after validation. */
+  readonly assertion: TraceAssert;
+
+  /** Step-local success criterion supplied separately by the controller call. */
+  readonly criterionId?: import('#core/ir/schema.js').InstructionCriterionId;
+}
+
+/**
+ * Observable finalization decisions before any grounding mutation occurs.
+ *
+ * @remarks
+ * A covered candidate is built and validated atomically from the journal's
+ * events, trailing assertions, and criterion tags; any mismatch yields abort
+ * without a write. A nominal success whose last observation is a snapshot or
+ * failed assertion passes without new grounding. A cold pass performs no
+ * write. A fallback pass deletes only the stale entry that led to fallback
+ * before returning passed. Abort and rejection preserve any existing entry.
+ * Keeping these outcomes separate prevents coverage enforcement from turning
+ * negative terminal sensing into a failed case or replayable evidence.
+ */
+export type AgenticInstructionCoverageFinalization =
+  | { readonly kind: 'covered-trace-candidate' }
+  | { readonly kind: 'pass-without-grounding-cold-no-write' }
+  | { readonly kind: 'pass-without-grounding-fallback-delete-stale-entry' }
+  | { readonly kind: 'abort-preserve-existing-entry' };
+
+/**
  * Wraps one live browser session for exactly one agentic execution.
  *
  * The wrapper is the authority that both materializes provider instructions
@@ -1483,8 +1998,9 @@ type LastAgenticObservation = 'none' | 'perform' | 'snapshot' | 'failed-assert' 
  * counter prevents unjournaled sensing from being mistaken for adjacent final
  * verification.
  */
-class AgenticRunPipeline implements AiActionController {
+class AgenticRunPipeline implements InstructionCoverageAiActionController {
   readonly #journal: Array<TraceAction | TraceAssert> = [];
+  readonly #passedAssertionTags: Array<import('#core/ir/schema.js').InstructionCriterionId | undefined> = [];
   readonly #secretRefs: ReadonlySet<string>;
   #trailingPassedAssertRun = 0;
   #lastObservation: LastAgenticObservation = 'none';
@@ -1549,7 +2065,10 @@ class AgenticRunPipeline implements AiActionController {
    * trigger the trace-replay fallback, which applies only before live agentic
    * execution begins.
    */
-  async evaluateAssert(check: TraceAssert): Promise<AssertOutcome> {
+  async evaluateAssert(
+    check: TraceAssert,
+    criterionId?: import('#core/ir/schema.js').InstructionCriterionId,
+  ): Promise<AssertOutcome> {
     const parsed = TraceAssert.safeParse(check);
     if (!parsed.success) {
       throw new IntegrityViolationError('The AI adapter supplied an invalid assertion observation.', {
@@ -1569,6 +2088,7 @@ class AgenticRunPipeline implements AiActionController {
       this.#trailingPassedAssertRun += 1;
       this.#lastObservation = 'passed-assert';
       this.#journal.push(parsed.data);
+      this.#passedAssertionTags.push(criterionId);
     } else {
       this.#trailingPassedAssertRun = 0;
       this.#lastObservation = 'failed-assert';
@@ -1586,7 +2106,8 @@ class AgenticRunPipeline implements AiActionController {
    *
    * AI-bound snapshots never carry screenshot bytes because pixel content
    * cannot be reliably masked by substring matching; this policy governs
-   * `AiActionController`-facing snapshot construction only. The accessibility
+   * `InstructionCoverageAiActionController`-facing snapshot construction only.
+   * The accessibility
    * tree preserves the parser-produced JSON structure while redacting resolved
    * values from its string values and object keys before they cross into the
    * AI adapter.
@@ -1628,14 +2149,47 @@ class AgenticRunPipeline implements AiActionController {
         }
         return entry;
       });
-      const parsed = TraceRecord.safeParse({ events, verification });
+      const criteria = this.context.instructionCoverageByStepId.get(this.step.id) ?? [];
+      const successIds = new Set(criteria.filter(({ kind }) => kind === 'success').map(({ id }) => id));
+      const terminalTags = this.#passedAssertionTags.slice(-this.#trailingPassedAssertRun);
+      const verificationCoverage = Object.create(null) as Record<string, number>;
+      let validTags = terminalTags.length === verification.length;
+      for (const [index, criterionId] of terminalTags.entries()) {
+        if (criterionId === undefined || !successIds.has(criterionId)
+          || Object.hasOwn(verificationCoverage, criterionId)) {
+          validTags = false;
+          continue;
+        }
+        verificationCoverage[criterionId] = index;
+      }
+      if (!validTags || Object.keys(verificationCoverage).length !== successIds.size) {
+        throw new AgenticCoverageAbort('The AI-directed interaction did not provide exact terminal criterion coverage.');
+      }
+      const parsed = TraceRecord.safeParse({ events, verification, verificationCoverage });
       if (!parsed.success) {
         throw new IntegrityViolationError('The AI verification journal is internally inconsistent.', {
           issues: parsed.error.issues,
         });
       }
 
-      this.context.updateGroundingEntry(this.step.id, { kind: 'ai', trace: parsed.data });
+      const preScanned = preScanTraceForInstructionCoverage(
+        parsed.data,
+        {
+          ...this.context,
+          resolvedSecrets: new Map(),
+          skipSecretPriming: true,
+        },
+        this.#secretRefs,
+      );
+      const classified = classifyPreScannedTraceCoverage({
+        trace: preScanned,
+        criteria,
+        runValues: { values: this.context.runState },
+      });
+      if (!classified.success || classified.data.kind !== 'covered') {
+        throw new AgenticCoverageAbort('The AI-directed interaction produced invalid terminal verification proof.');
+      }
+      this.context.updateGroundingEntry(this.step.id, { kind: 'ai', trace: classified.data.trace });
       return { kind: 'passed', via: 'ai-resolve' };
     }
 
@@ -1662,7 +2216,7 @@ class AgenticRunPipeline implements AiActionController {
 async function executeAgentic(
   step: Extract<Step, { kind: 'ai' }>,
   context: DispatchContext,
-  priorTrace: z.infer<typeof TraceRecord> | undefined,
+  priorTrace: import('#ports/ai.js').SafeLegacyTraceRecord | undefined,
   fallbackFromReplay: boolean,
 ): Promise<DispatchOutcome> {
   const secretRefs = step.secrets?.map((grant) => grant.ref) ?? [];
@@ -1673,6 +2227,7 @@ async function executeAgentic(
     instructionPrompt: step.instruction,
     allowedSecretRefs: secretRefs,
     allowedRunRefs: [...context.allowedRunRefs],
+    trustedInstructionCoverage: context.instructionCoverageByStepId.get(step.id) ?? [],
     controller: pipeline,
     ...(priorTrace === undefined ? {} : { priorTrace }),
     signal,
@@ -1682,14 +2237,17 @@ async function executeAgentic(
 }
 
 /**
- * Executes an AI step by replaying trusted grounding first, then falling back
- * to one fresh agentic interaction only for a behavioral trace miss.
+ * Executes an AI step through a pre-scan-first coverage trust boundary.
  *
  * The pre-scan is an integrity gate rather than a hint: an entry whose grants
  * no longer fit this case is never partially replayed and never handed back to
- * an AI provider. `cacheOnly` suppresses both cold-start and behavioral-miss
- * calls, producing the same case-abort outcome as replay that permits no AI
- * fallback.
+ * an AI provider. Completing that scan produces only a branded pre-scanned
+ * trace. A separate policy stage proves coverage absence before narrowing safe
+ * legacy provider context, or proves present coverage before narrowing a local
+ * replay candidate. Present-invalid coverage fails before browser, AI, or
+ * cache-only classification. A covered-valid trace replays without resolving
+ * an AI executor. `cacheOnly` suppresses both cold-start and recoverable miss
+ * calls but cannot downgrade integrity failure into an ordinary miss.
  */
 async function executeAiStep(
   step: Extract<Step, { kind: 'ai' }>,
@@ -1706,9 +2264,38 @@ async function executeAiStep(
     return executeAgentic(step, context, undefined, false);
   }
 
-  preScanTrace(entry.trace, context, secretRefs);
+  const preScanned = preScanTraceForInstructionCoverage(
+    entry.trace,
+    { ...context, rejectCapturedRunLiterals: !Object.hasOwn(entry.trace, 'verificationCoverage') },
+    secretRefs,
+  );
+  const classified = classifyPreScannedTraceCoverage({
+    trace: preScanned,
+    criteria: context.instructionCoverageByStepId.get(step.id) ?? [],
+    runValues: { values: context.runState },
+  });
+  if (!classified.success) {
+    throw new IntegrityViolationError('The grounding trace contains invalid instruction coverage or verification proof.', {
+      issues: classified.issues,
+    });
+  }
+  if (classified.data.kind === 'legacy-cache-miss') {
+    if (cacheOnly) {
+      throw new CaseAbort('AI-directed replay has no covered trace while cache-only mode is enabled.');
+    }
+    return executeAgentic(step, context, classified.data.priorTrace, true);
+  }
   try {
-    if (await replayTrace(entry.trace, context, secretRefs)) {
+    const replayContext: CoveredTraceReplayContext = {
+      session: context.session,
+      target: context.target,
+      runState: context.runState,
+      secrets: context.secrets,
+      resolvedSecrets: context.resolvedSecrets,
+      allowedRunRefs: context.allowedRunRefs,
+      ...(context.signal === undefined ? {} : { signal: context.signal }),
+    };
+    if (await replayCoveredTraceWithoutAi(classified.data.trace, replayContext, secretRefs)) {
       return { kind: 'passed', via: 'trace-replay' };
     }
   } catch (error) {
@@ -1723,7 +2310,7 @@ async function executeAiStep(
     throw new CaseAbort('AI trace replay missed while cache-only mode is enabled.');
   }
 
-  return executeAgentic(step, context, entry.trace, true);
+  return executeAgentic(step, context, undefined, true);
 }
 
 /**
@@ -2244,6 +2831,20 @@ export interface RunOptions {
 }
 
 /**
+ * Lazy resolver contract for criterion-aware live AI fallback.
+ *
+ * @remarks
+ * The criterion-aware run contract uses this resolver in place of the base
+ * `RunDeps.resolveAiExecutor` shape at the same lazy boundary. Covered replay
+ * therefore never probes a provider. Request construction and journal tag
+ * storage remain separate pipeline contracts and are not performed by the
+ * resolver.
+ */
+export type InstructionCoveredAiExecutorResolver = (
+  signal?: AbortSignal,
+) => Promise<InstructionCoveredAiExecutor>;
+
+/**
  * Dependencies at the deterministic replay boundary.
  *
  * @remarks
@@ -2293,9 +2894,11 @@ export interface RunDeps {
    * `runCase` memoizes this resolver after the first actual fallback, so AI
    * re-resolution and fresh agentic execution in the same case share one
    * executor without probing a provider for cache-only or complete-cache
-   * replay.
+   * replay. The instruction-coverage boundary narrows this field to
+   * {@link InstructionCoveredAiExecutorResolver} without changing that lazy
+   * transition point.
    */
-  readonly resolveAiExecutor: (signal?: AbortSignal) => Promise<AiExecutor>;
+  readonly resolveAiExecutor: InstructionCoveredAiExecutorResolver;
 
   /**
    * Receives successful step and real AI-call lifecycle events without affecting replay.
@@ -2414,9 +3017,12 @@ export type RunListedFile = { readonly file: string };
  * Each result uses a monotonic per-case duration so elapsed time remains
  * meaningful when wall-clock time changes. Replay validates the plan before
  * browser startup because only a canonical artifact with current inputs may
- * direct browser work. Grounding is a recoverable cache: an absent, malformed,
- * or stale cache falls back to empty grounding rather than invalidating the
- * trusted plan.
+ * direct browser work. Absent grounding, stale provenance, invalid JSON, and
+ * unrelated coverage-absent malformed grounding are recoverable cache misses.
+ * Current-provenance coverage present at the exact own
+ * `entries[rawKey].trace.verificationCoverage` path fails integrity before
+ * browser or provider dispatch when its document is malformed or
+ * noncanonical.
  *
  * The shared core resolver applies the same explicit, validated-default, and
  * sole-own-target policy as generation and freshness inspection. Its
@@ -2491,7 +3097,7 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
   let groundingPath: string | undefined;
   let grounding: GroundingDocumentType | undefined;
   let groundingDirty = false;
-  let aiExecutorPromise: Promise<AiExecutor> | undefined;
+  let aiExecutorPromise: Promise<InstructionCoveredAiExecutor> | undefined;
   let classifiedError: AmbercastErrorType | undefined;
   let result: ResultWithoutDuration | undefined;
   let resolvedSecrets: Map<string, Set<string>> | undefined;
@@ -2518,11 +3124,17 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
     const normalizedTestMd = normalizeTestMd(testMd);
     const inputsDigest = computeInputsDigest({
       normalizedTestMd,
-      schemaVersion: 1,
+      schemaVersion: PLAN_SCHEMA_VERSION,
       generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
       targetDefinitions: resolvedTargets,
     });
-    const plan = await readTrustedPlan(deps.storage, planPath, inputsDigest);
+    const trustedPlan = await readTrustedInstructionCoveredPlan(
+      deps.storage,
+      planPath,
+      inputsDigest,
+      normalizedTestMd,
+    );
+    const plan = trustedPlan.plan;
     /*
      * Re-attributing persisted grant spans before opening a browser ensures
      * every declared grant is consumed exactly once, rejecting hand-edited
@@ -2534,6 +3146,59 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
     const loadedGrounding = await readUsableGrounding(deps.storage, groundingPath, plan);
     grounding = loadedGrounding;
     const target = targetSelection.definition;
+
+    resolvedSecrets = new Map<string, Set<string>>();
+    const preflightAllowedRunRefs = new Set<RunVariableName>();
+    const preflightRunState = new Map<RunVariableName, string>();
+    let cacheOnlyAiMissBeforeExecutableStep = false;
+    let hasPriorExecutableStep = false;
+    for (const step of plan.steps) {
+      if (step.kind === 'capture') {
+        preflightAllowedRunRefs.add(step.variable);
+        preflightRunState.set(step.variable, `{{run.${step.variable}}}`);
+        hasPriorExecutableStep = true;
+        continue;
+      }
+      if (step.kind !== 'ai') {
+        hasPriorExecutableStep = true;
+        continue;
+      }
+      currentStep = step;
+      const entry = loadedGrounding.entries[step.id];
+      if (entry?.kind !== 'ai') {
+        if (options.cacheOnly && !hasPriorExecutableStep) cacheOnlyAiMissBeforeExecutableStep = true;
+        continue;
+      }
+      const secretRefs = new Set(step.secrets?.map((grant) => grant.ref) ?? []);
+      const trustContext: TraceTrustContext = {
+        target,
+        runState: preflightRunState,
+        secrets: deps.secrets,
+        resolvedSecrets,
+        allowedRunRefs: preflightAllowedRunRefs,
+        deferHighEntropyFillCheck: preflightAllowedRunRefs.size > 0,
+        rejectCapturedRunLiterals: !Object.hasOwn(entry.trace, 'verificationCoverage'),
+      };
+      const preScanned = preScanTraceForInstructionCoverage(entry.trace, trustContext, secretRefs);
+      const classified = classifyPreScannedTraceCoverage({
+        trace: preScanned,
+        criteria: trustedPlan.instructionCoverageByStepId.get(step.id) ?? [],
+        runValues: { values: preflightRunState },
+      });
+      if (!classified.success) {
+        throw new IntegrityViolationError('The grounding trace contains invalid instruction coverage or verification proof.', {
+          issues: classified.issues,
+        });
+      }
+      if (classified.data.kind === 'legacy-cache-miss' && options.cacheOnly && !hasPriorExecutableStep) {
+        cacheOnlyAiMissBeforeExecutableStep = true;
+      }
+      hasPriorExecutableStep = true;
+    }
+    if (cacheOnlyAiMissBeforeExecutableStep) {
+      throw new CaseAbort('AI-directed replay has no covered trace while cache-only mode is enabled.');
+    }
+    currentStep = undefined;
 
     try {
       session = await deps.browserDriver(target.browser).launch(target);
@@ -2547,7 +3212,7 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
 
     const allowedRunRefs = new Set<RunVariableName>();
     const resolvedVias = new Map<Step['id'], ResolutionVia>();
-    resolvedSecrets = new Map<string, Set<string>>();
+    resolvedSecrets ??= new Map<string, Set<string>>();
     runState = new Map<RunVariableName, string>();
     const context: DispatchContext = {
       session,
@@ -2557,6 +3222,7 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
       secrets: deps.secrets,
       resolvedSecrets,
       allowedRunRefs,
+      instructionCoverageByStepId: trustedPlan.instructionCoverageByStepId,
       resolveAiExecutor: () => {
         aiExecutorPromise ??= deps.resolveAiExecutor(deps.signal);
         return aiExecutorPromise;
@@ -2654,7 +3320,10 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
      * errors retain the fixed fallback explanation without examining their
      * message, so neither branch carries materialized case data.
      */
-    const evidence = session === undefined || currentStep === undefined
+    const evidence = error instanceof AgenticCoverageAbort
+      || error instanceof TraceProviderExposureIntegrityError
+      || session === undefined
+      || currentStep === undefined
       ? undefined
       : await captureFailureEvidence(
         session,

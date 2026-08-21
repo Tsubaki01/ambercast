@@ -84,11 +84,11 @@ describe('hand-authored trace replay against real Chromium', () => {
         fixture: { baseUrl, browser: 'chromium' },
       } as const satisfies Record<string, TargetDefinition>;
       const plan = PlanDocument.parse({
-        schemaVersion: 1,
+        schemaVersion: 2,
         source: {
           inputsDigest: computeInputsDigest({
             normalizedTestMd: normalizeTestMd(PROMPT),
-            schemaVersion: 1,
+            schemaVersion: 2,
             generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
             targetDefinitions: targets,
           }),
@@ -99,6 +99,11 @@ describe('hand-authored trace replay against real Chromium', () => {
             id: 'verify-hand-authored-trace',
             kind: 'ai',
             instruction: 'Verify that the trace replay fixture is ready.',
+            instructionCoverage: [{
+              id: 'fixture-ready',
+              kind: 'success',
+              sourceSpan: { startLine: 3, startColumn: 1, endLine: 3, endColumn: 29 },
+            }],
           },
         ],
       });
@@ -116,6 +121,7 @@ describe('hand-authored trace replay against real Chromium', () => {
               verification: [
                 { type: 'assert', check: 'text-visible', text: 'Trace replay fixture ready' },
               ],
+              verificationCoverage: { 'fixture-ready': 0 },
             },
           },
         },

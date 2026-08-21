@@ -43,6 +43,27 @@ const RUN_VARIABLE_NAME_PATTERN = /^[a-z][a-zA-Z0-9]*$/;
 const RUN_REF_PATTERN = /^\{\{run\.[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*\}\}$/;
 
 /**
+ * The only Plan IR version accepted or emitted by the instruction-coverage
+ * contract.
+ *
+ * @remarks
+ * Plan version 2 changes the plan input-digest preimage. Version 1 plans are
+ * regenerated or reported stale at their existing command boundary; they are
+ * not migrated in place. Grounding remains version 1 because coverage is an
+ * additive optional field nested inside its trace record.
+ *
+ * Every Plan schema and digest caller shares this literal.
+ */
+export const PLAN_SCHEMA_VERSION = 2 as const;
+
+/**
+ * The unchanged Grounding IR version after trace coverage is added.
+ *
+ * Grounding construction and validation share this literal.
+ */
+export const GROUNDING_SCHEMA_VERSION = 1 as const;
+
+/**
  * Validates a whole secret reference.
  *
  * Whole-value references keep secret-bearing fields unambiguous and prevent
@@ -277,6 +298,79 @@ export const Citation = z.string().min(1).max(CITATION_MAX_LENGTH).describe(
  * grant during generation.
  */
 export type Citation = z.infer<typeof Citation>;
+
+/**
+ * Identifies one instruction criterion within its containing AI step.
+ *
+ * @remarks
+ * The schema uses the same stable-slug grammar as a step identifier, but
+ * criterion IDs are step-local because each AI grounding entry owns an
+ * independent trace. Consumers use this Zod-derived type instead of
+ * maintaining a second grammar in policy code.
+ */
+export const InstructionCriterionId = z.string().regex(STEP_ID_PATTERN);
+
+/** Runtime schema authority for {@link InstructionCriterionId}. */
+export type InstructionCriterionId = z.infer<typeof InstructionCriterionId>;
+
+/** Describes whether an instruction clause is terminal success or directed action. */
+export type InstructionCriterionKind = 'success' | 'action';
+
+/**
+ * Locates an instruction excerpt precisely in normalized Markdown.
+ *
+ * @remarks
+ * Coordinates are one-based UTF-16 code-unit positions with an exclusive end.
+ * This precise range is separate from the line-only {@link SourceSpan} used
+ * for grammar-defined secret grants: multiple instruction clauses can share a
+ * line and must remain independently re-extractable.
+ *
+ * A strict Zod object defines the public type. Cross-field coordinate,
+ * prompt-boundary, and surrogate checks remain usecase policy because public
+ * JSON Schema cannot compare positions against source text.
+ */
+export const InstructionSourceSpan = z.strictObject({
+  startLine: z.int().positive(),
+  startColumn: z.int().positive(),
+  endLine: z.int().positive(),
+  endColumn: z.int().positive(),
+});
+
+/** Runtime schema authority for {@link InstructionSourceSpan}. */
+export type InstructionSourceSpan = z.infer<typeof InstructionSourceSpan>;
+
+/**
+ * A provider-authored instruction claim awaiting local source attribution.
+ *
+ * The exact citation must contain at least one non-whitespace character while
+ * preserving every interior whitespace code unit. Providers cannot submit
+ * coordinates because only local normalized-source search may establish
+ * persisted provenance.
+ */
+export const GeneratedInstructionCriterion = z.strictObject({
+  id: InstructionCriterionId,
+  kind: z.enum(['success', 'action']),
+  citation: z.string().min(1).max(CITATION_MAX_LENGTH),
+});
+
+/** Runtime provider schema authority for {@link GeneratedInstructionCriterion}. */
+export type GeneratedInstructionCriterion = z.infer<typeof GeneratedInstructionCriterion>;
+
+/**
+ * A committed instruction criterion with locally derived source provenance.
+ *
+ * Provider citations are absent from this shape. The committed span is the
+ * only serialized provenance and is re-extracted from the current normalized
+ * prompt before it becomes trusted metadata.
+ */
+export const InstructionCriterion = z.strictObject({
+  id: InstructionCriterionId,
+  kind: z.enum(['success', 'action']),
+  sourceSpan: InstructionSourceSpan,
+});
+
+/** Runtime committed schema authority for {@link InstructionCriterion}. */
+export type InstructionCriterion = z.infer<typeof InstructionCriterion>;
 
 /**
  * Validates the bare variable name written by a `capture` step.
@@ -617,6 +711,7 @@ export type AiStepSecretGrant = z.infer<typeof AiStepSecretGrant>;
 export const AiStep = z.strictObject({
   ...AiStepFields,
   secrets: z.array(AiStepSecretGrant).optional(),
+  instructionCoverage: z.array(InstructionCriterion).min(1),
 });
 
 /**
@@ -624,6 +719,18 @@ export const AiStep = z.strictObject({
  * secret grants and an explicitly empty list.
  */
 export type AiStep = z.infer<typeof AiStep>;
+
+/**
+ * The Plan-v2 AI-step contract with required instruction coverage.
+ *
+ * @remarks
+ * This consumer-facing alias preserves the required non-empty field already
+ * enforced by {@link AiStep}; it is not a second runtime authority.
+ */
+export type InstructionCoveredAiStep = AiStep & {
+  /** Locally attributed success and action criteria in canonical source order. */
+  readonly instructionCoverage: readonly InstructionCriterion[];
+};
 
 /**
  * Validates one ordered instruction in a generated plan.
@@ -638,6 +745,9 @@ export const Step = z.discriminatedUnion('kind', [ActionStep, AssertStep, Captur
  * The parsed outer step union narrowed by its `kind` discriminant.
  */
 export type Step = z.infer<typeof Step>;
+
+/** The Plan-v2 step union with instruction-covered AI branches. */
+export type InstructionCoveredStep = Step;
 
 /**
  * Validates a provider-authored `fill-secret` action before local attribution.
@@ -704,12 +814,53 @@ export type GeneratedAiStepSecretGrant = z.infer<typeof GeneratedAiStepSecretGra
 export const GeneratedAiStep = z.strictObject({
   ...AiStepFields,
   secrets: z.array(GeneratedAiStepSecretGrant).optional(),
+  instructionCoverage: z.array(GeneratedInstructionCriterion).min(1),
+  verificationIntent: z.array(z.lazy(() => VerificationIntent)).min(1),
 });
 
 /**
  * The provider-facing AI-step branch awaiting local attribution.
  */
 export type GeneratedAiStep = z.infer<typeof GeneratedAiStep>;
+
+/**
+ * A full provider-only assertion proposal for one named success criterion.
+ *
+ * @remarks
+ * The assertion is a bounded representability claim, not semantic proof. It
+ * is discarded after generation validates the exact success-ID bijection and
+ * never enters Plan IR, agentic metadata, or grounding. A strict Zod object
+ * validates this provider-only interface.
+ */
+export interface VerificationIntent {
+  /** Success criterion for which the provider proposes terminal evidence. */
+  readonly criterionId: InstructionCriterionId;
+
+  /** Complete assertion from the supported serializable vocabulary. */
+  readonly assertion: TraceAssert;
+}
+
+/** Runtime provider schema authority for {@link VerificationIntent}. */
+export const VerificationIntent: z.ZodType<VerificationIntent> = z.lazy(() => z.strictObject({
+  criterionId: InstructionCriterionId,
+  assertion: TraceAssert,
+}));
+
+/**
+ * The provider AI-step shape carrying citations and transient verification
+ * intents.
+ *
+ * @remarks
+ * This consumer-facing alias reflects both required arrays already enforced
+ * by {@link GeneratedAiStep}, the single provider-shape authority.
+ */
+export type GeneratedInstructionCoveredAiStep = GeneratedAiStep & {
+  /** Non-empty provider citations awaiting local attribution. */
+  readonly instructionCoverage: readonly GeneratedInstructionCriterion[];
+
+  /** One full transient assertion intent for every success criterion. */
+  readonly verificationIntent: readonly VerificationIntent[];
+};
 
 /**
  * Validates one complete provider-authored step before locally deterministic
@@ -838,6 +989,10 @@ export type TraceAction = z.infer<typeof TraceAction>;
  * field bundles prevents a recorded verification from accepting a shape that
  * the equivalent plan assertion rejects, and strict branches keep every
  * requirement visible to generated JSON Schema.
+ *
+ * Criterion identifiers deliberately do not belong to this serializable
+ * union. Agentic controllers carry the optional tag as separate journal
+ * metadata so replay assertions retain one stable public shape.
  */
 export const TraceAssert = z.discriminatedUnion('check', [
   z.strictObject({
@@ -902,6 +1057,7 @@ export type TraceEntry = z.infer<typeof TraceEntry>;
 export const TraceRecord = z.strictObject({
   events: z.array(TraceEntry),
   verification: z.array(TraceAssert).min(1),
+  verificationCoverage: z.record(InstructionCriterionId, z.int().nonnegative()).optional(),
 });
 
 /**
@@ -909,6 +1065,23 @@ export const TraceRecord = z.strictObject({
  * verification evidence.
  */
 export type TraceRecord = z.infer<typeof TraceRecord>;
+
+/** Criterion-to-terminal-verification indices stored in canonical trace data. */
+export const VerificationCoverage = z.record(InstructionCriterionId, z.int().nonnegative());
+
+/** Runtime schema authority for {@link VerificationCoverage}. */
+export type VerificationCoverage = z.infer<typeof VerificationCoverage>;
+
+/**
+ * The additive Grounding-v1 trace storage shape.
+ *
+ * @remarks
+ * Optionality exists only so coverage-less historical traces remain
+ * parseable. It does not make proof optional for newly persisted or replayed
+ * traces. {@link TraceRecord} owns the optional storage field directly; this
+ * alias names that compatibility boundary without creating another authority.
+ */
+export type TraceRecordWithCoverageStorage = TraceRecord;
 
 /**
  * Validates grounding recorded for an element-based action, assertion, or
@@ -1008,9 +1181,13 @@ export const JsonValue: z.ZodType<JsonValueT> = z.lazy(() => z.union([
  * uniqueness cannot be expressed by `uniqueItems`, which compares complete
  * values. The refinement reports a duplicate at the later step's ID so the
  * generator can direct a repair to the offending location.
+ *
+ * The instruction-coverage implementation accepts and emits only literal
+ * version 2. That version enters `inputsDigest`; version 1 is rejected rather
+ * than retained as a compatibility union branch.
  */
 export const PlanDocument = z.strictObject({
-  schemaVersion: z.literal(1),
+  schemaVersion: z.literal(PLAN_SCHEMA_VERSION),
   source: z.strictObject({ inputsDigest: HexSha256 }),
   generatorMeta: z.record(z.string(), JsonValue).optional(),
   targets: z.record(z.string(), TargetDefinition),
@@ -1037,6 +1214,16 @@ export const PlanDocument = z.strictObject({
 export type PlanDocument = z.infer<typeof PlanDocument>;
 
 /**
+ * Complete Plan-v2 shape at the instruction-coverage boundary.
+ *
+ * @remarks
+ * {@link PlanDocument} itself uses literal version 2 and derives its static
+ * type from Zod. Version 1 is not a union branch and therefore has no
+ * compatibility path through Plan validation.
+ */
+export type InstructionCoveredPlanDocument = PlanDocument;
+
+/**
  * Validates only the provider-authored portion of a generated plan response.
  *
  * Provider output deliberately excludes local provenance, target selection,
@@ -1056,6 +1243,24 @@ export const GeneratedPlanResponse = z.strictObject({
  */
 export type GeneratedPlanResponse = z.infer<typeof GeneratedPlanResponse>;
 
+/** The provider step union with required coverage fields on every AI branch. */
+export type GeneratedInstructionCoveredStep =
+  | Exclude<GeneratedStep, GeneratedAiStep>
+  | GeneratedInstructionCoveredAiStep;
+
+/**
+ * Provider response shape used to construct Plan v2.
+ *
+ * {@link GeneratedPlanResponse} validates the covered step union before
+ * generation policy examines citations or intent.
+ */
+export type GeneratedInstructionCoveredPlanResponse = Omit<
+  GeneratedPlanResponse,
+  'steps'
+> & {
+  readonly steps: readonly GeneratedInstructionCoveredStep[];
+};
+
 /**
  * Validates the committed grounding cache associated with one plan digest.
  *
@@ -1072,9 +1277,13 @@ export type GeneratedPlanResponse = z.infer<typeof GeneratedPlanResponse>;
  * untouched when `executeAgentic` fails or aborts. This preserves a
  * previously good trace and prevents a failed or partial execution from
  * becoming replay data.
+ *
+ * Grounding keeps literal version 1 when instruction coverage is installed.
+ * Compatibility lives only in the optional nested trace mapping; it does not
+ * introduce a second document version or weaken Plan-v2 freshness.
  */
 export const GroundingDocument = z.strictObject({
-  schemaVersion: z.literal(1),
+  schemaVersion: z.literal(GROUNDING_SCHEMA_VERSION),
   planDigest: HexSha256,
   entries: z.record(StepId, GroundingEntry),
 });
@@ -1083,3 +1292,24 @@ export const GroundingDocument = z.strictObject({
  * The parsed grounding cache for a particular generated plan.
  */
 export type GroundingDocument = z.infer<typeof GroundingDocument>;
+
+/** AI grounding entry whose trace may carry additive coverage storage. */
+export type AiGroundingEntryWithCoverageStorage = Omit<AiGroundingEntry, 'trace'> & {
+  /** Legacy-compatible trace storage before semantic coverage narrowing. */
+  readonly trace: TraceRecordWithCoverageStorage;
+};
+
+/** Grounding entry union with coverage-aware AI trace storage. */
+export type GroundingEntryWithCoverageStorage =
+  | Exclude<GroundingEntry, AiGroundingEntry>
+  | AiGroundingEntryWithCoverageStorage;
+
+/**
+ * Grounding-v1 projection after strict coverage-aware schema validation.
+ *
+ * @remarks
+ * This projection retains document version 1 and names the nested AI trace
+ * extension already owned by {@link TraceRecord}. The Zod-inferred
+ * {@link GroundingDocument} remains the sole runtime authority.
+ */
+export type GroundingDocumentWithCoverageStorage = GroundingDocument;

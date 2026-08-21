@@ -8,6 +8,7 @@
  */
 
 import {
+  buildAgenticPromptEnvelope,
   buildPromptEnvelope,
 } from '#core/ai/prompt-envelope.js';
 import type {
@@ -16,6 +17,7 @@ import type {
   SecretRef,
   TraceRecord,
 } from '#core/ir/schema.js';
+import type { InstructionCoveredAiAgenticRequest } from '#ports/ai.js';
 
 export {
   PROMPT_ENVELOPE_TEMPLATE,
@@ -33,6 +35,48 @@ export function buildStructuredPrompt(request: {
   readonly context?: JsonValueT;
 }): string {
   return buildPromptEnvelope(request.prompt, request.context);
+}
+
+/**
+ * Provider-facing prompt input with mandatory instruction coverage.
+ *
+ * The controller and cancellation signal remain transport capabilities and do
+ * not enter prompt context. Trusted criteria are locally re-extracted, while
+ * provider-authored citation and transient-intent fields are absent by type.
+ */
+export type InstructionCoveredAgenticPromptRequest = Pick<
+  InstructionCoveredAiAgenticRequest,
+  'instructionPrompt' | 'allowedSecretRefs' | 'allowedRunRefs' |
+  'trustedInstructionCoverage' | 'priorTrace'
+> & {
+  /** Optional provider evidence nested below the untrusted context key. */
+  readonly context?: JsonValueT;
+};
+
+/**
+ * Builds a criterion-aware agentic prompt without changing Plan freshness.
+ *
+ * @param request - Trusted Plan metadata, safe legacy recovery, and evidence.
+ * @returns Common injection framing plus agentic-only criterion policy.
+ * @remarks
+ * The renderer places locally derived criteria under `trustedPlanMetadata`,
+ * alongside secret and run grants. Safe legacy evidence and other provider
+ * context cannot occupy that authority-bearing path. The renderer uses the
+ * nonfingerprinted agentic policy partition; local journal validation
+ * remains authoritative when the model fails to follow its wording.
+ */
+export function buildInstructionCoveredAgenticPrompt(
+  request: InstructionCoveredAgenticPromptRequest,
+): string {
+  return buildAgenticPromptEnvelope(request.instructionPrompt, {
+    trustedPlanMetadata: {
+      allowedSecretRefs: request.allowedSecretRefs,
+      allowedRunRefs: request.allowedRunRefs,
+      trustedInstructionCoverage: request.trustedInstructionCoverage,
+    },
+    ...(request.priorTrace === undefined ? {} : { priorTrace: request.priorTrace }),
+    ...(request.context === undefined ? {} : { untrustedContext: request.context }),
+  });
 }
 
 /**

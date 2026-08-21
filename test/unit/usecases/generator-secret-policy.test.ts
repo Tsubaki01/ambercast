@@ -17,6 +17,7 @@ const FIRST_REF = '{{secrets.FIRST}}';
 const SECOND_REF = '{{secrets.SECOND}}';
 const THIRD_REF = '{{secrets.THIRD}}';
 const WHOLE_SECRET_REFERENCE = '{{secrets.PRODUCTION_PAYMENTS_API_KEY_Q7X9M2V8R4K6T1C3Z5}}';
+const SUCCESS_CRITERION_ID = 'sign-in-complete';
 
 function prompt(...grantRefs: readonly string[]) {
   return normalizeTestMd([
@@ -43,7 +44,17 @@ function generatedAi(
   secrets: readonly { readonly ref: string; readonly citation: string }[] = [],
   id = 'complete-sign-in',
 ): Extract<GeneratedStep, { kind: 'ai' }> {
-  return { id, kind: 'ai', instruction: 'Complete sign-in.', ...(secrets.length === 0 ? {} : { secrets: [...secrets] }) };
+  return {
+    id,
+    kind: 'ai',
+    instruction: 'Complete sign-in.',
+    instructionCoverage: [{ id: SUCCESS_CRITERION_ID, kind: 'success', citation: '# Sign in' }],
+    verificationIntent: [{
+      criterionId: SUCCESS_CRITERION_ID,
+      assertion: { type: 'assert', check: 'text-visible', text: 'Sign in' },
+    }],
+    ...(secrets.length === 0 ? {} : { secrets: [...secrets] }),
+  } as unknown as Extract<GeneratedStep, { kind: 'ai' }>;
 }
 
 function committedFill(
@@ -69,19 +80,24 @@ function committedAi(
     id,
     kind: 'ai',
     instruction: 'Complete sign-in.',
+    instructionCoverage: [{
+      id: SUCCESS_CRITERION_ID,
+      kind: 'success',
+      sourceSpan: { startLine: 1, startColumn: 1, endLine: 1, endColumn: 10 },
+    }],
     ...(secrets.length === 0 ? {} : {
       secrets: secrets.map(({ ref, startLine }) => ({ ref, sourceSpan: { startLine, endLine: startLine } })),
     }),
-  };
+  } as unknown as Extract<Step, { kind: 'ai' }>;
 }
 
 function plan(steps: readonly Step[]): PlanDocument {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     source: { inputsDigest: INPUTS_DIGEST },
     targets: { web: { baseUrl: 'https://example.test', browser: 'chromium' } },
     steps: [...steps],
-  };
+  } as unknown as PlanDocument;
 }
 
 function expectAttributionFailure(
@@ -172,6 +188,11 @@ describe('normalizeAiStepSecretGrants', () => {
       id: 'complete-sign-in',
       kind: 'ai',
       instruction: 'Complete sign-in.',
+      instructionCoverage: [{
+        id: SUCCESS_CRITERION_ID,
+        kind: 'success',
+        sourceSpan: { startLine: 1, startColumn: 1, endLine: 1, endColumn: 10 },
+      }],
       secrets: [
         { ref: FIRST_REF, sourceSpan: { startLine: 3, endLine: 9 } },
         { ref: FIRST_REF, sourceSpan: { startLine: 3, endLine: 4 } },
@@ -192,7 +213,7 @@ describe('normalizeAiStepSecretGrants', () => {
     const normalized = normalizeAiStepSecretGrants([action, emptyAi]);
 
     expect(normalized[0]).toBe(action);
-    expect(normalized[1]).toEqual({ id: 'complete-sign-in', kind: 'ai', instruction: 'Complete sign-in.' });
+    expect(normalized[1]).toEqual(committedAi());
     expect(normalized[1]).not.toHaveProperty('secrets');
   });
 });
@@ -301,14 +322,14 @@ describe('attributeSecretGrants', () => {
   });
 
   it('retains two same-reference grants when distinct citations resolve distinct occurrences', () => {
-    const testMd = normalizeTestMd(`${grantLine(FIRST_REF)}\nnotes\n${grantLine(FIRST_REF)}\n`);
+    const testMd = normalizeTestMd(`# Sign in\n${grantLine(FIRST_REF)}\nnotes\n${grantLine(FIRST_REF)}\n`);
 
     expect(attributeSecretGrants([generatedAi([
       { ref: FIRST_REF, citation: `${grantLine(FIRST_REF)}\nnotes` },
       { ref: FIRST_REF, citation: `notes\n${grantLine(FIRST_REF)}` },
     ])], testMd)).toEqual([committedAi([
-      { ref: FIRST_REF, startLine: 1 },
-      { ref: FIRST_REF, startLine: 3 },
+      { ref: FIRST_REF, startLine: 2 },
+      { ref: FIRST_REF, startLine: 4 },
     ])]);
   });
 
