@@ -23,8 +23,8 @@ function asNormalizedTestMd(value: string): NormalizedTestMd {
 function createInputs(overrides: Partial<DigestInputs> = {}): DigestInputs {
   return {
     normalizedTestMd: asNormalizedTestMd('# Smoke\n'),
-    schemaVersion: 1,
-    generatorPromptTemplateFingerprint: 'generator-template-v1',
+    schemaVersion: 2,
+    generatorPromptTemplateFingerprint: 'generator-template-v2',
     targetDefinitions: { app: targetDefinition() },
     ...overrides,
   };
@@ -42,7 +42,7 @@ function createPlan({
   generatorMeta?: Record<string, JsonValueT>;
 } = {}): PlanDocument {
   return PlanDocument.parse({
-    schemaVersion: 1,
+    schemaVersion: 2,
     source: { inputsDigest },
     ...(generatorMeta === undefined ? {} : { generatorMeta }),
     targets: { app: targetDefinition(targetBaseUrl) },
@@ -85,10 +85,10 @@ describe('computeInputsDigest', () => {
   });
 
   // The expected SHA-256 was calculated without calling the implementation.
-  // Its exact JCS preimage is {"generatorPromptTemplateFingerprint":"generator-template-v1","normalizedTestMd":"# Smoke\n","schemaVersion":1,"targetDefinitions":{"app":{"baseUrl":"https://example.test","browser":"chromium"}}}.
-  // Command: printf '%s' '{"generatorPromptTemplateFingerprint":"generator-template-v1","normalizedTestMd":"# Smoke\n","schemaVersion":1,"targetDefinitions":{"app":{"baseUrl":"https://example.test","browser":"chromium"}}}' | shasum -a 256
+  // Its exact JCS preimage is {"generatorPromptTemplateFingerprint":"generator-template-v2","normalizedTestMd":"# Smoke\n","schemaVersion":2,"targetDefinitions":{"app":{"baseUrl":"https://example.test","browser":"chromium"}}}.
+  // Command: printf '%s' '{"generatorPromptTemplateFingerprint":"generator-template-v2","normalizedTestMd":"# Smoke\n","schemaVersion":2,"targetDefinitions":{"app":{"baseUrl":"https://example.test","browser":"chromium"}}}' | shasum -a 256
   it('matches the independently derived SHA-256 oracle for the fixed preimage', () => {
-    expect(computeInputsDigest(createInputs())).toBe('1b1c607e53dbd5c9425f03da186aa2ea5e369c50f0cc592ee46f492f4f111524');
+    expect(computeInputsDigest(createInputs())).toBe('8bc85d6ea7d1d835870ef68982bd8b3831e203c197e9aff3d60ea75768e5911b');
   });
 
   // The `-?` modifier prevents a future optional DigestInputs field from silently evading this completeness check.
@@ -109,7 +109,7 @@ describe('computeInputsDigest', () => {
     },
     generatorPromptTemplateFingerprint: {
       displayName: 'generator prompt-template fingerprint',
-      mutate: (inputs) => ({ ...inputs, generatorPromptTemplateFingerprint: 'generator-template-v2' }),
+      mutate: (inputs) => ({ ...inputs, generatorPromptTemplateFingerprint: 'generator-template-v2-mutated' }),
     },
     targetDefinitions: {
       displayName: 'target definitions',

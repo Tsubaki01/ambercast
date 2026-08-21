@@ -1,6 +1,10 @@
 import type { ElementRef } from '../../../src/core/ir/schema.js';
 import type { BrowserSession } from '../../../src/ports/browser.js';
-import type { AiExecuteRequest, AiExecuteResult } from '../../../src/ports/ai.js';
+import type {
+  AiExecuteRequest,
+  AiExecuteResult,
+  InstructionCoveredAiAgenticRequest,
+} from '../../../src/ports/ai.js';
 import { registerAiExecutorContract } from '../../contracts/ai-executor.contract.js';
 import { registerBrowserDriverContract } from '../../contracts/browser-driver.contract.js';
 import {
@@ -95,7 +99,7 @@ registerAiExecutorContract({
         : scripted.execute as AiExecuteResult<T>;
     },
     executeAgentic: (request) => typeof scripted.executeAgentic === 'function'
-      ? scripted.executeAgentic(request)
+      ? scripted.executeAgentic(request as InstructionCoveredAiAgenticRequest)
       : scripted.executeAgentic,
     available: true,
   }),

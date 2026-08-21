@@ -87,4 +87,43 @@ describe('IR JSON Schema documents', () => {
     expect(schema.$schema).toBe('https://json-schema.org/draft/2020-12/schema');
     expect(() => new Ajv2020({ strict: true }).compile(schema)).not.toThrow();
   });
+
+  it('publishes Plan v2 instruction coverage and additive Grounding-v1 trace coverage', () => {
+    const planV2 = {
+      schemaVersion: 2,
+      source: { inputsDigest: 'a'.repeat(64) },
+      targets: { app: { baseUrl: 'https://example.test', browser: 'chromium' } },
+      steps: [{
+        id: 'reach-dashboard',
+        kind: 'ai',
+        instruction: 'Reach the dashboard.',
+        instructionCoverage: [{
+          id: 'dashboard-reached',
+          kind: 'success',
+          sourceSpan: { startLine: 1, startColumn: 1, endLine: 1, endColumn: 21 },
+        }],
+      }],
+    };
+    const coveredGroundingV1 = {
+      schemaVersion: 1,
+      planDigest: 'b'.repeat(64),
+      entries: {
+        'reach-dashboard': {
+          kind: 'ai',
+          trace: {
+            events: [],
+            verification: [{ type: 'assert', check: 'text-visible', text: 'Dashboard' }],
+            verificationCoverage: { 'dashboard-reached': 0 },
+          },
+        },
+      },
+    };
+
+    expect(PlanDocument.safeParse(planV2).success).toBe(true);
+    expect(validators.plan(planV2)).toBe(true);
+    expect(PlanDocument.safeParse({ ...planV2, schemaVersion: 1 }).success).toBe(false);
+    expect(validators.plan({ ...planV2, schemaVersion: 1 })).toBe(false);
+    expect(GroundingDocument.safeParse(coveredGroundingV1).success).toBe(true);
+    expect(validators.grounding(coveredGroundingV1)).toBe(true);
+  });
 });

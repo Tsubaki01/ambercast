@@ -4,9 +4,8 @@
  *
  * Check deliberately observes existing files instead of composing an AI
  * provider, browser driver, event sink, or mutable storage capability. That
- * boundary keeps a CI freshness gate reproducible and makes a future write or
- * execution dependency a type-level design change rather than an incidental
- * implementation detail.
+ * boundary keeps a CI freshness gate reproducible and makes any write or
+ * execution dependency an explicit type-level design change.
  */
 
 import type { ResolvedConfig } from '#core/config/schema.js';
@@ -15,13 +14,54 @@ import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest } from '#core/ir/digest.js';
-import { normalizeTestMd } from '#core/ir/normalize.js';
-import { PlanDocument, type JsonValueT } from '#core/ir/schema.js';
+import { normalizeTestMd, type NormalizedTestMd } from '#core/ir/normalize.js';
+import {
+  PLAN_SCHEMA_VERSION,
+  PlanDocument,
+  type InstructionCoveredPlanDocument,
+  type JsonValueT,
+  type StepId,
+} from '#core/ir/schema.js';
 import { GROUNDING_SUFFIX, PLAN_SUFFIX, type LayoutResolver } from '#core/layout/resolve.js';
 import { joinPath } from '#core/paths.js';
 import { resolveTarget } from '#core/target/resolve.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { CheckResult } from '#report/schema.js';
+import type {
+  InstructionCoverageResult,
+  TrustedInstructionCriterion,
+} from './instruction-coverage-policy.js';
+import { validateCommittedInstructionCoverage } from './instruction-coverage-policy.js';
+
+/**
+ * Performs the prompt-dependent committed-coverage portion of freshness.
+ *
+ * @param plan - Strict, canonical Plan-v2 document under inspection.
+ * @param normalizedTestMd - Current canonical source prompt.
+ * @returns Trusted local criterion projections for each AI step, or the
+ * complete deterministic issue list.
+ * @remarks
+ * Check has no AI, browser, or write capability. It invokes the same committed
+ * span policy as generation and run; any impossible,
+ * whitespace-only, duplicate, or out-of-order criterion makes the artifact
+ * stale. Plan version 2 and its generator-policy fingerprint participate in
+ * `inputsDigest`, while Grounding version 1 remains outside this read-only Plan
+ * decision.
+ */
+export function inspectCommittedInstructionCoverage(
+  plan: InstructionCoveredPlanDocument,
+  normalizedTestMd: NormalizedTestMd,
+): InstructionCoverageResult<ReadonlyMap<StepId, readonly TrustedInstructionCriterion[]>> {
+  const trusted = new Map<StepId, readonly TrustedInstructionCriterion[]>();
+  const issues = [];
+  for (const step of plan.steps) {
+    if (step.kind !== 'ai') continue;
+    const result = validateCommittedInstructionCoverage(step.instructionCoverage, normalizedTestMd);
+    if (!result.success) issues.push(...result.issues);
+    else trusted.set(step.id, result.data);
+  }
+  return issues.length === 0 ? { success: true, data: trusted } : { success: false, issues };
+}
 
 /**
  * Selection and exit-policy choices for one freshness inspection batch.
@@ -61,9 +101,9 @@ export interface CheckDeps {
   /**
    * The only storage capabilities check may use.
    *
-   * Narrowing this port prevents a future inspection implementation from
-   * acquiring a write capability by accident; reads and existence checks are
-   * sufficient for every plan, prompt, and orphan finding.
+   * Narrowing this port prevents inspection from acquiring a write capability
+   * by accident; reads and existence checks are sufficient for every plan,
+   * prompt, and orphan finding.
    */
   readonly storage: Pick<StorageAdapter, 'readText' | 'exists'>;
 
@@ -273,9 +313,19 @@ export async function check(deps: CheckDeps, options: CheckOptions): Promise<Che
         continue;
       }
 
+      const normalizedTestMd = normalizeTestMd(testMd);
+      const coverage = inspectCommittedInstructionCoverage(parsedPlan.data, normalizedTestMd);
+      if (!coverage.success) {
+        results.push({
+          ...identity,
+          status: 'stale',
+          reason: 'The plan has invalid instruction coverage or source spans.',
+        });
+        continue;
+      }
       const inputsDigest = computeInputsDigest({
-        normalizedTestMd: normalizeTestMd(testMd),
-        schemaVersion: 1,
+        normalizedTestMd,
+        schemaVersion: PLAN_SCHEMA_VERSION,
         generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
         targetDefinitions: targetSelection.definitions,
       });

@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
+import {
+  GENERATOR_INSTRUCTION_COVERAGE_POLICY_TEMPLATE,
+  promptTemplateFingerprint,
+} from '#core/ai/prompt-envelope.js';
 import {
   PlanDocument,
   type GeneratedPlanResponse,
@@ -18,6 +21,7 @@ import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import type { AiExecuteRequest } from '#ports/ai.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/generate.js';
+import { validateCommittedInstructionCoverage } from '#usecases/instruction-coverage-policy.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
 import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
 import { createRecordingEventSink } from '../../doubles/create-recording-event-sink.js';
@@ -55,6 +59,15 @@ const SECRET_GRANT_CITATION_FAILURES = [
         id: 'complete-sign-in',
         kind: 'ai',
         instruction: 'Complete the sign-in flow.',
+        instructionCoverage: [{
+          id: 'dashboard-reached',
+          kind: 'success',
+          citation: 'When I submit valid credentials, I reach the dashboard.',
+        }],
+        verificationIntent: [{
+          criterionId: 'dashboard-reached',
+          assertion: { type: 'assert', check: 'text-visible', text: 'Dashboard' },
+        }],
         secrets: [{ ref: FIRST_SECRET_REF, citation: `@ambercast-secret ${FIRST_SECRET_REF}` }],
       }],
       ambiguities: [],
@@ -272,16 +285,16 @@ async function createFreshPlan(
   const normalizedTestMd = normalizeTestMd(await storage.readText(testPath));
   const inputsDigest = computeInputsDigest({
     normalizedTestMd,
-    schemaVersion: 1,
+    schemaVersion: 2,
     generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
     targetDefinitions,
   });
-  const plan: PlanDocument = {
-    schemaVersion: 1,
+  const plan = {
+    schemaVersion: 2,
     source: { inputsDigest },
     targets: targetDefinitions,
     steps: [...steps],
-  };
+  } as unknown as PlanDocument;
 
   await storage.writeText(layout.planPathFor(testPath), toCanonicalArtifactText(plan as unknown as JsonValueT));
   return plan;
@@ -297,10 +310,325 @@ async function seedFreshArtifacts(
   const plan = await createFreshPlan(storage, testPath, steps, targetDefinitions);
   const grounding: GroundingDocument = { schemaVersion: 1, planDigest: computePlanDigest(plan), entries: {} };
 
-  await storage.writeText(layout.groundingPathFor(testPath), toCanonicalArtifactText(grounding));
+  await storage.writeText(
+    layout.groundingPathFor(testPath),
+    toCanonicalArtifactText(grounding as unknown as JsonValueT),
+  );
 }
 
 describe('generate', () => {
+  const coveredResponse = {
+    steps: [{
+      id: 'reach-dashboard',
+      kind: 'ai',
+      instruction: 'Reach the dashboard.',
+      instructionCoverage: [{
+        id: 'dashboard-reached',
+        kind: 'success',
+        citation: 'When I submit valid credentials, I reach the dashboard.',
+      }],
+      verificationIntent: [{
+        criterionId: 'dashboard-reached',
+        assertion: { type: 'assert', check: 'text-visible', text: 'Dashboard' },
+      }],
+    }],
+    ambiguities: [],
+  } as unknown as GeneratedPlanResponse;
+
+  it('keeps the generated success-span fixture locally re-extractable from its prompt', () => {
+    const result = validateCommittedInstructionCoverage([{
+      id: 'dashboard-reached',
+      kind: 'success',
+      sourceSpan: { startLine: 3, startColumn: 1, endLine: 3, endColumn: 56 },
+    }], normalizeTestMd(PROMPT));
+
+    expect(result).toEqual({
+      success: true,
+      data: [expect.objectContaining({ text: 'When I submit valid credentials, I reach the dashboard.' })],
+    });
+  });
+
+  it.each([
+    ['ordinary', DEFAULT_OPTIONS, 'generated', 2],
+    ['forced', { ...DEFAULT_OPTIONS, force: true }, 'generated', 2],
+    ['dry-run', { ...DEFAULT_OPTIONS, dryRun: true }, 'would-generate', 0],
+  ] as const)(
+    'attributes and discards provider-only instruction proof on the %s generation path',
+    async (_mode, options, status, expectedWrites) => {
+      const raw = JSON.stringify(coveredResponse);
+      const { deps, recordingStorage } = createScenario({
+        aiExecutor: createFakeAiExecutor({
+          execute: async () => ({ data: coveredResponse, raw }),
+        }),
+      });
+      const testPath = await writePrompt(recordingStorage.storage);
+      recordingStorage.reset();
+
+      const outcome = await generate(deps, options);
+
+      expect(outcome.results[0]).toMatchObject({ file: testPath, status });
+      expect(recordingStorage.writes).toHaveLength(expectedWrites);
+      if (options.dryRun) {
+        return;
+      }
+      const planText = await recordingStorage.storage.readText(deps.layout.planPathFor(testPath));
+      const plan = JSON.parse(planText) as Record<string, unknown>;
+      expect(plan).toMatchObject({
+        schemaVersion: 2,
+        steps: [{
+          id: 'reach-dashboard',
+          kind: 'ai',
+          instructionCoverage: [{
+            id: 'dashboard-reached',
+            kind: 'success',
+            sourceSpan: { startLine: 3, startColumn: 1, endLine: 3, endColumn: 56 },
+          }],
+        }],
+      });
+      expect(planText).not.toContain('citation');
+      expect(planText).not.toContain('verificationIntent');
+      expect(planText).not.toContain('When I submit valid credentials');
+    },
+  );
+
+  it.each([
+    ['missing success intent', [], ['verificationIntent', 'dashboard-reached']],
+    ['unknown success intent', [{ criterionId: 'unknown', assertion: { type: 'assert', check: 'text-visible', text: 'Dashboard' } }], ['verificationIntent', 0, 'criterionId']],
+    ['duplicate success intent', [
+      { criterionId: 'dashboard-reached', assertion: { type: 'assert', check: 'text-visible', text: 'Dashboard' } },
+      { criterionId: 'dashboard-reached', assertion: { type: 'assert', check: 'text-visible', text: 'Dashboard' } },
+    ], ['verificationIntent', 1, 'criterionId']],
+    ['unsupported assertion shape', [{
+      criterionId: 'dashboard-reached',
+      assertion: { type: 'assert', check: 'element-count', target: PASSWORD_TARGET, min: 0 },
+    }], ['steps', 0, 'verificationIntent', 0, 'assertion']],
+    ['terminal url intent', [{ criterionId: 'dashboard-reached', assertion: { type: 'assert', check: 'url-matches', pattern: '/dashboard$' } }], ['verificationIntent', 0, 'assertion']],
+  ] as const)(
+    'preserves raw response and a path for %s without writing either artifact',
+    async (_name, verificationIntent, expectedPath) => {
+      const response = {
+        ...coveredResponse,
+        steps: [{ ...coveredResponse.steps[0], verificationIntent }],
+      } as unknown as GeneratedPlanResponse;
+      const raw = `RAW:${JSON.stringify(response)}`;
+      const { deps, recordingStorage } = createScenario({
+        aiExecutor: createFakeAiExecutor({
+          execute: async () => ({ data: response, raw }),
+        }),
+      });
+      await writePrompt(recordingStorage.storage);
+      recordingStorage.reset();
+
+      const outcome = await generate(deps, DEFAULT_OPTIONS);
+      const error = outcome.results[0]?.error;
+
+      expect(outcome.results[0]).toMatchObject({ status: 'failed' });
+      expect(error).toBeInstanceOf(AiResponseInvalidError);
+      expect(error).toMatchObject({
+        details: {
+          raw,
+          issues: expect.arrayContaining([expect.objectContaining({ path: expectedPath })]),
+        },
+      });
+      expect(recordingStorage.writes).toEqual([]);
+    },
+  );
+
+  it('rejects an action criterion named by terminal intent with raw output, path, and zero writes', async () => {
+    const response = {
+      ...coveredResponse,
+      steps: [{
+        id: 'reach-dashboard',
+        kind: 'ai',
+        instruction: 'Reach the dashboard.',
+        instructionCoverage: [
+          {
+            id: 'dashboard-reached',
+            kind: 'success',
+            citation: 'When I submit valid credentials, I reach the dashboard.',
+          },
+          { id: 'sign-in-action', kind: 'action', citation: '# Sign in' },
+        ],
+        verificationIntent: [
+          {
+            criterionId: 'dashboard-reached',
+            assertion: { type: 'assert', check: 'text-visible', text: 'Dashboard' },
+          },
+          { criterionId: 'sign-in-action', assertion: { type: 'assert', check: 'text-visible', text: 'Sign in' } },
+        ],
+      }],
+    } as unknown as GeneratedPlanResponse;
+    const raw = `RAW:${JSON.stringify(response)}`;
+    const { deps, recordingStorage } = createScenario({
+      aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: response, raw }) }),
+    });
+    await writePrompt(recordingStorage.storage);
+    recordingStorage.reset();
+
+    const outcome = await generate(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.error).toBeInstanceOf(AiResponseInvalidError);
+    expect(outcome.results[0]?.error).toMatchObject({
+      details: {
+        raw,
+        issues: expect.arrayContaining([expect.objectContaining({
+          path: ['verificationIntent', 1, 'criterionId'],
+        })]),
+      },
+    });
+    expect(recordingStorage.writes).toEqual([]);
+  });
+
+  it('rejects action-only coverage with empty intent while preserving raw/path evidence and zero writes', async () => {
+    const response = {
+      ...coveredResponse,
+      steps: [{
+        ...coveredResponse.steps[0],
+        instructionCoverage: [{ id: 'sign-in-action', kind: 'action', citation: '# Sign in' }],
+        verificationIntent: [],
+      }],
+    } as unknown as GeneratedPlanResponse;
+    const raw = `RAW:${JSON.stringify(response)}`;
+    const { deps, recordingStorage } = createScenario({
+      aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: response, raw }) }),
+    });
+    await writePrompt(recordingStorage.storage);
+    recordingStorage.reset();
+
+    const outcome = await generate(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.error).toBeInstanceOf(AiResponseInvalidError);
+    expect(outcome.results[0]?.error).toMatchObject({
+      details: {
+        raw,
+        issues: expect.arrayContaining([expect.objectContaining({
+          path: ['instructionCoverage'],
+        })]),
+      },
+    });
+    expect(recordingStorage.writes).toEqual([]);
+  });
+
+  it.each([
+    ['missing', 'This citation is absent.', PROMPT],
+    ['ambiguous', 'When I submit valid credentials, I reach the dashboard.', `${PROMPT}When I submit valid credentials, I reach the dashboard.\n`],
+  ] as const)('rejects a %s instruction citation with raw/path evidence and zero writes', async (_name, citation, prompt) => {
+    const response = {
+      ...coveredResponse,
+      steps: [{
+        ...coveredResponse.steps[0],
+        instructionCoverage: [{ id: 'dashboard-reached', kind: 'success', citation }],
+      }],
+    } as unknown as GeneratedPlanResponse;
+    const raw = `RAW:${JSON.stringify(response)}`;
+    const { deps, recordingStorage } = createScenario({
+      aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: response, raw }) }),
+    });
+    await writePrompt(recordingStorage.storage, 'login.test.md', prompt);
+    recordingStorage.reset();
+
+    const outcome = await generate(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.error).toBeInstanceOf(AiResponseInvalidError);
+    expect(outcome.results[0]?.error).toMatchObject({
+      details: {
+        raw,
+        issues: expect.arrayContaining([expect.objectContaining({
+          path: ['instructionCoverage', 0, 'citation'],
+        })]),
+      },
+    });
+    expect(recordingStorage.writes).toEqual([]);
+  });
+
+  it.each([
+    ['lone high surrogate', '\uD83D'],
+    ['lone low surrogate', '\uDE00'],
+  ] as const)(
+    'rejects a %s provider citation against emoji text with raw/path evidence and zero writes',
+    async (_name, citation) => {
+      const response = {
+        ...coveredResponse,
+        steps: [{
+          ...coveredResponse.steps[0],
+          instructionCoverage: [{ id: 'dashboard-reached', kind: 'success', citation }],
+        }],
+      } as unknown as GeneratedPlanResponse;
+      const raw = `RAW:${JSON.stringify(response)}`;
+      const { deps, recordingStorage } = createScenario({
+        aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: response, raw }) }),
+      });
+      await writePrompt(recordingStorage.storage, 'login.test.md', '# Emoji\n\n😀 Ready\n');
+      recordingStorage.reset();
+
+      const outcome = await generate(deps, DEFAULT_OPTIONS);
+
+      expect(outcome.results[0]?.error).toBeInstanceOf(AiResponseInvalidError);
+      expect(outcome.results[0]?.error).toMatchObject({
+        details: {
+          raw,
+          issues: expect.arrayContaining([expect.objectContaining({
+            path: ['instructionCoverage', 0, 'citation'],
+          })]),
+        },
+      });
+      expect(recordingStorage.writes).toEqual([]);
+    },
+  );
+
+  it.each([
+    ['text-visible', { type: 'assert', check: 'text-visible', text: 'Dashboard' }],
+    ['text-equals', { type: 'assert', check: 'text-equals', target: PASSWORD_TARGET, text: 'Dashboard' }],
+    ['element-visible', { type: 'assert', check: 'element-visible', target: PASSWORD_TARGET }],
+    ['element-count exact zero', { type: 'assert', check: 'element-count', target: PASSWORD_TARGET, count: 0 }],
+  ] as const)('accepts provider terminal intent vocabulary %s', async (_name, assertion) => {
+    const response = {
+      ...coveredResponse,
+      steps: [{
+        ...coveredResponse.steps[0],
+        verificationIntent: [{ criterionId: 'dashboard-reached', assertion }],
+      }],
+    } as unknown as GeneratedPlanResponse;
+    const { deps, recordingStorage } = createScenario({
+      aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: response, raw: JSON.stringify(response) }) }),
+    });
+    await writePrompt(recordingStorage.storage);
+
+    await expect(generate(deps, DEFAULT_OPTIONS)).resolves.toMatchObject({
+      results: [{ status: 'generated' }],
+    });
+  });
+
+  it('prefixes the deterministic generation task with the exact exported generator policy', async () => {
+    let request: AiExecuteRequest<unknown> | undefined;
+    const { deps, recordingStorage } = createScenario({
+      aiExecutor: createFakeAiExecutor({
+        execute: async (nextRequest) => {
+          request = nextRequest;
+          return { data: coveredResponse, raw: JSON.stringify(coveredResponse) };
+        },
+      }),
+    });
+    await writePrompt(recordingStorage.storage);
+
+    await generate(deps, DEFAULT_OPTIONS);
+
+    expect(request?.prompt).toBe(
+      `${GENERATOR_INSTRUCTION_COVERAGE_POLICY_TEMPLATE.trim()}\n\nGenerate a deterministic ambercast execution plan.`,
+    );
+    expect(request?.context).toEqual({
+      testMd: normalizeTestMd(PROMPT),
+      targets: TARGETS,
+    });
+    expect(request?.responseSchema).toMatchObject({
+      type: 'object',
+      properties: {
+        steps: expect.objectContaining({ type: 'array' }),
+        ambiguities: expect.objectContaining({ type: 'array' }),
+      },
+    });
+  });
+
   it('uses configured discovery when files are absent and reports deterministic discovered paths', async () => {
     const { deps, recordingStorage } = createScenario({ discoverTestFiles: async () => ['a.test.md', 'z.test.md'] });
     await writePrompt(recordingStorage.storage, 'a.test.md');
@@ -379,6 +707,86 @@ describe('generate', () => {
     expect(events.emitted()).toEqual([]);
     expect(recordingStorage.writes).toEqual([]);
   });
+
+  it('skips a current-digest covered AI plan only after committed coverage policy accepts it', async () => {
+    const { deps, events, execute, recordingStorage } = createScenario();
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [{
+      id: 'reach-dashboard',
+      kind: 'ai',
+      instruction: 'Reach the dashboard.',
+      instructionCoverage: [{
+        id: 'dashboard-reached',
+        kind: 'success',
+        sourceSpan: { startLine: 3, startColumn: 1, endLine: 3, endColumn: 56 },
+      }],
+    } as unknown as Step]);
+    recordingStorage.reset();
+
+    await expect(generate(deps, DEFAULT_OPTIONS)).resolves.toMatchObject({
+      results: [{ file: testPath, status: 'skipped-fresh' }],
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(events.emitted()).toEqual([]);
+    expect(recordingStorage.writes).toEqual([]);
+  });
+
+  it.each([
+    ['out-of-range span', [{
+      id: 'dashboard-reached',
+      kind: 'success',
+      sourceSpan: { startLine: 99, startColumn: 1, endLine: 99, endColumn: 2 },
+    }]],
+    ['noncanonical order', [
+      {
+        id: 'dashboard-reached',
+        kind: 'success',
+        sourceSpan: { startLine: 3, startColumn: 33, endLine: 3, endColumn: 56 },
+      },
+      {
+        id: 'submit-action',
+        kind: 'action',
+        sourceSpan: { startLine: 3, startColumn: 1, endLine: 3, endColumn: 32 },
+      },
+    ]],
+    ['duplicate criterion ID', [
+      {
+        id: 'dashboard-reached',
+        kind: 'success',
+        sourceSpan: { startLine: 3, startColumn: 1, endLine: 3, endColumn: 5 },
+      },
+      {
+        id: 'dashboard-reached',
+        kind: 'success',
+        sourceSpan: { startLine: 3, startColumn: 6, endLine: 3, endColumn: 10 },
+      },
+    ]],
+  ] as const)(
+    'does not skip a same-digest AI plan with %s and regenerates or previews it',
+    async (_name, instructionCoverage) => {
+      for (const dryRun of [false, true]) {
+        const { deps, events, execute, recordingStorage } = createScenario();
+        const testPath = await writePrompt(recordingStorage.storage);
+        await seedFreshArtifacts(recordingStorage.storage, testPath, [{
+          id: 'reach-dashboard',
+          kind: 'ai',
+          instruction: 'Reach the dashboard.',
+          instructionCoverage,
+        } as unknown as Step]);
+        recordingStorage.reset();
+
+        await expect(generate(deps, { ...DEFAULT_OPTIONS, dryRun })).resolves.toMatchObject({
+          results: [{
+            file: testPath,
+            status: dryRun ? 'would-generate' : 'generated',
+          }],
+        });
+        expect(execute).toHaveBeenCalledTimes(1);
+        expect(events.emitted()).toEqual([{ type: 'ai-call' }]);
+        expect(recordingStorage.writes).toHaveLength(dryRun ? 0 : 2);
+      }
+    },
+  );
 
   it('regenerates an otherwise fresh plan with an uncovered secret grant', async () => {
     const secretRef = FIRST_SECRET_REF;
@@ -1058,7 +1466,10 @@ describe('generate', () => {
       }
       if (groundingState === 'digest-mismatched') {
         const staleGrounding: GroundingDocument = { schemaVersion: 1, planDigest: 'f'.repeat(64), entries: {} };
-        await recordingStorage.storage.writeText(groundingPath, toCanonicalArtifactText(staleGrounding));
+        await recordingStorage.storage.writeText(
+          groundingPath,
+          toCanonicalArtifactText(staleGrounding as unknown as JsonValueT),
+        );
       }
       recordingStorage.reset();
 
@@ -1080,7 +1491,10 @@ describe('generate', () => {
       }
       if (groundingState === 'digest-mismatched') {
         const staleGrounding: GroundingDocument = { schemaVersion: 1, planDigest: 'f'.repeat(64), entries: {} };
-        await recordingStorage.storage.writeText(groundingPath, toCanonicalArtifactText(staleGrounding));
+        await recordingStorage.storage.writeText(
+          groundingPath,
+          toCanonicalArtifactText(staleGrounding as unknown as JsonValueT),
+        );
       }
       recordingStorage.reset();
 
@@ -1265,7 +1679,7 @@ describe('generate', () => {
   ] as const)('keeps grounded secret usage on the existing %s path', async (_mode, options, status) => {
     const declaredSecretRef = '{{secrets.LOGIN_PASSWORD}}';
     const secondDeclaredSecretRef = '{{secrets.PAYMENT_TOKEN}}';
-    const response: GeneratedPlanResponse = {
+    const response = {
       steps: [
         {
           id: 'fill-password',
@@ -1279,11 +1693,20 @@ describe('generate', () => {
           id: 'complete-sign-in',
           kind: 'ai',
           instruction: 'Complete the sign-in flow.',
+          instructionCoverage: [{
+            id: 'dashboard-reached',
+            kind: 'success',
+            citation: 'When I submit valid credentials, I reach the dashboard.',
+          }],
+          verificationIntent: [{
+            criterionId: 'dashboard-reached',
+            assertion: { type: 'assert', check: 'text-visible', text: 'Dashboard' },
+          }],
           secrets: [{ ref: secondDeclaredSecretRef, citation: `@ambercast-secret ${secondDeclaredSecretRef}` }],
         },
       ],
       ambiguities: [],
-    };
+    } as unknown as GeneratedPlanResponse;
     const { deps, recordingStorage } = createScenario({
       aiExecutor: createFakeAiExecutor({
         execute: async () => ({ data: response, raw: JSON.stringify(response) }),

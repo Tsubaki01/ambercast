@@ -18,15 +18,22 @@ import {
   type JsonValueT,
   type PlanDocument,
   type Step,
+  type TraceAssert,
 } from '#core/ir/schema.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
-import type { AiExecutor } from '#ports/ai.js';
+import type {
+  AiActionController,
+  AiExecutor,
+  InstructionCoverageAiActionController,
+  InstructionCoveredAiAgenticRequest,
+} from '#ports/ai.js';
 import type { BrowserSession } from '#ports/browser.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { SecretsProvider } from '#ports/system.js';
 import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/generate.js';
 import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
+import { validateCommittedInstructionCoverage } from '#usecases/instruction-coverage-policy.js';
 import { buildRunReport } from '#usecases/run-report.js';
 import { baseUrlSecretPolicy } from '../../doubles/base-url-secret-policy.js';
 import { boundTarget } from '../../doubles/bound-target.js';
@@ -50,7 +57,9 @@ const TARGETS = { web: { baseUrl: 'https://example.test', browser: 'chromium' } 
 const PROMPT = '# Sign in\n\nWhen I submit valid credentials, I reach the dashboard.\n';
 const SECRET_REF = '{{secrets.AMBERCAST_SECRET_DUMMY}}';
 const SECRET_VALUE = 'sk-AMBERCAST_SECRET_DUMMY';
-const SECRET_GRANT_SPAN = { startLine: 1, endLine: 1 } as const;
+const SECRET_GRANT_SPAN = { startLine: 4, endLine: 4 } as const;
+const SUCCESS_CRITERION_ID = 'dashboard-reached';
+const SUCCESS_SOURCE_SPAN = { startLine: 3, startColumn: 1, endLine: 3, endColumn: 56 } as const;
 const FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v2', hash: 'a'.repeat(64) };
 const EMAIL: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Email' };
 const PASSWORD: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Password' };
@@ -119,7 +128,8 @@ async function writePrompt(
   includeSecretGrant = true,
 ): Promise<string> {
   const path = `${TEST_DIR}/login.test.md`;
-  await storage.writeText(path, `${includeSecretGrant ? `@ambercast-secret ${SECRET_REF}\n` : ''}${contents}`);
+  const grantSeparator = includeSecretGrant && !contents.endsWith('\n') ? '\n' : '';
+  await storage.writeText(path, `${contents}${includeSecretGrant ? `${grantSeparator}@ambercast-secret ${SECRET_REF}\n` : ''}`);
   return path;
 }
 
@@ -129,18 +139,38 @@ async function createFreshPlan(
   steps: readonly Step[],
 ): Promise<PlanDocument> {
   const normalizedTestMd = normalizeTestMd(await storage.readText(testPath));
+  const promptLines = normalizedTestMd.split('\n');
+  const grantSpanFor = (secretRef: string) => {
+    const grantLine = promptLines.findIndex((line) => line === `@ambercast-secret ${secretRef}`);
+    if (grantLine < 0) {
+      throw new Error(`The secret-sink fixture is missing the grant for ${secretRef}.`);
+    }
+    return { startLine: grantLine + 1, endLine: grantLine + 1 };
+  };
+  const committedSteps = steps.map((step) => {
+    if (step.kind === 'action' && step.action === 'fill-secret') {
+      return { ...step, secretGrantSpan: grantSpanFor(step.secretRef) };
+    }
+    if (step.kind === 'ai' && step.secrets !== undefined) {
+      return {
+        ...step,
+        secrets: step.secrets.map(({ ref }) => ({ ref, sourceSpan: grantSpanFor(ref) })),
+      };
+    }
+    return step;
+  });
   const inputsDigest = computeInputsDigest({
     normalizedTestMd,
-    schemaVersion: 1,
+    schemaVersion: 2,
     generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
     targetDefinitions: TARGETS,
   });
-  const plan: PlanDocument = {
-    schemaVersion: 1,
+  const plan = {
+    schemaVersion: 2,
     source: { inputsDigest },
     targets: TARGETS,
-    steps: [...steps],
-  };
+    steps: committedSteps,
+  } as unknown as PlanDocument;
   const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
   await storage.writeText(layout.planPathFor(testPath), toCanonicalArtifactText(plan as unknown as JsonValueT));
   return plan;
@@ -167,8 +197,18 @@ function aiStep(): Extract<Step, { kind: 'ai' }> {
     id: 'recorded-ai',
     kind: 'ai',
     instruction: 'Complete the sign-in flow and verify the dashboard.',
+    instructionCoverage: [{ id: SUCCESS_CRITERION_ID, kind: 'success', sourceSpan: SUCCESS_SOURCE_SPAN }],
     secrets: [{ ref: SECRET_REF, sourceSpan: SECRET_GRANT_SPAN }],
-  };
+  } as unknown as Extract<Step, { kind: 'ai' }>;
+}
+
+async function evaluateTerminal(
+  controller: AiActionController,
+  assertion: TraceAssert,
+): Promise<unknown> {
+  return (controller as unknown as {
+    evaluateAssert(check: TraceAssert, criterionId?: string): Promise<unknown>;
+  }).evaluateAssert(assertion, SUCCESS_CRITERION_ID);
 }
 
 function createRunScenario(
@@ -201,6 +241,29 @@ function createRunScenario(
     },
   };
 }
+
+describe('secret-sink instruction coverage fixture', () => {
+  it('re-extracts the line-three success criterion after the appended secret grant', async () => {
+    const storage = createInMemoryStorage();
+    const testPath = await writePrompt(storage);
+    const step = aiStep() as unknown as {
+      readonly instructionCoverage: readonly [{
+        readonly id: string;
+        readonly kind: 'success';
+        readonly sourceSpan: typeof SUCCESS_SOURCE_SPAN;
+      }];
+    };
+    const result = validateCommittedInstructionCoverage(
+      step.instructionCoverage,
+      normalizeTestMd(await storage.readText(testPath)),
+    );
+
+    expect(result).toEqual({
+      success: true,
+      data: [expect.objectContaining({ text: 'When I submit valid credentials, I reach the dashboard.' })],
+    });
+  });
+});
 
 function createRotatingSecretsProvider(ref: string, values: readonly string[]): SecretsProvider {
   let next = 0;
@@ -300,12 +363,20 @@ describe('run secret sinks', () => {
       context: { sanitizedReference: SECRET_REF },
       responseSchema: typedJsonSchema(z.object({ ok: z.boolean() })),
     });
-    await expect(executor.executeAgentic({
+    const agenticRequest: InstructionCoveredAiAgenticRequest = {
       instructionPrompt: 'Drive the browser without materialized secrets.',
       allowedSecretRefs: [SECRET_REF],
       allowedRunRefs: [],
-      controller,
-    })).rejects.toMatchObject({ kind: 'ai-executor-unavailable' });
+      trustedInstructionCoverage: [{
+        id: 'dashboard-reached',
+        kind: 'success',
+        sourceSpan: SUCCESS_SOURCE_SPAN,
+        text: 'When I submit valid credentials, I reach the dashboard.',
+      }],
+      controller: controller as InstructionCoverageAiActionController,
+    };
+    await expect(executor.executeAgentic(agenticRequest))
+      .rejects.toMatchObject({ kind: 'ai-executor-unavailable' });
 
     expect(runner.calls).toHaveLength(1);
     for (const call of runner.calls) {
@@ -335,7 +406,7 @@ describe('run secret sinks', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: SECRET_REF });
-        await request.controller.evaluateAssert({
+        await evaluateTerminal(request.controller, {
           type: 'assert',
           check: 'text-visible',
           text: `Welcome back, token=${SECRET_VALUE}!`,
@@ -362,7 +433,7 @@ describe('run secret sinks', () => {
     ]);
   });
 
-  it('rejects a secret-tainted fill-secret target during trace replay before the fill can reach the browser', async () => {
+  it('pre-scans a coverage-less legacy trace before safe fallback without cached browser replay', async () => {
     const preScanValue = 'AMBERCAST_SECRET_PRE_SCAN_VALUE';
     const materializationValue = 'AMBERCAST_SECRET_MATERIALIZATION_VALUE';
     const secretTaintedTarget: ElementRef = {
@@ -374,13 +445,17 @@ describe('run secret sinks', () => {
     const resolveGrounded = vi.spyOn(session, 'resolveGrounded');
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
-        await request.controller.evaluateAssert({ type: 'assert', check: 'text-visible', text: 'Dashboard' });
+        await evaluateTerminal(request.controller, { type: 'assert', check: 'text-visible', text: 'Dashboard' });
         return { outcome: 'success' };
       },
     });
     const { deps, recordingStorage } = createRunScenario(session, executor);
     const rotatingSecrets = createRotatingSecretsProvider(SECRET_REF, [preScanValue, materializationValue]);
     const testPath = await writePrompt(recordingStorage.storage, `${PROMPT}\n${SECRET_REF}\n`);
+    const priorTrace = {
+      events: [{ type: 'fill-secret' as const, target: secretTaintedTarget, secretRef: SECRET_REF }],
+      verification: [{ type: 'assert' as const, check: 'text-visible' as const, text: 'Cached dashboard' }],
+    };
     await seedFreshArtifacts(
       recordingStorage.storage,
       testPath,
@@ -388,10 +463,7 @@ describe('run secret sinks', () => {
       {
         'recorded-ai': {
           kind: 'ai',
-          trace: {
-            events: [{ type: 'fill-secret', target: secretTaintedTarget, secretRef: SECRET_REF }],
-            verification: [{ type: 'assert', check: 'text-visible', text: 'Cached dashboard' }],
-          },
+          trace: priorTrace,
         },
       },
     );
@@ -400,17 +472,11 @@ describe('run secret sinks', () => {
 
     expect(outcome.results[0]?.result.status).toBe('passed');
     expect(executor.agenticRequests).toHaveLength(1);
-    expect(resolveGrounded).toHaveBeenCalledWith(secretTaintedTarget, expect.objectContaining({ mode: 'compute' }));
-    const computeQuery = resolveGrounded.mock.calls
-      .map(([, query]) => query)
-      .find((query) => query.mode === 'compute');
-
-    expect(computeQuery?.mode).toBe('compute');
-    if (computeQuery?.mode === 'compute') {
-      expect([...computeQuery.resolvedSecrets]).toEqual([new Set([preScanValue, materializationValue])]);
-    }
+    expect(executor.agenticRequests[0]?.priorTrace).toEqual(priorTrace);
+    expect(resolveGrounded).not.toHaveBeenCalled();
     expect(session.operations().filter((operation) => operation.type === 'perform')).toEqual([]);
     expect(session.operations().filter((operation) => operation.type === 'fill-secret')).toEqual([]);
+    expect(JSON.stringify(outcome)).not.toContain(preScanValue);
     expect(JSON.stringify(outcome)).not.toContain(materializationValue);
   });
 
@@ -469,7 +535,7 @@ describe('run secret sinks', () => {
         await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: SECRET_REF });
         await request.controller.perform({ type: 'click', target: unsafeTarget });
         await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: SECRET_REF });
-        await request.controller.evaluateAssert({ type: 'assert', check: 'text-visible', text: 'Dashboard' });
+        await evaluateTerminal(request.controller, { type: 'assert', check: 'text-visible', text: 'Dashboard' });
         return { outcome: 'success' };
       },
     });
@@ -514,7 +580,7 @@ describe('run secret sinks', () => {
         await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: SECRET_REF });
         await request.controller.perform({ type: 'click', target: unsafeTarget });
         await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: SECRET_REF });
-        await request.controller.evaluateAssert({ type: 'assert', check: 'text-visible', text: 'Dashboard' });
+        await evaluateTerminal(request.controller, { type: 'assert', check: 'text-visible', text: 'Dashboard' });
         return { outcome: 'success' };
       },
     });
@@ -548,7 +614,7 @@ describe('run secret sinks', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef: SECRET_REF });
-        await request.controller.evaluateAssert({ type: 'assert', check: 'text-visible', text: 'Dashboard' });
+        await evaluateTerminal(request.controller, { type: 'assert', check: 'text-visible', text: 'Dashboard' });
         return { outcome: 'success' };
       },
     });
@@ -558,8 +624,9 @@ describe('run secret sinks', () => {
       id: authoredStepId,
       kind: 'ai',
       instruction: 'Complete the sign-in flow and verify the dashboard.',
+      instructionCoverage: [{ id: SUCCESS_CRITERION_ID, kind: 'success', sourceSpan: SUCCESS_SOURCE_SPAN }],
       secrets: [{ ref: SECRET_REF, sourceSpan: SECRET_GRANT_SPAN }],
-    }]);
+    } as unknown as Step]);
     recordingStorage.writes.length = 0;
 
     const outcome = await run(deps, RUN_OPTIONS);

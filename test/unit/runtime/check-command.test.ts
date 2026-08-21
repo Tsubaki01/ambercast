@@ -83,19 +83,19 @@ describe('runCheckCommand', () => {
     const layout = createLayoutResolver(CONFIG);
     const testPath = `${CONFIG.testDir}/login.test.md`;
     const prompt = '# Sign in\n\nI reach the dashboard.\n';
-    const plan: PlanDocument = {
-      schemaVersion: 1,
+    const plan = {
+      schemaVersion: 2,
       source: {
         inputsDigest: computeInputsDigest({
           normalizedTestMd: normalizeTestMd(prompt),
-          schemaVersion: 1,
+          schemaVersion: 2,
           generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
           targetDefinitions: { web: CONFIG.targets.web! },
         }),
       },
       targets: { web: CONFIG.targets.web! },
       steps: [],
-    };
+    } as unknown as PlanDocument;
     await storage.writeText(testPath, prompt);
     await storage.writeText(layout.planPathFor(testPath), toCanonicalArtifactText(plan as unknown as JsonValueT));
     mocks.createFsStorage.mockReturnValue(storage);

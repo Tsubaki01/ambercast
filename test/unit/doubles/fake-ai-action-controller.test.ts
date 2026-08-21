@@ -16,13 +16,15 @@ describe('createFakeAiActionController', () => {
   it('forwards every operation to its supplied override and returns its result', async () => {
     const performed: TraceAction[] = [];
     const evaluated: TraceAssert[] = [];
+    const criterionIds: (string | undefined)[] = [];
     const snapshotArguments: [][] = [];
     const controller = createFakeAiActionController({
       perform: async (action) => {
         performed.push(action);
       },
-      evaluateAssert: async (check) => {
+      evaluateAssert: async (check, criterionId) => {
         evaluated.push(check);
+        criterionIds.push(criterionId);
         return OUTCOME;
       },
       snapshotForResolution: async (...argumentsReceived: []) => {
@@ -32,16 +34,18 @@ describe('createFakeAiActionController', () => {
     });
 
     await expect(controller.perform(ACTION)).resolves.toBeUndefined();
-    await expect(controller.evaluateAssert(CHECK)).resolves.toBe(OUTCOME);
+    await expect(controller.evaluateAssert(CHECK, 'submit-visible')).resolves.toBe(OUTCOME);
     await expect(controller.snapshotForResolution()).resolves.toBe(SNAPSHOT);
 
     expect(performed).toHaveLength(1);
     expect(performed[0]).toBe(ACTION);
     expect(evaluated).toHaveLength(1);
     expect(evaluated[0]).toBe(CHECK);
+    expect(criterionIds).toEqual(['submit-visible']);
     expect(snapshotArguments).toEqual([[]]);
     expect(controller.performed).toEqual([ACTION]);
     expect(controller.evaluated).toEqual([CHECK]);
+    expect(controller.evaluatedCriterionIds).toEqual(['submit-visible']);
     expect(controller.snapshots).toBe(1);
   });
 

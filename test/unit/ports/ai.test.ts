@@ -16,6 +16,10 @@ import type {
   AiExecuteRequest,
   AiExecuteResult,
   AiExecutor,
+  AiTrustedInstructionCriterion,
+  InstructionCoverageAiActionController,
+  InstructionCoveredAiAgenticRequest,
+  SafeLegacyTraceRecord,
   AiResolutionSnapshot,
   AiUsage,
 } from '../../../src/ports/ai.js';
@@ -105,5 +109,22 @@ describe('AI port shapes', () => {
       (request: AiAgenticRequest) => Promise<AiAgenticResult>
     >();
     expectTypeOf<AiExecutor['isAvailable']>().toEqualTypeOf<(signal?: AbortSignal) => Promise<boolean>>();
+  });
+
+  it('narrows instruction-covered agentic authority to local criteria and safe legacy recovery', () => {
+    expectTypeOf<InstructionCoverageAiActionController['evaluateAssert']>().toEqualTypeOf<
+      (check: TraceAssert, criterionId?: string) => Promise<AssertOutcome>
+    >();
+    expectTypeOf<InstructionCoveredAiAgenticRequest>().toMatchTypeOf<{
+      readonly instructionPrompt: string;
+      readonly allowedSecretRefs: readonly SecretRef[];
+      readonly allowedRunRefs: readonly RunVariableName[];
+      readonly trustedInstructionCoverage: readonly AiTrustedInstructionCriterion[];
+      readonly controller: InstructionCoverageAiActionController;
+      readonly priorTrace?: SafeLegacyTraceRecord;
+      readonly signal?: AbortSignal;
+    }>();
+    expectTypeOf<InstructionCoveredAiAgenticRequest>()
+      .not.toHaveProperty('verificationIntent');
   });
 });

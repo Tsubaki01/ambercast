@@ -1,13 +1,21 @@
-import type { AiActionController, AiResolutionSnapshot } from '../../src/ports/ai.js';
-import type { TraceAction, TraceAssert } from '../../src/core/ir/schema.js';
+import type {
+  AiResolutionSnapshot,
+  InstructionCoverageAiActionController,
+} from '../../src/ports/ai.js';
+import type {
+  InstructionCriterionId,
+  TraceAction,
+  TraceAssert,
+} from '../../src/core/ir/schema.js';
 import type { AssertOutcome } from '../../src/ports/browser.js';
 
 /**
  * The controller contract plus immutable-by-convention operation histories.
  */
-export interface FakeAiActionController extends AiActionController {
+export interface FakeAiActionController extends InstructionCoverageAiActionController {
   readonly performed: readonly TraceAction[];
   readonly evaluated: readonly TraceAssert[];
+  readonly evaluatedCriterionIds: readonly (InstructionCriterionId | undefined)[];
   readonly snapshots: number;
 }
 
@@ -21,9 +29,12 @@ export interface FakeAiActionController extends AiActionController {
  * @param overrides - Per-operation behavior needed by the calling scenario.
  * @returns A controller that forwards configured operations unchanged.
  */
-export function createFakeAiActionController(overrides: Partial<AiActionController> = {}): FakeAiActionController {
+export function createFakeAiActionController(
+  overrides: Partial<InstructionCoverageAiActionController> = {},
+): FakeAiActionController {
   const performed: TraceAction[] = [];
   const evaluated: TraceAssert[] = [];
+  const evaluatedCriterionIds: (InstructionCriterionId | undefined)[] = [];
   let snapshots = 0;
 
   return {
@@ -35,13 +46,17 @@ export function createFakeAiActionController(overrides: Partial<AiActionControll
 
       await overrides.perform(action);
     },
-    async evaluateAssert(check: TraceAssert): Promise<AssertOutcome> {
+    async evaluateAssert(
+      check: TraceAssert,
+      criterionId?: InstructionCriterionId,
+    ): Promise<AssertOutcome> {
       evaluated.push(check);
+      evaluatedCriterionIds.push(criterionId);
       if (overrides.evaluateAssert === undefined) {
         throw new Error('No override configured for evaluateAssert');
       }
 
-      return overrides.evaluateAssert(check);
+      return overrides.evaluateAssert(check, criterionId);
     },
     async snapshotForResolution(): Promise<AiResolutionSnapshot> {
       snapshots += 1;
@@ -53,6 +68,7 @@ export function createFakeAiActionController(overrides: Partial<AiActionControll
     },
     performed,
     evaluated,
+    evaluatedCriterionIds,
     get snapshots(): number {
       return snapshots;
     },

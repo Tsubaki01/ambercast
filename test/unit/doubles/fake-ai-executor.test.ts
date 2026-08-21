@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { typedJsonSchema } from '../../../src/core/ai/typed-json-schema.js';
-import type { AiAgenticResult, AiExecuteRequest, AiExecuteResult } from '../../../src/ports/ai.js';
+import type {
+  AiAgenticResult,
+  AiExecuteRequest,
+  AiExecuteResult,
+  InstructionCoverageAiActionController,
+  InstructionCoveredAiAgenticRequest,
+  SafeLegacyTraceRecord,
+} from '../../../src/ports/ai.js';
 import { createFakeAiActionController } from '../../doubles/fake-ai-action-controller.js';
 import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
 
@@ -11,6 +18,24 @@ const AGENTIC_RESULT: AiAgenticResult = { outcome: 'success' };
 
 function request(context: string): AiExecuteRequest {
   return { prompt: `respond to ${context}`, responseSchema: typedJsonSchema(z.object({ answer: z.string() })), context };
+}
+
+function coveredAgenticRequest(
+  overrides: Partial<InstructionCoveredAiAgenticRequest> = {},
+): InstructionCoveredAiAgenticRequest {
+  return {
+    instructionPrompt: 'Complete sign-in.',
+    allowedSecretRefs: [],
+    allowedRunRefs: [],
+    trustedInstructionCoverage: [{
+      id: 'sign-in-complete',
+      kind: 'success',
+      sourceSpan: { startLine: 3, startColumn: 1, endLine: 3, endColumn: 22 },
+      text: 'Complete sign-in.',
+    }],
+    controller: createFakeAiActionController() as InstructionCoverageAiActionController,
+    ...overrides,
+  };
 }
 
 describe('createFakeAiExecutor', () => {
@@ -72,12 +97,9 @@ describe('createFakeAiExecutor', () => {
     });
     const controller = createFakeAiActionController();
 
-    await expect(executor.executeAgentic({
-      instructionPrompt: 'Complete sign-in.',
-      allowedSecretRefs: [],
-      allowedRunRefs: [],
-      controller,
-    })).resolves.toBe(AGENTIC_RESULT);
+    await expect(executor.executeAgentic(coveredAgenticRequest({
+      controller: controller as InstructionCoverageAiActionController,
+    }))).resolves.toBe(AGENTIC_RESULT);
     expect(receivedController).toBe(controller);
   });
 
@@ -88,12 +110,9 @@ describe('createFakeAiExecutor', () => {
     });
     const structured = request('history');
     const controller = createFakeAiActionController();
-    const agentic = {
-      instructionPrompt: 'Complete sign-in.',
-      allowedSecretRefs: [],
-      allowedRunRefs: [],
-      controller,
-    } as const;
+    const agentic = coveredAgenticRequest({
+      controller: controller as InstructionCoverageAiActionController,
+    });
 
     await executor.execute(structured);
     await executor.executeAgentic(agentic);
@@ -102,16 +121,32 @@ describe('createFakeAiExecutor', () => {
     expect(executor.agenticRequests).toEqual([agentic]);
   });
 
+  it('retains locally trusted instruction coverage and safe legacy recovery evidence exactly', async () => {
+    const executor = createFakeAiExecutor({ executeAgentic: () => AGENTIC_RESULT });
+    const request = coveredAgenticRequest({
+      priorTrace: {
+        events: [],
+        verification: [{ type: 'assert', check: 'text-visible', text: 'Sign in' }],
+      } as unknown as SafeLegacyTraceRecord,
+    });
+
+    await executor.executeAgentic(request);
+
+    expect(executor.agenticRequests).toEqual([request]);
+    expect(executor.agenticRequests[0]).toMatchObject({
+      trustedInstructionCoverage: request.trustedInstructionCoverage,
+      priorTrace: request.priorTrace,
+    });
+    expect(executor.agenticRequests[0]).not.toHaveProperty('verificationIntent');
+  });
+
   it('rejects an unscripted agentic request instead of silently returning a result', async () => {
     const controller = createFakeAiActionController();
     const executor = createFakeAiExecutor();
 
-    await expect(executor.executeAgentic({
-      instructionPrompt: 'Complete sign-in.',
-      allowedSecretRefs: [],
-      allowedRunRefs: [],
-      controller,
-    }))
+    await expect(executor.executeAgentic(coveredAgenticRequest({
+      controller: controller as InstructionCoverageAiActionController,
+    })))
       .rejects.toThrow(/override|configured|unscripted/i);
   });
 

@@ -1,11 +1,36 @@
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
-import type { AiExecutor } from '../../src/ports/ai.js';
+import type {
+  AiExecutor,
+  InstructionCoverageAiActionController,
+  InstructionCoveredAiAgenticRequest,
+  SafeLegacyTraceRecord,
+} from '../../src/ports/ai.js';
 import { typedJsonSchema } from '../../src/core/ai/typed-json-schema.js';
 import { createFakeAiActionController } from '../doubles/fake-ai-action-controller.js';
 
 function responseSchema() {
   return typedJsonSchema(z.object({ ok: z.boolean() }));
+}
+
+function coveredAgenticRequest(signal?: AbortSignal): InstructionCoveredAiAgenticRequest {
+  return {
+    instructionPrompt: 'Complete sign-in without trusting provider-authored proof.',
+    allowedSecretRefs: [],
+    allowedRunRefs: [],
+    trustedInstructionCoverage: [{
+      id: 'sign-in-complete',
+      kind: 'success',
+      sourceSpan: { startLine: 3, startColumn: 1, endLine: 3, endColumn: 22 },
+      text: 'Complete sign-in.',
+    }],
+    controller: createFakeAiActionController() as InstructionCoverageAiActionController,
+    priorTrace: {
+      events: [],
+      verification: [{ type: 'assert', check: 'text-visible', text: 'Sign in' }],
+    } as unknown as SafeLegacyTraceRecord,
+    ...(signal === undefined ? {} : { signal }),
+  };
 }
 
 export interface AiExecutorTransportHarness {
@@ -113,12 +138,8 @@ export function registerAiExecutorTransportContract(harness: AiExecutorTransport
       try {
         const executor = await harness.createExecutor('agentic');
 
-        await expect(executor.executeAgentic({
-          instructionPrompt: 'Complete sign-in.',
-          allowedSecretRefs: [],
-          allowedRunRefs: [],
-          controller: createFakeAiActionController(),
-        })).rejects.toThrow(/agentic|browser|unavailable/i);
+        await expect(executor.executeAgentic(coveredAgenticRequest()))
+          .rejects.toThrow(/agentic|browser|unavailable/i);
       } finally {
         await harness.dispose?.();
       }
@@ -131,13 +152,8 @@ export function registerAiExecutorTransportContract(harness: AiExecutorTransport
         const reason = new Error('agentic request cancelled');
         controller.abort(reason);
 
-        await expect(executor.executeAgentic({
-          instructionPrompt: 'Complete sign-in.',
-          allowedSecretRefs: [],
-          allowedRunRefs: [],
-          controller: createFakeAiActionController(),
-          signal: controller.signal,
-        })).rejects.toBe(reason);
+        await expect(executor.executeAgentic(coveredAgenticRequest(controller.signal)))
+          .rejects.toBe(reason);
       } finally {
         await harness.dispose?.();
       }
