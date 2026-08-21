@@ -5,14 +5,54 @@
 import type { TypedJsonSchema } from '#core/ai/typed-json-schema.js';
 import type {
   JsonValueT,
+  InstructionCriterionId,
+  InstructionCriterion,
   RunVariableName,
   SecretRef,
   TraceAction,
   TraceAssert,
   TraceRecord,
+  TraceRecordWithCoverageStorage,
 } from '#core/ir/schema.js';
 
 import type { AssertOutcome } from './browser.js';
+
+declare const PRE_SCANNED_TRACE_RECORD: unique symbol;
+
+/**
+ * A trace after the run usecase has completed its full safety pre-scan.
+ *
+ * @remarks
+ * The unforgeable brand records a trust transition that a plain
+ * {@link TraceRecord} cannot express. Only the run pipeline's complete scan of
+ * static shape, secret references, run references, and materialized-secret
+ * exclusion may produce this type.
+ */
+export type PreScannedTraceRecord<
+  T extends TraceRecordWithCoverageStorage = TraceRecordWithCoverageStorage,
+> = T & { readonly [PRE_SCANNED_TRACE_RECORD]: true };
+
+/**
+ * Safely pre-scanned compatibility evidence with no coverage claim.
+ *
+ * The `never` field prevents a trace with present coverage from flowing into
+ * provider recovery context. Covered traces belong exclusively to local
+ * replay after independent semantic validation.
+ */
+export type SafeLegacyTraceRecord = PreScannedTraceRecord<TraceRecord & {
+  readonly verificationCoverage?: never;
+}>;
+
+/**
+ * Locally trusted criterion metadata supplied to an agentic provider.
+ *
+ * The exact text is re-extracted from the committed span for this request and
+ * is never persisted as another prompt source of truth.
+ */
+export interface AiTrustedInstructionCriterion extends InstructionCriterion {
+  /** Exact normalized prompt text selected by the committed source span. */
+  readonly text: string;
+}
 
 /**
  * Optional provider-reported token accounting for one AI call.
@@ -175,12 +215,63 @@ export interface AiAgenticRequest {
    * nor run-derived values cross into provider context. Before executing an
    * agentic request, the run pipeline verifies that every trace secret
    * reference is still covered by this request's current secret grants.
+   * Instruction-covered callers use {@link InstructionCoveredAiAgenticRequest}
+   * instead; that contract permits only branded coverage-absent legacy data.
    */
   readonly priorTrace?: TraceRecord;
 
   /** Cancellation signal forwarded to a provider that supports cancellation. */
   readonly signal?: AbortSignal;
 }
+
+/**
+ * Criterion-aware controller installed with instruction-covered agentic work.
+ *
+ * @remarks
+ * The criterion ID is separate call metadata and never becomes a property of
+ * serializable {@link TraceAssert}. Mid-flow assertions may omit it; every
+ * assertion in the trailing terminal run must supply one before grounding can
+ * be committed.
+ */
+export interface InstructionCoverageAiActionController extends Omit<
+  AiActionController,
+  'evaluateAssert'
+> {
+  /**
+   * Evaluates an assertion while retaining its optional in-memory criterion tag.
+   *
+   * @param check - Unresolved assertion that remains safe to journal.
+   * @param criterionId - Step-local success ID, when this is terminal proof.
+   * @returns A passing or diagnosable failing browser outcome.
+   */
+  evaluateAssert(
+    check: TraceAssert,
+    criterionId?: InstructionCriterionId,
+  ): Promise<AssertOutcome>;
+}
+
+/**
+ * Agentic request with the instruction-coverage runtime contract.
+ *
+ * @remarks
+ * This type narrows the base request's controller and prior-trace fields. Only
+ * safely pre-scanned,
+ * coverage-absent evidence may cross to a provider; covered traces remain
+ * local zero-AI replay candidates.
+ */
+export type InstructionCoveredAiAgenticRequest = Omit<
+  AiAgenticRequest,
+  'controller' | 'priorTrace'
+> & {
+  /** Locally re-extracted criteria, never provider-authored intent. */
+  readonly trustedInstructionCoverage: readonly AiTrustedInstructionCriterion[];
+
+  /** Criterion-aware browser operations and nonserializable journal tags. */
+  readonly controller: InstructionCoverageAiActionController;
+
+  /** Safely pre-scanned compatibility evidence used only for recovery. */
+  readonly priorTrace?: SafeLegacyTraceRecord;
+};
 
 /**
  * The outcome of a completed AI-directed browser interaction.
@@ -257,4 +348,15 @@ export interface AiExecutor {
    * cannot determine availability.
    */
   isAvailable(signal?: AbortSignal): Promise<boolean>;
+}
+
+/**
+ * AI executor seam whose agentic method requires trusted instruction metadata.
+ *
+ * The structured generation method remains unchanged, while the agentic
+ * parameter requires the narrowed Plan-v2 request.
+ */
+export interface InstructionCoveredAiExecutor extends Omit<AiExecutor, 'executeAgentic'> {
+  /** Performs live recovery using criterion-aware, safely narrowed inputs. */
+  executeAgentic(request: InstructionCoveredAiAgenticRequest): Promise<AiAgenticResult>;
 }

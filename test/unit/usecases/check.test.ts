@@ -36,18 +36,18 @@ function createConfig(overrides: Partial<TestConfig> = {}): TestConfig {
 
 function freshPlan(prompt = PROMPT, targetDefinitions: Readonly<Record<string, TargetDefinition>> = TARGETS): PlanDocument {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     source: {
       inputsDigest: computeInputsDigest({
         normalizedTestMd: normalizeTestMd(prompt),
-        schemaVersion: 1,
+        schemaVersion: 2,
         generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
         targetDefinitions,
       }),
     },
     targets: targetDefinitions,
     steps: [],
-  };
+  } as unknown as PlanDocument;
 }
 
 async function writePlan(
@@ -125,6 +125,68 @@ async function captureTargetFailure(operation: Promise<unknown>): Promise<Target
 }
 
 describe('check', () => {
+  it('reports a schema-valid Plan v2 with impossible committed instruction provenance as stale', async () => {
+    const { storage, layout, deps } = createScenario();
+    const testPath = `${TEST_DIR}/invalid-coverage.test.md`;
+    await storage.writeText(testPath, PROMPT);
+    const plan = {
+      ...freshPlan(),
+      steps: [{
+        id: 'reach-dashboard',
+        kind: 'ai',
+        instruction: 'Reach the dashboard.',
+        instructionCoverage: [{
+          id: 'dashboard-reached',
+          kind: 'success',
+          sourceSpan: { startLine: 99, startColumn: 1, endLine: 99, endColumn: 2 },
+        }],
+      }],
+    };
+    await storage.writeText(
+      layout.planPathFor(testPath),
+      toCanonicalArtifactText(plan as unknown as JsonValueT),
+    );
+
+    await expect(check(deps, { ...OPTIONS, files: [testPath] })).resolves.toMatchObject({
+      results: [{ id: testPath, status: 'stale', reason: expect.stringMatching(/instruction|coverage|span/i) }],
+    });
+  });
+
+  it('reports a Plan v2 with locally valid covered provenance and covered grounding as fresh', async () => {
+    const { storage, layout, deps } = createScenario();
+    const testPath = `${TEST_DIR}/valid-coverage.test.md`;
+    await storage.writeText(testPath, PROMPT);
+    const plan = {
+      ...freshPlan(),
+      steps: [{
+        id: 'reach-dashboard',
+        kind: 'ai',
+        instruction: 'Use the UI to complete the scenario.',
+        instructionCoverage: [{
+          id: 'dashboard-reached',
+          kind: 'success',
+          sourceSpan: { startLine: 3, startColumn: 1, endLine: 3, endColumn: 56 },
+        }],
+      }],
+    } as unknown as PlanDocument;
+    await writePlan(storage, layout, testPath, plan);
+    await writeGrounding(storage, layout, testPath, plan, {
+      'reach-dashboard': {
+        kind: 'ai',
+        trace: {
+          events: [],
+          verification: [{ type: 'assert', check: 'text-visible', text: 'Dashboard' }],
+          verificationCoverage: { 'dashboard-reached': 0 },
+        },
+      },
+    } as GroundingDocument['entries']);
+
+    await expect(check(deps, { ...OPTIONS, files: [testPath] })).resolves.toMatchObject({
+      results: [{ id: testPath, status: 'fresh' }],
+      errors: [],
+    });
+  });
+
   it('discovers nested relative test paths and anchors their findings to the configured test directory', async () => {
     const relativeTestPath = 'ui/login.test.md';
     const testPath = `${TEST_DIR}/${relativeTestPath}`;

@@ -36,4 +36,18 @@ describe('writeJsonSchemaFiles', () => {
   it('produces byte-identical writes when generation is repeated', () => {
     expect(captureSchemaWrites()).toEqual(captureSchemaWrites());
   });
+
+  it('emits Plan-v2 required coverage and additive Grounding-v1 coverage fields', () => {
+    const writes = captureSchemaWrites();
+    const planText = writes.find(({ path }) => path.endsWith('plan.schema.json'))?.content ?? '';
+    const groundingText = writes.find(({ path }) => path.endsWith('grounding.schema.json'))?.content ?? '';
+
+    expect(planText).toContain('instructionCoverage');
+    expect(planText).toContain('sourceSpan');
+    expect(planText).toContain('startColumn');
+    expect(planText).toContain('endColumn');
+    expect(planText).toMatch(/"const":2/);
+    expect(groundingText).toContain('verificationCoverage');
+    expect(groundingText).toMatch(/"const":1/);
+  });
 });

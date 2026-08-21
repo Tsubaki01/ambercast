@@ -5,7 +5,10 @@
 
 import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
 import { composeAiDeadline, isAiDeadlineTimeout } from '#core/ai/ai-deadline.js';
-import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
+import {
+  buildGeneratorTask,
+  promptTemplateFingerprint,
+} from '#core/ai/prompt-envelope.js';
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
@@ -16,13 +19,20 @@ import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { normalizeTestMd, type NormalizedTestMd } from '#core/ir/normalize.js';
 import {
+  GeneratedAiStep,
   GeneratedPlanResponse,
+  GeneratedStep,
+  GROUNDING_SCHEMA_VERSION,
   GroundingDocument,
+  InstructionCriterionId,
+  JsonValue,
+  PLAN_SCHEMA_VERSION,
   PlanDocument,
   type GroundingDocument as GroundingDocumentType,
+  type GeneratedInstructionCoveredPlanResponse,
+  type InstructionCoveredStep,
   type JsonValueT,
   type PlanDocument as PlanDocumentType,
-  type Step,
 } from '#core/ir/schema.js';
 import type { LayoutResolver } from '#core/layout/resolve.js';
 import { joinPath } from '#core/paths.js';
@@ -30,14 +40,78 @@ import { resolveTarget } from '#core/target/resolve.js';
 import type { AiExecutor } from '#ports/ai.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { EventSink } from '#ports/system.js';
+import { z } from 'zod';
 import {
   assertCommittedSecretAttributionSound,
   assertNoLiteralSecrets,
   attributeSecretGrants,
+  InstructionCoverageAttributionError,
+  type InstructionPolicyGeneratedStep,
   normalizeAiStepSecretGrants,
 } from './generator-secret-policy.js';
+import {
+  validateCommittedInstructionCoverage,
+  type InstructionCoverageResult,
+} from './instruction-coverage-policy.js';
 
 const GENERATED_PLAN_RESPONSE_SCHEMA = typedJsonSchema(GeneratedPlanResponse);
+
+/*
+ * Empty transient intent remains policy input only for an action-only AI step,
+ * whose actionable failure is the missing success criterion. An arbitrary
+ * JSON assertion likewise reaches the policy's supported-vocabulary check.
+ * Relaxing only this transient provider field after transport validation
+ * avoids coupling either diagnostic to Zod's issue-code and union-path
+ * representation while every other provider field still passes the strict
+ * generated response authority.
+ */
+const GENERATED_PLAN_RESPONSE_FOR_POLICY = GeneratedPlanResponse.extend({
+  steps: z.array(z.union([
+    GeneratedStep,
+    GeneratedAiStep.extend({
+      verificationIntent: z.array(z.strictObject({
+        criterionId: InstructionCriterionId,
+        assertion: JsonValue,
+      })),
+    }),
+  ])),
+});
+
+type GeneratedPlanResponseForPolicy = Omit<
+  GeneratedInstructionCoveredPlanResponse,
+  'steps'
+> & {
+  readonly steps: readonly InstructionPolicyGeneratedStep[];
+};
+
+/**
+ * Attributes and validates provider instruction coverage before Plan assembly.
+ *
+ * @param response - Strict provider response with citations and full intents.
+ * @param normalizedTestMd - Canonical prompt used for local attribution.
+ * @returns Committed-shape steps without citation or intent data, or the
+ * complete deterministic provider issue list.
+ * @remarks
+ * Generation composes this phase with secret attribution, but neither policy
+ * grants authority to the other. Instruction validation runs
+ * for every AI step, requires exact step-local success/intent bijections, and
+ * discards transient fields before Plan construction. Failure maps to
+ * `AiResponseInvalidError` with raw provider output and performs no artifact
+ * write.
+ */
+export function prepareInstructionCoveredSteps(
+  response: GeneratedPlanResponseForPolicy,
+  normalizedTestMd: NormalizedTestMd,
+): InstructionCoverageResult<InstructionCoveredStep[]> {
+  try {
+    return { success: true, data: attributeSecretGrants(response.steps, normalizedTestMd) };
+  } catch (error) {
+    if (error instanceof InstructionCoverageAttributionError) {
+      return { success: false, issues: error.issues };
+    }
+    throw error;
+  }
+}
 
 function asArtifactText(value: JsonValueT): string {
   return toCanonicalArtifactText(value);
@@ -51,7 +125,14 @@ function fileFailure(error: unknown, message: string): AmbercastErrorType {
   return error instanceof AmbercastError ? error : fsIoError(message, error);
 }
 
-/** Treats a thrown SecretGrantUnattributableError as not-fresh so generation regenerates instead of propagating it. */
+/**
+ * Treats committed provenance failure as not fresh so generation regenerates.
+ *
+ * The instruction-coverage implementation composes local span re-extraction
+ * with the existing secret check here. A Plan-v2 artifact is reusable only
+ * when strict schema, canonical bytes, input digest, and every committed AI
+ * criterion agree with the current normalized prompt.
+ */
 function validFreshPlan(
   text: string,
   inputsDigest: string,
@@ -68,6 +149,12 @@ function validFreshPlan(
     }
 
     assertCommittedSecretAttributionSound(parsed.data, normalizedTestMd);
+    for (const step of parsed.data.steps) {
+      if (step.kind === 'ai'
+        && !validateCommittedInstructionCoverage(step.instructionCoverage, normalizedTestMd).success) {
+        return undefined;
+      }
+    }
     return parsed.data;
   } catch {
     return undefined;
@@ -88,7 +175,7 @@ async function freshPlan(
 }
 
 function emptyGrounding(plan: PlanDocumentType): GroundingDocumentType {
-  return { schemaVersion: 1, planDigest: computePlanDigest(plan), entries: {} };
+  return { schemaVersion: GROUNDING_SCHEMA_VERSION, planDigest: computePlanDigest(plan), entries: {} };
 }
 
 async function groundingIsCurrent(
@@ -334,7 +421,7 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
     const normalizedTestMd = normalizeTestMd(testMd);
     const inputsDigest = computeInputsDigest({
       normalizedTestMd,
-      schemaVersion: 1,
+      schemaVersion: PLAN_SCHEMA_VERSION,
       generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
       targetDefinitions: resolvedTargets,
     });
@@ -366,7 +453,7 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
     try {
       deps.events.emit({ type: 'ai-call' });
       response = await deps.aiExecutor.execute({
-        prompt: 'Generate a deterministic ambercast execution plan for the supplied Markdown test.',
+        prompt: buildGeneratorTask('Generate a deterministic ambercast execution plan.'),
         responseSchema: GENERATED_PLAN_RESPONSE_SCHEMA,
         context: { testMd: normalizedTestMd, targets: resolvedTargets } as unknown as JsonValueT,
         signal: deadline.signal,
@@ -382,17 +469,44 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
       continue;
     }
 
-    let attributedSteps: Step[];
+    const parsedResponse = GENERATED_PLAN_RESPONSE_FOR_POLICY.safeParse(response.data);
+    if (!parsedResponse.success) {
+      results.push({
+        file,
+        status: 'failed',
+        error: new AiResponseInvalidError(
+          'The AI provider response did not match the generation contract.',
+          { raw: response.raw, issues: parsedResponse.error.issues },
+        ),
+      });
+      continue;
+    }
+
+    let prepared: InstructionCoverageResult<InstructionCoveredStep[]>;
     try {
-      attributedSteps = attributeSecretGrants(response.data.steps, normalizedTestMd);
+      prepared = prepareInstructionCoveredSteps(
+        parsedResponse.data,
+        normalizedTestMd,
+      );
     } catch (error) {
       results.push({ file, status: 'failed', error: fileFailure(error, 'The generated plan could not be inspected.') });
       continue;
     }
+    if (!prepared.success) {
+      results.push({
+        file,
+        status: 'failed',
+        error: new AiResponseInvalidError(
+          'The AI provider response contains invalid instruction coverage.',
+          { raw: response.raw, issues: prepared.issues },
+        ),
+      });
+      continue;
+    }
 
-    const normalizedSteps = normalizeAiStepSecretGrants(attributedSteps);
+    const normalizedSteps = normalizeAiStepSecretGrants(prepared.data);
     const candidate = {
-      schemaVersion: 1,
+      schemaVersion: PLAN_SCHEMA_VERSION,
       source: { inputsDigest },
       ...(response.data.generatorMeta === undefined ? {} : { generatorMeta: response.data.generatorMeta }),
       targets: resolvedTargets,

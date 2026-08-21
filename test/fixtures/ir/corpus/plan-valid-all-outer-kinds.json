@@ -2,7 +2,7 @@
   "document": "plan",
   "expected": "valid",
   "value": {
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "source": { "inputsDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
     "generatorMeta": { "model": "test-model", "attempt": 1, "nested": [true, null] },
     "targets": { "app": { "baseUrl": "https://example.test", "browser": "chromium" } },
@@ -10,7 +10,18 @@
       { "id": "open-home", "kind": "action", "action": "navigate", "url": "https://example.test" },
       { "id": "welcome-visible", "kind": "assert", "check": "text-visible", "text": "Welcome" },
       { "id": "capture-welcome", "kind": "capture", "target": { "strategy": "accessibility", "role": "heading", "name": "Welcome" }, "variable": "welcomeText" },
-      { "id": "continue-with-ai", "kind": "ai", "instruction": "Continue after {{run.welcomeText}}" }
+      {
+        "id": "continue-with-ai",
+        "kind": "ai",
+        "instruction": "Continue after {{run.welcomeText}}",
+        "instructionCoverage": [
+          {
+            "id": "continued",
+            "kind": "success",
+            "sourceSpan": { "startLine": 1, "startColumn": 1, "endLine": 1, "endColumn": 9 }
+          }
+        ]
+      }
     ]
   }
 }

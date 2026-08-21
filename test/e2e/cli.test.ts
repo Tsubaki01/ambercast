@@ -57,19 +57,19 @@ async function writeSoleTargetConfigAndFreshPlan(project: string): Promise<void>
     targets: targetDefinitions,
     ai: { provider: 'codex' },
   }));
-  const plan: PlanDocument = {
-    schemaVersion: 1,
+  const plan = {
+    schemaVersion: 2,
     source: {
       inputsDigest: computeInputsDigest({
         normalizedTestMd: normalizeTestMd(FIXTURE_PROMPT),
-        schemaVersion: 1,
+        schemaVersion: 2,
         generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
         targetDefinitions,
       }),
     },
     targets: targetDefinitions,
     steps: [],
-  };
+  } as unknown as PlanDocument;
   await writeFile(
     join(project, 'tests', 'test.ambercast.plan.json'),
     toCanonicalArtifactText(plan as unknown as JsonValueT),
@@ -78,7 +78,7 @@ async function writeSoleTargetConfigAndFreshPlan(project: string): Promise<void>
 
 async function writeStalePlan(project: string): Promise<void> {
   await writeFile(join(project, 'tests', 'test.ambercast.plan.json'), toCanonicalArtifactText({
-    schemaVersion: 1,
+    schemaVersion: 2,
     source: { inputsDigest: 'f'.repeat(64) },
     targets: { web: { baseUrl: 'https://example.test', browser: 'chromium' } },
     steps: [],

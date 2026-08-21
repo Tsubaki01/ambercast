@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { typedJsonSchema } from '../../../src/core/ai/typed-json-schema.js';
-import type { AiAgenticResult, AiExecuteRequest, AiExecuteResult } from '../../../src/ports/ai.js';
+import type {
+  AiAgenticResult,
+  AiExecuteRequest,
+  AiExecuteResult,
+  InstructionCoveredAiAgenticRequest,
+  SafeLegacyTraceRecord,
+} from '../../../src/ports/ai.js';
+import type { TraceRecord } from '../../../src/core/ir/schema.js';
 import { createFakeAiActionController } from '../../doubles/fake-ai-action-controller.js';
 import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
 
@@ -11,6 +18,30 @@ const AGENTIC_RESULT: AiAgenticResult = { outcome: 'success' };
 
 function request(context: string): AiExecuteRequest {
   return { prompt: `respond to ${context}`, responseSchema: typedJsonSchema(z.object({ answer: z.string() })), context };
+}
+
+function safeLegacyTrace(
+  trace: TraceRecord & { readonly verificationCoverage?: never },
+): SafeLegacyTraceRecord {
+  return trace as SafeLegacyTraceRecord;
+}
+
+function coveredAgenticRequest(
+  overrides: Partial<InstructionCoveredAiAgenticRequest> = {},
+): InstructionCoveredAiAgenticRequest {
+  return {
+    instructionPrompt: 'Complete sign-in.',
+    allowedSecretRefs: [],
+    allowedRunRefs: [],
+    trustedInstructionCoverage: [{
+      id: 'sign-in-complete',
+      kind: 'success',
+      sourceSpan: { startLine: 3, startColumn: 1, endLine: 3, endColumn: 22 },
+      text: 'Complete sign-in.',
+    }],
+    controller: createFakeAiActionController(),
+    ...overrides,
+  };
 }
 
 describe('createFakeAiExecutor', () => {
@@ -72,12 +103,9 @@ describe('createFakeAiExecutor', () => {
     });
     const controller = createFakeAiActionController();
 
-    await expect(executor.executeAgentic({
-      instructionPrompt: 'Complete sign-in.',
-      allowedSecretRefs: [],
-      allowedRunRefs: [],
+    await expect(executor.executeAgentic(coveredAgenticRequest({
       controller,
-    })).resolves.toBe(AGENTIC_RESULT);
+    }))).resolves.toBe(AGENTIC_RESULT);
     expect(receivedController).toBe(controller);
   });
 
@@ -88,12 +116,9 @@ describe('createFakeAiExecutor', () => {
     });
     const structured = request('history');
     const controller = createFakeAiActionController();
-    const agentic = {
-      instructionPrompt: 'Complete sign-in.',
-      allowedSecretRefs: [],
-      allowedRunRefs: [],
+    const agentic = coveredAgenticRequest({
       controller,
-    } as const;
+    });
 
     await executor.execute(structured);
     await executor.executeAgentic(agentic);
@@ -102,16 +127,28 @@ describe('createFakeAiExecutor', () => {
     expect(executor.agenticRequests).toEqual([agentic]);
   });
 
+  it('retains locally trusted instruction coverage and safe legacy recovery evidence exactly', async () => {
+    const executor = createFakeAiExecutor({ executeAgentic: () => AGENTIC_RESULT });
+    const request = coveredAgenticRequest({
+      priorTrace: safeLegacyTrace({
+        events: [],
+        verification: [{ type: 'assert', check: 'text-visible', text: 'Sign in' }],
+      }),
+    });
+
+    await executor.executeAgentic(request);
+
+    expect(executor.agenticRequests).toEqual([request]);
+    expect(executor.agenticRequests[0]).not.toHaveProperty('verificationIntent');
+  });
+
   it('rejects an unscripted agentic request instead of silently returning a result', async () => {
     const controller = createFakeAiActionController();
     const executor = createFakeAiExecutor();
 
-    await expect(executor.executeAgentic({
-      instructionPrompt: 'Complete sign-in.',
-      allowedSecretRefs: [],
-      allowedRunRefs: [],
+    await expect(executor.executeAgentic(coveredAgenticRequest({
       controller,
-    }))
+    })))
       .rejects.toThrow(/override|configured|unscripted/i);
   });
 
