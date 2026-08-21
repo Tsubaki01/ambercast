@@ -1,13 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type {
-  AiActionController,
   AiAgenticResult,
   AiExecuteRequest,
   AiExecuteResult,
-  AiExecutor,
   AiResolutionSnapshot,
-  InstructionCoverageAiActionController,
   InstructionCoveredAiAgenticRequest,
+  InstructionCoveredAiExecutor,
   SafeLegacyTraceRecord,
 } from '../../src/ports/ai.js';
 import type {
@@ -35,8 +33,8 @@ export interface AiExecutorContractScript {
 }
 
 export interface AiExecutorContractHarness {
-  createExecutor(scripted: AiExecutorContractScript): AiExecutor | Promise<AiExecutor>;
-  createActionController(overrides: Partial<AiActionController>): AiActionController;
+  createExecutor(scripted: AiExecutorContractScript): InstructionCoveredAiExecutor | Promise<InstructionCoveredAiExecutor>;
+  createActionController(overrides: Partial<InstructionCoveredAiAgenticRequest['controller']>): InstructionCoveredAiAgenticRequest['controller'];
   dispose?(): void | Promise<void>;
 }
 
@@ -66,7 +64,7 @@ function safeLegacyTrace(
 }
 
 function coveredAgenticRequest(
-  controller: AiActionController,
+  controller: InstructionCoveredAiAgenticRequest['controller'],
   overrides: Partial<Omit<InstructionCoveredAiAgenticRequest, 'controller'>> = {},
 ): InstructionCoveredAiAgenticRequest {
   return {
@@ -79,13 +77,13 @@ function coveredAgenticRequest(
       text: 'Reach the dashboard.',
       sourceSpan: { startLine: 1, startColumn: 1, endLine: 1, endColumn: 21 },
     }],
-    controller: controller as InstructionCoverageAiActionController,
+    controller,
     ...overrides,
   };
 }
 
 interface RecordingController {
-  readonly controller: AiActionController;
+  readonly controller: InstructionCoveredAiAgenticRequest['controller'];
   readonly performed: TraceAction[];
   readonly evaluated: TraceAssert[];
   readonly criterionIds: (InstructionCriterionId | undefined)[];
@@ -220,9 +218,8 @@ export function registerAiExecutorContract(harness: AiExecutorContractHarness): 
         const executor = await harness.createExecutor({
           execute: EXECUTE_RESULT,
           executeAgentic: async (request) => {
-            received = request as InstructionCoveredAiAgenticRequest;
-            await (request.controller as InstructionCoverageAiActionController)
-              .evaluateAssert(CHECK, 'dashboard-visible');
+            received = request;
+            await request.controller.evaluateAssert(CHECK, 'dashboard-visible');
             return AGENTIC_RESULT;
           },
         });

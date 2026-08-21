@@ -19,9 +19,13 @@ import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { normalizeTestMd, type NormalizedTestMd } from '#core/ir/normalize.js';
 import {
+  GeneratedAiStep,
   GeneratedPlanResponse,
+  GeneratedStep,
   GROUNDING_SCHEMA_VERSION,
   GroundingDocument,
+  InstructionCriterionId,
+  JsonValue,
   PLAN_SCHEMA_VERSION,
   PlanDocument,
   type GroundingDocument as GroundingDocumentType,
@@ -36,11 +40,13 @@ import { resolveTarget } from '#core/target/resolve.js';
 import type { AiExecutor } from '#ports/ai.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { EventSink } from '#ports/system.js';
+import { z } from 'zod';
 import {
   assertCommittedSecretAttributionSound,
   assertNoLiteralSecrets,
   attributeSecretGrants,
   InstructionCoverageAttributionError,
+  type InstructionPolicyGeneratedStep,
   normalizeAiStepSecretGrants,
 } from './generator-secret-policy.js';
 import {
@@ -49,6 +55,34 @@ import {
 } from './instruction-coverage-policy.js';
 
 const GENERATED_PLAN_RESPONSE_SCHEMA = typedJsonSchema(GeneratedPlanResponse);
+
+/*
+ * Empty transient intent remains policy input only for an action-only AI step,
+ * whose actionable failure is the missing success criterion. An arbitrary
+ * JSON assertion likewise reaches the policy's supported-vocabulary check.
+ * Relaxing only this transient provider field after transport validation
+ * avoids coupling either diagnostic to Zod's issue-code and union-path
+ * representation while every other provider field still passes the strict
+ * generated response authority.
+ */
+const GENERATED_PLAN_RESPONSE_FOR_POLICY = GeneratedPlanResponse.extend({
+  steps: z.array(z.union([
+    GeneratedStep,
+    GeneratedAiStep.extend({
+      verificationIntent: z.array(z.strictObject({
+        criterionId: InstructionCriterionId,
+        assertion: JsonValue,
+      })),
+    }),
+  ])),
+});
+
+type GeneratedPlanResponseForPolicy = Omit<
+  GeneratedInstructionCoveredPlanResponse,
+  'steps'
+> & {
+  readonly steps: readonly InstructionPolicyGeneratedStep[];
+};
 
 /**
  * Attributes and validates provider instruction coverage before Plan assembly.
@@ -66,7 +100,7 @@ const GENERATED_PLAN_RESPONSE_SCHEMA = typedJsonSchema(GeneratedPlanResponse);
  * write.
  */
 export function prepareInstructionCoveredSteps(
-  response: GeneratedInstructionCoveredPlanResponse,
+  response: GeneratedPlanResponseForPolicy,
   normalizedTestMd: NormalizedTestMd,
 ): InstructionCoverageResult<InstructionCoveredStep[]> {
   try {
@@ -435,12 +469,8 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
       continue;
     }
 
-    const parsedResponse = GeneratedPlanResponse.safeParse(response.data);
-    const onlyEmptyIntent = !parsedResponse.success && parsedResponse.error.issues.every((responseIssue) => (
-      responseIssue.code === 'too_small'
-      && responseIssue.path.at(-1) === 'verificationIntent'
-    ));
-    if (!parsedResponse.success && !onlyEmptyIntent) {
+    const parsedResponse = GENERATED_PLAN_RESPONSE_FOR_POLICY.safeParse(response.data);
+    if (!parsedResponse.success) {
       results.push({
         file,
         status: 'failed',
@@ -455,7 +485,7 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
     let prepared: InstructionCoverageResult<InstructionCoveredStep[]>;
     try {
       prepared = prepareInstructionCoveredSteps(
-        parsedResponse.success ? parsedResponse.data : response.data,
+        parsedResponse.data,
         normalizedTestMd,
       );
     } catch (error) {

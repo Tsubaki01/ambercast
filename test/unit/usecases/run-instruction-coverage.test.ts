@@ -9,7 +9,12 @@ import { createLayoutResolver } from '#core/layout/resolve.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { InstructionCoverageAiActionController } from '#ports/ai.js';
 import type { AssertOutcome } from '#ports/browser.js';
-import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
+import {
+  inspectGroundingCoverageSource,
+  run,
+  type RunDeps,
+  type RunOptions,
+} from '#usecases/run.js';
 import type { CoveredTraceRecord } from '#usecases/instruction-coverage-policy.js';
 import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
 import { createFakeBrowserDriver } from '../../doubles/fake-browser-driver.js';
@@ -120,6 +125,11 @@ function coveredTrace(overrides: Partial<TraceRecord & { verificationCoverage: R
     verificationCoverage: { 'dashboard-reached': 0 },
     ...overrides,
   };
+}
+
+function duplicateReaderFailureGroundingRaw(plan: PlanDocument = coveredPlan()): string {
+  const deepButValidJson = `${'['.repeat(15_000)}0${']'.repeat(15_000)}`;
+  return `{"entries":{},"readerStress":${deepButValidJson},"planDigest":"${computePlanDigest(plan)}","schemaVersion":1}`;
 }
 
 async function arrangeArtifacts(
@@ -240,6 +250,66 @@ describe('run instruction coverage trust boundary', () => {
     ]);
   });
 
+  it('observes cancellation before every covered replay event', async () => {
+    const { replayCoveredTraceWithoutAi } = await import('#usecases/run.js');
+    const controller = new AbortController();
+    const reason = new Error('covered event replay cancelled');
+    const session = createFakeBrowserSession(new Map(), {
+      baseUrl: TARGETS.web.baseUrl,
+      currentUrl: TARGETS.web.baseUrl,
+      onPerform: () => controller.abort(reason),
+    });
+    const trace = {
+      events: [
+        { type: 'navigate' as const, url: '/first' },
+        { type: 'navigate' as const, url: '/second' },
+      ],
+      verification: [],
+      verificationCoverage: {},
+    } as unknown as CoveredTraceRecord;
+
+    await expect(replayCoveredTraceWithoutAi(trace, {
+      session,
+      target: TARGETS.web,
+      runState: new Map(),
+      secrets: createFakeSecretsProvider(new Map()),
+      resolvedSecrets: new Map(),
+      allowedRunRefs: new Set(),
+      signal: controller.signal,
+    }, new Set())).rejects.toBe(reason);
+    expect(session.operations()).toEqual([
+      { type: 'perform', action: { type: 'navigate', url: '/first' } },
+    ]);
+  });
+
+  it('observes cancellation before every covered replay verification', async () => {
+    const { replayCoveredTraceWithoutAi } = await import('#usecases/run.js');
+    const controller = new AbortController();
+    const reason = new Error('covered verification replay cancelled');
+    const session = createFakeBrowserSession(new Map(), {
+      assertOutcomes: [{ passed: true }, { passed: true }],
+      onEvaluateAssert: () => controller.abort(reason),
+    });
+    const trace = {
+      events: [],
+      verification: [READY_ASSERTION, { ...READY_ASSERTION, text: 'Account' }],
+      verificationCoverage: { 'dashboard-reached': 0, 'account-reached': 1 },
+    } as unknown as CoveredTraceRecord;
+
+    await expect(replayCoveredTraceWithoutAi(trace, {
+      session,
+      target: TARGETS.web,
+      runState: new Map(),
+      secrets: createFakeSecretsProvider(new Map()),
+      resolvedSecrets: new Map(),
+      allowedRunRefs: new Set(),
+      signal: controller.signal,
+    }, new Set())).rejects.toBe(reason);
+    expect(session.operations()).toEqual([
+      { type: 'evaluate-assert', check: { check: 'text-visible', text: 'Dashboard' } },
+    ]);
+  });
+
   it.each([false, true])('replays valid covered evidence with zero AI calls in cacheOnly=%s', async (cacheOnly) => {
     const recording = recordingStorage();
     await arrangeArtifacts(recording.storage, coveredTrace());
@@ -270,8 +340,7 @@ describe('run instruction coverage trust boundary', () => {
     recording.resetMutations();
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
-        await (request.controller as InstructionCoverageAiActionController)
-          .evaluateAssert(READY_ASSERTION, 'constructor');
+        await request.controller.evaluateAssert(READY_ASSERTION, 'constructor');
         return { outcome: 'success' };
       },
     });
@@ -319,8 +388,7 @@ describe('run instruction coverage trust boundary', () => {
     recording.resetMutations();
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
-        await (request.controller as InstructionCoverageAiActionController)
-          .evaluateAssert(READY_ASSERTION, 'constructor');
+        await request.controller.evaluateAssert(READY_ASSERTION, 'constructor');
         return { outcome: 'success' };
       },
     });
@@ -362,8 +430,7 @@ describe('run instruction coverage trust boundary', () => {
     let receivedPriorTrace: unknown;
     const executeAgentic = vi.fn(async (request) => {
       receivedPriorTrace = request.priorTrace;
-      await (request.controller as InstructionCoverageAiActionController)
-        .evaluateAssert(READY_ASSERTION, 'dashboard-reached');
+      await request.controller.evaluateAssert(READY_ASSERTION, 'dashboard-reached');
       return { outcome: 'success' as const };
     });
     const executor = createFakeAiExecutor({ executeAgentic });
@@ -642,6 +709,38 @@ describe('run instruction coverage trust boundary', () => {
     },
   );
 
+  it('classifies a duplicate-preserving reader failure after current provenance as integrity failure', () => {
+    const plan = coveredPlan();
+    const raw = duplicateReaderFailureGroundingRaw(plan);
+    expect(() => JSON.parse(raw)).not.toThrow();
+
+    expect(inspectGroundingCoverageSource(raw, computePlanDigest(plan))).toEqual({
+      kind: 'integrity-failure',
+      reason: 'coverage-structure-invalid',
+    });
+  });
+
+  it.each([false, true])(
+    'fails closed when current grounding provenance survives but raw claim inspection throws in cacheOnly=%s',
+    async (cacheOnly) => {
+      const recording = recordingStorage();
+      await arrangeRawGrounding(recording.storage, {}, { raw: duplicateReaderFailureGroundingRaw() });
+      recording.resetMutations();
+      const arranged = scenario(recording);
+
+      const outcome = await run(arranged.deps, { ...OPTIONS, cacheOnly });
+
+      expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+      expect(outcome.results[0]?.error?.message).toMatch(/coverage|grounding|integrity/i);
+      expect(arranged.resolveAiExecutor).not.toHaveBeenCalled();
+      expect(arranged.browserDriver).not.toHaveBeenCalled();
+      expect(arranged.session.operations()).toEqual([]);
+      expect(recording.writes).toEqual([]);
+      expect(recording.binaryWrites).toEqual([]);
+      expect(recording.ensuredDirectories).toEqual([]);
+    },
+  );
+
   it.each([
     ['duplicate entry key', false, (covered: string, legacy: string) => [
       `"reach-dashboard":{"kind":"ai","trace":${covered}}`,
@@ -901,8 +1000,7 @@ describe('run instruction coverage trust boundary', () => {
     recording.resetMutations();
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
-        await (request.controller as InstructionCoverageAiActionController)
-          .evaluateAssert(READY_ASSERTION, 'dashboard-reached');
+        await request.controller.evaluateAssert(READY_ASSERTION, 'dashboard-reached');
         return { outcome: 'success' };
       },
     });
@@ -964,8 +1062,7 @@ describe('run instruction coverage trust boundary', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         receivedPriorTrace = request.priorTrace;
-        await (request.controller as InstructionCoverageAiActionController)
-          .evaluateAssert(READY_ASSERTION, 'dashboard-reached');
+        await request.controller.evaluateAssert(READY_ASSERTION, 'dashboard-reached');
         return { outcome: 'success' };
       },
     });
@@ -990,7 +1087,7 @@ describe('run instruction coverage trust boundary', () => {
     recording.writes.length = 0;
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
-        const controller = request.controller as InstructionCoverageAiActionController;
+        const { controller } = request;
         await controller.evaluateAssert({ ...READY_ASSERTION, text: 'Page reached' }, 'page-reached');
         await controller.evaluateAssert(READY_ASSERTION, 'dashboard-visible');
         return { outcome: 'success' };
@@ -1024,8 +1121,7 @@ describe('run instruction coverage trust boundary', () => {
     recording.resetMutations();
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
-        await (request.controller as InstructionCoverageAiActionController)
-          .evaluateAssert(assertion, 'dashboard-reached');
+        await request.controller.evaluateAssert(assertion, 'dashboard-reached');
         return { outcome: 'success' };
       },
     });
@@ -1098,7 +1194,7 @@ describe('run instruction coverage trust boundary', () => {
     recording.resetMutations();
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
-        await script(request.controller as InstructionCoverageAiActionController);
+        await script(request.controller);
         return { outcome: 'success' };
       },
     });
@@ -1140,7 +1236,7 @@ describe('run instruction coverage trust boundary', () => {
     const before = await recording.storage.readText(groundingPath);
     recording.resetMutations();
     const executeAgentic = vi.fn(async (request) => {
-      const controller = request.controller as InstructionCoverageAiActionController;
+      const { controller } = request;
       await controller.evaluateAssert({ ...READY_ASSERTION, text: 'Page reached' }, criterionIds[0]);
       await controller.evaluateAssert(READY_ASSERTION, criterionIds[1]);
       return { outcome: 'success' as const };
@@ -1190,7 +1286,7 @@ describe('run instruction coverage trust boundary', () => {
     recording.resetMutations();
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
-        const controller = request.controller as InstructionCoverageAiActionController;
+        const { controller } = request;
         await controller.evaluateAssert({ ...READY_ASSERTION, text: 'Page reached' }, criterionIds[0]);
         await controller.evaluateAssert(READY_ASSERTION, criterionIds[1]);
         return { outcome: 'success' };
@@ -1234,8 +1330,7 @@ describe('run instruction coverage trust boundary', () => {
           if (terminal === 'snapshot') {
             await request.controller.snapshotForResolution();
           } else {
-            await (request.controller as InstructionCoverageAiActionController)
-              .evaluateAssert(
+            await request.controller.evaluateAssert(
                 { ...READY_ASSERTION, text: 'Not ready' },
                 hasLegacyTrace ? 'dashboard-reached' : undefined,
               );

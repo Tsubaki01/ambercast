@@ -5,10 +5,10 @@ import type {
   AiAgenticResult,
   AiExecuteRequest,
   AiExecuteResult,
-  InstructionCoverageAiActionController,
   InstructionCoveredAiAgenticRequest,
   SafeLegacyTraceRecord,
 } from '../../../src/ports/ai.js';
+import type { TraceRecord } from '../../../src/core/ir/schema.js';
 import { createFakeAiActionController } from '../../doubles/fake-ai-action-controller.js';
 import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
 
@@ -18,6 +18,12 @@ const AGENTIC_RESULT: AiAgenticResult = { outcome: 'success' };
 
 function request(context: string): AiExecuteRequest {
   return { prompt: `respond to ${context}`, responseSchema: typedJsonSchema(z.object({ answer: z.string() })), context };
+}
+
+function safeLegacyTrace(
+  trace: TraceRecord & { readonly verificationCoverage?: never },
+): SafeLegacyTraceRecord {
+  return trace as SafeLegacyTraceRecord;
 }
 
 function coveredAgenticRequest(
@@ -33,7 +39,7 @@ function coveredAgenticRequest(
       sourceSpan: { startLine: 3, startColumn: 1, endLine: 3, endColumn: 22 },
       text: 'Complete sign-in.',
     }],
-    controller: createFakeAiActionController() as InstructionCoverageAiActionController,
+    controller: createFakeAiActionController(),
     ...overrides,
   };
 }
@@ -98,7 +104,7 @@ describe('createFakeAiExecutor', () => {
     const controller = createFakeAiActionController();
 
     await expect(executor.executeAgentic(coveredAgenticRequest({
-      controller: controller as InstructionCoverageAiActionController,
+      controller,
     }))).resolves.toBe(AGENTIC_RESULT);
     expect(receivedController).toBe(controller);
   });
@@ -111,7 +117,7 @@ describe('createFakeAiExecutor', () => {
     const structured = request('history');
     const controller = createFakeAiActionController();
     const agentic = coveredAgenticRequest({
-      controller: controller as InstructionCoverageAiActionController,
+      controller,
     });
 
     await executor.execute(structured);
@@ -124,19 +130,15 @@ describe('createFakeAiExecutor', () => {
   it('retains locally trusted instruction coverage and safe legacy recovery evidence exactly', async () => {
     const executor = createFakeAiExecutor({ executeAgentic: () => AGENTIC_RESULT });
     const request = coveredAgenticRequest({
-      priorTrace: {
+      priorTrace: safeLegacyTrace({
         events: [],
         verification: [{ type: 'assert', check: 'text-visible', text: 'Sign in' }],
-      } as unknown as SafeLegacyTraceRecord,
+      }),
     });
 
     await executor.executeAgentic(request);
 
     expect(executor.agenticRequests).toEqual([request]);
-    expect(executor.agenticRequests[0]).toMatchObject({
-      trustedInstructionCoverage: request.trustedInstructionCoverage,
-      priorTrace: request.priorTrace,
-    });
     expect(executor.agenticRequests[0]).not.toHaveProperty('verificationIntent');
   });
 
@@ -145,7 +147,7 @@ describe('createFakeAiExecutor', () => {
     const executor = createFakeAiExecutor();
 
     await expect(executor.executeAgentic(coveredAgenticRequest({
-      controller: controller as InstructionCoverageAiActionController,
+      controller,
     })))
       .rejects.toThrow(/override|configured|unscripted/i);
   });

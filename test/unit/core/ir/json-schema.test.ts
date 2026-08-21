@@ -121,6 +121,10 @@ describe('IR JSON Schema documents', () => {
 
     expect(PlanDocument.safeParse(planV2).success).toBe(true);
     expect(validators.plan(planV2)).toBe(true);
+    const { instructionCoverage: _coverage, ...aiStepWithoutCoverage } = planV2.steps[0]!;
+    const planWithoutCoverage = { ...planV2, steps: [aiStepWithoutCoverage] };
+    expect(PlanDocument.safeParse(planWithoutCoverage).success).toBe(false);
+    expect(validators.plan(planWithoutCoverage)).toBe(false);
     expect(PlanDocument.safeParse({ ...planV2, schemaVersion: 1 }).success).toBe(false);
     expect(validators.plan({ ...planV2, schemaVersion: 1 })).toBe(false);
     expect(GroundingDocument.safeParse(coveredGroundingV1).success).toBe(true);

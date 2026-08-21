@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import { TraceRecord } from '#core/ir/schema.js';
@@ -198,7 +198,7 @@ describe('validateGeneratedInstructionCoverage transient intent', () => {
 
   it.each([
     ['missing success', [], ['intent-id-missing']],
-    ['unknown ID', [{ criterionId: 'unknown', assertion: READY_ASSERTION }], ['intent-id-missing', 'intent-id-unknown']],
+    ['unknown ID', [{ criterionId: 'unknown', assertion: READY_ASSERTION }], ['intent-id-unknown', 'intent-id-missing']],
     ['duplicate ID', [
       { criterionId: 'ready', assertion: READY_ASSERTION },
       { criterionId: 'ready', assertion: READY_ASSERTION },
@@ -208,6 +208,22 @@ describe('validateGeneratedInstructionCoverage transient intent', () => {
       ...generatedCoverage('Ready'),
       verificationIntent,
     }, normalizeTestMd('Ready')), codes);
+  });
+
+  it('reports every missing success intent at a distinct criterion path', () => {
+    const result = validateGeneratedInstructionCoverage({
+      instructionCoverage: [
+        { id: 'first-ready', kind: 'success', citation: 'First ready' },
+        { id: 'second-ready', kind: 'success', citation: 'Second ready' },
+      ],
+      verificationIntent: [],
+    }, normalizeTestMd('First ready, then Second ready'));
+    const issues = expectIssueCodes(result, ['intent-id-missing', 'intent-id-missing']);
+
+    expect(issues.map(({ path }) => path)).toEqual([
+      ['verificationIntent', 'first-ready'],
+      ['verificationIntent', 'second-ready'],
+    ]);
   });
 
   it('rejects an action ID in terminal intent', () => {
@@ -387,6 +403,86 @@ describe('classifyPreScannedTraceCoverage', () => {
     }));
 
     expect(result).toEqual({ kind: 'legacy-cache-miss', priorTrace: trace });
+  });
+
+  it('classifies an own undefined coverage value as a safe legacy cache miss', () => {
+    const trace = preScanned({
+      events: [],
+      verification: [READY_ASSERTION],
+      verificationCoverage: undefined,
+    } as unknown as TraceRecordWithCoverageStorage);
+    expect(Object.hasOwn(trace, 'verificationCoverage')).toBe(true);
+
+    expect(expectSuccess(classifyPreScannedTraceCoverage({
+      trace,
+      criteria,
+      runValues: { values: new Map() },
+    }))).toEqual({ kind: 'legacy-cache-miss', priorTrace: trace });
+  });
+
+  it('never trusts inherited defined coverage as an additive coverage claim', () => {
+    const trace = Object.assign(
+      Object.create({ verificationCoverage: { ready: 0 } }) as object,
+      { events: [], verification: [READY_ASSERTION] },
+    ) as TraceRecordWithCoverageStorage;
+    const scanned = preScanned(trace);
+    expect(Object.hasOwn(scanned, 'verificationCoverage')).toBe(false);
+    expect(scanned.verificationCoverage).toEqual({ ready: 0 });
+
+    expect(expectSuccess(classifyPreScannedTraceCoverage({
+      trace: scanned,
+      criteria,
+      runValues: { values: new Map() },
+    }))).toEqual({ kind: 'legacy-cache-miss', priorTrace: scanned });
+  });
+
+  it('does not evaluate an inherited coverage getter while checking own presence', () => {
+    let accesses = 0;
+    const prototype = Object.defineProperty({}, 'verificationCoverage', {
+      get() {
+        accesses += 1;
+        throw new Error('inherited coverage getter must not execute');
+      },
+    });
+    const trace = Object.assign(Object.create(prototype) as object, {
+      events: [],
+      verification: [READY_ASSERTION],
+    }) as TraceRecordWithCoverageStorage;
+    const scanned = preScanned(trace);
+
+    expect(expectSuccess(classifyPreScannedTraceCoverage({
+      trace: scanned,
+      criteria,
+      runValues: { values: new Map() },
+    }))).toEqual({ kind: 'legacy-cache-miss', priorTrace: scanned });
+    expect(accesses).toBe(0);
+  });
+
+  it('orders same-path diagnostics by UTF-16 code units without consulting locale', () => {
+    const localeCompare = vi.spyOn(String.prototype, 'localeCompare').mockReturnValue(1);
+    try {
+      const issues = expectIssueCodes(classifyPreScannedTraceCoverage({
+        trace: preScanned({
+          events: [],
+          verification: [READY_ASSERTION],
+          verificationCoverage: { unknown: -1 },
+        }),
+        criteria,
+        runValues: { values: new Map() },
+      }), [
+        'verification-coverage-id-missing',
+        'verification-coverage-id-unknown',
+        'verification-coverage-index-invalid',
+      ]);
+
+      expect(issues.slice(1).map(({ code }) => code)).toEqual([
+        'verification-coverage-id-unknown',
+        'verification-coverage-index-invalid',
+      ]);
+      expect(localeCompare).not.toHaveBeenCalled();
+    } finally {
+      localeCompare.mockRestore();
+    }
   });
 
   it('accepts exact success-to-terminal-index coverage including prototype-shaped IDs', () => {

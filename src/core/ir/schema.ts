@@ -350,7 +350,7 @@ export type InstructionSourceSpan = z.infer<typeof InstructionSourceSpan>;
 export const GeneratedInstructionCriterion = z.strictObject({
   id: InstructionCriterionId,
   kind: z.enum(['success', 'action']),
-  citation: z.string().min(1),
+  citation: z.string().min(1).max(CITATION_MAX_LENGTH),
 });
 
 /** Runtime provider schema authority for {@link GeneratedInstructionCriterion}. */

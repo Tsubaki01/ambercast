@@ -50,14 +50,8 @@ describe('prompt envelope', () => {
 
   it('exports one generator task composer with the fingerprinted policy delimiter', () => {
     const task = 'Generate the sign-in plan.';
-    const promptEnvelopeExports = corePromptEnvelope as typeof corePromptEnvelope & {
-      buildGeneratorTask?: (task: string) => string;
-    };
 
-    expect(typeof promptEnvelopeExports.buildGeneratorTask).toBe('function');
-    if (promptEnvelopeExports.buildGeneratorTask === undefined) return;
-
-    expect(promptEnvelopeExports.buildGeneratorTask(task)).toBe(
+    expect(corePromptEnvelope.buildGeneratorTask(task)).toBe(
       `${corePromptEnvelope.GENERATOR_INSTRUCTION_COVERAGE_POLICY_TEMPLATE.trim()}\n\n${task}`,
     );
   });

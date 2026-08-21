@@ -584,7 +584,10 @@ function rawGroundingHasCoverageClaim(sourceText: string): boolean {
  * each trace is classified independently after pre-scan. Present coverage also
  * requires exact canonical bytes. Prototype inheritance never establishes
  * presence, duplicate raw keys cannot survive canonical equality, and no
- * branch returns an unvalidated raw trace.
+ * branch returns an unvalidated raw trace. Once current provenance is
+ * established, a duplicate-preserving reader failure is itself an integrity
+ * failure because the loader can no longer prove that a hidden exact-path
+ * coverage claim is absent.
  */
 export function inspectGroundingCoverageSource(
   sourceText: string,
@@ -601,7 +604,12 @@ export function inspectGroundingCoverageSource(
   if (root.schemaVersion !== GROUNDING_SCHEMA_VERSION || root.planDigest !== expectedPlanDigest) {
     return { kind: 'cache-miss' };
   }
-  const hasClaim = rawGroundingHasCoverageClaim(sourceText);
+  let hasClaim: boolean;
+  try {
+    hasClaim = rawGroundingHasCoverageClaim(sourceText);
+  } catch {
+    return { kind: 'integrity-failure', reason: 'coverage-structure-invalid' };
+  }
   const parsed = GroundingDocument.safeParse(raw);
   if (!parsed.success) {
     return hasClaim
@@ -1243,6 +1251,9 @@ export function preScanTraceForInstructionCoverage(
  * change how a later ordinary action rejection is handled. The abort neither
  * examines the browser's message nor retains the materialized value, and
  * placing this rule here leaves fresh agentic dispatch unchanged.
+ * Cancellation is observed before every event and terminal verification, so
+ * an abort raised by one browser operation prevents the next journal entry
+ * from reaching materialization or the browser.
  */
 export async function replayCoveredTraceWithoutAi(
   trace: CoveredTraceRecord,
@@ -1250,6 +1261,7 @@ export async function replayCoveredTraceWithoutAi(
   secretRefs: ReadonlySet<string>,
 ): Promise<boolean> {
   for (const entry of trace.events) {
+    context.signal?.throwIfAborted();
     if (entry.type === 'assert') {
       const outcome = await context.session.evaluateAssert(await materializeTraceAssert(entry, context));
       if (!outcome.passed) {
@@ -1280,6 +1292,7 @@ export async function replayCoveredTraceWithoutAi(
   }
 
   for (const assertion of trace.verification) {
+    context.signal?.throwIfAborted();
     const outcome = await context.session.evaluateAssert(await materializeTraceAssert(assertion, context));
     if (!outcome.passed) {
       return false;

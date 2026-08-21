@@ -1,16 +1,22 @@
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import type {
-  AiExecutor,
-  InstructionCoverageAiActionController,
   InstructionCoveredAiAgenticRequest,
+  InstructionCoveredAiExecutor,
   SafeLegacyTraceRecord,
 } from '../../src/ports/ai.js';
+import type { TraceRecord } from '../../src/core/ir/schema.js';
 import { typedJsonSchema } from '../../src/core/ai/typed-json-schema.js';
 import { createFakeAiActionController } from '../doubles/fake-ai-action-controller.js';
 
 function responseSchema() {
   return typedJsonSchema(z.object({ ok: z.boolean() }));
+}
+
+function safeLegacyTrace(
+  trace: TraceRecord & { readonly verificationCoverage?: never },
+): SafeLegacyTraceRecord {
+  return trace as SafeLegacyTraceRecord;
 }
 
 function coveredAgenticRequest(signal?: AbortSignal): InstructionCoveredAiAgenticRequest {
@@ -24,17 +30,17 @@ function coveredAgenticRequest(signal?: AbortSignal): InstructionCoveredAiAgenti
       sourceSpan: { startLine: 3, startColumn: 1, endLine: 3, endColumn: 22 },
       text: 'Complete sign-in.',
     }],
-    controller: createFakeAiActionController() as InstructionCoverageAiActionController,
-    priorTrace: {
+    controller: createFakeAiActionController(),
+    priorTrace: safeLegacyTrace({
       events: [],
       verification: [{ type: 'assert', check: 'text-visible', text: 'Sign in' }],
-    } as unknown as SafeLegacyTraceRecord,
+    }),
     ...(signal === undefined ? {} : { signal }),
   };
 }
 
 export interface AiExecutorTransportHarness {
-  createExecutor(scenario: AiExecutorTransportScenario): AiExecutor | Promise<AiExecutor>;
+  createExecutor(scenario: AiExecutorTransportScenario): InstructionCoveredAiExecutor | Promise<InstructionCoveredAiExecutor>;
   dispose?(): void | Promise<void>;
 }
 

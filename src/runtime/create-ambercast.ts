@@ -17,7 +17,7 @@ import { readCommandEnvironment } from '#adapters/system/process-command-environ
 import { createSystemClock } from '#adapters/system/system-clock.js';
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { createLayoutResolver, type LayoutResolver } from '#core/layout/resolve.js';
-import type { AiExecutor } from '#ports/ai.js';
+import type { InstructionCoveredAiExecutor } from '#ports/ai.js';
 import type { BrowserDriverResolver } from '#ports/index.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { Clock, EventSink, SecretsProvider } from '#ports/system.js';
@@ -71,7 +71,7 @@ export interface Ambercast {
   readonly layout: LayoutResolver;
 
   /** The selected provider adapter. */
-  readonly aiExecutor: AiExecutor;
+  readonly aiExecutor: InstructionCoveredAiExecutor;
 
   /** Host clock used by command reporting and replay's per-case duration measurement. */
   readonly clock: Clock;

@@ -1,6 +1,7 @@
 import { describe, expectTypeOf, it } from 'vitest';
 import type {
   ElementRef,
+  InstructionCriterionId,
   JsonValueT,
   RunVariableName,
   SecretRef,
@@ -19,10 +20,14 @@ import type {
   AiTrustedInstructionCriterion,
   InstructionCoverageAiActionController,
   InstructionCoveredAiAgenticRequest,
+  InstructionCoveredAiExecutor,
   SafeLegacyTraceRecord,
   AiResolutionSnapshot,
   AiUsage,
 } from '../../../src/ports/ai.js';
+import { createClaudeCodeCliExecutor } from '../../../src/adapters/ai/claude-code-cli/index.js';
+import { createCodexCliExecutor } from '../../../src/adapters/ai/codex-cli/index.js';
+import { AI_EXECUTOR_FACTORIES } from '../../../src/adapters/ai/registry.js';
 import type {
   AssertCheck,
   AssertOutcome,
@@ -113,7 +118,7 @@ describe('AI port shapes', () => {
 
   it('narrows instruction-covered agentic authority to local criteria and safe legacy recovery', () => {
     expectTypeOf<InstructionCoverageAiActionController['evaluateAssert']>().toEqualTypeOf<
-      (check: TraceAssert, criterionId?: string) => Promise<AssertOutcome>
+      (check: TraceAssert, criterionId?: InstructionCriterionId) => Promise<AssertOutcome>
     >();
     expectTypeOf<InstructionCoveredAiAgenticRequest>().toMatchTypeOf<{
       readonly instructionPrompt: string;
@@ -126,5 +131,16 @@ describe('AI port shapes', () => {
     }>();
     expectTypeOf<InstructionCoveredAiAgenticRequest>()
       .not.toHaveProperty('verificationIntent');
+  });
+
+  it('preserves the instruction-covered executor type through concrete factories and registry lookup', () => {
+    expectTypeOf(createClaudeCodeCliExecutor()).toEqualTypeOf<InstructionCoveredAiExecutor>();
+    expectTypeOf(createCodexCliExecutor()).toEqualTypeOf<InstructionCoveredAiExecutor>();
+    expectTypeOf(AI_EXECUTOR_FACTORIES.claude({ run: async () => ({
+      outcome: 'exited', stdout: '', stderr: '', exitCode: 0,
+    }) })).toEqualTypeOf<InstructionCoveredAiExecutor>();
+    expectTypeOf(AI_EXECUTOR_FACTORIES.codex({ run: async () => ({
+      outcome: 'exited', stdout: '', stderr: '', exitCode: 0,
+    }) })).toEqualTypeOf<InstructionCoveredAiExecutor>();
   });
 });

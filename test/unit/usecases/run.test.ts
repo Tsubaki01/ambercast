@@ -35,7 +35,7 @@ import {
   type TraceRecord,
 } from '#core/ir/schema.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
-import type { AiAgenticRequest, InstructionCoverageAiActionController } from '#ports/ai.js';
+import type { AiAgenticRequest, InstructionCoveredAiAgenticRequest } from '#ports/ai.js';
 import type { BrowserDriver, BrowserEngine, BrowserSession, PerformableAction } from '#ports/browser.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { Clock, RunEvent } from '#ports/system.js';
@@ -324,12 +324,11 @@ function passingText(text: string): TraceAssert {
 }
 
 function evaluateTerminalAssert(
-  request: AiAgenticRequest,
+  request: InstructionCoveredAiAgenticRequest,
   assertion: TraceAssert,
   criterionId = 'dashboard-reached',
 ) {
-  return (request.controller as InstructionCoverageAiActionController)
-    .evaluateAssert(assertion, criterionId);
+  return request.controller.evaluateAssert(assertion, criterionId);
 }
 
 function aiCalls(events: ReturnType<typeof createRecordingEventSink>): readonly Extract<RunEvent, { type: 'ai-call' }>[] {
@@ -1994,8 +1993,7 @@ describe('run agentic fallback pipeline', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'navigate', url: '/dashboard' });
-        await (request.controller as InstructionCoverageAiActionController)
-          .evaluateAssert(passingText('Dashboard'), 'dashboard-reached');
+        await request.controller.evaluateAssert(passingText('Dashboard'), 'dashboard-reached');
         return { outcome: 'success' };
       },
     });
@@ -2382,9 +2380,8 @@ describe('run agentic fallback pipeline', () => {
         }
       },
     });
-    const executeAgentic = vi.fn(async (request: AiAgenticRequest) => {
-      await (request.controller as InstructionCoverageAiActionController)
-        .evaluateAssert(passingText('Recovered dashboard'), 'dashboard-reached');
+    const executeAgentic = vi.fn(async (request: InstructionCoveredAiAgenticRequest) => {
+      await request.controller.evaluateAssert(passingText('Recovered dashboard'), 'dashboard-reached');
       return { outcome: 'success' as const };
     });
     const executor = createFakeAiExecutor({ executeAgentic });
@@ -2432,9 +2429,8 @@ describe('run agentic fallback pipeline', () => {
     );
     const session = createFakeBrowserSession(new Map());
     const fillSecret = vi.spyOn(session, 'fillSecret');
-    const executeAgentic = vi.fn(async (request: AiAgenticRequest) => {
-      await (request.controller as InstructionCoverageAiActionController)
-        .evaluateAssert(passingText('Recovered after bind miss'), 'dashboard-reached');
+    const executeAgentic = vi.fn(async (request: InstructionCoveredAiAgenticRequest) => {
+      await request.controller.evaluateAssert(passingText('Recovered after bind miss'), 'dashboard-reached');
       return { outcome: 'success' as const };
     });
     const executor = createFakeAiExecutor({ executeAgentic });
@@ -2558,8 +2554,7 @@ describe('run agentic fallback pipeline', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'press', target: SUBMIT, key: 'Enter' });
-        await (request.controller as InstructionCoverageAiActionController)
-          .evaluateAssert(passingText('Refreshed dashboard'), 'dashboard-reached');
+        await request.controller.evaluateAssert(passingText('Refreshed dashboard'), 'dashboard-reached');
         return { outcome: 'success' };
       },
     });
@@ -2615,8 +2610,7 @@ describe('run agentic fallback pipeline', () => {
     arrange(session);
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
-        await (request.controller as InstructionCoverageAiActionController)
-          .evaluateAssert(passingText('Recovered'), 'dashboard-reached');
+        await request.controller.evaluateAssert(passingText('Recovered'), 'dashboard-reached');
         return { outcome: 'success' };
       },
     });
@@ -2644,8 +2638,7 @@ describe('run agentic fallback pipeline', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'click', target: SUBMIT });
-        await (request.controller as InstructionCoverageAiActionController)
-          .evaluateAssert(passingText('Refreshed dashboard'), 'dashboard-reached');
+        await request.controller.evaluateAssert(passingText('Refreshed dashboard'), 'dashboard-reached');
         return { outcome: 'success' };
       },
     });
@@ -4130,8 +4123,7 @@ describe('run agentic wrapper state machine', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'navigate', url: '/settings' });
-        await (request.controller as InstructionCoverageAiActionController)
-          .evaluateAssert(passingText('Settings'), 'dashboard-reached');
+        await request.controller.evaluateAssert(passingText('Settings'), 'dashboard-reached');
         return { outcome: 'success' };
       },
     });
@@ -4157,10 +4149,8 @@ describe('run agentic wrapper state machine', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'navigate', url: '/dashboard' });
-        await (request.controller as InstructionCoverageAiActionController)
-          .evaluateAssert(passingText('Dashboard'), 'credentials-submitted');
-        await (request.controller as InstructionCoverageAiActionController)
-          .evaluateAssert(passingText('Signed in as Ari'), 'dashboard-reached');
+        await request.controller.evaluateAssert(passingText('Dashboard'), 'credentials-submitted');
+        await request.controller.evaluateAssert(passingText('Signed in as Ari'), 'dashboard-reached');
         return { outcome: 'success' };
       },
     });
@@ -4226,8 +4216,7 @@ describe('run agentic wrapper state machine', () => {
         await request.controller.perform({ type: 'navigate', url: '/dashboard' });
         await request.controller.evaluateAssert(passingText('Earlier dashboard'));
         await interrupt(request);
-        await (request.controller as InstructionCoverageAiActionController)
-          .evaluateAssert(passingText('Terminal dashboard'), 'dashboard-reached');
+        await request.controller.evaluateAssert(passingText('Terminal dashboard'), 'dashboard-reached');
         return { outcome: 'success' };
       },
     });
@@ -4351,8 +4340,7 @@ describe('run agentic wrapper state machine', () => {
     const executor = createFakeAiExecutor({
       async executeAgentic(request) {
         await request.controller.perform({ type: 'navigate', url: '/fresh' });
-        await (request.controller as InstructionCoverageAiActionController)
-          .evaluateAssert(passingText('Fresh'), 'dashboard-reached');
+        await request.controller.evaluateAssert(passingText('Fresh'), 'dashboard-reached');
         return { outcome: 'success' };
       },
     });

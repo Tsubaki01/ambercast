@@ -32,11 +32,11 @@ import {
 import type {
   GeneratedInstructionCriterion,
   InstructionCriterion,
+  JsonValueT,
   RunVariableName,
   TraceRecord,
   TraceRecordWithCoverageStorage,
   VerificationCoverage,
-  VerificationIntent,
 } from '#core/ir/schema.js';
 import type {
   AiTrustedInstructionCriterion,
@@ -50,7 +50,10 @@ export interface GeneratedInstructionCoverage {
   readonly instructionCoverage: readonly GeneratedInstructionCriterion[];
 
   /** One transient full assertion intent for every success criterion. */
-  readonly verificationIntent: readonly VerificationIntent[];
+  readonly verificationIntent: readonly {
+    readonly criterionId: string;
+    readonly assertion: JsonValueT;
+  }[];
 }
 
 /**
@@ -202,10 +205,6 @@ export type MaterializedNonUrlTraceAssert = Exclude<
 export function materializeAssertionForCoverage(
   assertion: MaterializedNonUrlTraceAssert,
   runValues: ReadonlyRunValueProjection,
-): MaterializedNonUrlTraceAssert;
-export function materializeAssertionForCoverage(
-  assertion: MaterializedNonUrlTraceAssert,
-  runValues: ReadonlyRunValueProjection,
 ): MaterializedNonUrlTraceAssert {
   const replace = (value: string): string => value.replace(
     /\{\{run\.([A-Za-z0-9_]+)\}\}/g,
@@ -222,6 +221,10 @@ export function materializeAssertionForCoverage(
   }
 }
 
+function compareUtf16(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 function compareCriteria(left: InstructionCriterion, right: InstructionCriterion): number {
   const leftSpan = left.sourceSpan;
   const rightSpan = right.sourceSpan;
@@ -229,8 +232,8 @@ function compareCriteria(left: InstructionCriterion, right: InstructionCriterion
     || leftSpan.startColumn - rightSpan.startColumn
     || leftSpan.endLine - rightSpan.endLine
     || leftSpan.endColumn - rightSpan.endColumn
-    || left.kind.localeCompare(right.kind)
-    || left.id.localeCompare(right.id);
+    || compareUtf16(left.kind, right.kind)
+    || compareUtf16(left.id, right.id);
 }
 
 function comparePathSegment(left: string | number, right: string | number): number {
@@ -252,7 +255,7 @@ function sortedIssues(issues: InstructionCoverageIssue[]): readonly InstructionC
       if (comparison !== 0) return comparison;
     }
     return left.path.length - right.path.length
-      || left.code.localeCompare(right.code);
+      || compareUtf16(left.code, right.code);
   });
 }
 
@@ -364,10 +367,6 @@ export interface TraceCoverageValidationInput {
 export function validateGeneratedInstructionCoverage(
   generated: GeneratedInstructionCoverage,
   normalizedTestMd: NormalizedTestMd,
-): InstructionCoverageResult<readonly InstructionCriterion[]>;
-export function validateGeneratedInstructionCoverage(
-  generated: GeneratedInstructionCoverage,
-  normalizedTestMd: NormalizedTestMd,
 ): InstructionCoverageResult<readonly InstructionCriterion[]> {
   const issues: InstructionCoverageIssue[] = [];
   const criteria: InstructionCriterion[] = [];
@@ -431,14 +430,15 @@ export function validateGeneratedInstructionCoverage(
     intentIds.add(intent.criterionId);
     if (actionIds.has(intent.criterionId)) issues.push(issue('intent-id-action', ['verificationIntent', index, 'criterionId']));
     else if (!successIds.has(intent.criterionId)) issues.push(issue('intent-id-unknown', ['verificationIntent', index, 'criterionId']));
-    if (intent.assertion.check === 'url-matches') {
+    const parsedAssertion = TraceAssert.safeParse(intent.assertion);
+    if (parsedAssertion.success && parsedAssertion.data.check === 'url-matches') {
       issues.push(issue('terminal-url-matches-forbidden', ['verificationIntent', index, 'assertion']));
-    } else if (!TraceAssert.safeParse(intent.assertion).success) {
+    } else if (!parsedAssertion.success) {
       issues.push(issue('intent-assertion-unsupported', ['verificationIntent', index, 'assertion']));
     }
   }
   for (const id of successIds) {
-    if (!intentIds.has(id)) issues.push(issue('intent-id-missing', ['verificationIntent', 0, 'criterionId']));
+    if (!intentIds.has(id)) issues.push(issue('intent-id-missing', ['verificationIntent', id]));
   }
 
   return issues.length > 0 ? failure(issues) : { success: true, data: criteria.sort(compareCriteria) };
@@ -464,10 +464,6 @@ export function validateGeneratedInstructionCoverage(
  * work. The policy is pure; each caller owns whether failure means regenerate,
  * stale, or integrity violation.
  */
-export function validateCommittedInstructionCoverage(
-  criteria: readonly InstructionCriterion[],
-  normalizedTestMd: NormalizedTestMd,
-): InstructionCoverageResult<readonly TrustedInstructionCriterion[]>;
 export function validateCommittedInstructionCoverage(
   criteria: readonly InstructionCriterion[],
   normalizedTestMd: NormalizedTestMd,
@@ -510,9 +506,9 @@ export function validateCommittedInstructionCoverage(
  * The caller first distinguishes cold storage from an existing trace, then
  * runs the complete secret, run-reference, and structural pre-scan before
  * calling this function. That ordering prevents unsafe legacy data from being
- * exposed as `priorTrace` to a provider. After pre-scan, absent coverage is a
- * recoverable normal-mode fallback or cache-only abort; it is never replayed
- * or re-persisted unchanged.
+ * exposed as `priorTrace` to a provider. After pre-scan, absent coverage or an
+ * own property whose value is `undefined` is a recoverable normal-mode
+ * fallback or cache-only abort; it is never replayed or re-persisted unchanged.
  *
  * Current-provenance data claiming coverage passes raw parse, strict schema,
  * and canonical-byte checks before reaching this typed boundary. Present
@@ -536,14 +532,14 @@ export function validateCommittedInstructionCoverage(
  */
 export function classifyPreScannedTraceCoverage(
   input: TraceCoverageValidationInput,
-): InstructionCoverageResult<PreScannedTraceCoverage>;
-export function classifyPreScannedTraceCoverage(
-  input: TraceCoverageValidationInput,
 ): InstructionCoverageResult<PreScannedTraceCoverage> {
   if (!Object.hasOwn(input.trace, 'verificationCoverage')) {
     return { success: true, data: { kind: 'legacy-cache-miss', priorTrace: input.trace as SafeLegacyTraceRecord } };
   }
-  const coverage = input.trace.verificationCoverage!;
+  const coverage = input.trace.verificationCoverage;
+  if (coverage === undefined) {
+    return { success: true, data: { kind: 'legacy-cache-miss', priorTrace: input.trace as SafeLegacyTraceRecord } };
+  }
   const issues: InstructionCoverageIssue[] = [];
   const successIds = new Set(input.criteria.filter(({ kind }) => kind === 'success').map(({ id }) => id));
   const actionIds = new Set(input.criteria.filter(({ kind }) => kind === 'action').map(({ id }) => id));

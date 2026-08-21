@@ -4,7 +4,7 @@ import {
   toCanonicalArtifactText,
   toCanonicalDigestBytes,
 } from '../../../../src/core/ir/canonical-json.js';
-import { PlanDocument } from '../../../../src/core/ir/schema.js';
+import { JsonValue, PlanDocument } from '../../../../src/core/ir/schema.js';
 import type { JsonValueT, Step } from '../../../../src/core/ir/schema.js';
 import { normalizeAiStepSecretGrants } from '../../../../src/usecases/generator-secret-policy.js';
 
@@ -269,7 +269,7 @@ describe('canonical JSON serialization', () => {
       ref: '{{secrets.account.token}}',
       sourceSpan: { startLine: 6, endLine: 6 },
     }];
-    const first = normalizeAiStepSecretGrants([{
+    const firstSteps: Step[] = [{
       id: 'complete-sign-in',
       kind: 'ai',
       instruction: 'Complete sign-in.',
@@ -279,8 +279,8 @@ describe('canonical JSON serialization', () => {
         sourceSpan: { startLine: 1, startColumn: 1, endLine: 1, endColumn: 10 },
       }],
       secrets: grants,
-    }] as unknown as Step[]);
-    const second = normalizeAiStepSecretGrants([{
+    }];
+    const secondSteps: Step[] = [{
       id: 'complete-sign-in',
       kind: 'ai',
       instruction: 'Complete sign-in.',
@@ -290,9 +290,11 @@ describe('canonical JSON serialization', () => {
         sourceSpan: { startLine: 1, startColumn: 1, endLine: 1, endColumn: 10 },
       }],
       secrets: [...grants].reverse(),
-    }] as unknown as Step[]);
+    }];
+    const first = normalizeAiStepSecretGrants(firstSteps);
+    const second = normalizeAiStepSecretGrants(secondSteps);
 
-    expect(toCanonicalArtifactText(first as unknown as JsonValueT))
-      .toBe(toCanonicalArtifactText(second as unknown as JsonValueT));
+    expect(toCanonicalArtifactText(JsonValue.parse(first)))
+      .toBe(toCanonicalArtifactText(JsonValue.parse(second)));
   });
 });

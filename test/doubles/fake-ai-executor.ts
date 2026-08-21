@@ -1,15 +1,17 @@
 import type {
-  AiAgenticRequest,
   AiAgenticResult,
   AiExecuteRequest,
   AiExecuteResult,
-  AiExecutor,
+  InstructionCoveredAiAgenticRequest,
+  InstructionCoveredAiExecutor,
 } from '../../src/ports/ai.js';
 import { rejectOnAbort } from '../../src/core/ai/reject-on-abort.js';
 
 export interface FakeAiExecutorOptions {
   readonly execute?: (request: AiExecuteRequest<unknown>) => AiExecuteResult<unknown> | Promise<AiExecuteResult<unknown>>;
-  readonly executeAgentic?: (request: AiAgenticRequest) => AiAgenticResult | Promise<AiAgenticResult>;
+  readonly executeAgentic?: (
+    request: InstructionCoveredAiAgenticRequest,
+  ) => AiAgenticResult | Promise<AiAgenticResult>;
   readonly cannedResponses?: ReadonlyMap<string, AiExecuteResult<unknown>>;
   readonly available?: boolean;
 }
@@ -20,9 +22,9 @@ export interface FakeAiExecutorOptions {
  * The histories make lazy-fallback and prior-trace assertions observable
  * without asking an individual test to wrap the fake in another recorder.
  */
-export interface FakeAiExecutor extends AiExecutor {
+export interface FakeAiExecutor extends InstructionCoveredAiExecutor {
   readonly structuredRequests: readonly AiExecuteRequest<unknown>[];
-  readonly agenticRequests: readonly AiAgenticRequest[];
+  readonly agenticRequests: readonly InstructionCoveredAiAgenticRequest[];
 }
 
 /**
@@ -40,7 +42,7 @@ export interface FakeAiExecutor extends AiExecutor {
  */
 export function createFakeAiExecutor(options: FakeAiExecutorOptions = {}): FakeAiExecutor {
   const structuredRequests: AiExecuteRequest<unknown>[] = [];
-  const agenticRequests: AiAgenticRequest[] = [];
+  const agenticRequests: InstructionCoveredAiAgenticRequest[] = [];
 
   return {
     name: 'codex-cli',
@@ -63,7 +65,7 @@ export function createFakeAiExecutor(options: FakeAiExecutorOptions = {}): FakeA
         return cannedResponse as AiExecuteResult<T>;
       });
     },
-    async executeAgentic(request: AiAgenticRequest): Promise<AiAgenticResult> {
+    async executeAgentic(request: InstructionCoveredAiAgenticRequest): Promise<AiAgenticResult> {
       return rejectOnAbort(request.signal, async () => {
         agenticRequests.push(request);
         if (options.executeAgentic === undefined) {

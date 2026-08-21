@@ -945,6 +945,14 @@ describe('PlanDocument', () => {
       ...generated,
       verificationIntent: [{ ...VERIFICATION_INTENT[0], unexpected: true }],
     });
+    expectAccepted(GeneratedAiStep, {
+      ...generated,
+      instructionCoverage: [{ ...GENERATED_INSTRUCTION_COVERAGE[0], citation: 'a'.repeat(4_096) }],
+    });
+    expectRejected(GeneratedAiStep, {
+      ...generated,
+      instructionCoverage: [{ ...GENERATED_INSTRUCTION_COVERAGE[0], citation: 'a'.repeat(4_097) }],
+    });
   });
 });
 

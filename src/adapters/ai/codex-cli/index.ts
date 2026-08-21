@@ -17,11 +17,11 @@ import {
   type CommandRunner,
 } from '#adapters/ai/shared/command-runner.js';
 import type {
-  AiAgenticRequest,
   AiAgenticResult,
   AiExecuteRequest,
   AiExecuteResult,
-  AiExecutor,
+  InstructionCoveredAiAgenticRequest,
+  InstructionCoveredAiExecutor,
 } from '#ports/ai.js';
 
 /**
@@ -52,7 +52,9 @@ import type {
      * ambient credentials. Injected runners leave the protocol deterministic
      * under test.
  */
-export function createCodexCliExecutor(deps: { readonly run?: CommandRunner } = {}): AiExecutor {
+export function createCodexCliExecutor(
+  deps: { readonly run?: CommandRunner } = {},
+): InstructionCoveredAiExecutor {
   const run = deps.run ?? createSpawnCommandRunner();
 
   return {
@@ -123,7 +125,7 @@ export function createCodexCliExecutor(deps: { readonly run?: CommandRunner } = 
         throw error;
       });
     },
-    async executeAgentic(request: AiAgenticRequest): Promise<AiAgenticResult> {
+    async executeAgentic(request: InstructionCoveredAiAgenticRequest): Promise<AiAgenticResult> {
       if (request.signal?.aborted) {
         throw abortReason(request.signal);
       }

@@ -401,7 +401,7 @@ describe('generate', () => {
     ['unsupported assertion shape', [{
       criterionId: 'dashboard-reached',
       assertion: { type: 'assert', check: 'element-count', target: PASSWORD_TARGET, min: 0 },
-    }], ['steps', 0, 'verificationIntent', 0, 'assertion']],
+    }], ['verificationIntent', 0, 'assertion']],
     ['terminal url intent', [{ criterionId: 'dashboard-reached', assertion: { type: 'assert', check: 'url-matches', pattern: '/dashboard$' } }], ['verificationIntent', 0, 'assertion']],
   ] as const)(
     'preserves raw response and a path for %s without writing either artifact',

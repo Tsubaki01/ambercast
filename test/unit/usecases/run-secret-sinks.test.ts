@@ -25,7 +25,6 @@ import { createLayoutResolver } from '#core/layout/resolve.js';
 import type {
   AiActionController,
   AiExecutor,
-  InstructionCoverageAiActionController,
   InstructionCoveredAiAgenticRequest,
 } from '#ports/ai.js';
 import type { BrowserSession } from '#ports/browser.js';
@@ -373,7 +372,7 @@ describe('run secret sinks', () => {
         sourceSpan: SUCCESS_SOURCE_SPAN,
         text: 'When I submit valid credentials, I reach the dashboard.',
       }],
-      controller: controller as InstructionCoverageAiActionController,
+      controller,
     };
     await expect(executor.executeAgentic(agenticRequest))
       .rejects.toMatchObject({ kind: 'ai-executor-unavailable' });

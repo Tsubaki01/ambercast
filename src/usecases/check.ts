@@ -28,6 +28,7 @@ import { resolveTarget } from '#core/target/resolve.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { CheckResult } from '#report/schema.js';
 import type {
+  InstructionCoverageIssue,
   InstructionCoverageResult,
   TrustedInstructionCriterion,
 } from './instruction-coverage-policy.js';
@@ -53,7 +54,7 @@ export function inspectCommittedInstructionCoverage(
   normalizedTestMd: NormalizedTestMd,
 ): InstructionCoverageResult<ReadonlyMap<StepId, readonly TrustedInstructionCriterion[]>> {
   const trusted = new Map<StepId, readonly TrustedInstructionCriterion[]>();
-  const issues = [];
+  const issues: InstructionCoverageIssue[] = [];
   for (const step of plan.steps) {
     if (step.kind !== 'ai') continue;
     const result = validateCommittedInstructionCoverage(step.instructionCoverage, normalizedTestMd);

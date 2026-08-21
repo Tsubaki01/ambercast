@@ -18,6 +18,7 @@ import {
 } from '#core/ir/schema.js';
 import {
   validateGeneratedInstructionCoverage,
+  type GeneratedInstructionCoverage,
   type InstructionCoverageIssue,
 } from './instruction-coverage-policy.js';
 import type { NormalizedTestMd } from '#core/ir/normalize.js';
@@ -100,11 +101,18 @@ export const SECRET_GRANT_UNATTRIBUTABLE_HINTS: Record<
  * claimed-grant map. Encoding it as a refinement would hide the contract from
  * generated JSON Schema and still could not express its document-wide state.
  */
+/** Provider steps accepted by local instruction policy after transport parsing. */
+export type InstructionPolicyGeneratedStep =
+  | Exclude<GeneratedStep, GeneratedAiStep>
+  | (Omit<GeneratedAiStep, 'verificationIntent'> & GeneratedInstructionCoverage);
+
 /** Provider steps after secret citations are attributed but before instruction attribution. */
 type SecretAttributedGeneratedStep =
   | Exclude<GeneratedStep, GeneratedAiStep | Extract<GeneratedStep, { action: 'fill-secret' }>>
   | Extract<Step, { kind: 'action'; action: 'fill-secret' }>
-  | (Omit<GeneratedAiStep, 'secrets'> & { readonly secrets?: AiStepSecretGrant[] });
+  | (Omit<Extract<InstructionPolicyGeneratedStep, { kind: 'ai' }>, 'secrets'> & {
+    readonly secrets?: AiStepSecretGrant[];
+  });
 
 export class InstructionCoverageAttributionError extends Error {
   constructor(readonly issues: readonly InstructionCoverageIssue[]) {
@@ -113,7 +121,7 @@ export class InstructionCoverageAttributionError extends Error {
 }
 
 export function attributeSecretGrants(
-  steps: readonly GeneratedStep[],
+  steps: readonly InstructionPolicyGeneratedStep[],
   normalizedTestMd: NormalizedTestMd,
 ): Step[] {
   const grants = extractSecretGrants(normalizedTestMd);
@@ -171,16 +179,7 @@ export function attributeSecretGrants(
       verificationIntent: step.verificationIntent,
     }, normalizedTestMd);
     if (!result.success) {
-      const missingIds = step.instructionCoverage
-        .filter(({ kind, id }) => kind === 'success'
-          && !step.verificationIntent.some(({ criterionId }) => criterionId === id))
-        .map(({ id }) => id);
-      let missingIndex = 0;
-      throw new InstructionCoverageAttributionError(result.issues.map((coverageIssue) => (
-        coverageIssue.code === 'intent-id-missing'
-          ? { ...coverageIssue, path: ['verificationIntent', missingIds[missingIndex++] ?? 'missing'] }
-          : coverageIssue
-      )));
+      throw new InstructionCoverageAttributionError(result.issues);
     }
     const { verificationIntent: _intent, instructionCoverage: _coverage, ...committed } = step;
     return { ...committed, instructionCoverage: [...result.data] };
