@@ -667,6 +667,256 @@ describe('run', () => {
     expect(browserDriver).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    [
+      'an invalid explicit target',
+      {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets: TARGETS,
+        defaultTarget: 'web',
+        ai: { provider: 'codex' as const, timeoutMs: 120_000 },
+      },
+      { target: 'missing' },
+      'The requested target is not configured.',
+      { target: 'missing' },
+    ],
+    [
+      'an ambiguous implicit target',
+      {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets: MULTI_TARGETS,
+        ai: { provider: 'codex' as const, timeoutMs: 120_000 },
+      },
+      {},
+      'A target could not be selected from the configured targets.',
+      { target: '(default)', targetNames: ['staging', 'web'] },
+    ],
+  ] as const)('keeps two ordered case failures for %s without downstream work', async (
+    _description,
+    config,
+    optionOverride,
+    message,
+    details,
+  ) => {
+    const { deps, browserDriver, recordingStorage, resolveAiExecutor } = createScenario({
+      config,
+      discoverTestFiles: async () => ['first.test.md', 'second.test.md'],
+    });
+    const firstPath = await writePrompt(recordingStorage.storage, 'first.test.md', 'first');
+    const secondPath = await writePrompt(recordingStorage.storage, 'second.test.md', 'second');
+    recordingStorage.reads.length = 0;
+    recordingStorage.exists.length = 0;
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, { ...DEFAULT_OPTIONS, ...optionOverride });
+
+    expect(outcome.results.map(({ result }) => ({ file: result.file, status: result.status }))).toEqual([
+      { file: firstPath, status: 'error' },
+      { file: secondPath, status: 'error' },
+    ]);
+    for (const caseOutcome of outcome.results) {
+      expect(caseOutcome.error).toBeInstanceOf(TargetUnresolvedError);
+      expect(caseOutcome.error).toMatchObject({
+        kind: 'target-unresolved',
+        exitCode: 2,
+        message,
+        details,
+      });
+      expect(caseOutcome.error?.details).toEqual(details);
+    }
+    expect(recordingStorage.reads).toEqual([firstPath, secondPath]);
+    expect(recordingStorage.exists).toEqual([]);
+    expect(recordingStorage.writes).toEqual([]);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(browserDriver).not.toHaveBeenCalled();
+  });
+
+  it('rejects an inherited explicit target without falling back to a valid own default', async () => {
+    const inheritedName = 'inherited-replay';
+    const inheritedDefinition = {
+      baseUrl: 'https://inherited.example.test',
+      browser: 'chromium' as const,
+    };
+    const prototype = Object.fromEntries([[inheritedName, inheritedDefinition]]);
+    const targets = Object.assign(
+      Object.create(prototype) as Record<string, Readonly<typeof inheritedDefinition>>,
+      { web: TARGETS.web },
+    ) as RunDeps['config']['targets'];
+    expect(Object.hasOwn(targets, 'web')).toBe(true);
+    expect(Object.hasOwn(targets, inheritedName)).toBe(false);
+    expect(targets[inheritedName]).toBe(inheritedDefinition);
+
+    const { deps, browserDriver, events, recordingStorage, resolveAiExecutor } = createScenario({
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 120_000 },
+      },
+      discoverTestFiles: async () => ['first.test.md', 'second.test.md'],
+    });
+    const firstPath = await writePrompt(recordingStorage.storage, 'first.test.md', 'first');
+    const secondPath = await writePrompt(recordingStorage.storage, 'second.test.md', 'second');
+    recordingStorage.reads.length = 0;
+    recordingStorage.exists.length = 0;
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, { ...DEFAULT_OPTIONS, target: inheritedName });
+
+    expect(outcome.results.map(({ result }) => ({ file: result.file, status: result.status }))).toEqual([
+      { file: firstPath, status: 'error' },
+      { file: secondPath, status: 'error' },
+    ]);
+    for (const caseOutcome of outcome.results) {
+      expect(caseOutcome.error).toBeInstanceOf(TargetUnresolvedError);
+      expect(caseOutcome.error).toMatchObject({
+        kind: 'target-unresolved',
+        exitCode: 2,
+        message: 'The requested target is not configured.',
+      });
+      expect(caseOutcome.error?.details).toEqual({ target: inheritedName });
+    }
+    expect(recordingStorage.reads).toEqual([firstPath, secondPath]);
+    expect(recordingStorage.exists).toEqual([]);
+    expect(recordingStorage.writes).toEqual([]);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(browserDriver).not.toHaveBeenCalled();
+    expect(events.emitted()).toEqual([]);
+  });
+
+  it('replays a fresh plan through the sole implicit target and launches its exact definition', async () => {
+    const soleDefinition = {
+      baseUrl: 'https://replacement.example.test',
+      browser: 'chromium' as const,
+    };
+    const soleTargets = { replacement: soleDefinition };
+    const session = createFakeBrowserSession(new Map());
+    const launch = vi.fn<BrowserDriver['launch']>(async () => session);
+    const driver: BrowserDriver = { engine: 'chromium', launch };
+    const browserDriver = vi.fn<(engine: BrowserEngine) => BrowserDriver>(() => driver);
+    const { deps, recordingStorage } = createScenario({
+      browserDriver,
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets: soleTargets,
+        ai: { provider: 'codex', timeoutMs: 120_000 },
+      },
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [], {}, soleTargets);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(launch).toHaveBeenCalledOnce();
+    expect(launch.mock.calls[0]?.[0]).toBe(soleDefinition);
+  });
+
+  it.each([
+    ['the configured default', undefined, 'web'],
+    ['an explicit override', 'staging', 'staging'],
+  ] as const)('launches the exact definition selected by %s', async (
+    _selection,
+    target,
+    expectedName,
+  ) => {
+    const session = createFakeBrowserSession(new Map());
+    const launch = vi.fn<BrowserDriver['launch']>(async () => session);
+    const driver: BrowserDriver = { engine: 'chromium', launch };
+    const browserDriver = vi.fn<(engine: BrowserEngine) => BrowserDriver>(() => driver);
+    const { deps, recordingStorage } = createScenario({
+      browserDriver,
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets: MULTI_TARGETS,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 120_000 },
+      },
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    const expectedDefinition = MULTI_TARGETS[expectedName];
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [],
+      {},
+      { [expectedName]: expectedDefinition },
+    );
+
+    const outcome = await run(deps, {
+      ...DEFAULT_OPTIONS,
+      ...(target === undefined ? {} : { target }),
+    });
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(launch.mock.calls[0]?.[0]).toBe(expectedDefinition);
+  });
+
+  it('treats a selected target change as stale while ignoring an unrelated target change', async () => {
+    const selectedChanged = {
+      web: { baseUrl: 'https://changed.example.test', browser: 'chromium' as const },
+      staging: MULTI_TARGETS.staging,
+    };
+    const changedScenario = createScenario({
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets: selectedChanged,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 120_000 },
+      },
+    });
+    const changedPath = await writePrompt(changedScenario.recordingStorage.storage);
+    await createFreshPlan(changedScenario.recordingStorage.storage, changedPath, [], { web: TARGETS.web });
+
+    const changedOutcome = await run(changedScenario.deps, DEFAULT_OPTIONS);
+
+    expect(changedOutcome.results[0]?.error).toBeInstanceOf(StaleIrError);
+    expect(changedScenario.browserDriver).not.toHaveBeenCalled();
+
+    const unrelatedChanged = {
+      web: TARGETS.web,
+      staging: { baseUrl: 'https://changed-staging.example.test', browser: 'chromium' as const },
+    };
+    const unrelatedScenario = createScenario({
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets: unrelatedChanged,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 120_000 },
+      },
+    });
+    const unrelatedPath = await writePrompt(unrelatedScenario.recordingStorage.storage);
+    await seedFreshArtifacts(
+      unrelatedScenario.recordingStorage.storage,
+      unrelatedPath,
+      [],
+      {},
+      { web: TARGETS.web },
+    );
+
+    const unrelatedOutcome = await run(unrelatedScenario.deps, DEFAULT_OPTIONS);
+
+    expect(unrelatedOutcome.results[0]?.result.status).toBe('passed');
+    expect(unrelatedOutcome.results[0]?.error).toBeUndefined();
+    expect(unrelatedScenario.browserDriver).toHaveBeenCalledOnce();
+  });
+
   it('reports a source prompt read failure as a pre-dispatch filesystem error', async () => {
     const { deps, browserDriver, recordingStorage } = createScenario();
     await writePrompt(recordingStorage.storage);
@@ -1811,6 +2061,425 @@ describe('run agentic fallback pipeline', () => {
     expect(await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`)).toBe(
       groundingBeforeSecondRun,
     );
+  });
+
+  it('issue 167 aborts a rejected replayed fill-secret without AI retry or persisted diagnostics', async () => {
+    const secretRef = '{{secrets.ISSUE_167_REPLAY_ABORT}}';
+    const secretValue = 'ISSUE_167_REPLAY_ABORT_VALUE';
+    const browserDiagnostic = 'ISSUE_167_BROWSER_DIAGNOSTIC_SENTINEL';
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      onFillSecret() {
+        throw new Error(browserDiagnostic);
+      },
+    });
+    const executeAgentic = vi.fn(async (request: AiAgenticRequest) => {
+      await request.controller.evaluateAssert(passingText('Fallback must not run'));
+      return { outcome: 'success' as const };
+    });
+    const executor = createFakeAiExecutor({ executeAgentic });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep('recorded-ai', [secretRef])],
+      aiGrounding(trace(
+        [
+          { type: 'fill-secret', target: PASSWORD, secretRef },
+          { type: 'navigate', url: '/must-not-run' },
+        ],
+        [passingText('Cached dashboard')],
+      )),
+    );
+    const planPath = `${TEST_DIR}/login.ambercast.plan.json`;
+    const groundingPath = `${TEST_DIR}/login.ambercast.grounding.json`;
+    const planBefore = await recordingStorage.storage.readText(planPath);
+    const groundingBefore = await recordingStorage.storage.readText(groundingPath);
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const report = buildRunReport({
+      startedAt: '2026-08-20T00:00:00Z',
+      durationMs: 0,
+      options: { allowEmpty: false, list: false },
+      outcome,
+    });
+    const planAfter = await recordingStorage.storage.readText(planPath);
+    const groundingAfter = await recordingStorage.storage.readText(groundingPath);
+
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(outcome.results[0]?.result).toMatchObject({
+      status: 'error',
+      explanation: 'The replayed secret fill did not complete.',
+      steps: [{ id: 'recorded-ai', status: 'error', kind: 'environment' }],
+    });
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(executeAgentic).not.toHaveBeenCalled();
+    expect(executor.agenticRequests).toEqual([]);
+    expect(aiCalls(events)).toEqual([]);
+    expect(events.emitted()).toEqual([{ type: 'step-start', stepId: 'recorded-ai' }]);
+    expect(session.operations().filter((operation) => operation.type === 'fill-secret')).toEqual([
+      {
+        type: 'fill-secret',
+        target: boundTarget(PASSWORD, FINGERPRINT),
+        value: secretValue,
+        policy: baseUrlSecretPolicy(secretRef, TARGETS.web),
+      },
+    ]);
+    expect(session.operations().filter((operation) => (
+      operation.type === 'perform' && operation.action.type === 'navigate'
+    ))).toEqual([]);
+    expect(recordingStorage.writes).toEqual([]);
+    expect(planAfter).toBe(planBefore);
+    expect(groundingAfter).toBe(groundingBefore);
+
+    const retainedSurfaces = JSON.stringify({
+      result: outcome.results[0]?.result,
+      error: outcome.results[0]?.error,
+      events: events.emitted(),
+      report,
+      persisted: { plan: planAfter, grounding: groundingAfter, writes: recordingStorage.writes },
+    });
+    expect(retainedSurfaces).not.toContain(secretValue);
+    expect(retainedSurfaces).not.toContain(browserDiagnostic);
+  });
+
+  it('issue 167 preserves a classified replayed fill-secret rejection without AI fallback', async () => {
+    const secretRef = '{{secrets.ISSUE_167_CLASSIFIED}}';
+    const secretValue = 'ISSUE_167_CLASSIFIED_VALUE';
+    const message = 'The current page origin is not allowed to receive this secret.';
+    const details = {
+      secretRef,
+      allowedOrigins: ['https://example.test'],
+      source: 'target-base-url' as const,
+    };
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      onFillSecret() {
+        throw new IntegrityViolationError(message, details);
+      },
+    });
+    const executeAgentic = vi.fn(async () => ({ outcome: 'success' as const }));
+    const executor = createFakeAiExecutor({ executeAgentic });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep('recorded-ai', [secretRef])],
+      aiGrounding(trace(
+        [{ type: 'fill-secret', target: PASSWORD, secretRef }],
+        [passingText('Cached dashboard')],
+      )),
+    );
+    const groundingBefore = await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`);
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const report = buildRunReport({
+      startedAt: '2026-08-20T00:00:00Z',
+      durationMs: 0,
+      options: { allowEmpty: false, list: false },
+      outcome,
+    });
+    const error = outcome.results[0]?.error;
+
+    expect(error).toBeInstanceOf(IntegrityViolationError);
+    expect(error).toMatchObject({
+      kind: 'integrity-violation',
+      exitCode: 4,
+      message,
+      details,
+    });
+    expect(outcome.results[0]?.result).toMatchObject({
+      status: 'error',
+      explanation: message,
+      steps: [{ id: 'recorded-ai', status: 'error', kind: 'environment' }],
+    });
+    expect(report.envelope.errors).toEqual([
+      expect.objectContaining({ kind: 'usage', code: 'INTEGRITY_VIOLATION', message }),
+    ]);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(executeAgentic).not.toHaveBeenCalled();
+    expect(aiCalls(events)).toEqual([]);
+    expect(recordingStorage.writes).toEqual([]);
+    expect(await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`)).toBe(groundingBefore);
+    expect(JSON.stringify({ outcome, report, events: events.emitted() })).not.toContain(secretValue);
+  });
+
+  it('issue 167 preserves the exact post-materialization SecretUnresolvedError without AI fallback', async () => {
+    const secretRef = '{{secrets.ISSUE_167_POST_MATERIALIZATION_UNRESOLVED}}';
+    const secretValue = 'ISSUE_167_POST_MATERIALIZATION_UNRESOLVED_VALUE';
+    const message = 'The referenced secret became unavailable at browser invocation.';
+    const details = { secretRef };
+    const classifiedError = new SecretUnresolvedError(message, details);
+    let errorAtCaseRedactionBoundary: unknown;
+    let constructorReads = 0;
+    Object.defineProperty(classifiedError, 'constructor', {
+      configurable: true,
+      get() {
+        constructorReads += 1;
+        errorAtCaseRedactionBoundary = classifiedError;
+        return SecretUnresolvedError;
+      },
+    });
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      onFillSecret() {
+        throw classifiedError;
+      },
+    });
+    const executeAgentic = vi.fn(async () => ({ outcome: 'success' as const }));
+    const executor = createFakeAiExecutor({ executeAgentic });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep('recorded-ai', [secretRef])],
+      aiGrounding(trace(
+        [
+          { type: 'fill-secret', target: PASSWORD, secretRef },
+          { type: 'navigate', url: '/must-not-run-after-classified-error' },
+        ],
+        [passingText('Cached dashboard')],
+      )),
+    );
+    const planPath = `${TEST_DIR}/login.ambercast.plan.json`;
+    const groundingPath = `${TEST_DIR}/login.ambercast.grounding.json`;
+    const planBefore = await recordingStorage.storage.readText(planPath);
+    const groundingBefore = await recordingStorage.storage.readText(groundingPath);
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const report = buildRunReport({
+      startedAt: '2026-08-20T00:00:00Z',
+      durationMs: 0,
+      options: { allowEmpty: false, list: false },
+      outcome,
+    });
+    const planAfter = await recordingStorage.storage.readText(planPath);
+    const groundingAfter = await recordingStorage.storage.readText(groundingPath);
+    const error = outcome.results[0]?.error;
+
+    // Replay preserves identity up to the mandatory case-output redaction, which
+    // then reconstructs classified errors so retained diagnostics cannot leak.
+    expect(errorAtCaseRedactionBoundary).toBe(classifiedError);
+    expect(constructorReads).toBeGreaterThan(0);
+    expect(error).not.toBe(classifiedError);
+    expect(error).toBeInstanceOf(SecretUnresolvedError);
+    expect(error).toMatchObject({
+      kind: 'secret-unresolved',
+      exitCode: 2,
+      message,
+      details,
+    });
+    expect(outcome.results[0]?.result).toMatchObject({
+      status: 'error',
+      explanation: message,
+      steps: [{ id: 'recorded-ai', status: 'error', kind: 'environment' }],
+    });
+    expect(report.exitCode).toBe(2);
+    expect(report.envelope.errors).toEqual([
+      expect.objectContaining({ kind: 'usage', code: 'SECRET_UNRESOLVED', message }),
+    ]);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(executeAgentic).not.toHaveBeenCalled();
+    expect(executor.agenticRequests).toEqual([]);
+    expect(aiCalls(events)).toEqual([]);
+    expect(events.emitted()).toEqual([{ type: 'step-start', stepId: 'recorded-ai' }]);
+    expect(session.operations().filter((operation) => operation.type === 'fill-secret')).toEqual([
+      {
+        type: 'fill-secret',
+        target: boundTarget(PASSWORD, FINGERPRINT),
+        value: secretValue,
+        policy: baseUrlSecretPolicy(secretRef, TARGETS.web),
+      },
+    ]);
+    expect(session.operations().filter((operation) => (
+      operation.type === 'perform' && operation.action.type === 'navigate'
+    ))).toEqual([]);
+    expect(recordingStorage.writes).toEqual([]);
+    expect(planAfter).toBe(planBefore);
+    expect(groundingAfter).toBe(groundingBefore);
+
+    const retainedSurfaces = JSON.stringify({
+      outcome,
+      report,
+      events: events.emitted(),
+      persisted: { plan: planAfter, grounding: groundingAfter, writes: recordingStorage.writes },
+    });
+    expect(retainedSurfaces).not.toContain(secretValue);
+  });
+
+  it('issue 167 keeps fallback for an ordinary trace rejection after a successful fill-secret', async () => {
+    const secretRef = '{{secrets.ISSUE_167_LATER_FALLBACK}}';
+    const secretValue = 'ISSUE_167_LATER_FALLBACK_VALUE';
+    const priorTrace = trace(
+      [
+        { type: 'fill-secret', target: PASSWORD, secretRef },
+        { type: 'navigate', url: '/cached-route' },
+      ],
+      [passingText('Cached dashboard')],
+    );
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      onPerform(action) {
+        if (action.type === 'navigate' && action.url === '/cached-route') {
+          throw new Error('The ordinary cached navigation failed.');
+        }
+      },
+    });
+    const executeAgentic = vi.fn(async (request: AiAgenticRequest) => {
+      await request.controller.evaluateAssert(passingText('Recovered dashboard'));
+      return { outcome: 'success' as const };
+    });
+    const executor = createFakeAiExecutor({ executeAgentic });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep('recorded-ai', [secretRef])],
+      aiGrounding(priorTrace),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(resolveAiExecutor).toHaveBeenCalledTimes(1);
+    expect(executeAgentic).toHaveBeenCalledTimes(1);
+    expect(executor.agenticRequests).toHaveLength(1);
+    expect(executor.agenticRequests[0]?.priorTrace).toEqual(priorTrace);
+    expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'recorded-ai' }]);
+    expect(session.operations().filter((operation) => operation.type === 'fill-secret')).toHaveLength(1);
+    expect(session.operations()).toContainEqual({
+      type: 'perform',
+      action: { type: 'navigate', url: '/cached-route' },
+    });
+    expect(session.operations().filter((operation) => operation.type === 'evaluate-assert')).toEqual([
+      {
+        type: 'evaluate-assert',
+        check: { check: 'text-visible', text: 'Recovered dashboard' },
+      },
+    ]);
+  });
+
+  it('issue 167 keeps fallback for a fill-secret target miss before browser invocation', async () => {
+    const secretRef = '{{secrets.ISSUE_167_BIND_MISS}}';
+    const secretValue = 'ISSUE_167_BIND_MISS_VALUE';
+    const priorTrace = trace(
+      [{ type: 'fill-secret', target: PASSWORD, secretRef }],
+      [passingText('Cached dashboard')],
+    );
+    const session = createFakeBrowserSession(new Map());
+    const fillSecret = vi.spyOn(session, 'fillSecret');
+    const executeAgentic = vi.fn(async (request: AiAgenticRequest) => {
+      await request.controller.evaluateAssert(passingText('Recovered after bind miss'));
+      return { outcome: 'success' as const };
+    });
+    const executor = createFakeAiExecutor({ executeAgentic });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep('recorded-ai', [secretRef])],
+      aiGrounding(priorTrace),
+    );
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(fillSecret).not.toHaveBeenCalled();
+    expect(resolveAiExecutor).toHaveBeenCalledTimes(1);
+    expect(executeAgentic).toHaveBeenCalledTimes(1);
+    expect(executor.agenticRequests[0]?.priorTrace).toEqual(priorTrace);
+    expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'recorded-ai' }]);
+    expect(session.operations()).toContainEqual({
+      type: 'resolve-grounded',
+      target: PASSWORD,
+      query: expect.objectContaining({ mode: 'compute' }),
+    });
+    expect(session.operations().filter((operation) => operation.type === 'fill-secret')).toEqual([]);
+  });
+
+  it('issue 167 leaves a fresh-agentic fill-secret rejection at the controller boundary', async () => {
+    const secretRef = '{{secrets.ISSUE_167_FRESH_AGENTIC}}';
+    const secretValue = 'ISSUE_167_FRESH_AGENTIC_VALUE';
+    const browserMessage = `Fresh agentic browser rejected ${secretValue}.`;
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]), {
+      onFillSecret() {
+        throw new Error(browserMessage);
+      },
+    });
+    let controllerRejection: unknown;
+    const executeAgentic = vi.fn(async (request: AiAgenticRequest) => {
+      try {
+        await request.controller.perform({ type: 'fill-secret', target: PASSWORD, secretRef });
+      } catch (error) {
+        controllerRejection = error;
+        return { outcome: 'failure' as const };
+      }
+      throw new Error('The fresh-agentic browser rejection was not delivered to the executor.');
+    });
+    const executor = createFakeAiExecutor({ executeAgentic });
+    const resolveAiExecutor = vi.fn<RunDeps['resolveAiExecutor']>(async () => executor);
+    const { deps, events, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(
+      recordingStorage.storage,
+      testPath,
+      [aiStep('recorded-ai', [secretRef])],
+    );
+    const groundingBefore = await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`);
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(controllerRejection).toBeInstanceOf(Error);
+    expect((controllerRejection as Error).message).toBe(`Fresh agentic browser rejected ${secretRef}.`);
+    expect(outcome.results[0]?.error).toBeUndefined();
+    expect(outcome.results[0]?.result).toMatchObject({
+      status: 'error',
+      explanation: 'The AI-directed interaction did not complete successfully.',
+      steps: [{ id: 'recorded-ai', status: 'error', kind: 'environment' }],
+    });
+    expect(resolveAiExecutor).toHaveBeenCalledTimes(1);
+    expect(executeAgentic).toHaveBeenCalledTimes(1);
+    expect(executor.agenticRequests).toHaveLength(1);
+    expect(executor.agenticRequests[0]).not.toHaveProperty('priorTrace');
+    expect(aiCalls(events)).toEqual([{ type: 'ai-call', stepId: 'recorded-ai' }]);
+    expect(recordingStorage.writes).toEqual([]);
+    expect(await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.grounding.json`)).toBe(groundingBefore);
+    expect(JSON.stringify({ outcome, events: events.emitted() })).not.toContain(secretValue);
+    expect(JSON.stringify({ outcome, events: events.emitted() })).not.toContain(browserMessage);
   });
 
   it('rejects a cross-origin fresh agentic navigate before it reaches the browser', async () => {

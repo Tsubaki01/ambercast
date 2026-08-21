@@ -42,6 +42,7 @@ import {
 import type { LayoutResolver } from '#core/layout/resolve.js';
 import { joinPath, relativeWithin } from '#core/paths.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
+import { resolveTarget } from '#core/target/resolve.js';
 import type { AiActionController, AiExecutor } from '#ports/ai.js';
 import type {
   AssertCheck,
@@ -208,20 +209,6 @@ class CaseAbort extends Error {}
 
 function fsIoError(message: string, cause: unknown): FsIoError {
   return new FsIoError(message, undefined, { cause });
-}
-
-function resolveTarget(
-  config: RunDeps['config'],
-  options: RunOptions,
-): Readonly<Record<string, TargetDefinition>> | TargetUnresolvedError {
-  const targetName = options.target ?? config.defaultTarget;
-  const target = targetName === undefined ? undefined : config.targets[targetName];
-
-  if (targetName === undefined || target === undefined) {
-    return new TargetUnresolvedError('The requested replay target is not configured.', { target: targetName ?? '(default)' });
-  }
-
-  return { [targetName]: target };
 }
 
 function emptyGrounding(plan: PlanDocumentType): GroundingDocumentType {
@@ -549,7 +536,11 @@ function recordResolvedSecret(registry: Map<string, Set<string>>, ref: string, v
  * not a complete data-flow proof: an aliased indirection or a call through a
  * differently typed value could evade it. Taking only the session-shaped
  * dependency keeps the dispatcher independent of the broader dispatch
- * context, whose remaining state it never needs.
+ * context, whose remaining state it never needs. The dispatcher deliberately
+ * leaves browser rejections unchanged: stored-trace replay applies its
+ * secret-specific fail-closed rule only to rejection of the materialized
+ * `fill-secret` operation being invoked, while fresh agentic execution retains
+ * its existing controller semantics.
  *
  * @param materialized - An ordinary action or the private secret-fill action.
  * @param session - The browser session that owns the corresponding port methods.
@@ -809,11 +800,20 @@ function preScanTrace(trace: z.infer<typeof TraceRecord>, context: DispatchConte
  * Replays a trusted trace in journal order and returns whether the browser
  * confirmed every recorded observation.
  *
- * A false assertion is an expected behavioral miss. An ordinary browser
- * rejection, including a compute-mode bind miss from trace materialization,
- * propagates as a plain error. Its caller treats that error as a replay miss
- * and continues to the existing agentic fallback; integrity, secret, and
- * case-abort failures retain their classified control flow instead.
+ * A false assertion is an expected behavioral miss. Ordinary browser
+ * rejections, including compute-mode bind misses from trace materialization,
+ * propagate so the caller can continue to the existing agentic fallback.
+ * An unclassified rejection from invoking the current materialized
+ * `fill-secret` operation, however, becomes a static `CaseAbort` at this
+ * replay boundary. Invocation is the no-retry boundary because the browser
+ * write may already have happened; AI re-drive could issue a second write
+ * against a different target or origin. If that same invocation instead
+ * throws a classified `IntegrityViolationError` or `SecretUnresolvedError`,
+ * the classification takes precedence and its exact type propagates unchanged.
+ * The rule is scoped to that operation: a successful secret fill does not
+ * change how a later ordinary action rejection is handled. The abort neither
+ * examines the browser's message nor retains the materialized value, and
+ * placing this rule here leaves fresh agentic dispatch unchanged.
  */
 async function replayTrace(
   trace: z.infer<typeof TraceRecord>,
@@ -829,10 +829,25 @@ async function replayTrace(
       continue;
     }
 
-    await performMaterializedAction(
-      await materializeTraceAction(entry, context, secretRefs),
-      context.session,
-    );
+    const materialized = await materializeTraceAction(entry, context, secretRefs);
+    if (materialized.type !== 'fill-secret') {
+      await performMaterializedAction(materialized, context.session);
+      continue;
+    }
+
+    try {
+      await performMaterializedAction(materialized, context.session);
+    } catch (error) {
+      if (
+        error instanceof IntegrityViolationError
+        || error instanceof SecretUnresolvedError
+        || error instanceof CaseAbort
+      ) {
+        throw error;
+      }
+
+      throw new CaseAbort('The replayed secret fill did not complete.');
+    }
   }
 
   for (const assertion of trace.verification) {
@@ -2180,11 +2195,13 @@ function grepMatches(grep: RegExp, path: string, testDir: string): boolean {
  *
  * @remarks
  * A caller may give literal prompt paths or let the use case ask the injected
- * discovery seam for them. Target selection is also batch-wide because it
- * participates in the plan's input digest: selecting a different configured
- * target must fail as stale rather than replaying a plan against a silently
- * different browser target. Empty-selection acceptance remains report policy,
- * while list mode is the sole selection policy that prevents case execution.
+ * discovery seam for them. The shared core target policy is batch-wide because
+ * its one selected definition participates in the plan's input digest and is
+ * the only definition allowed to choose browser behavior. Selecting a
+ * different configured target must fail as stale rather than replaying a plan
+ * against a silently different browser target. Empty-selection acceptance
+ * remains report policy, while list mode is the sole selection policy that
+ * prevents case execution.
  */
 export interface RunOptions {
   /** Literal prompt paths, or an empty list to use configured discovery. */
@@ -2199,7 +2216,7 @@ export interface RunOptions {
    */
   readonly grep?: RegExp;
 
-  /** Optional configured target name whose definition contributes to freshness. */
+  /** Optional explicit target name; an invalid name never falls back. */
   readonly target?: string;
 
   /** Whether grounding misses and trace misses must fail without an AI fallback. */
@@ -2401,6 +2418,14 @@ export type RunListedFile = { readonly file: string };
  * or stale cache falls back to empty grounding rather than invalidating the
  * trusted plan.
  *
+ * The shared core resolver applies the same explicit, validated-default, and
+ * sole-own-target policy as generation and freshness inspection. Its
+ * one-entry result limits both digest input and browser authority to the same
+ * target. A classified selection failure stops the current case before digest
+ * computation, plan inspection, provider resolution, or browser launch, then
+ * remains captured by that case so later cases keep run's existing per-file
+ * isolation.
+ *
  * Deterministic steps materialize run and secret values only immediately
  * before browser operations. Agentic instructions, provider-visible context,
  * and committed traces retain unresolved references; trusted trace replay
@@ -2480,10 +2505,15 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
       throw fsIoError('The test prompt could not be read.', error);
     }
 
-    const resolvedTargets = resolveTarget(deps.config, options);
-    if (resolvedTargets instanceof TargetUnresolvedError) {
-      throw resolvedTargets;
+    const targetSelection = resolveTarget({
+      targets: deps.config.targets,
+      defaultTarget: deps.config.defaultTarget,
+      explicitTarget: options.target,
+    });
+    if (targetSelection instanceof TargetUnresolvedError) {
+      throw targetSelection;
     }
+    const resolvedTargets = targetSelection.definitions;
 
     const normalizedTestMd = normalizeTestMd(testMd);
     const inputsDigest = computeInputsDigest({
@@ -2503,14 +2533,7 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
     groundingPath = deps.layout.groundingPathFor(file);
     const loadedGrounding = await readUsableGrounding(deps.storage, groundingPath, plan);
     grounding = loadedGrounding;
-    const [targetName] = Object.keys(resolvedTargets);
-    const target = targetName === undefined ? undefined : resolvedTargets[targetName];
-
-    // `resolveTarget` establishes this record, but preserving this guard keeps
-    // the browser boundary closed if a future target representation changes.
-    if (target === undefined) {
-      throw new TargetUnresolvedError('The requested replay target is not configured.');
-    }
+    const target = targetSelection.definition;
 
     try {
       session = await deps.browserDriver(target.browser).launch(target);

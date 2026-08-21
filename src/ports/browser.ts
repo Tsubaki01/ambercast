@@ -93,11 +93,16 @@ export type AccessibilityCapture = {
  * caller's runtime mutation of either public value therefore cannot alter the
  * provenance, locator, or expected fingerprint that a later operation uses.
  *
- * A `BoundElement` is not a DOM node handle and cannot prove physical-node
- * identity. Its checks narrow, rather than eliminate, wrong-target risk: an
- * in-place replacement by another node with the same fingerprint before the
- * next re-verification is indistinguishable. The same residual interval
- * remains between a successful re-verification and the browser operation.
+ * A `BoundElement` is not a DOM node handle and cannot by itself prove
+ * physical-node identity. Its checks narrow, rather than eliminate,
+ * wrong-target risk: an in-place replacement by another node with the same
+ * fingerprint before the next re-verification is indistinguishable. Ordinary
+ * targeted operations may retain a residual interval after that check.
+ * {@link BrowserSession.fillSecret} has the stronger portable contract of
+ * fixing its write target before the final live-origin validation and never
+ * resolving another target afterward. A real-browser adapter can satisfy that
+ * contract with an implementation-private physical object; this public handle
+ * neither requires nor exposes that mechanism.
  *
  * The handle is inherently session-local and short-lived: it is never
  * persisted (grounding stores an `ElementRef` and a `Fingerprint`, not this
@@ -312,22 +317,33 @@ export interface BrowserSession {
    * @remarks
    * This is the only port method permitted to receive a secret value. The
    * caller resolves `policy` once and supplies it unchanged; implementations
-   * never recompute it. Implementations check the current page origin against
-   * that policy at three checkpoints: before continuity re-verification, when
-   * continuity re-verification rejects, and synchronously immediately before
-   * the underlying fill. The first checkpoint preserves the integrity failure
-   * when a navigation changes both origin and generation. After a continuity
-   * failure, the origin check replaces that error only if the origin is now
-   * unsound; otherwise the original continuity error propagates unchanged.
+   * never recompute it. Unlike ordinary targeted actions, every implementation
+   * fixes the write target before the final live-origin validation and never
+   * resolves another target afterward. An asynchronous real-browser adapter
+   * can satisfy this semantic guarantee by strictly acquiring a per-call
+   * physical object after continuity and validating navigation around that
+   * acquisition. Such mechanics remain implementation-private rather than
+   * becoming part of `BoundElement` or this port.
+   *
+   * Implementations check the current page origin against the policy before
+   * continuity work, when continuity, implementation-specific target fixing,
+   * or post-fixing navigation validation rejects, and immediately before
+   * filling the fixed target. The first checkpoint preserves the integrity
+   * failure when a navigation changes both origin and generation. During the
+   * reclassification region, the origin check replaces the original failure
+   * only if the origin is now unsound; otherwise that failure propagates
+   * unchanged.
    * A fully synchronous implementation whose continuity re-verification has no
    * asynchronous or callback boundary may omit the reclassification checkpoint:
    * no origin mutation can interleave for its catch to observe, so its pre-check
-   * and final pre-fill check suffice, as in the fake test double in
-   * `test/doubles/fake-browser-session.ts`.
-   * No additional `await` sits between that post-failure origin re-check and
-   * the final pre-fill check, nor between that final check and the fill,
-   * applying operation-immediate re-verification to origin just as
-   * `BoundElement` continuity applies it to staleness.
+   * and final pre-fill check suffice. A synchronous fake whose model already
+   * identifies one fixed target therefore conforms without introducing a
+   * physical acquisition or disposal resource.
+   * No target resolution or additional `await` may occur between the final
+   * origin check and invoking the fill on the target already fixed. In a
+   * real-browser adapter, a navigation that starts after invocation can detach
+   * an acquired object and make the fill fail, but it cannot make the
+   * implementation reacquire a matching element in the new document.
    *
    * Origin and `BoundElement` continuity are independent layers: the latter
    * remains the ordinary failure documented by {@link resolveGrounded}, while
@@ -335,24 +351,32 @@ export interface BrowserSession {
    * targeted port operations, every implementation uses the classified error
    * required below for this origin-specific path.
    *
-   * This closes the JavaScript-visible asynchronous gap but cannot make origin
-   * inspection and the browser's DOM mutation atomic in the renderer process.
-   * A navigation can still land after the browser receives the fill and before
-   * the renderer executes it; that residual TOCTOU interval is outside what
-   * this port can observe or close.
+   * An implementation that acquires a disposable physical target releases it
+   * after every post-acquisition outcome. Cleanup failures never replace a
+   * primary error and are also suppressed after success, keeping resource
+   * cleanup from changing the operation's semantic result or exposing
+   * browser-provided text. The final check and fixed-target operation close
+   * cross-document retargeting, but cannot make origin inspection and a real
+   * browser renderer's mutation atomic; that narrower renderer-internal
+   * interval is outside this port.
    *
    * @param target - The session-local element to receive the secret.
    * @param value - The materialized secret value, which implementations must not expose.
    * @param policy - The already-resolved secret-sink policy for `value`.
    * @returns Resolves after the browser fill completes.
-   * @throws A plain, reason-bearing `Error` when `target` fails
-   *   operation-immediate continuity re-verification and the post-failure
-   *   origin re-check finds the origin still sound.
-   * @throws {IntegrityViolationError} When any of the three
-   *   operation-immediate origin checkpoints rejects the page.
-   *   Implementations preserve this exact class so replay preserves the
-   *   integrity failure instead of treating it as a behavioral miss eligible
-   *   for agentic fallback.
+   * @throws A plain, reason-bearing `Error` when continuity,
+   *   implementation-specific target fixing, or post-fixing navigation
+   *   validation fails and origin reclassification confirms that the current
+   *   origin remains permitted.
+   * @throws A plain, reason-bearing `Error` when filling the already-fixed
+   *   target rejects. That rejection propagates unchanged because no origin
+   *   check follows invocation of the fixed-target fill.
+   * @throws {IntegrityViolationError} When the initial or final live-origin
+   *   check rejects the page, or when reclassification after a pre-fill
+   *   failure finds that the current origin is not permitted. Implementations
+   *   preserve this exact class so replay preserves the integrity failure
+   *   instead of treating it as a behavioral miss eligible for agentic
+   *   fallback.
    */
   fillSecret(target: BoundElement, value: string, policy: SecretSinkPolicy): Promise<void>;
 

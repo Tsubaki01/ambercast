@@ -14,6 +14,8 @@ import { createLayoutResolver } from '#core/layout/resolve.js';
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
 import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
 import { SecretGrantUnattributableError } from '#core/errors/secret-grant-unattributable-error.js';
+import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
+import type { AiExecuteRequest } from '#ports/ai.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/generate.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
@@ -140,6 +142,7 @@ const DEFAULT_OPTIONS: GenerateOptions = {
 interface RecordingStorage {
   readonly storage: StorageAdapter;
   readonly reads: string[];
+  readonly exists: string[];
   readonly writes: { readonly path: string; readonly content: string }[];
   reset(): void;
 }
@@ -149,10 +152,12 @@ function createRecordingStorage(
 ): RecordingStorage {
   const backing = createInMemoryStorage();
   const reads: string[] = [];
+  const exists: string[] = [];
   const writes: { path: string; content: string }[] = [];
 
   return {
     reads,
+    exists,
     writes,
     storage: {
       ...backing,
@@ -162,6 +167,10 @@ function createRecordingStorage(
           throw new Error(`read failed: ${path}`);
         }
         return backing.readText(path);
+      },
+      async exists(path) {
+        exists.push(path);
+        return backing.exists(path);
       },
       async writeText(path, content) {
         if (path === fail.write) {
@@ -173,6 +182,7 @@ function createRecordingStorage(
     },
     reset() {
       reads.splice(0);
+      exists.splice(0);
       writes.splice(0);
     },
   };
@@ -181,7 +191,10 @@ function createRecordingStorage(
 function createScenario(overrides: Partial<GenerateDeps> = {}) {
   const recordingStorage = createRecordingStorage();
   const events = createRecordingEventSink();
-  const execute = vi.fn(async () => ({ data: RESPONSE, raw: JSON.stringify(RESPONSE) }));
+  const execute = vi.fn(async (_request: AiExecuteRequest<unknown>) => ({
+    data: RESPONSE,
+    raw: JSON.stringify(RESPONSE),
+  }));
   const deps: GenerateDeps = {
     storage: recordingStorage.storage,
     layout: createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR }),
@@ -253,6 +266,7 @@ async function createFreshPlan(
   storage: StorageAdapter,
   testPath: string,
   steps: readonly Step[] = [],
+  targetDefinitions: PlanDocument['targets'] = TARGETS,
 ): Promise<PlanDocument> {
   const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
   const normalizedTestMd = normalizeTestMd(await storage.readText(testPath));
@@ -260,12 +274,12 @@ async function createFreshPlan(
     normalizedTestMd,
     schemaVersion: 1,
     generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
-    targetDefinitions: TARGETS,
+    targetDefinitions,
   });
   const plan: PlanDocument = {
     schemaVersion: 1,
     source: { inputsDigest },
-    targets: TARGETS,
+    targets: targetDefinitions,
     steps: [...steps],
   };
 
@@ -277,9 +291,10 @@ async function seedFreshArtifacts(
   storage: StorageAdapter,
   testPath: string,
   steps: readonly Step[] = [],
+  targetDefinitions: PlanDocument['targets'] = TARGETS,
 ): Promise<void> {
   const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
-  const plan = await createFreshPlan(storage, testPath, steps);
+  const plan = await createFreshPlan(storage, testPath, steps, targetDefinitions);
   const grounding: GroundingDocument = { schemaVersion: 1, planDigest: computePlanDigest(plan), entries: {} };
 
   await storage.writeText(layout.groundingPathFor(testPath), toCanonicalArtifactText(grounding));
@@ -526,19 +541,248 @@ describe('generate', () => {
     expect(execute).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ['unknown explicit target', { target: 'missing' }],
-    ['absent target when configuration has no default', {}],
-  ] as const)('records %s as a per-file target-unresolved failure', async (_description, optionOverride) => {
+  it('selects the sole own target when configuration omits defaultTarget', async () => {
+    const soleTargets = {
+      replacement: { baseUrl: 'https://replacement.example.test', browser: 'chromium' as const },
+    };
     const { deps, execute, recordingStorage } = createScenario({
-      config: { testDir: TEST_DIR, testMatch: ['**/*.test.md'], testIgnore: [], targets: TARGETS, ai: { provider: 'codex', timeoutMs: 100 } },
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets: soleTargets,
+        ai: { provider: 'codex', timeoutMs: 100 },
+      },
     });
     await writePrompt(recordingStorage.storage);
 
-    await expect(generate(deps, { ...DEFAULT_OPTIONS, ...optionOverride })).resolves.toMatchObject({
-      results: [{ status: 'failed', error: { kind: 'target-unresolved' } }],
+    await expect(generate(deps, DEFAULT_OPTIONS)).resolves.toMatchObject({
+      results: [{ status: 'generated' }],
     });
+    expect(execute).toHaveBeenCalledOnce();
+    const context = execute.mock.calls[0]?.[0].context as {
+      readonly targets: GenerateDeps['config']['targets'];
+    };
+    expect(Object.keys(context.targets)).toEqual(['replacement']);
+    expect(context.targets.replacement).toBe(soleTargets.replacement);
+    const plan = PlanDocument.parse(JSON.parse(
+      await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.plan.json`),
+    ));
+    expect(Object.keys(plan.targets)).toEqual(['replacement']);
+    expect(plan.targets).toEqual(soleTargets);
+  });
+
+  it.each([
+    [
+      'an invalid explicit target',
+      {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets: TARGETS,
+        defaultTarget: 'web',
+        ai: { provider: 'codex' as const, timeoutMs: 100 },
+      },
+      { target: 'missing' },
+      'The requested target is not configured.',
+      { target: 'missing' },
+    ],
+    [
+      'an ambiguous implicit target',
+      {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets: {
+          web: TARGETS.web,
+          admin: { baseUrl: 'https://admin.example.test', browser: 'chromium' as const },
+        },
+        ai: { provider: 'codex' as const, timeoutMs: 100 },
+      },
+      {},
+      'A target could not be selected from the configured targets.',
+      { target: '(default)', targetNames: ['admin', 'web'] },
+    ],
+  ] as const)('records two ordered shared failures for %s without downstream work', async (
+    _description,
+    config,
+    optionOverride,
+    message,
+    details,
+  ) => {
+    const { deps, events, execute, recordingStorage } = createScenario({
+      config,
+      discoverTestFiles: async () => ['first.test.md', 'second.test.md'],
+    });
+    const firstPath = await writePrompt(recordingStorage.storage, 'first.test.md', 'first');
+    const secondPath = await writePrompt(recordingStorage.storage, 'second.test.md', 'second');
+    recordingStorage.reset();
+
+    const outcome = await generate(deps, { ...DEFAULT_OPTIONS, ...optionOverride });
+
+    expect(outcome.results.map(({ file, status }) => ({ file, status }))).toEqual([
+      { file: firstPath, status: 'failed' },
+      { file: secondPath, status: 'failed' },
+    ]);
+    for (const result of outcome.results) {
+      expect(result.error).toBeInstanceOf(TargetUnresolvedError);
+      expect(result.error).toMatchObject({
+        kind: 'target-unresolved',
+        exitCode: 2,
+        message,
+        details,
+      });
+      expect(result.error?.details).toEqual(details);
+    }
+    expect(recordingStorage.reads).toEqual([firstPath, secondPath]);
+    expect(recordingStorage.exists).toEqual([]);
+    expect(recordingStorage.writes).toEqual([]);
     expect(execute).not.toHaveBeenCalled();
+    expect(events.emitted()).toEqual([]);
+  });
+
+  it('rejects an inherited explicit target without falling back to a valid own default', async () => {
+    const inheritedName = 'inherited-preview';
+    const inheritedDefinition = {
+      baseUrl: 'https://inherited.example.test',
+      browser: 'chromium' as const,
+    };
+    const prototype = Object.fromEntries([[inheritedName, inheritedDefinition]]);
+    const targets = Object.assign(
+      Object.create(prototype) as Record<string, Readonly<typeof inheritedDefinition>>,
+      { web: TARGETS.web },
+    ) as GenerateDeps['config']['targets'];
+    expect(Object.hasOwn(targets, 'web')).toBe(true);
+    expect(Object.hasOwn(targets, inheritedName)).toBe(false);
+    expect(targets[inheritedName]).toBe(inheritedDefinition);
+
+    const { deps, events, execute, recordingStorage } = createScenario({
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 100 },
+      },
+      discoverTestFiles: async () => ['first.test.md', 'second.test.md'],
+    });
+    const firstPath = await writePrompt(recordingStorage.storage, 'first.test.md', 'first');
+    const secondPath = await writePrompt(recordingStorage.storage, 'second.test.md', 'second');
+    recordingStorage.reset();
+
+    const outcome = await generate(deps, { ...DEFAULT_OPTIONS, target: inheritedName });
+
+    expect(outcome.results.map(({ file, status }) => ({ file, status }))).toEqual([
+      { file: firstPath, status: 'failed' },
+      { file: secondPath, status: 'failed' },
+    ]);
+    for (const result of outcome.results) {
+      expect(result.error).toBeInstanceOf(TargetUnresolvedError);
+      expect(result.error).toMatchObject({
+        kind: 'target-unresolved',
+        exitCode: 2,
+        message: 'The requested target is not configured.',
+      });
+      expect(result.error?.details).toEqual({ target: inheritedName });
+    }
+    expect(recordingStorage.reads).toEqual([firstPath, secondPath]);
+    expect(recordingStorage.exists).toEqual([]);
+    expect(recordingStorage.writes).toEqual([]);
+    expect(execute).not.toHaveBeenCalled();
+    expect(events.emitted()).toEqual([]);
+  });
+
+  it.each([
+    ['the configured default', undefined, 'web'],
+    ['an explicit override', 'admin', 'admin'],
+  ] as const)('uses %s before sending the selected target to AI', async (
+    _selection,
+    target,
+    expectedName,
+  ) => {
+    const targets = {
+      web: TARGETS.web,
+      admin: { baseUrl: 'https://admin.example.test', browser: 'chromium' as const },
+    };
+    const { deps, execute, recordingStorage } = createScenario({
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 100 },
+      },
+    });
+    await writePrompt(recordingStorage.storage);
+
+    await generate(deps, { ...DEFAULT_OPTIONS, ...(target === undefined ? {} : { target }) });
+
+    expect(execute).toHaveBeenCalledOnce();
+    const expectedDefinition = targets[expectedName];
+    const otherName = expectedName === 'web' ? 'admin' : 'web';
+    const context = execute.mock.calls[0]?.[0].context as {
+      readonly targets: GenerateDeps['config']['targets'];
+    };
+    expect(Object.keys(context.targets)).toEqual([expectedName]);
+    expect(context.targets[expectedName]).toBe(expectedDefinition);
+    expect(Object.hasOwn(context.targets, otherName)).toBe(false);
+    const plan = PlanDocument.parse(JSON.parse(
+      await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.plan.json`),
+    ));
+    expect(Object.keys(plan.targets)).toEqual([expectedName]);
+    expect(plan.targets[expectedName]).toEqual(expectedDefinition);
+    expect(Object.hasOwn(plan.targets, otherName)).toBe(false);
+  });
+
+  it('regenerates for a changed selected target but ignores an unrelated target change', async () => {
+    const selectedChanged = {
+      web: { baseUrl: 'https://changed.example.test', browser: 'chromium' as const },
+      admin: { baseUrl: 'https://admin.example.test', browser: 'chromium' as const },
+    };
+    const unrelatedChanged = {
+      web: TARGETS.web,
+      admin: { baseUrl: 'https://changed-admin.example.test', browser: 'chromium' as const },
+    };
+
+    const changedScenario = createScenario({
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets: selectedChanged,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 100 },
+      },
+    });
+    const changedPath = await writePrompt(changedScenario.recordingStorage.storage);
+    await createFreshPlan(changedScenario.recordingStorage.storage, changedPath, [], TARGETS);
+    changedScenario.recordingStorage.reset();
+
+    await expect(generate(changedScenario.deps, DEFAULT_OPTIONS)).resolves.toMatchObject({
+      results: [{ status: 'generated' }],
+    });
+    expect(changedScenario.execute).toHaveBeenCalledOnce();
+
+    const unrelatedScenario = createScenario({
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: [],
+        targets: unrelatedChanged,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 100 },
+      },
+    });
+    const unrelatedPath = await writePrompt(unrelatedScenario.recordingStorage.storage);
+    await createFreshPlan(unrelatedScenario.recordingStorage.storage, unrelatedPath, [], TARGETS);
+    unrelatedScenario.recordingStorage.reset();
+
+    await expect(generate(unrelatedScenario.deps, DEFAULT_OPTIONS)).resolves.toMatchObject({
+      results: [{ status: 'skipped-fresh' }],
+    });
+    expect(unrelatedScenario.execute).not.toHaveBeenCalled();
   });
 
   it.each([

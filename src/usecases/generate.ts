@@ -23,10 +23,10 @@ import {
   type JsonValueT,
   type PlanDocument as PlanDocumentType,
   type Step,
-  type TargetDefinition,
 } from '#core/ir/schema.js';
 import type { LayoutResolver } from '#core/layout/resolve.js';
 import { joinPath } from '#core/paths.js';
+import { resolveTarget } from '#core/target/resolve.js';
 import type { AiExecutor } from '#ports/ai.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { EventSink } from '#ports/system.js';
@@ -49,20 +49,6 @@ function fsIoError(message: string, cause: unknown): FsIoError {
 
 function fileFailure(error: unknown, message: string): AmbercastErrorType {
   return error instanceof AmbercastError ? error : fsIoError(message, error);
-}
-
-function resolveTarget(
-  config: GenerateDeps['config'],
-  options: GenerateOptions,
-): Readonly<Record<string, TargetDefinition>> | TargetUnresolvedError {
-  const targetName = options.target ?? config.defaultTarget;
-  const target = targetName === undefined ? undefined : config.targets[targetName];
-
-  if (targetName === undefined || target === undefined) {
-    return new TargetUnresolvedError('The requested generation target is not configured.', { target: targetName ?? '(default)' });
-  }
-
-  return { [targetName]: target };
 }
 
 /** Treats a thrown SecretGrantUnattributableError as not-fresh so generation regenerates instead of propagating it. */
@@ -171,7 +157,7 @@ export interface GenerateOptions {
   /** Whether validated artifacts are previewed instead of written. */
   readonly dryRun: boolean;
 
-  /** Optional configured target name for this batch. */
+  /** Optional explicit target name; an invalid name never falls back. */
   readonly target?: string;
 
   /** Whether zero discovered files are an allowed empty outcome. */
@@ -284,9 +270,14 @@ export interface GenerateOutcome {
  * non-dry-run fresh plan repairs only its grounding cache, while dry-run leaves
  * that cache untouched; `force` is the explicit opt-out from fresh-plan reuse.
  * The provider receives a smaller response contract than the committed plan:
- * this use case owns provenance and target selection, then validates the
- * assembled plan and its duplicate-ID invariant before the literal-secret
- * policy permits persistence.
+ * the shared core resolver supplies one target while this use case owns
+ * provenance, then validates the assembled plan and its duplicate-ID invariant
+ * before the literal-secret policy permits persistence. Restricting the target
+ * record to that selection prevents unrelated definitions from changing the
+ * digest or entering provider context. A classified selection failure remains
+ * attached to its file and stops that case before digest computation, existing
+ * plan inspection, provider invocation, or artifact writes. Later prompts
+ * retain the same isolation as other generation failures.
  *
  * The caller signal is distinct from the per-call timeout. Caller cancellation
  * stops scheduling and returns the completed partial outcome, while a timeout
@@ -329,11 +320,16 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
       continue;
     }
 
-    const resolvedTargets = resolveTarget(deps.config, options);
-    if (resolvedTargets instanceof TargetUnresolvedError) {
-      results.push({ file, status: 'failed', error: resolvedTargets });
+    const targetSelection = resolveTarget({
+      targets: deps.config.targets,
+      defaultTarget: deps.config.defaultTarget,
+      explicitTarget: options.target,
+    });
+    if (targetSelection instanceof TargetUnresolvedError) {
+      results.push({ file, status: 'failed', error: targetSelection });
       continue;
     }
+    const resolvedTargets = targetSelection.definitions;
 
     const normalizedTestMd = normalizeTestMd(testMd);
     const inputsDigest = computeInputsDigest({
