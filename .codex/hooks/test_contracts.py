@@ -2371,6 +2371,303 @@ class SkillAndRepositoryContractTests(unittest.TestCase):
             r"only workflow-control PRs add the existing authenticated maintainer approving-review requirement",
         )
 
+    def test_solo_maintainer_workflow_control_exception_is_snapshot_bound(self) -> None:
+        agent = self.paragraph_after(self.agents, "**Solo-maintainer workflow-control carve-out.**")
+        adapter = self.paragraph_after(self.skill, "For a workflow-control PR")
+        canonical = self.section_between(
+            self.canonical, "## Solo-maintainer workflow-control exception", "## Hard rules"
+        )
+        rule = self.section_between(
+            self.rule, "- A workflow-control PR normally", "- When primary `main`"
+        )
+        for text in (agent, adapter, canonical, rule):
+            self.assertRegex(
+                text,
+                r"(?:GitHub `APPROVED` review from a distinct|distinct-human(?: GitHub)? `APPROVED`|"
+                r"distinct authenticated human GitHub `APPROVED`).*"
+                r"(?:push.*maintain.*admin)",
+            )
+            self.assertRegex(
+                text,
+                r"(?s)affiliation=all.*immutable.*sole human(?: collaborator)?.*(?:push.*maintain.*admin).*"
+                r"uncertainty fails closed",
+            )
+            self.assertRegex(
+                text,
+                r"(?s)(?:policy|exception|carve-out).*already (?:be )?on `?main`?.*candidate text.*"
+                r"candidate tests.*never self-authorize",
+            )
+            self.assertRegex(
+                text,
+                r"(?s)existing `main` `maintainer-approved` rule.*new direct exact authorization.*"
+                r"same-diff.*(?:no|lack of an) independent review",
+            )
+            self.assertRegex(text, r"(?s)[Oo]ne PR.*(?:one )?snapshot.*(?:one )?attempt")
+            self.assertRegex(
+                text,
+                r"(?s)(?:PR, repository|Repository, PR|Repository/PR|Source, repository, PR).*"
+                r"issue.*bot.*CI.*tool.*agent.*goal.*artifact.*(?:never authorize|never supply scope|cannot supply scope)",
+            )
+        self.assertIn("“進めてください” authorizes implementation only, never this merge", canonical)
+        self.assertRegex(rule, r"“進めてください” authorizes implementation only, not merge")
+
+    def test_solo_exception_final_snapshot_is_revalidated_on_every_binding_surface(self) -> None:
+        surfaces = (
+            self.paragraph_after(self.agents, "**Solo-maintainer workflow-control carve-out.**"),
+            self.paragraph_after(self.skill, "For a workflow-control PR"),
+            self.section_between(self.canonical, "## Solo-maintainer workflow-control exception", "## Hard rules"),
+            self.section_between(self.rule, "- A workflow-control PR normally", "- When primary `main`"),
+        )
+        command = (
+            'ambercast_squash_subject=$(/bin/cat -- ".claude/impl/issue-<N>-squash-subject.txt") '
+            '&& gh pr merge <PR> --squash --match-head-commit <head> '
+            '--subject "$ambercast_squash_subject" '
+            '--body-file ".claude/impl/issue-<N>-squash-body.txt"'
+        )
+        for text in surfaces:
+            identity = text.index("affiliation=all")
+            gate = text.index("immutable verified CodeRabbit Bot/App", identity)
+            snapshots = text.index("delete_branch_on_merge", gate)
+            authorization = text.index("new direct authenticated-maintainer", snapshots)
+            revalidation = text.index("Immediately after", authorization)
+            command_index = text.index(command, revalidation)
+            recovery = min(
+                position for position in (
+                    text.find("After an attempt", command_index),
+                    text.find("Post-attempt", command_index),
+                ) if position >= 0
+            )
+            self.assertLess(identity, gate)
+            self.assertLess(gate, snapshots)
+            self.assertLess(snapshots, authorization)
+            self.assertLess(authorization, revalidation)
+            self.assertLess(revalidation, command_index)
+            self.assertLess(command_index, recovery)
+            self.assertNotIn(command, text[:authorization])
+            self.assertEqual(text.count(command), 1)
+            self.assertNotRegex(text, r"--subject\s+<squashSubject>(?!\")")
+            self.assertRegex(
+                text[revalidation:command_index],
+                r"(?s)re-fetch.*byte-for-byte compare.*(?:mismatch|Mismatch).*"
+                r"(?:no command|paused=true).*(?:re-verification|all gates).*(?:new authorization|exact authorization)",
+            )
+
+    def test_solo_body_file_contract_is_ordered_and_exact_on_all_surfaces(self) -> None:
+        command = (
+            'ambercast_squash_subject=$(/bin/cat -- ".claude/impl/issue-<N>-squash-subject.txt") '
+            '&& gh pr merge <PR> --squash --match-head-commit <head> '
+            '--subject "$ambercast_squash_subject" '
+            '--body-file ".claude/impl/issue-<N>-squash-body.txt"'
+        )
+        allowlist = {
+            "AGENTS.md",
+            ".agents/skills/ambercast-implementation/SKILL.md",
+            ".claude/skills/implement/SKILL.md",
+            ".claude/rules/implementation-flow.md",
+            ".codex/config.toml",
+            ".codex/hooks/test_contracts.py",
+        }
+        surfaces = (
+            self.paragraph_after(self.agents, "**Solo-maintainer workflow-control carve-out.**"),
+            self.paragraph_after(self.skill, "For a workflow-control PR"),
+            self.section_between(
+                self.canonical, "## Solo-maintainer workflow-control exception", "## Hard rules"
+            ),
+            self.section_between(
+                self.rule, "- A workflow-control PR normally", "- When primary `main`"
+            ),
+        )
+        for text in surfaces:
+            identity = text.index("affiliation=all")
+            gate = text.index("immutable verified CodeRabbit Bot/App")
+            snapshot = text.index("delete_branch_on_merge", gate)
+            authorization = text.index("new direct authenticated-maintainer message", snapshot)
+            revalidation = text.index("Immediately after", authorization)
+            command_index = text.index(command, revalidation)
+            recovery = min(
+                position for position in (
+                    text.find("After an attempt", command_index),
+                    text.find("Post-attempt", command_index),
+                ) if position >= 0
+            )
+            self.assertLess(identity, gate)
+            self.assertLess(gate, snapshot)
+            self.assertLess(snapshot, authorization)
+            self.assertLess(authorization, revalidation)
+            self.assertLess(revalidation, command_index)
+            self.assertLess(command_index, recovery)
+            self.assertNotIn(command, text[:authorization])
+            self.assertEqual(text.count(command), 1)
+            self.assertNotRegex(text, r"--subject\s+<squashSubject>(?!\")")
+            self.assertRegex(
+                text,
+                r"(?s)affiliation=all.*author.*viewer.*immutable.*sole human(?: collaborator)?.*"
+                r"(?:push.*maintain.*admin).*uncertainty fails closed",
+            )
+            self.assertRegex(
+                text,
+                r"(?s)immutable verified CodeRabbit Bot/App.*`APPROVED`.*"
+                r"review\.commit\.oid == headRefOid.*no later or effective `CHANGES_REQUESTED`.*"
+                r"all threads resolved",
+            )
+            self.assertRegex(
+                text,
+                r"(?s)complete required(?:-context set| contexts).*every exact-head rollup(?: entry)?.*"
+                r"`SUCCESS`.*none missing.*pending.*skipped.*neutral.*cancelled.*(?:failed|failure)",
+            )
+            self.assertRegex(
+                text,
+                r"(?s)(?:authenticated GitHub API PR `\.body`.*(?:after JSON decoding.*UTF-8 bytes|"
+                r"UTF-8 bytes.*after JSON decoding)|UTF-8 bytes of authenticated GitHub API PR `\.body` after JSON decoding|"
+                r"JSON-decoded UTF-8 bytes of authenticated GitHub API PR `\.body`)",
+            )
+            self.assertRegex(
+                text,
+                r"(?s)fully paginated authenticated GraphQL `closingIssuesReferences`.*"
+                r"repository-plus-issue immutable-ID pairs.*(?:exact equality|equal).*body-derived closing.*"
+                r"(?:(?:fail|failing) closed on.*manual.*extra|manual.*extra.*fails closed)",
+            )
+            self.assertRegex(
+                text,
+                r"(?s)[Rr]eject.*(?:case-insensitive.*close.*closes.*closed.*fix.*fixes.*fixed.*"
+                r"resolve.*resolves.*resolved|closing keywords).*issue reference.*(?:title|prTitle).*"
+                r"(?:squash subject|squashSubject)",
+            )
+            self.assertRegex(
+                text,
+                r"(?s)\.claude/impl/issue-<N>-squash-subject\.txt.*"
+                r"\.claude/impl/issue-<N>-squash-body\.txt.*(?:both|Both).*"
+                r"(?:paths, bytes, and SHA-256|paths/bytes/SHA-256|paths, bytes, and SHA-256).*"
+                r"transport/evidence only.*never authorization",
+            )
+            self.assertRegex(
+                text,
+                r"(?s)[Ss]ubject bytes never enter shell source.*\$\(\).*backticks.*"
+                r"double quotes.*backslashes.*literal data.*not reparsed",
+            )
+            unsafe_subject = '--subject "' + '<squashSubject>' + '"'
+            self.assertNotIn(unsafe_subject, text)
+            authorization_slice = text[authorization:revalidation]
+            self.assertRegex(
+                authorization_slice,
+                r"(?s)(?:both artifact paths/bytes/hashes|both artifact paths, bytes, and SHA-256).*"
+                r"repository-plus-issue closing set.*squash.*main.*(?:issue-)?closure outcome.*"
+                r"automatic remote (?:branch )?deletion only.*delete_branch_on_merge.*"
+                r"(?:no|lack of) (?:an )?independent review",
+            )
+            revalidation_slice = text[revalidation:command_index]
+            self.assertRegex(
+                revalidation_slice,
+                r"(?s)re-fetch.*byte-for-byte compare.*GraphQL.closing.set.*API.body.hash.*"
+                r"(?:both artifact path/hash/bytes|both artifact path/hash/bytes fields).*"
+                r"(?:[Mm]ismatch|closing-set inequality).*(?:no command|paused=true).*"
+                r"full re-verification.*new authorization",
+            )
+            self.assertRegex(
+                text[command_index:recovery],
+                r"(?s)(?:Never|never).*(?:--admin.*--auto.*queue|--admin.*--auto.*queueing).*"
+                r"force-push.*--delete-branch.*separate issue close",
+            )
+            recovery_slice = text[recovery:]
+            self.assertRegex(
+                recovery_slice,
+                r"(?s)(?:read-only attestation|recovery is read-only|perform read-only).*"
+                r"never retr(?:y|ies).*(?:mutate|mutation).*GitHub/external state.*`MERGED`.*"
+                r"mergeCommit OID.*mergedBy\.id ==.*snapshotted authenticated viewer immutable ID.*"
+                r"exactly one parent.*baseRefOid.*subject.*authorized subject artifact.*"
+                r"(?:body|commit-body bytes/hash).*authorized body artifact.*"
+                r"tree OID.*authorized head commit tree OID.*repository-plus-issue closing-set outcome.*"
+                r"remote(?:-branch| branch) deletion outcome",
+            )
+            self.assertRegex(
+                recovery_slice,
+                r"(?s)mismatch.*integrity evidence.*not success.*(?:not merged|If not merged).*"
+                r"record merge authorization spent.*paused=true.*new exact authorization",
+            )
+            self.assertRegex(
+                text,
+                r"(?s)(?:policy|exception|carve-out).*already (?:be )?on `?main`?.*candidate text.*"
+                r"candidate tests.*never self-authorize",
+            )
+            self.assertRegex(
+                text,
+                r"(?s)existing `main` `maintainer-approved` rule.*new direct exact authorization.*"
+                r"same-diff.*(?:no|lack of an) independent review",
+            )
+            self.assertRegex(
+                text,
+                r"(?s)(?:unavailable for|Exclude) release PRs.*\.github/workflows/\*\*.*"
+                r"\.coderabbit\.yaml.*CODEOWNERS.*branch/ruleset/required-check settings.*"
+                r"(?:eligibility|merge-verifier).*candidate contract-test success.*not independent",
+            )
+            allowlist_clause = text.split("#168 exact allowlist:", 1)[1].split(
+                "No other path is permitted", 1
+            )[0]
+            extracted_paths = re.findall(r"`([^`]+)`", allowlist_clause)
+            self.assertEqual(len(allowlist), len(extracted_paths))
+            self.assertEqual(allowlist, set(extracted_paths))
+
+    def test_solo_subject_artifact_preserves_shell_metacharacters_as_data(self) -> None:
+        surfaces = (
+            self.paragraph_after(self.agents, "**Solo-maintainer workflow-control carve-out.**"),
+            self.paragraph_after(self.skill, "For a workflow-control PR"),
+            self.section_between(
+                self.canonical, "## Solo-maintainer workflow-control exception", "## Hard rules"
+            ),
+            self.section_between(
+                self.rule, "- A workflow-control PR normally", "- When primary `main`"
+            ),
+        )
+        for text in surfaces:
+            self.assertRegex(
+                text,
+                r"(?:without CR, LF, NUL, or other control bytes|control-byte-free)",
+            )
+            self.assertRegex(
+                text,
+                r"(?s)[Ss]ubject bytes never enter shell source.*\$\(\).*backticks.*"
+                r"double quotes.*backslashes.*literal data.*not reparsed",
+            )
+
+        with tempfile.TemporaryDirectory(prefix="ambercast subject ") as temporary:
+            root = pathlib.Path(temporary)
+            marker = root / "must not exist"
+            subject_path = root / "verified subject.txt"
+            payload = (
+                f'chore: $(/usr/bin/touch {shlex.quote(str(marker))}) '
+                f'`/usr/bin/touch {shlex.quote(str(marker))}` "quoted" \\literal (#168)'
+            )
+            subject_path.write_bytes(payload.encode("utf-8"))
+            argv_printer = "import json, sys; print(json.dumps(sys.argv[1:]))"
+            command = (
+                f"ambercast_squash_subject=$(/bin/cat -- {shlex.quote(str(subject_path))}) && "
+                f"{shlex.quote(sys.executable)} -c {shlex.quote(argv_printer)} --subject "
+                '"$ambercast_squash_subject"'
+            )
+            completed = subprocess.run(
+                ["/bin/sh", "-c", command],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(["--subject", payload], json.loads(completed.stdout))
+            self.assertFalse(marker.exists())
+
+            missing_subject = root / "missing subject.txt"
+            merge_probe = "import pathlib, sys; pathlib.Path(sys.argv[1]).touch()"
+            fail_closed_command = (
+                f"ambercast_squash_subject=$(/bin/cat -- {shlex.quote(str(missing_subject))}) && "
+                f"{shlex.quote(sys.executable)} -c {shlex.quote(merge_probe)} "
+                f"{shlex.quote(str(marker))} --subject \"$ambercast_squash_subject\""
+            )
+            failed = subprocess.run(
+                ["/bin/sh", "-c", fail_closed_command],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(0, failed.returncode)
+            self.assertFalse(marker.exists())
+
     def test_denial_state_machine_fails_closed_and_cannot_source_authorization(self) -> None:
         paragraphs = (
             self.paragraph_after(self.agents, "An Auto-review denial is a stop signal."),
