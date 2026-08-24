@@ -24,6 +24,10 @@ import type { ReadStorageAdapter } from '#ports/storage.js';
 export function createFsReadStorage(): ReadStorageAdapter {
   return {
     async readText(path: string): Promise<string> {
+      if (!(await stat(path)).isFile()) {
+        throw new Error(`${path} is not a regular file`);
+      }
+
       return readFile(path, 'utf8');
     },
     async exists(path: string): Promise<boolean> {

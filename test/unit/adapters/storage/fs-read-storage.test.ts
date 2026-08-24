@@ -50,6 +50,14 @@ describe('createFsReadStorage()', () => {
     });
   });
 
+  it('rejects a text read for a directory path', async () => {
+    await withIsolatedStorage(async (storage) => {
+      await mkdir('directory');
+
+      await expect(storage.readText('directory')).rejects.toThrow('directory is not a regular file');
+    });
+  });
+
   it.each([
     { name: 'a missing path', path: 'missing.txt', prepare: async (): Promise<void> => undefined },
     { name: 'a directory path', path: 'directory', prepare: async (): Promise<void> => { await mkdir('directory'); } },
