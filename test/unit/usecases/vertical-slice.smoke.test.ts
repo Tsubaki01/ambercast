@@ -57,7 +57,7 @@ const GENERATE_OPTIONS: GenerateOptions = {
   allowEmpty: false,
   list: false,
 };
-const RUN_OPTIONS: RunOptions = { files: [TEST_PATH], cacheOnly: false, allowEmpty: false, list: false, stale: 'fail' };
+const RUN_OPTIONS: RunOptions = { files: [TEST_PATH], cacheOnly: false, updateCache: false, allowEmpty: false, list: false, stale: 'fail' };
 const CHECK_OPTIONS: CheckOptions = { files: [TEST_PATH], allowEmpty: false, list: false };
 const SUCCESS_CITATION = 'When I submit valid credentials, I reach the dashboard.';
 const SUCCESS_INTENT = {
@@ -82,6 +82,7 @@ function checkDeps(storage: ReturnType<typeof createInMemoryStorage>, layout: Re
       testIgnore: ['**/.runs/**'],
       targets: TARGETS,
       defaultTarget: 'web',
+      grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
     },
   };
 }
@@ -172,6 +173,7 @@ describe('fake vertical slice', () => {
       }),
       events: createRecordingEventSink().sink,
       discoverTestFiles: async () => [],
+      isCI: false,
       config: {
         testDir: TEST_DIR,
         testMatch: ['**/*.test.md'],
@@ -179,6 +181,8 @@ describe('fake vertical slice', () => {
         targets: TARGETS,
         defaultTarget: 'web',
         ai: { provider: 'codex', timeoutMs: 120_000 },
+        ci: { heal: false, updateGroundingCache: false },
+        grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
       },
     };
 
@@ -274,6 +278,7 @@ describe('fake vertical slice', () => {
       },
       events: events.sink,
       discoverTestFiles: async () => [],
+      isCI: false,
       config: {
         testDir: TEST_DIR,
         testMatch: ['**/*.test.md'],
@@ -281,6 +286,8 @@ describe('fake vertical slice', () => {
         targets: TARGETS,
         defaultTarget: 'web',
         ai: { provider: 'codex', timeoutMs: 120_000 },
+        ci: { heal: false, updateGroundingCache: false },
+        grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
       },
     };
 
@@ -383,6 +390,7 @@ describe('fake vertical slice', () => {
       resolveAiExecutor,
       events: events.sink,
       discoverTestFiles: async () => [],
+      isCI: false,
       config: {
         testDir: TEST_DIR,
         testMatch: ['**/*.test.md'],
@@ -390,6 +398,8 @@ describe('fake vertical slice', () => {
         targets: TARGETS,
         defaultTarget: 'web',
         ai: { provider: 'codex', timeoutMs: 120_000 },
+        ci: { heal: false, updateGroundingCache: false },
+        grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
       },
     };
 

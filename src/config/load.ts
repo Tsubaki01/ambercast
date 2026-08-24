@@ -100,7 +100,7 @@ export interface LoadConfigOptions {
  * `configRoot` is also exposed as `projectRoot` for report-path relativization.
  *
  * The merge applies top-level overrides, merges only one level of `ai`,
- * `viewer`, and `ci`, and replaces `targets` as a whole. Atomic target
+ * `viewer`, `ci`, and `grounding`, and replaces `targets` as a whole. Atomic target
  * replacement means that when a raw file supplies `targets`, its record
  * entirely replaces `DEFAULT_RAW_CONFIG.targets`: the built-in `web-user`
  * target is gone rather than merged alongside the replacement record. In that
@@ -110,7 +110,16 @@ export interface LoadConfigOptions {
  * that replacement record, never against the built-in targets. A missing
  * default target is legal even for multiple targets: choosing among them
  * depends on command-level `--target` information that the loader does not
- * receive.
+ * receive. The resolved grounding group keeps repository policy and local
+ * write-back posture together: check consumes repositoryPolicy for its
+ * grounding-lifecycle status mapping, and a future init command consumes
+ * that same policy when scaffolding .gitignore. Run consumes
+ * localWriteBack to gate grounding persistence after a case completes behind
+ * `--update-cache` when explicit persistence is selected outside CI. CI
+ * ignores localWriteBack and instead allows write-back only through
+ * `--update-cache` or `ci.updateGroundingCache`. Defaults of `committed` and
+ * `auto` preserve this repository's committed-artifact posture while run
+ * persists grounding automatically outside CI.
  *
  * A valid `configEnv.aiProviderRaw` value overrides the merged file/default
  * `ai.provider`, giving this loader the environment-variable portion of the
@@ -201,6 +210,10 @@ export async function loadConfig(options: LoadConfigOptions): Promise<ResolvedCo
     ci: {
       heal: overrides.ci?.heal ?? DEFAULT_RAW_CONFIG.ci.heal,
       updateGroundingCache: overrides.ci?.updateGroundingCache ?? DEFAULT_RAW_CONFIG.ci.updateGroundingCache,
+    },
+    grounding: {
+      repositoryPolicy: overrides.grounding?.repositoryPolicy ?? DEFAULT_RAW_CONFIG.grounding.repositoryPolicy,
+      localWriteBack: overrides.grounding?.localWriteBack ?? DEFAULT_RAW_CONFIG.grounding.localWriteBack,
     },
   };
 

@@ -3,7 +3,7 @@ import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { ConfigInvalidError } from '#core/errors/config-invalid-error.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
-import { computeInputsDigest } from '#core/ir/digest.js';
+import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import type { JsonValueT, PlanDocument } from '#core/ir/schema.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
@@ -42,6 +42,7 @@ const CONFIG: ResolvedConfig = {
   ai: { provider: 'auto', timeoutMs: 120_000 },
   viewer: { port: 4600 },
   ci: { heal: false, updateGroundingCache: false },
+  grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
 };
 
 function input(overrides: Partial<CheckCommandInput> = {}): CheckCommandInput {
@@ -146,6 +147,11 @@ describe('runCheckCommand', () => {
     } as unknown as PlanDocument;
     await storage.writeText(testPath, prompt);
     await storage.writeText(layout.planPathFor(testPath), toCanonicalArtifactText(plan as unknown as JsonValueT));
+    await storage.writeText(layout.groundingPathFor(testPath), toCanonicalArtifactText({
+      schemaVersion: 1,
+      planDigest: computePlanDigest(plan),
+      entries: {},
+    }));
     mocks.createFsStorage.mockReturnValue(storage);
     mocks.loadConfig.mockResolvedValue(CONFIG);
     mocks.createFsTestFileDiscovery.mockReturnValue(async () => []);

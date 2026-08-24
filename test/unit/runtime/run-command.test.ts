@@ -26,6 +26,7 @@ const mocks = vi.hoisted(() => ({
   createCryptoRandom: vi.fn(),
   createAmbercast: vi.fn(),
   createNoopEventSink: vi.fn(),
+  createProcessEnvironmentInfo: vi.fn(),
   readCommandEnvironment: vi.fn(),
   createSystemClock: vi.fn(),
   loadConfig: vi.fn(),
@@ -46,6 +47,7 @@ vi.mock('#adapters/system/env-secrets-provider.js', () => ({
   createEnvSecretsProvider: mocks.createEnvSecretsProvider,
 }));
 vi.mock('#adapters/system/noop-event-sink.js', () => ({ createNoopEventSink: mocks.createNoopEventSink }));
+vi.mock('#adapters/system/process-environment-info.js', () => ({ createProcessEnvironmentInfo: mocks.createProcessEnvironmentInfo }));
 vi.mock('#adapters/system/process-command-environment.js', () => ({
   readCommandEnvironment: mocks.readCommandEnvironment,
 }));
@@ -67,6 +69,7 @@ const CONFIG: ResolvedConfig = {
   ai: { provider: 'auto', timeoutMs: 120_000 },
   viewer: { port: 4600 },
   ci: { heal: false, updateGroundingCache: false },
+  grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
 };
 
 function reportOutput(exitCode: RunCommandOutput['exitCode'], errors: ReportError[] = []): RunCommandOutput {
@@ -90,7 +93,7 @@ function reportOutput(exitCode: RunCommandOutput['exitCode'], errors: ReportErro
 
 function input(overrides: Partial<RunCommandInput> = {}): RunCommandInput {
   return {
-    files: [], headed: false, cacheOnly: false, allowEmpty: false, list: false, stale: 'fail', cwd: '/workspace', ...overrides,
+    files: [], headed: false, cacheOnly: false, updateCache: false, allowEmpty: false, list: false, stale: 'fail', cwd: '/workspace', ...overrides,
   };
 }
 
@@ -116,6 +119,7 @@ function capturedRunner(factory: FactoryCallRecorder): CommandRunner {
 }
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   vi.resetAllMocks();
   vi.doMock('#usecases/run-report.js', () => ({ buildRunReport: mocks.buildRunReport }));
 });
@@ -123,9 +127,75 @@ afterEach(() => {
 beforeEach(() => {
   mocks.createSystemClock.mockReturnValue(createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 10));
   mocks.createCryptoRandom.mockReturnValue({ uuid: () => '550e8400-e29b-41d4-a716-446655440000' });
+  mocks.createProcessEnvironmentInfo.mockReturnValue({ isCI: () => false });
 });
 
 describe('runRunCommand', () => {
+  it.each([
+    ['active CI', true, true],
+    ['active CI without cache updates', true, false],
+    ['inactive CI with cache updates', false, true],
+    ['inactive CI', false, false],
+  ] as const)('threads %s and updateCache unchanged into run', async (_name, isCI, updateCache) => {
+    const storage = createInMemoryStorage();
+    const output = reportOutput(0);
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.createBrowserDriverResolver.mockReturnValue(createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
+    mocks.createEnvSecretsProvider.mockReturnValue(createFakeSecretsProvider(new Map()));
+    mocks.createNoopEventSink.mockReturnValue(createRecordingEventSink().sink);
+    mocks.createAmbercast.mockReturnValue({
+      storage,
+      layout: { runReportPathFor: () => '/workspace/tests/.runs/report.json' },
+      clock: createFixedClock(new Date(), 1),
+      discoverTestFiles: vi.fn(async () => []),
+    });
+    mocks.createProcessEnvironmentInfo.mockReturnValue({ isCI: () => isCI });
+    mocks.run.mockResolvedValue({ results: [], noTestsFound: false, listed: [] });
+    mocks.buildRunReport.mockReturnValue(output);
+
+    await runRunCommand(input({ updateCache }));
+
+    expect(mocks.run).toHaveBeenCalledWith(
+      expect.objectContaining({ isCI }),
+      expect.objectContaining({ updateCache }),
+    );
+  });
+
+  it.each([
+    ['active CI', 'true', true],
+    ['unset CI', undefined, false],
+  ] as const)('threads %s from the real process environment adapter into run', async (_name, ci, isCI) => {
+    const storage = createInMemoryStorage();
+    const output = reportOutput(0);
+    const { createProcessEnvironmentInfo } = await vi.importActual<
+      typeof import('#adapters/system/process-environment-info.js')
+    >('#adapters/system/process-environment-info.js');
+    vi.stubEnv('CI', ci);
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.createBrowserDriverResolver.mockReturnValue(createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
+    mocks.createEnvSecretsProvider.mockReturnValue(createFakeSecretsProvider(new Map()));
+    mocks.createNoopEventSink.mockReturnValue(createRecordingEventSink().sink);
+    mocks.createAmbercast.mockReturnValue({
+      storage,
+      layout: { runReportPathFor: () => '/workspace/tests/.runs/report.json' },
+      clock: createFixedClock(new Date(), 1),
+      discoverTestFiles: vi.fn(async () => []),
+    });
+    mocks.createProcessEnvironmentInfo.mockImplementation(createProcessEnvironmentInfo);
+    mocks.run.mockResolvedValue({ results: [], noTestsFound: false, listed: [] });
+    mocks.buildRunReport.mockReturnValue(output);
+
+    await runRunCommand(input());
+
+    expect(mocks.createProcessEnvironmentInfo).toHaveBeenCalledOnce();
+    expect(mocks.run).toHaveBeenCalledWith(
+      expect.objectContaining({ isCI }),
+      expect.any(Object),
+    );
+  });
+
   it('returns and persists identities relative to the config-resolved root rather than cwd', async () => {
     const storage = createInMemoryStorage();
     const projectRoot = '/workspace/config-parent';
@@ -755,11 +825,13 @@ describe('runRunCommand', () => {
       discoverTestFiles,
       config: CONFIG,
       resolveAiExecutor: expect.any(Function),
+      isCI: false,
     }, {
       files: ['/workspace/login.test.md'],
       grep,
       target: 'web',
       cacheOnly: true,
+      updateCache: false,
       allowEmpty: false,
       list: false,
       stale: 'fail',

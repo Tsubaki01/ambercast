@@ -32,6 +32,7 @@ const TARGETS = { web: { baseUrl: 'https://example.test', browser: 'chromium' as
 const OPTIONS: RunOptions = {
   files: [TEST_PATH],
   cacheOnly: false,
+  updateCache: false,
   allowEmpty: false,
   list: false,
   stale: 'fail',
@@ -207,6 +208,7 @@ function scenario(
     resolveAiExecutor,
     events: events.sink,
     discoverTestFiles: async () => [],
+    isCI: false,
     config: {
       testDir: TEST_DIR,
       testMatch: ['**/*.test.md'],
@@ -214,6 +216,8 @@ function scenario(
       targets: TARGETS,
       defaultTarget: 'web',
       ai: { provider: 'codex', timeoutMs: 1000 },
+      ci: { heal: false, updateGroundingCache: false },
+      grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
     },
     ...overrides,
   };

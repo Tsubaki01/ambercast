@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
-import { computeInputsDigest } from '#core/ir/digest.js';
+import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import type { JsonValueT, PlanDocument } from '#core/ir/schema.js';
 import { ReportEnvelope } from '#report/schema.js';
@@ -73,6 +73,10 @@ async function writeSoleTargetConfigAndFreshPlan(project: string): Promise<void>
   await writeFile(
     join(project, 'tests', 'test.ambercast.plan.json'),
     toCanonicalArtifactText(plan as unknown as JsonValueT),
+  );
+  await writeFile(
+    join(project, 'tests', 'test.ambercast.grounding.json'),
+    toCanonicalArtifactText({ schemaVersion: 1, planDigest: computePlanDigest(plan), entries: {} }),
   );
 }
 

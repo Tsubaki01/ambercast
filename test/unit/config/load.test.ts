@@ -50,6 +50,10 @@ function expectedDefaults(configRoot: string): ResolvedConfig {
       heal: false,
       updateGroundingCache: false,
     },
+    grounding: {
+      repositoryPolicy: 'committed',
+      localWriteBack: 'auto',
+    },
   };
 }
 
@@ -134,6 +138,10 @@ function expectNestedGroupsToBeIndependent(first: ResolvedConfig, second: Resolv
   expect(first.ci).not.toBe(second.ci);
   expect(first.ci).not.toBe(DEFAULT_RAW_CONFIG.ci);
   expect(second.ci).not.toBe(DEFAULT_RAW_CONFIG.ci);
+
+  expect(first.grounding).not.toBe(second.grounding);
+  expect(first.grounding).not.toBe(DEFAULT_RAW_CONFIG.grounding);
+  expect(second.grounding).not.toBe(DEFAULT_RAW_CONFIG.grounding);
 }
 
 async function createDiscoveryConflictFixture(): Promise<StorageAdapter> {
@@ -482,7 +490,7 @@ describe('loadConfig', () => {
       await expectConfigInvalid(load(storage));
     });
 
-    it('merges ai, viewer, and ci one level deep while replacing other supplied top-level values', async () => {
+    it('merges ai, viewer, ci, and grounding one level deep while replacing other supplied top-level values', async () => {
       const storage = createInMemoryStorage();
       await writeConfig(storage, `${CWD}/ambercast.config.json`, {
         testMatch: ['specs/**/*.md'],
@@ -490,6 +498,7 @@ describe('loadConfig', () => {
         ai: { provider: 'claude', timeoutMs: 321 },
         viewer: { port: 4_321 },
         ci: { heal: true },
+        grounding: { repositoryPolicy: 'uncommitted' },
       });
 
       const config = await load(storage);
@@ -501,7 +510,30 @@ describe('loadConfig', () => {
         ai: { provider: 'claude', timeoutMs: 321 },
         viewer: { port: 4_321 },
         ci: { heal: true, updateGroundingCache: false },
+        grounding: { repositoryPolicy: 'uncommitted', localWriteBack: 'auto' },
       });
+    });
+
+    it('defaults an omitted grounding repository policy when the file supplies local write-back', async () => {
+      const storage = createInMemoryStorage();
+      await writeConfig(storage, `${CWD}/ambercast.config.json`, {
+        grounding: { localWriteBack: 'explicit' },
+      });
+
+      await expect(load(storage)).resolves.toStrictEqual({
+        ...expectedDefaults(CWD),
+        grounding: { repositoryPolicy: 'committed', localWriteBack: 'explicit' },
+      });
+    });
+
+    it.each([
+      ['grounding.repositoryPolicy', { grounding: { repositoryPolicy: 'unsupported' } }],
+      ['grounding.localWriteBack', { grounding: { localWriteBack: 'unsupported' } }],
+    ] as const)('rejects an invalid %s enum value', async (_field, rawConfig) => {
+      const storage = createInMemoryStorage();
+      await writeConfig(storage, `${CWD}/ambercast.config.json`, rawConfig);
+
+      await expectConfigInvalid(load(storage));
     });
   });
 
@@ -573,6 +605,7 @@ describe('loadConfig', () => {
         ai: { provider: 'claude' | 'codex' | 'auto' };
         viewer: { port: number };
         ci: { heal: boolean; updateGroundingCache: boolean };
+        grounding: { repositoryPolicy: 'committed' | 'uncommitted'; localWriteBack: 'auto' | 'explicit' };
       };
 
       expectNestedGroupsToBeIndependent(first, second);
@@ -583,6 +616,7 @@ describe('loadConfig', () => {
       mutableFirst.ai.provider = 'claude';
       mutableFirst.viewer.port = 9_999;
       mutableFirst.ci.heal = true;
+      mutableFirst.grounding.repositoryPolicy = 'uncommitted';
 
       expect(second).toStrictEqual(expectedDefaults(CWD));
       expect(DEFAULT_RAW_CONFIG).toStrictEqual(EXPECTED_DEFAULT_CONFIG);
@@ -597,6 +631,7 @@ describe('loadConfig', () => {
         ai: { provider: 'codex', timeoutMs: 120_000 },
         viewer: { port: 4_321 },
         ci: { heal: true, updateGroundingCache: true },
+        grounding: { repositoryPolicy: 'uncommitted', localWriteBack: 'explicit' },
       } as const;
       await writeConfig(storage, `${CWD}/ambercast.config.json`, fileConfig);
 
@@ -609,6 +644,7 @@ describe('loadConfig', () => {
         ai: { provider: 'claude' | 'codex' | 'auto' };
         viewer: { port: number };
         ci: { heal: boolean; updateGroundingCache: boolean };
+        grounding: { repositoryPolicy: 'committed' | 'uncommitted'; localWriteBack: 'auto' | 'explicit' };
       };
 
       expectNestedGroupsToBeIndependent(first, second);
@@ -619,6 +655,7 @@ describe('loadConfig', () => {
       mutableFirst.ai.provider = 'claude';
       mutableFirst.viewer.port = 9_999;
       mutableFirst.ci.heal = false;
+      mutableFirst.grounding.repositoryPolicy = 'committed';
 
       expect(second).toStrictEqual({
         ...withoutDefaultTarget(expectedDefaults(CWD)),
