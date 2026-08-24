@@ -5,10 +5,12 @@
  * This runtime path intentionally has no provider, browser, secrets, or event
  * composition. Its dependencies prove that checking committed artifact
  * freshness is independent from the execution machinery used by generation
- * and replay.
+ * and replay. It composes the filesystem read factory for both config
+ * loading and checking, so this entry point cannot introduce the write-capable
+ * storage factory into the check dependency closure.
  */
 
-import { createFsStorage } from '#adapters/storage/fs-storage.js';
+import { createFsReadStorage } from '#adapters/storage/fs-read-storage.js';
 import { readConfigEnvironment } from '#adapters/system/process-config-environment.js';
 import { createSystemClock } from '#adapters/system/system-clock.js';
 import { loadConfig } from '#config/load.js';
@@ -105,7 +107,7 @@ export async function runCheckCommand(input: CheckCommandInput): Promise<CheckCo
   });
 
   try {
-    const storage = createFsStorage();
+    const storage = createFsReadStorage();
     const config = await loadConfig({
       cwd: input.cwd,
       storage,

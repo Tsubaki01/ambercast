@@ -1,5 +1,6 @@
 import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { DEFAULT_RAW_CONFIG } from '#config/defaults.js';
+import type { ResolvedConfig } from '#core/config/schema.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
@@ -12,6 +13,8 @@ import {
   type TargetDefinition,
 } from '#core/ir/schema.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
+import type { LayoutResolver } from '#core/layout/resolve.js';
+import type { ReadStorageAdapter } from '#ports/storage.js';
 import { check, type CheckDeps, type CheckOptions } from '#usecases/check.js';
 import { BatchInterruptionTracker } from '#usecases/batch-interruption.js';
 import { buildCheckReport } from '#usecases/check-report.js';
@@ -1257,6 +1260,19 @@ describe('check', () => {
   });
 
   it('pins the read-only CheckDeps dependency surface at compile time', () => {
+    expectTypeOf<CheckDeps['storage']>().toEqualTypeOf<ReadStorageAdapter>();
+    expectTypeOf<CheckDeps['layout']>().toEqualTypeOf<LayoutResolver>();
+    expectTypeOf<CheckDeps['discoverTestFiles']>().toEqualTypeOf<
+      (config: {
+        readonly testDir: string;
+        readonly testMatch: readonly string[];
+        readonly testIgnore: readonly string[];
+      }) => Promise<readonly string[]>
+    >();
+    expectTypeOf<CheckDeps['config']>().toEqualTypeOf<
+      Pick<ResolvedConfig, 'testDir' | 'testMatch' | 'testIgnore' | 'targets' | 'defaultTarget' | 'grounding'>
+    >();
+    expectTypeOf<CheckDeps['signal']>().toEqualTypeOf<AbortSignal | undefined>();
     expectTypeOf<keyof CheckDeps>().toEqualTypeOf<
       'storage' | 'layout' | 'discoverTestFiles' | 'config' | 'signal'
     >();

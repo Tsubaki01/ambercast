@@ -26,7 +26,7 @@ import { GROUNDING_SUFFIX, PLAN_SUFFIX, type LayoutResolver } from '#core/layout
 import { matchesTestPatterns } from '#core/discovery/pattern-match.js';
 import { joinPath, relativeWithin } from '#core/paths.js';
 import { resolveTarget } from '#core/target/resolve.js';
-import type { StorageAdapter } from '#ports/storage.js';
+import type { ReadStorageAdapter } from '#ports/storage.js';
 import type { CheckResult } from '#report/schema.js';
 import type {
   InstructionCoverageIssue,
@@ -109,11 +109,12 @@ export interface CheckDeps {
   /**
    * The only storage capabilities check may use.
    *
-   * Narrowing this port prevents inspection from acquiring a write capability
-   * by accident; reads and existence checks are sufficient for every plan,
-   * prompt, grounding companion, and orphan finding.
+   * This no-write contract is an invariant of check's design, not merely a
+   * description of its current calls: inspection must never gain authority to
+   * modify storage. Reads and existence checks are sufficient for
+   * every plan, prompt, grounding companion, and orphan finding.
    */
-  readonly storage: Pick<StorageAdapter, 'readText' | 'exists'>;
+  readonly storage: ReadStorageAdapter;
 
   /** Deterministic companion-path and inverse orphan-path arithmetic. */
   readonly layout: LayoutResolver;
