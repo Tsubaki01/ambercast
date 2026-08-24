@@ -1,6 +1,6 @@
 import { computePlanDigest, isPlanDigestCurrent } from '#core/ir/digest.js';
 import { GroundingDocument, type PlanDocument } from '#core/ir/schema.js';
-import type { StorageAdapter } from '#ports/storage.js';
+import type { ReadStorageAdapter } from '#ports/storage.js';
 
 /*
  * Check needs to report which grounding lifecycle condition it observed, so it
@@ -26,15 +26,28 @@ export type GroundingInspection =
   | { readonly kind: 'stale' }
   | { readonly kind: 'valid' };
 
-/*
- * This inspects one plan's grounding companion using only the read
- * capability that check already has. Narrowing storage to `exists` and
- * `readText` prevents this reporting helper from gaining mutation authority.
- * It returns only a classification because the caller selects a report status;
- * neither a parsed document nor parse diagnostics are useful at that boundary.
+/**
+ * Classifies the grounding companion associated with one plan.
+ *
+ * @param storage - Read-only storage whose no-write contract is an invariant
+ * of check's design: grounding inspection must never acquire authority to
+ * create, replace, or otherwise mutate storage.
+ * @param groundingPath - Opaque path of the companion artifact to inspect.
+ * @param plan - The parsed plan whose digest the companion is compared
+ * against.
+ * @returns The companion's absence, validity, or relationship to `plan`.
+ * @throws Propagates a storage rejection while reading an existing companion,
+ * so the caller can preserve it as a per-file I/O error.
+ *
+ * @remarks
+ * The helper returns only a classification because its caller
+ * owns report-status selection; parsed content and parse diagnostics do not
+ * cross that boundary. A named read port also keeps this check-closure helper
+ * consistent with its parent use case instead of encoding the same capability
+ * as an ad hoc structural `Pick`.
  */
 export async function inspectGroundingArtifact(
-  storage: Pick<StorageAdapter, 'readText' | 'exists'>,
+  storage: ReadStorageAdapter,
   groundingPath: string,
   plan: PlanDocument,
 ): Promise<GroundingInspection> {

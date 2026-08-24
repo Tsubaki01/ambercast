@@ -227,6 +227,14 @@ const edgeCases: readonly EdgeCase[] = [
     compliantSource: 'src/build-tools/synthetic-build-tool.ts',
     compliantTarget: 'fs/promises',
   },
+  {
+    id: 'check-transitive-closure',
+    expectedRuleId: 'check-no-write-capable-dependencies',
+    source: 'src/runtime/check-command.ts',
+    target: 'src/adapters/ai/synthetic-ai.ts',
+    compliantSource: 'src/runtime/check-command.ts',
+    compliantTarget: 'src/core/synthetic-token.ts',
+  },
 ];
 
 function fixturePath(id: string, variant: 'violation' | 'compliant'): string {
@@ -289,6 +297,38 @@ describe('dependency-cruiser architecture rules', () => {
       'build-tools-boundary',
       'global-types-boundary',
     ]));
+  });
+
+  test('pins every check read-only closure root, target, and reachability mode', () => {
+    const candidate = dependencyCruiserConfig.forbidden.find((rule: { readonly name: string }) => (
+      rule.name === 'check-no-write-capable-dependencies'
+    ));
+    expect(candidate).toBeDefined();
+
+    if (candidate === undefined) {
+      throw new Error('Expected the check read-only closure rule to be configured.');
+    }
+
+    const rule = candidate as {
+      readonly from: { readonly path: string };
+      readonly to: { readonly path: readonly string[]; readonly reachable: boolean };
+    };
+    const sourcePattern = new RegExp(rule.from.path);
+    const targetPattern = new RegExp(rule.to.path.join('|'));
+
+    expect(sourcePattern.test('src/usecases/check.ts')).toBe(true);
+    expect(sourcePattern.test('src/usecases/check-report.ts')).toBe(true);
+    expect(sourcePattern.test('src/runtime/check-command.ts')).toBe(true);
+    expect(sourcePattern.test('src/usecases/generate.ts')).toBe(false);
+
+    expect(targetPattern.test('src/adapters/ai/whatever.ts')).toBe(true);
+    expect(targetPattern.test('src/adapters/browser/whatever.ts')).toBe(true);
+    expect(targetPattern.test('src/adapters/system/env-secrets-provider.ts')).toBe(true);
+    expect(targetPattern.test('src/adapters/system/noop-event-sink.ts')).toBe(true);
+    expect(targetPattern.test('src/adapters/storage/fs-storage.ts')).toBe(true);
+    expect(targetPattern.test('src/adapters/system/system-clock.ts')).toBe(false);
+    expect(targetPattern.test('src/adapters/system/process-config-environment.ts')).toBe(false);
+    expect(rule.to.reachable).toBe(true);
   });
 
   test('forbids every import from a flat adapters-root file', async () => {

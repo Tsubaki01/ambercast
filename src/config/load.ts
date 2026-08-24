@@ -24,7 +24,7 @@ import {
 } from '#core/config/schema.js';
 import { ConfigInvalidError } from '#core/errors/config-invalid-error.js';
 import { dirnamePath, isAbsolutePath, joinPath } from '#core/paths.js';
-import type { StorageAdapter } from '#ports/storage.js';
+import type { ReadStorageAdapter } from '#ports/storage.js';
 import { DEFAULT_RAW_CONFIG } from './defaults.js';
 
 const CONFIG_FILE_NAME = 'ambercast.config.json';
@@ -65,7 +65,17 @@ export interface LoadConfigOptions {
    * that follows this interface's explicit-path contract.
    */
   readonly configEnv?: ConfigEnvSnapshot;
-  readonly storage: StorageAdapter;
+  /**
+   * Reads configuration candidates without granting the loader authority to
+   * modify them.
+   *
+   * @remarks
+   * The loader uses only text reads and existence probes, so accepting the
+   * read port keeps the check command's configuration path capability-limited
+   * without creating a check-specific loader. A full `StorageAdapter` remains
+   * acceptable wherever callers already provide one.
+   */
+  readonly storage: ReadStorageAdapter;
 }
 
 /**
