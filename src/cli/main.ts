@@ -66,6 +66,7 @@ interface ParsedRunCommand {
     readonly target?: string;
     readonly headed: boolean;
     readonly cacheOnly: boolean;
+    readonly updateCache: boolean;
     /**
      * Whether a zero-match replay selection is an allowed empty outcome.
      *
@@ -104,7 +105,7 @@ interface ParsedCheckCommand {
   readonly color: boolean;
 }
 
-const USAGE = `Usage: ambercast <command> [options]\n\nCommands:\n  generate [files...]  Generate deterministic plans\n  run [files...]       Replay deterministic plans\n  check [files...]     Check plan freshness\n\nGenerate options:\n  --strict  --force  --dry-run  --target <name>  --ai <claude|codex>\n  --allow-empty  --list  --json  --config <path>  --no-color\n\nRun options:\n  --grep <pattern>  --target <name>  --headed  --cache-only  --allow-empty  --list\n  --stale <fail>  --json  --no-color\n\nCheck options:\n  --target <name>  --allow-empty  --list  --json  --config <path>  --no-color\n`;
+const USAGE = `Usage: ambercast <command> [options]\n\nCommands:\n  generate [files...]  Generate deterministic plans\n  run [files...]       Replay deterministic plans\n  check [files...]     Check plan freshness\n\nGenerate options:\n  --strict  --force  --dry-run  --target <name>  --ai <claude|codex>\n  --allow-empty  --list  --json  --config <path>  --no-color\n\nRun options:\n  --grep <pattern>  --target <name>  --headed  --cache-only  --update-cache  --allow-empty  --list\n  --stale <fail>  --json  --no-color\n\nCheck options:\n  --target <name>  --allow-empty  --list  --json  --config <path>  --no-color\n`;
 
 /*
  * Human rendering remains command-agnostic: only known healthy states are
@@ -113,7 +114,7 @@ const USAGE = `Usage: ambercast <command> [options]\n\nCommands:\n  generate [fi
  * also defaults to failure styling, preventing a report vocabulary extension
  * from acquiring success styling accidentally.
  */
-const HEALTHY_REPORT_STATUSES = new Set(['generated', 'skipped-fresh', 'listed', 'fresh', 'passed']);
+const HEALTHY_REPORT_STATUSES = new Set(['generated', 'skipped-fresh', 'listed', 'fresh', 'fresh-without-grounding', 'passed']);
 
 /**
  * Fixed warning that `main()` writes to stderr exactly once when a run
@@ -267,7 +268,10 @@ function parseGenerate(argv: readonly string[], signal: AbortSignal): ParsedGene
  * target, `--headed` requests visible browser execution, `--json` selects the
  * report rendering, and `--no-color` disables its ANSI styling. `--cache-only`
  * forces a replay miss to fail immediately instead of falling back to the AI
- * executor. `--stale` accepts `fail` and `regenerate` as enum
+ * executor. `--update-cache` is the caller's explicit request to persist this
+ * invocation's grounding-cache changes: it is required before an `explicit`
+ * local write-back posture may write, and in CI it independently opts in
+ * alongside `ci.updateGroundingCache`. `--stale` accepts `fail` and `regenerate` as enum
  * values, while runtime rejects `regenerate` as an unavailable option before
  * touching files. `--ai` retains the shared CLI provider-override syntax without
  * making replay resolve a provider.
@@ -292,6 +296,7 @@ function parseRun(argv: readonly string[], signal: AbortSignal): ParsedRunComman
   let headed = false;
   let json = false;
   let cacheOnly = false;
+  let updateCache = false;
   let allowEmpty = false;
   let list = false;
   let stale: 'fail' | 'regenerate' = 'fail';
@@ -319,6 +324,8 @@ function parseRun(argv: readonly string[], signal: AbortSignal): ParsedRunComman
       json = true;
     } else if (argument === '--cache-only') {
       cacheOnly = true;
+    } else if (argument === '--update-cache') {
+      updateCache = true;
     } else if (argument === '--no-color') {
       color = false;
     } else if (argument === '--grep' || argument === '--target' || argument === '--stale' || argument === '--ai') {
@@ -359,6 +366,7 @@ function parseRun(argv: readonly string[], signal: AbortSignal): ParsedRunComman
       ...(target === undefined ? {} : { target }),
       headed,
       cacheOnly,
+      updateCache,
       allowEmpty,
       list,
       stale,

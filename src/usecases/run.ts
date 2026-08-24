@@ -2813,6 +2813,14 @@ export interface RunOptions {
   /** Whether grounding misses and trace misses must fail without an AI fallback. */
   readonly cacheOnly: boolean;
 
+  /*
+   * Records the caller's explicit request to persist grounding changes when
+   * the write-back posture would otherwise keep this invocation memory-only.
+   * Environment detection remains a dependency instead of becoming another
+   * command option, so the predicate can keep user intent and host facts apart.
+   */
+  readonly updateCache: boolean;
+
   /**
    * Lets reporting accept an empty resolved selection without changing replay.
    *
@@ -2926,11 +2934,23 @@ export interface RunDeps {
     readonly testIgnore: readonly string[];
   }) => Promise<readonly string[]>;
 
-  /** The configuration subset used for discovery, target/digest resolution, and per-call AI timeout policy. */
+  /*
+   * The configuration subset used for discovery, target/digest resolution,
+   * and per-call AI timeout policy. Its ci.updateGroundingCache and
+ * grounding.localWriteBack members also supply the CI and local inputs
+   * to the grounding write-back gate, together with isCI and updateCache.
+   */
   readonly config: Pick<
     ResolvedConfig,
-    'testDir' | 'testMatch' | 'testIgnore' | 'targets' | 'defaultTarget' | 'ai'
+    'testDir' | 'testMatch' | 'testIgnore' | 'targets' | 'defaultTarget' | 'ai' | 'ci' | 'grounding'
   >;
+
+  /*
+   * Runtime supplies this environment fact once per invocation. It belongs
+   * with composed dependencies, rather than command options, because parsing
+   * must not let a caller claim a local run while actually executing in CI.
+   */
+  readonly isCI: boolean;
 
   /**
    * Caller cancellation observed at the sequential case boundary.
@@ -2941,6 +2961,36 @@ export interface RunDeps {
    * {@link RunCaseOutcome}.
    */
   readonly signal?: AbortSignal;
+}
+
+/*
+ * Holds the two deliberately separate persistence policies plus the invocation
+ * and environment facts that choose between them. Keeping this data at the
+ * pure gate makes the write-back decision testable without replay I/O or the
+ * surrounding cleanup path.
+ */
+export interface GroundingWriteBackOptions {
+  readonly localWriteBack: 'auto' | 'explicit';
+  readonly updateCache: boolean;
+  readonly isCI: boolean;
+  readonly updateGroundingCacheConfig: boolean;
+}
+
+/*
+ * A non-CI auto posture always allows write-back regardless of the other two
+ * inputs, while a non-CI explicit posture requires updateCache. CI always
+ * requires updateCache or ci.updateGroundingCache regardless of
+ * localWriteBack.
+ *
+ * CI never consults localWriteBack, and non-CI never consults
+ * ci.updateGroundingCache. Keeping both non-interference directions explicit
+ * prevents a CI-only opt-in from changing local behavior, or a local posture
+ * from silently broadening CI persistence.
+ */
+export function groundingWriteBackAllowed(options: GroundingWriteBackOptions): boolean {
+  return options.isCI
+    ? (options.updateCache || options.updateGroundingCacheConfig)
+    : (options.localWriteBack === 'auto' || options.updateCache);
 }
 
 /**
@@ -3063,9 +3113,11 @@ export type RunListedFile = { readonly file: string };
  * Dispatch-time failures with a live browser preserve best-effort screenshot
  * and redacted accessibility evidence before the session closes, while
  * pre-launch and post-close failures correctly have none. Each case isolates
- * its own failure so later cases may continue, closes its browser session, and
- * flushes accumulated grounding atomically; a flush error changes only an
- * otherwise successful case. The unified case-abort result covers suppressed
+ * its own failure so later cases may continue and closes its browser session.
+ * Changed grounding flushes atomically only when the CI/local posture gate
+ * permits it; otherwise it remains memory-only. The secret scan and flush
+ * error classification likewise run only on an allowed write path, where
+ * a flush error changes only an otherwise successful case. The unified case-abort result covers suppressed
  * fallback and unavailable capture or verification evidence without inventing
  * an error kind that misrepresents those conditions.
  */
@@ -3385,7 +3437,23 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
       }
     }
 
-    if (groundingDirty && groundingPath !== undefined && grounding !== undefined) {
+    /*
+     * Write-back requires both a changed, addressable grounding artifact
+     * and the posture gate above. Keeping the gate around the whole persistence
+     * boundary means a disallowed write also avoids its secret scan and
+     * write-error reclassification, preserving a genuinely memory-only run.
+     */
+    if (
+      groundingDirty
+      && groundingPath !== undefined
+      && grounding !== undefined
+      && groundingWriteBackAllowed({
+        localWriteBack: deps.config.grounding.localWriteBack,
+        updateCache: options.updateCache,
+        isCI: deps.isCI,
+        updateGroundingCacheConfig: deps.config.ci.updateGroundingCache,
+      })
+    ) {
       try {
         /*
          * Immediately before serialization, this persistence boundary inspects

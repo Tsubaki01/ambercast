@@ -13,6 +13,7 @@ import { createFsStorage } from '#adapters/storage/fs-storage.js';
 import { createEnvSecretsProvider } from '#adapters/system/env-secrets-provider.js';
 import { createCryptoRandom } from '#adapters/system/crypto-random.js';
 import { createNoopEventSink } from '#adapters/system/noop-event-sink.js';
+import { createProcessEnvironmentInfo } from '#adapters/system/process-environment-info.js';
 import { readCommandEnvironment } from '#adapters/system/process-command-environment.js';
 import { readConfigEnvironment } from '#adapters/system/process-config-environment.js';
 import { createSystemClock } from '#adapters/system/system-clock.js';
@@ -140,6 +141,15 @@ export interface RunCommandInput {
   readonly cacheOnly: boolean;
 
   /**
+   * Records the caller's explicit request to persist this invocation's
+   * grounding-cache changes. It is the request an explicit local write-back
+   * posture requires before run performs grounding persistence after a case
+   * completes, and in CI
+   * it independently opts in alongside `ci.updateGroundingCache`.
+   */
+  readonly updateCache: boolean;
+
+  /**
    * Allows a resolved empty selection to report success.
    *
    * This is reporting policy rather than replay policy, so runtime threads it
@@ -228,6 +238,13 @@ export async function runRunCommand(input: RunCommandInput): Promise<RunCommandO
   const startedAt = reportTimestamp(clock.now());
   const runId = runIdFor(startedAt, createCryptoRandom().uuid());
   const startedMs = clock.monotonicMs();
+  /*
+   * Environment detection is composed directly at this command boundary,
+   * matching the existing direct randomness adapter. `createAmbercast` owns
+   * services shared by command paths, while invocation-specific host facts
+   * remain local to the runtime that consumes them.
+   */
+  const isCI = createProcessEnvironmentInfo().isCI();
   /**
    * Supplies both report paths with one consistent timing and options shape.
    *
@@ -273,6 +290,7 @@ export async function runRunCommand(input: RunCommandInput): Promise<RunCommandO
       events,
       discoverTestFiles: ambercast.discoverTestFiles,
       config,
+      isCI,
       resolveAiExecutor: (signal) => resolveAiProvider(
         config.ai.provider,
         input.aiProviderOverride,
@@ -286,6 +304,7 @@ export async function runRunCommand(input: RunCommandInput): Promise<RunCommandO
       ...(input.grep === undefined ? {} : { grep: input.grep }),
       ...(input.target === undefined ? {} : { target: input.target }),
       cacheOnly: input.cacheOnly,
+      updateCache: input.updateCache,
       allowEmpty: input.allowEmpty,
       list: input.list,
       stale: input.stale,

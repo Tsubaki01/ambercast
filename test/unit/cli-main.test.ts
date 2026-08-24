@@ -288,6 +288,7 @@ describe('main()', () => {
       '--headed',
       '--json',
       '--cache-only',
+      '--update-cache',
       '--stale',
       'regenerate',
       '--ai',
@@ -300,6 +301,7 @@ describe('main()', () => {
       target: 'web',
       headed: true,
       cacheOnly: true,
+      updateCache: true,
       stale: 'regenerate',
       aiProviderOverride: 'claude',
     }));
@@ -350,7 +352,26 @@ describe('main()', () => {
 
     await run(['run', '--stale', 'fail']);
 
-    expect(runRunCommand).toHaveBeenCalledWith(expect.objectContaining({ stale: 'fail' }));
+    expect(runRunCommand).toHaveBeenCalledWith(expect.objectContaining({ stale: 'fail', updateCache: false }));
+  });
+
+  it('renders --update-cache in the actual usage text', async () => {
+    const result = await run(['--help']);
+
+    expect(result.stdout).toContain('--update-cache');
+  });
+
+  it.each(['generate', 'check'] as const)('rejects --update-cache for %s before runtime composition', async (command) => {
+    const result = await run([command, '--update-cache']);
+
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain(`Unknown ${command} option: --update-cache.`);
+    expect(result.exitCode).toBe(2);
+    if (command === 'generate') {
+      expect(runGenerateCommand).not.toHaveBeenCalled();
+    } else {
+      expect(runCheckCommand).not.toHaveBeenCalled();
+    }
   });
 
   it.each([
@@ -497,6 +518,7 @@ describe('main()', () => {
     '--headed',
     '--cache-only',
     '--stale',
+    '--update-cache',
   ] as const)('rejects the generate/run-only %s flag before runtime composition', async (flag) => {
     const result = await run(['check', flag]);
 
@@ -547,6 +569,26 @@ describe('main()', () => {
     expect(result.stdout).toContain('\u001B[32mfresh\u001B[0m fresh.test.md: The plan matches the current prompt and target.');
     expect(result.stdout).toContain('\u001B[31mstale\u001B[0m stale.test.md: The plan is stale for the current prompt or target.');
     expect(result.exitCode).toBe(4);
+  });
+
+  it('renders the uncommitted grounding waiver as a healthy green check row', async () => {
+    runCheckCommand.mockResolvedValue({
+      exitCode: 0,
+      envelope: {
+        ...CHECK_ENVELOPE,
+        summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 },
+        results: [{
+          id: 'fresh.test.md', file: 'fresh.test.md', planFile: 'fresh.ambercast.plan.json',
+          status: 'fresh-without-grounding',
+          reason: "The plan is fresh; a grounding cache is not required by this project's repository policy.",
+        }],
+      },
+    } as never);
+
+    const result = await run(['check']);
+
+    expect(result.stdout).toContain('\u001B[32mfresh-without-grounding\u001B[0m fresh.test.md');
+    expect(result.exitCode).toBe(0);
   });
 
   it('passes a check runtime exit code through unchanged', async () => {

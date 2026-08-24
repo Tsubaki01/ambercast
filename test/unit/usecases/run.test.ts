@@ -83,6 +83,7 @@ const SUBMIT: ElementRef = { strategy: 'accessibility', role: 'button', name: 'S
 const DEFAULT_OPTIONS: RunOptions = {
   files: [],
   cacheOnly: false,
+  updateCache: false,
   allowEmpty: false,
   list: false,
   stale: 'fail',
@@ -190,6 +191,7 @@ function createScenario(overrides: Partial<RunDeps> = {}): Scenario {
     resolveAiExecutor,
     events: events.sink,
     discoverTestFiles: vi.fn(async () => ['login.test.md']),
+    isCI: false,
     config: {
       testDir: TEST_DIR,
       testMatch: ['**/*.test.md'],
@@ -197,6 +199,8 @@ function createScenario(overrides: Partial<RunDeps> = {}): Scenario {
       targets: TARGETS,
       defaultTarget: 'web',
       ai: { provider: 'codex', timeoutMs: 120_000 },
+      ci: { heal: false, updateGroundingCache: false },
+      grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
     },
     ...overrides,
   };
@@ -400,6 +404,8 @@ function configWithAiTimeout(timeoutMs: number): RunDeps['config'] {
     targets: TARGETS,
     defaultTarget: 'web',
     ai: { provider: 'codex', timeoutMs },
+    ci: { heal: false, updateGroundingCache: false },
+    grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
   };
 }
 
@@ -686,6 +692,8 @@ describe('run', () => {
         targets: MULTI_TARGETS,
         defaultTarget: 'web',
         ai: { provider: 'codex', timeoutMs: 120_000 },
+        ci: { heal: false, updateGroundingCache: false },
+        grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
       },
     });
     const testPath = await writePrompt(recordingStorage.storage);
@@ -711,6 +719,8 @@ describe('run', () => {
         targets: TARGETS,
         defaultTarget: 'web',
         ai: { provider: 'codex' as const, timeoutMs: 120_000 },
+        ci: { heal: false, updateGroundingCache: false },
+        grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
       },
       { target: 'missing' },
       'The requested target is not configured.',
@@ -724,6 +734,8 @@ describe('run', () => {
         testIgnore: [],
         targets: MULTI_TARGETS,
         ai: { provider: 'codex' as const, timeoutMs: 120_000 },
+        ci: { heal: false, updateGroundingCache: false },
+        grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
       },
       {},
       'A target could not be selected from the configured targets.',
@@ -792,6 +804,8 @@ describe('run', () => {
         targets,
         defaultTarget: 'web',
         ai: { provider: 'codex', timeoutMs: 120_000 },
+        ci: { heal: false, updateGroundingCache: false },
+        grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
       },
       discoverTestFiles: async () => ['first.test.md', 'second.test.md'],
     });
@@ -842,6 +856,8 @@ describe('run', () => {
         testIgnore: [],
         targets: soleTargets,
         ai: { provider: 'codex', timeoutMs: 120_000 },
+        ci: { heal: false, updateGroundingCache: false },
+        grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
       },
     });
     const testPath = await writePrompt(recordingStorage.storage);
@@ -876,6 +892,8 @@ describe('run', () => {
         targets: MULTI_TARGETS,
         defaultTarget: 'web',
         ai: { provider: 'codex', timeoutMs: 120_000 },
+        ci: { heal: false, updateGroundingCache: false },
+        grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
       },
     });
     const testPath = await writePrompt(recordingStorage.storage);
@@ -911,6 +929,8 @@ describe('run', () => {
         targets: selectedChanged,
         defaultTarget: 'web',
         ai: { provider: 'codex', timeoutMs: 120_000 },
+        ci: { heal: false, updateGroundingCache: false },
+        grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
       },
     });
     const changedPath = await writePrompt(changedScenario.recordingStorage.storage);
@@ -933,6 +953,8 @@ describe('run', () => {
         targets: unrelatedChanged,
         defaultTarget: 'web',
         ai: { provider: 'codex', timeoutMs: 120_000 },
+        ci: { heal: false, updateGroundingCache: false },
+        grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
       },
     });
     const unrelatedPath = await writePrompt(unrelatedScenario.recordingStorage.storage);
@@ -972,6 +994,8 @@ describe('run', () => {
         testIgnore: [],
         targets: TARGETS,
         ai: { provider: 'codex', timeoutMs: 120_000 },
+        ci: { heal: false, updateGroundingCache: false },
+        grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
       },
     });
     const testPath = await writePrompt(recordingStorage.storage);
@@ -5429,6 +5453,95 @@ describe('run per-case grounding flush and dispatch wiring', () => {
   });
 });
 
+describe('run grounding write-back posture integration', () => {
+  it.each([
+    ['local auto without update', false, 'auto', false, false, true],
+    ['local auto with update', false, 'auto', true, false, true],
+    ['local explicit without update', false, 'explicit', false, false, false],
+    ['local explicit with update', false, 'explicit', true, false, true],
+    ['CI auto without an opt-in', true, 'auto', false, false, false],
+    ['CI auto with update', true, 'auto', true, false, true],
+    ['CI auto with configured opt-in', true, 'auto', false, true, true],
+    ['CI explicit without an opt-in', true, 'explicit', false, false, false],
+    ['local explicit ignores the CI config opt-in', false, 'explicit', false, true, false],
+    ['CI explicit accepts the CI config opt-in', true, 'explicit', false, true, true],
+  ] as const)('attempts grounding write-back only when allowed for %s', async (_name, isCI, localWriteBack, updateCache, updateGroundingCache, allowed) => {
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await evaluateTerminalAssert(request, passingText('Dashboard'));
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      isCI,
+      config: {
+        ...configWithAiTimeout(120_000),
+        ci: { heal: false, updateGroundingCache },
+        grounding: { repositoryPolicy: 'committed', localWriteBack },
+      },
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()]);
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, { ...DEFAULT_OPTIONS, updateCache });
+    const groundingWrites = recordingStorage.writes.filter(({ path }) => path === deps.layout.groundingPathFor(testPath));
+
+    expect(groundingWrites).toHaveLength(allowed ? 1 : 0);
+    expect(outcome.results[0]?.result.status).toBe('passed');
+  });
+
+  it('skips both the secret scan and write-error reclassification when explicit local write-back lacks --update-cache', async () => {
+    const secretRef = '{{secrets.grounding_write_back}}';
+    const secretValue = 'grounding-write-back-secret';
+    const session = createFakeBrowserSession(liveEntries([PASSWORD]));
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'fill', target: PASSWORD, value: secretValue });
+        await evaluateTerminalAssert(request, passingText('Dashboard'));
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([[secretRef, secretValue]])),
+      resolveAiExecutor: async () => executor,
+      config: {
+        ...configWithAiTimeout(120_000),
+        grounding: { repositoryPolicy: 'committed', localWriteBack: 'explicit' },
+      },
+    });
+    const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${secretRef}\n`);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep('recorded-ai', [secretRef])]);
+    recordingStorage.writes.length = 0;
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(recordingStorage.writes.filter(({ path }) => path === deps.layout.groundingPathFor(testPath))).toHaveLength(0);
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(outcome.results[0]?.error).toBeUndefined();
+  });
+
+  it('keeps the not-dirty short-circuit ahead of every write-back gate input', async () => {
+    const { deps, recordingStorage } = createScenario({
+      isCI: true,
+      config: {
+        ...configWithAiTimeout(120_000),
+        ci: { heal: false, updateGroundingCache: true },
+        grounding: { repositoryPolicy: 'committed', localWriteBack: 'explicit' },
+      },
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath);
+    recordingStorage.writes.length = 0;
+
+    await run(deps, { ...DEFAULT_OPTIONS, updateCache: true });
+
+    expect(recordingStorage.writes.filter(({ path }) => path === deps.layout.groundingPathFor(testPath))).toHaveLength(0);
+  });
+});
+
 describe('run failure evidence', () => {
   it('persists a normal assertion screenshot with real filesystem storage and a schema-valid result', async () => {
     const root = await mkdtemp(join(tmpdir(), 'ambercast-run-evidence-'));
@@ -5469,8 +5582,9 @@ describe('run failure evidence', () => {
         browserDriver: () => createFakeBrowserDriver(() => session), secrets: createFakeSecretsProvider(new Map()),
         resolveAiExecutor: async () => createFakeAiExecutor(), events: createRecordingEventSink().sink,
         discoverTestFiles: async () => [],
-        config: { testDir, testMatch: ['**/*.test.md'], testIgnore: ['**/.runs/**'], targets: TARGETS, defaultTarget: 'web', ai: { provider: 'codex', timeoutMs: 120_000 } },
-      }, { files: [testPath], cacheOnly: false, allowEmpty: false, list: false, stale: 'fail' });
+        config: { testDir, testMatch: ['**/*.test.md'], testIgnore: ['**/.runs/**'], targets: TARGETS, defaultTarget: 'web', ai: { provider: 'codex', timeoutMs: 120_000 }, ci: { heal: false, updateGroundingCache: false }, grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' } },
+        isCI: false,
+      }, { files: [testPath], cacheOnly: false, updateCache: false, allowEmpty: false, list: false, stale: 'fail' });
       const result = outcome.results[0]?.result;
       const step = result?.steps[0];
       const screenshotPath = join(runsDir, runId, 'login', 'assert-dashboard.png');

@@ -34,6 +34,7 @@ import type {
 } from './instruction-coverage-policy.js';
 import { validateCommittedInstructionCoverage } from './instruction-coverage-policy.js';
 import { BatchInterruptionTracker } from './batch-interruption.js';
+import { inspectGroundingArtifact } from './check-grounding.js';
 
 /**
  * Performs the prompt-dependent committed-coverage portion of freshness.
@@ -105,7 +106,7 @@ export interface CheckDeps {
    *
    * Narrowing this port prevents inspection from acquiring a write capability
    * by accident; reads and existence checks are sufficient for every plan,
-   * prompt, and orphan finding.
+   * prompt, grounding companion, and orphan finding.
    */
   readonly storage: Pick<StorageAdapter, 'readText' | 'exists'>;
 
@@ -125,10 +126,15 @@ export interface CheckDeps {
     readonly testIgnore: readonly string[];
   }) => Promise<readonly string[]>;
 
-  /** The resolved configuration fields that affect selection and digest inputs. */
+  /*
+   * The resolved configuration fields that affect selection and digest inputs.
+   * grounding is the exception: it affects only the report-status mapping
+   * for an already-fresh plan's grounding companion, never selection or the
+   * digest itself.
+   */
   readonly config: Pick<
     ResolvedConfig,
-    'testDir' | 'testMatch' | 'testIgnore' | 'targets' | 'defaultTarget'
+    'testDir' | 'testMatch' | 'testIgnore' | 'targets' | 'defaultTarget' | 'grounding'
   >;
 
   /**
@@ -163,12 +169,16 @@ export interface CheckFileError {
   readonly file: string;
 
   /**
-   * The classified storage failure for that prompt or its existing plan.
+   * The classified storage failure for that prompt, its existing plan, or an
+   * existing grounding companion.
    *
    * This intentionally accepts only `FsIoError`: freshness states belong in
    * `CheckFileOutcome`, while target resolution remains a command-level
-   * failure. The narrow type prevents either category from being silently
-   * reintroduced as a case error that the report boundary cannot represent.
+   * failure. A grounding read rejection becomes this per-file error rather
+   * than an invalid-grounding finding or a deferred fresh row, while later
+   * files remain inspectable. The narrow type prevents either category from
+   * being silently reintroduced as a case error that the report boundary
+   * cannot represent.
    */
   readonly error: FsIoError;
 }
@@ -388,6 +398,74 @@ export async function check(deps: CheckDeps, options: CheckOptions): Promise<Che
         generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
         targetDefinitions: targetSelection.definitions,
       });
+      if (parsedPlan.data.source.inputsDigest === inputsDigest) {
+        /*
+         * Grounding is inspected only after the plan has passed its own
+         * freshness contract, so an already stale or invalid plan keeps its
+         * established outcome. The mapping replaces this file's deferred fresh
+         * row rather than appending a second row. These statuses add lifecycle
+         * evidence to an otherwise fresh plan; they do not redefine plan
+         * freshness itself.
+         *
+         * An existing grounding companion whose read rejects instead produces
+         * this file's FsIoError in errors[], with neither a grounding
+         * row nor the deferred fresh row; that isolated error does not stop
+         * later selected files.
+         *
+         * An emitted stale-grounding or invalid-grounding row includes
+         * groundingFile because the existing artifact is evidence of that
+         * finding. A missing-grounding or fresh-without-grounding row omits
+         * it because no artifact exists, or the uncommitted waiver deliberately
+         * withholds its identity. Fixed path-free reasons keep the status
+         * mapping reportable without disclosing a host path.
+         */
+        const groundingPath = deps.layout.groundingPathFor(file);
+        let groundingInspection;
+        try {
+          groundingInspection = await inspectGroundingArtifact(
+            deps.storage,
+            groundingPath,
+            parsedPlan.data,
+          );
+        } catch (error) {
+          errors.push({
+            file,
+            error: new FsIoError('The existing grounding cache could not be read.', undefined, { cause: error }),
+          });
+          continue;
+        }
+
+        if (groundingInspection.kind !== 'valid') {
+          if (deps.config.grounding.repositoryPolicy === 'uncommitted') {
+            results.push({
+              ...identity,
+              status: 'fresh-without-grounding',
+              reason: "The plan is fresh; a grounding cache is not required by this project's repository policy.",
+            });
+          } else if (groundingInspection.kind === 'missing') {
+            results.push({
+              ...identity,
+              status: 'missing-grounding',
+              reason: 'The grounding cache does not exist.',
+            });
+          } else if (groundingInspection.kind === 'invalid') {
+            results.push({
+              ...identity,
+              groundingFile: groundingPath,
+              status: 'invalid-grounding',
+              reason: 'The grounding cache is not valid or does not match the grounding schema.',
+            });
+          } else {
+            results.push({
+              ...identity,
+              groundingFile: groundingPath,
+              status: 'stale-grounding',
+              reason: 'The grounding cache does not match the current plan.',
+            });
+          }
+          continue;
+        }
+      }
       results.push({
         ...identity,
         status: parsedPlan.data.source.inputsDigest === inputsDigest ? 'fresh' : 'stale',

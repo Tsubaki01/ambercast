@@ -52,4 +52,15 @@ export const DEFAULT_RAW_CONFIG = {
     heal: false,
     updateGroundingCache: false,
   },
+  /*
+   * Grounding defaults preserve this repository's committed-artifact
+   * posture while ensuring run persists grounding automatically outside CI
+   * under the auto default. A project can opt into an uncommitted cache or an
+   * explicit per-invocation write request without changing either default for
+   * every other project.
+   */
+  grounding: {
+    repositoryPolicy: 'committed',
+    localWriteBack: 'auto',
+  },
 } as const satisfies Omit<ResolvedConfig, 'projectRoot'>;

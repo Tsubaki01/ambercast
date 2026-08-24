@@ -32,6 +32,7 @@ function createConfig(overrides: Partial<TestConfig> = {}): TestConfig {
     testIgnore: ['**/.runs/**'],
     targets: TARGETS,
     defaultTarget: 'web',
+    grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
     ...overrides,
   };
 }
@@ -197,7 +198,8 @@ describe('check', () => {
     ));
     const { storage, layout, deps } = createScenario({ discoverTestFiles });
     await storage.writeText(testPath, PROMPT);
-    await writePlan(storage, layout, testPath);
+    const plan = await writePlan(storage, layout, testPath);
+    await writeGrounding(storage, layout, testPath, plan);
 
     const outcome = await check(deps, OPTIONS);
 
@@ -245,7 +247,7 @@ describe('check', () => {
     });
   });
 
-  it('keeps a digest-mismatched grounding fresh when the canonical plan matches inputs', async () => {
+  it('reports a digest-mismatched grounding as stale when the canonical plan matches inputs', async () => {
     const testPath = `${TEST_DIR}/grounding-digest.test.md`;
     const { storage, layout, deps } = createScenario({
       discoverTestFiles: createDiscovery([], [], ['grounding-digest.ambercast.grounding.json']),
@@ -256,14 +258,16 @@ describe('check', () => {
 
     const outcome = await check(deps, { ...OPTIONS, files: [testPath] });
 
-    expect(outcome.results).toEqual([expect.objectContaining({ id: testPath, status: 'fresh' })]);
+    expect(outcome.results).toEqual([expect.objectContaining({
+      id: testPath, status: 'stale-grounding', groundingFile: layout.groundingPathFor(testPath),
+    })]);
     expect(outcome.results).not.toContainEqual(expect.objectContaining({
       id: testPath,
       status: 'orphaned-grounding',
     }));
   });
 
-  it('keeps invalid JSON in a discovered grounding artifact from demoting a fresh plan', async () => {
+  it('reports invalid JSON in a discovered grounding artifact for a fresh plan', async () => {
     const testPath = `${TEST_DIR}/malformed-grounding.test.md`;
     const { storage, layout, deps } = createScenario({
       discoverTestFiles: createDiscovery([], [], ['malformed-grounding.ambercast.grounding.json']),
@@ -274,7 +278,9 @@ describe('check', () => {
 
     const outcome = await check(deps, { ...OPTIONS, files: [testPath] });
 
-    expect(outcome.results).toEqual([expect.objectContaining({ id: testPath, status: 'fresh' })]);
+    expect(outcome.results).toEqual([expect.objectContaining({
+      id: testPath, status: 'invalid-grounding', groundingFile: layout.groundingPathFor(testPath),
+    })]);
     expect(outcome.results).not.toContainEqual(expect.objectContaining({
       id: testPath,
       status: 'orphaned-grounding',
@@ -365,7 +371,8 @@ describe('check', () => {
       discoverTestFiles: createDiscovery([], ['removed.ambercast.plan.json']),
     });
     await storage.writeText(selectedPath, PROMPT);
-    await writePlan(storage, layout, selectedPath);
+    const selectedPlan = await writePlan(storage, layout, selectedPath);
+    await writeGrounding(storage, layout, selectedPath, selectedPlan);
     await storage.writeText(layout.planPathFor(orphanPath), '{}');
 
     await expect(check(deps, { ...OPTIONS, files: [selectedPath] })).resolves.toMatchObject({
@@ -415,7 +422,8 @@ describe('check', () => {
       ),
     });
     await storage.writeText(freshPath, PROMPT);
-    await writePlan(storage, layout, freshPath);
+    const freshPlanDocument = await writePlan(storage, layout, freshPath);
+    await writeGrounding(storage, layout, freshPath, freshPlanDocument);
     await storage.writeText(stalePath, PROMPT);
     await writePlan(storage, layout, stalePath, freshPlan(`${PROMPT}stale`));
     await storage.writeText(layout.planPathFor(orphanedPlanPath), '{}');
@@ -500,7 +508,8 @@ describe('check', () => {
     } as const;
     const { storage, layout } = createScenario();
     await storage.writeText(testPath, PROMPT);
-    await writePlan(storage, layout, testPath, freshPlan(PROMPT, { web: planTargets.web }));
+    const plan = await writePlan(storage, layout, testPath, freshPlan(PROMPT, { web: planTargets.web }));
+    await writeGrounding(storage, layout, testPath, plan);
 
     await expect(check({
       storage,
@@ -636,7 +645,8 @@ describe('check', () => {
       config: { ...configWithoutDefault, targets: soleTargets },
     });
     await storage.writeText(testPath, PROMPT);
-    await writePlan(storage, layout, testPath, freshPlan(PROMPT, soleTargets));
+    const plan = await writePlan(storage, layout, testPath, freshPlan(PROMPT, soleTargets));
+    await writeGrounding(storage, layout, testPath, plan);
 
     await expect(check(deps, { ...OPTIONS, files: [testPath] })).resolves.toMatchObject({
       results: [{ id: testPath, status: 'fresh' }],
@@ -661,12 +671,13 @@ describe('check', () => {
       config: createConfig({ targets, defaultTarget: 'web' }),
     });
     await storage.writeText(testPath, PROMPT);
-    await writePlan(
+    const plan = await writePlan(
       storage,
       layout,
       testPath,
       freshPlan(PROMPT, { [expectedName]: targets[expectedName] }),
     );
+    await writeGrounding(storage, layout, testPath, plan);
 
     await expect(check(deps, {
       ...OPTIONS,
@@ -891,7 +902,8 @@ describe('check', () => {
     const controller = new AbortController();
     const { storage, layout, deps } = createScenario({ signal: controller.signal });
     await storage.writeText(freshPath, PROMPT);
-    await writePlan(storage, layout, freshPath);
+    const freshPlanDocument = await writePlan(storage, layout, freshPath);
+    await writeGrounding(storage, layout, freshPath, freshPlanDocument);
     await storage.writeText(stalePath, PROMPT);
     await writePlan(storage, layout, stalePath, freshPlan(`${PROMPT}changed`));
     const readText = vi.fn(async (path: string) => {
@@ -1047,6 +1059,169 @@ describe('check', () => {
     expectTypeOf<keyof CheckDeps>().toEqualTypeOf<
       'storage' | 'layout' | 'discoverTestFiles' | 'config' | 'signal'
     >();
+  });
+});
+
+describe('check grounding lifecycle integration', () => {
+  it.each([
+    ['missing', 'missing-grounding', 'The grounding cache does not exist.'],
+    ['invalid JSON', 'invalid-grounding', 'The grounding cache is not valid or does not match the grounding schema.'],
+    ['schema-invalid JSON', 'invalid-grounding', 'The grounding cache is not valid or does not match the grounding schema.'],
+    ['a mismatched plan digest', 'stale-grounding', 'The grounding cache does not match the current plan.'],
+  ] as const)('routes committed %s grounding through the full check usecase', async (kind, status, reason) => {
+    const { storage, layout, deps } = createScenario();
+    const testPath = `${TEST_DIR}/committed-${kind}.test.md`;
+    await storage.writeText(testPath, PROMPT);
+    const plan = await writePlan(storage, layout, testPath);
+    const groundingPath = layout.groundingPathFor(testPath);
+    if (kind === 'invalid JSON') await storage.writeText(groundingPath, '{not JSON');
+    if (kind === 'schema-invalid JSON') await storage.writeText(groundingPath, '{"schemaVersion":999}');
+    if (kind === 'a mismatched plan digest') await writeGrounding(storage, layout, testPath, plan, {}, 'b'.repeat(64));
+
+    const outcome = await check(deps, { ...OPTIONS, files: [testPath] });
+    const row = outcome.results.find((result) => result.id === testPath);
+
+    expect(outcome.results.filter((result) => result.id === testPath)).toHaveLength(1);
+    expect(row).toMatchObject({ id: testPath, status, reason });
+    if (status === 'missing-grounding') {
+      expect(row).not.toHaveProperty('groundingFile');
+    } else {
+      expect(row).toMatchObject({ groundingFile: groundingPath });
+    }
+    expect(buildCheckReport({
+      startedAt: '2026-08-24T00:00:00Z', durationMs: 1, options: OPTIONS, outcome,
+    }).exitCode).toBe(4);
+  });
+
+  it.each([
+    ['empty entries', {}],
+    ['non-empty entries', {
+      'click-submit': { kind: 'element', fingerprint: { algorithm: 'a11y-neighborhood-v2', hash: 'a'.repeat(64) } },
+    }],
+  ] as const)('keeps committed matching grounding with %s fresh', async (_name, entries) => {
+    const { storage, layout, deps } = createScenario();
+    const testPath = `${TEST_DIR}/committed-valid-${_name}.test.md`;
+    await storage.writeText(testPath, PROMPT);
+    const plan = await writePlan(storage, layout, testPath);
+    await writeGrounding(storage, layout, testPath, plan, entries as GroundingDocument['entries']);
+
+    await expect(check(deps, { ...OPTIONS, files: [testPath] })).resolves.toMatchObject({
+      results: [{ id: testPath, status: 'fresh' }], errors: [],
+    });
+  });
+
+  it.each(['missing', 'invalid', 'stale'] as const)('collapses uncommitted %s grounding without leaking its cause', async (kind) => {
+    const { storage, layout, deps } = createScenario({
+      config: createConfig({ grounding: { repositoryPolicy: 'uncommitted', localWriteBack: 'auto' } }),
+    });
+    const testPath = `${TEST_DIR}/uncommitted-${kind}.test.md`;
+    await storage.writeText(testPath, PROMPT);
+    const plan = await writePlan(storage, layout, testPath);
+    if (kind === 'invalid') await storage.writeText(layout.groundingPathFor(testPath), '{not JSON');
+    if (kind === 'stale') await writeGrounding(storage, layout, testPath, plan, {}, 'b'.repeat(64));
+
+    const outcome = await check(deps, { ...OPTIONS, files: [testPath] });
+    const row = outcome.results.find((result) => result.id === testPath);
+
+    expect(outcome.results.filter((result) => result.id === testPath)).toHaveLength(1);
+    expect(row).toMatchObject({
+      id: testPath,
+      status: 'fresh-without-grounding',
+      reason: 'The plan is fresh; a grounding cache is not required by this project\'s repository policy.',
+    });
+    expect(row).not.toHaveProperty('groundingFile');
+    expect(buildCheckReport({
+      startedAt: '2026-08-24T00:00:00Z', durationMs: 1, options: OPTIONS, outcome,
+    }).exitCode).toBe(0);
+  });
+
+  it.each(['empty entries', 'non-empty entries'] as const)('keeps uncommitted matching grounding with %s fresh', async (kind) => {
+    const { storage, layout, deps } = createScenario({
+      config: createConfig({ grounding: { repositoryPolicy: 'uncommitted', localWriteBack: 'auto' } }),
+    });
+    const testPath = `${TEST_DIR}/uncommitted-valid-${kind}.test.md`;
+    await storage.writeText(testPath, PROMPT);
+    const plan = await writePlan(storage, layout, testPath);
+    await writeGrounding(storage, layout, testPath, plan, kind === 'empty entries' ? {} : {
+      'click-submit': { kind: 'element', fingerprint: { algorithm: 'a11y-neighborhood-v2', hash: 'a'.repeat(64) } },
+    } as GroundingDocument['entries']);
+
+    await expect(check(deps, { ...OPTIONS, files: [testPath] })).resolves.toMatchObject({
+      results: [{ id: testPath, status: 'fresh' }], errors: [],
+    });
+  });
+
+  it.each([
+    ['stale', 'stale'],
+    ['missing-plan', 'missing-plan'],
+    ['schema-invalid', 'stale'],
+  ] as const)('does not inspect grounding for a %s plan', async (kind, status) => {
+    const { storage, layout, deps } = createScenario();
+    const testPath = `${TEST_DIR}/no-grounding-${kind}.test.md`;
+    const groundingPath = layout.groundingPathFor(testPath);
+    await storage.writeText(testPath, PROMPT);
+    if (kind === 'stale') await writePlan(storage, layout, testPath, freshPlan(`${PROMPT}changed`));
+    if (kind === 'schema-invalid') await storage.writeText(layout.planPathFor(testPath), '{"schemaVersion":999}');
+    const exists = vi.fn(async (path: string) => {
+      if (path === groundingPath) throw new Error('stale and missing plans must not inspect grounding');
+      return storage.exists(path);
+    });
+    const readText = vi.fn(async (path: string) => {
+      if (path === groundingPath) throw new Error('stale and missing plans must not read grounding');
+      return storage.readText(path);
+    });
+
+    await expect(check({ ...deps, storage: { exists, readText } }, { ...OPTIONS, files: [testPath] })).resolves.toMatchObject({
+      results: [{ id: testPath, status }], errors: [],
+    });
+    expect(exists).not.toHaveBeenCalledWith(groundingPath);
+    expect(readText).not.toHaveBeenCalledWith(groundingPath);
+  });
+
+  it('emits exactly one grounding-derived row for each fresh selected occurrence', async () => {
+    const { storage, layout, deps } = createScenario();
+    const testPath = `${TEST_DIR}/duplicate-grounding.test.md`;
+    await storage.writeText(testPath, PROMPT);
+    await writePlan(storage, layout, testPath);
+    const groundingPathFor = vi.spyOn(layout, 'groundingPathFor');
+
+    const outcome = await check(deps, { ...OPTIONS, files: [testPath, testPath] });
+    const rows = outcome.results.filter((result) => result.id === testPath);
+
+    expect(rows).toHaveLength(2);
+    expect(rows).toEqual([
+      expect.objectContaining({ status: 'missing-grounding' }),
+      expect.objectContaining({ status: 'missing-grounding' }),
+    ]);
+    expect(groundingPathFor).toHaveBeenCalledTimes(2);
+    expect(groundingPathFor).toHaveBeenNthCalledWith(1, testPath);
+    expect(groundingPathFor).toHaveBeenNthCalledWith(2, testPath);
+  });
+
+  it('routes a grounding read failure to the file error without a fallback fresh row', async () => {
+    const { storage, layout, deps } = createScenario();
+    const testPath = `${TEST_DIR}/grounding-read-failure.test.md`;
+    const laterPath = `${TEST_DIR}/later-valid-grounding.test.md`;
+    await storage.writeText(testPath, PROMPT);
+    await storage.writeText(laterPath, PROMPT);
+    await writePlan(storage, layout, testPath);
+    const laterPlan = await writePlan(storage, layout, laterPath);
+    await writeGrounding(storage, layout, laterPath, laterPlan);
+    const groundingPath = layout.groundingPathFor(testPath);
+    const exists = vi.fn(async (path: string) => path === groundingPath || storage.exists(path));
+    const readText = vi.fn(async (path: string) => {
+      if (path === groundingPath) throw new Error('grounding read failure');
+      return storage.readText(path);
+    });
+
+    const outcome = await check({ ...deps, storage: { exists, readText } }, {
+      ...OPTIONS,
+      files: [testPath, laterPath],
+    });
+
+    expect(outcome.errors).toEqual([expect.objectContaining({ file: testPath, error: expect.objectContaining({ kind: 'fs-io-error' }) })]);
+    expect(outcome.results).not.toContainEqual(expect.objectContaining({ id: testPath }));
+    expect(outcome.results).toContainEqual(expect.objectContaining({ id: laterPath, status: 'fresh' }));
   });
 });
 
@@ -1222,6 +1397,32 @@ describe('check interruption contract', () => {
     ]);
     expect(exists).toHaveBeenCalledTimes(1);
     expect(discover).not.toHaveBeenCalled();
+    expect(outcome.interrupted).toBe(true);
+  });
+
+  it('keeps the selected grounding inspection terminal and skips its pending selected suffix when abort arrives during it', async () => {
+    const controller = new AbortController();
+    const first = `${TEST_DIR}/first-grounding.test.md`;
+    const second = `${TEST_DIR}/second-grounding.test.md`;
+    const { storage, layout, deps } = createScenario({ signal: controller.signal });
+    await storage.writeText(first, PROMPT);
+    await storage.writeText(second, PROMPT);
+    const firstPlan = await writePlan(storage, layout, first);
+    await writeGrounding(storage, layout, first, firstPlan);
+    await writePlan(storage, layout, second);
+    const groundingPathFor = vi.fn((file: string) => {
+      const groundingPath = layout.groundingPathFor(file);
+      if (file === first) controller.abort();
+      return groundingPath;
+    });
+
+    const outcome = await check({ ...deps, layout: { ...layout, groundingPathFor } }, { ...OPTIONS, files: [first, second] });
+
+    expect(groundingPathFor).toHaveBeenCalledWith(first);
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: first, status: 'fresh' }),
+      { id: second, file: second, status: 'skipped' },
+    ]);
     expect(outcome.interrupted).toBe(true);
   });
 

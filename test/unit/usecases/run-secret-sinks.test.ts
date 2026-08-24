@@ -63,7 +63,7 @@ const FINGERPRINT: Fingerprint = { algorithm: 'a11y-neighborhood-v2', hash: 'a'.
 const EMAIL: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Email' };
 const PASSWORD: ElementRef = { strategy: 'accessibility', role: 'textbox', name: 'Password' };
 const SUBMIT: ElementRef = { strategy: 'accessibility', role: 'button', name: 'Submit' };
-const RUN_OPTIONS: RunOptions = { files: [], cacheOnly: false, allowEmpty: false, list: false, stale: 'fail' };
+const RUN_OPTIONS: RunOptions = { files: [], cacheOnly: false, updateCache: false, allowEmpty: false, list: false, stale: 'fail' };
 const GENERATE_OPTIONS: GenerateOptions = {
   files: [],
   strict: false,
@@ -229,6 +229,7 @@ function createRunScenario(
       resolveAiExecutor: async () => executor,
       events: events.sink,
       discoverTestFiles: async () => ['login.test.md'],
+      isCI: false,
       config: {
         testDir: TEST_DIR,
         testMatch: ['**/*.test.md'],
@@ -236,6 +237,8 @@ function createRunScenario(
         targets: TARGETS,
         defaultTarget: 'web',
         ai: { provider: 'codex', timeoutMs: 120_000 },
+        ci: { heal: false, updateGroundingCache: false },
+        grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
       },
     },
   };
