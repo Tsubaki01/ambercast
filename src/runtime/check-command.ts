@@ -38,7 +38,13 @@ export interface CheckCommandInput {
   /** Whether a genuinely empty inspection is accepted. */
   readonly allowEmpty: boolean;
 
-  /** Whether an empty inspection suppresses exit 5 without changing inspection work. */
+  /**
+   * Whether listing ends after selection with identity-only `listed` rows.
+   *
+   * The command does not inspect plans or grounding, validate freshness, or
+   * scan artifacts in this mode, so an empty selection is a successful list
+   * result rather than an ordinary empty-inspection outcome.
+   */
   readonly list: boolean;
 
   /** Optional explicit configuration path. */

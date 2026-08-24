@@ -13,6 +13,18 @@ const BASE = {
 } as const;
 
 function result(status: CheckResult['status'], name = status): CheckResult {
+  if (status === 'listed') {
+    return { id: `${name}.test.md`, file: `${name}.test.md`, status };
+  }
+  if (status === 'invalid-artifact-name') {
+    return {
+      id: `${name}.ambercast.plan.json`,
+      file: `${name}.ambercast.plan.json`,
+      status,
+      reason: `${status} fixture`,
+      artifactFile: `${name}.ambercast.plan.json`,
+    };
+  }
   return {
     id: `${name}.test.md`,
     file: `${name}.test.md`,
@@ -46,6 +58,15 @@ describe('buildCheckReport', () => {
     const output = report({ outcome: { noTestsFound: false, results, errors: [] } });
 
     expect(output.envelope.summary).toEqual(summary);
+  });
+
+  it('returns exit 0 for listed-only discovery results', () => {
+    const output = report({
+      options: { allowEmpty: false, list: true },
+      outcome: { noTestsFound: false, results: [result('listed')], errors: [] },
+    });
+
+    expect(output.exitCode).toBe(0);
   });
 
   it('round-trips complete check results through the full report-envelope schema', () => {
@@ -127,7 +148,7 @@ describe('buildCheckReport', () => {
     ['a non-fresh result', 4, { noTestsFound: false, results: [result('stale')], errors: [] }, BASE.options],
     ['a disallowed genuine zero match', 5, { noTestsFound: true, results: [], errors: [] }, BASE.options],
     ['an allowed genuine zero match', 0, { noTestsFound: true, results: [], errors: [] }, { allowEmpty: true, list: false }],
-    ['a listed genuine zero match', 0, { noTestsFound: true, results: [], errors: [] }, { allowEmpty: false, list: true }],
+    ['a defensively-suppressed zero match under list (not producible by check() itself)', 0, { noTestsFound: true, results: [], errors: [] }, { allowEmpty: false, list: true }],
   ] as const)('%s selects exit %i', (_name, exitCode, outcome, options) => {
     const output = buildCheckReport({ ...BASE, options, outcome: { ...outcome, interrupted: false } });
 

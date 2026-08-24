@@ -23,7 +23,8 @@ import {
   type StepId,
 } from '#core/ir/schema.js';
 import { GROUNDING_SUFFIX, PLAN_SUFFIX, type LayoutResolver } from '#core/layout/resolve.js';
-import { joinPath } from '#core/paths.js';
+import { matchesTestPatterns } from '#core/discovery/pattern-match.js';
+import { joinPath, relativeWithin } from '#core/paths.js';
 import { resolveTarget } from '#core/target/resolve.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { CheckResult } from '#report/schema.js';
@@ -80,12 +81,16 @@ export interface CheckOptions {
   readonly allowEmpty: boolean;
 
   /**
-   * Whether a genuinely empty inspection suppresses exit 5.
+   * Whether discovery-only listing returns selected paths without inspection.
    *
    * @remarks
-   * Unlike generation and replay listing, check list mode is inspection policy
-   * rather than a discovery-only short circuit. Check remains interruptible;
-   * artifact-only listing requires the separate inverse-discovery capability.
+   * The short-circuit is an atomic boundary after selection: it emits
+   * only identity-only `listed` rows and does not read plans or grounding,
+   * validate digests, scan artifacts, resolve an implicit target, or register
+   * interruptible inspection work. This scope is intentionally limited to
+   * `options.list`. A zero-selection invocation without list mode continues to
+   * artifact scans, so orphan-only integrity findings retain their existing
+   * behavior.
    */
   readonly list: boolean;
 }
@@ -153,11 +158,11 @@ export interface CheckDeps {
  * @remarks
  * This direct alias keeps the usecase and report contracts aligned while
  * allowing report construction to preserve outcomes without unsafe casting or
- * a duplicate mapping contract. Inspection findings, including check's
- * `listed` status, carry `id`, `file`, `planFile`, `status`, and a fixed
- * path-free `reason`, plus the relevant optional `groundingFile` or
- * `artifactFile`. Interruption-only `skipped` rows carry exactly `id`,
- * `file`, and `status`, with no inspection evidence.
+ * a duplicate mapping contract. Completed inspection findings carry `id`,
+ * `file`, `planFile`, `status`, and a fixed path-free `reason`, plus the
+ * relevant optional `groundingFile` or `artifactFile`. Discovery-only
+ * `listed`, inverse-incapable `invalid-artifact-name`, and interruption-only
+ * `skipped` rows each use their dedicated minimal evidence shape.
  */
 export type CheckFileOutcome = CheckResult;
 
@@ -203,14 +208,16 @@ export interface CheckOutcome {
   readonly errors: readonly CheckFileError[];
 
   /**
-   * Whether neither selected tests nor orphaned companion artifacts exist.
+   * Whether neither selected tests nor artifact-scan findings exist.
    *
    * The exact formula is
    * `!interrupted && selectedWorkItems.length === 0 && orphanFindingRows.length === 0`
    * after every non-suppressed discovery phase completes. Healthy companion
-   * candidates that emit no orphan row do not change the existing zero-match
+   * candidates that emit no finding do not change the existing zero-match
    * meaning, while known pending work prevents a cancelled batch from being
-   * reported as empty.
+   * reported as empty. `options.list` bypasses this formula entirely and
+   * always reports `false`, because its discovery-only short circuit never
+   * reaches the phases measured here.
    */
   readonly noTestsFound: boolean;
 
@@ -268,14 +275,22 @@ export interface CheckOutcome {
  *
  * Freshness accepts only canonical plans whose digest reflects the normalized
  * prompt and the resolved target. Grounding content is deliberately excluded:
- * it is a recoverable replay cache rather than a freshness input. Orphan
- * detection is instead a whole-tree integrity invariant, independent of
- * literal selection and selected-file outcomes; its stable ordering follows
- * selected findings with plans before grounding. The inspector recognizes
- * only its established plan and grounding companion scans and keeps `--list`
- * as inspection policy; it provides neither artifact inverse-scan behavior nor
- * a discovery-only check path. Orphan grounding findings place the artifact path
- * only in `groundingFile` and use the exact path-free reason
+ * it is a recoverable replay cache rather than a freshness input. `--list`
+ * handling ends immediately after selection, before implicit target
+ * resolution or any inspection phase, so even an empty listing succeeds
+ * without relying on the ordinary zero-match path.
+ *
+ * Artifact detection remains a whole-tree integrity invariant, independent of
+ * literal selection and selected-file outcomes. Each scan enumerates by
+ * its fixed suffix without applying configured ignores, then inverse-derive a
+ * virtual test path and judge that path against `testMatch` and `testIgnore`.
+ * An inverse-incapable artifact becomes an `invalid-artifact-name` finding in
+ * `orphanFindings`, which preserves the existing zero-match formula and puts
+ * it before that phase's later orphan findings. The registration and terminal
+ * loops remain separate so the batch tracker still knows the whole discovered
+ * phase before asynchronous existence checks begin. Stable ordering follows
+ * selected findings with plans before grounding. Orphan grounding findings
+ * place the artifact path only in `groundingFile` and use the exact path-free reason
  * `No corresponding test file exists for this grounding artifact.`, so free
  * text cannot disclose a host path. These boundaries preserve shared exit
  * priority between integrity findings, case errors, interruption, and genuine
@@ -302,6 +317,23 @@ export async function check(deps: CheckDeps, options: CheckOptions): Promise<Che
       testIgnore: deps.config.testIgnore,
     })).map((path) => joinPath(deps.config.testDir, path))
     : [...options.files];
+
+  /*
+   * The list-only return belongs exactly here, after selection but
+   * before implicit target resolution and every inspection phase. That atomic
+   * boundary makes listing lenient for literal paths and prevents plan, grounding,
+   * digest, artifact-scan, and interruption work. It must not become a general
+   * zero-selection return: ordinary zero-selection checks still need orphan
+   * scans, whereas only `options.list` bypasses them.
+   */
+  if (options.list) {
+    return {
+      results: selectedTestFiles.map((file) => ({ id: file, file, status: 'listed' as const })),
+      errors: [],
+      noTestsFound: false,
+      interrupted: false,
+    };
+  }
 
   const results: CheckFileOutcome[] = [];
   const errors: CheckFileError[] = [];
@@ -483,27 +515,61 @@ export async function check(deps: CheckDeps, options: CheckOptions): Promise<Che
     return { results: [...results, ...tracker.pendingIdentities.map((file) => ({ id: file, file, status: 'skipped' as const }))], errors, noTestsFound: false, interrupted: true };
   }
 
-  const artifactIgnore = artifactTestIgnore(deps.config.testIgnore);
+  /*
+   * Artifact enumeration passes no configured ignores. Ignoring
+   * an artifact by its own path decides ownership before its virtual test path
+   * is known; the later inverse-then-judge step instead applies the complete
+   * configured matcher to that derived path.
+   */
   const planPaths = (await deps.discoverTestFiles({
     testDir: deps.config.testDir,
     testMatch: [`**/*${PLAN_SUFFIX}`],
-    testIgnore: artifactIgnore,
+    testIgnore: [],
   })).map((path) => joinPath(deps.config.testDir, path));
   if (tracker.interrupted) {
     return { results: [...results, ...tracker.pendingIdentities.map((file) => ({ id: file, file, status: 'skipped' as const }))], errors, noTestsFound: false, interrupted: true };
   }
+  /*
+   * The registration pass inverse-derives each plan path before
+   * judging its virtual test path. An un-derivable artifact is recorded as an
+   * `invalid-artifact-name` finding in `orphanFindings` without tracker work;
+   * a derived but unmanaged path is skipped. This keeps every artifact-scan
+   * finding in one accumulator, so the established zero-match formula needs no
+   * parallel count or exception.
+   */
+  const orphanFindings: CheckFileOutcome[] = [];
   for (const [index, planPath] of planPaths.entries()) {
     const testPath = deps.layout.testPathForPlan(planPath);
-    if (testPath !== undefined) tracker.addDiscovered(`plan:${index}:${planPath}`, testPath);
+    if (testPath === undefined) {
+      orphanFindings.push({
+        id: planPath,
+        file: planPath,
+        status: 'invalid-artifact-name',
+        reason: 'The artifact name could not be inverse-derived into a corresponding test path.',
+        artifactFile: planPath,
+      });
+      continue;
+    }
+    const relativeTestPath = relativeWithin(deps.config.testDir, testPath)!;
+    if (matchesTestPatterns(relativeTestPath, deps.config.testMatch, deps.config.testIgnore)) {
+      tracker.addDiscovered(`plan:${index}:${planPath}`, testPath);
+    }
   }
   if (tracker.interrupted) {
-    return { results: [...results, ...tracker.pendingIdentities.map((file) => ({ id: file, file, status: 'skipped' as const }))], errors, noTestsFound: false, interrupted: true };
+    return { results: [...results, ...orphanFindings, ...tracker.pendingIdentities.map((file) => ({ id: file, file, status: 'skipped' as const }))], errors, noTestsFound: false, interrupted: true };
   }
-  const orphanFindings: CheckFileOutcome[] = [];
-
+  /*
+   * The terminal pass repeats the pure inverse and match judgment
+   * before checking existence. Repeating cheap pure work preserves the
+   * register-whole-phase-then-inspect tracker contract; inverse-incapable and
+   * unmanaged paths have already been reported or intentionally excluded and
+   * never gain a second row here.
+   */
   for (const [index, planPath] of planPaths.entries()) {
     const testPath = deps.layout.testPathForPlan(planPath);
     if (testPath === undefined) continue;
+    const relativeTestPath = relativeWithin(deps.config.testDir, testPath)!;
+    if (!matchesTestPatterns(relativeTestPath, deps.config.testMatch, deps.config.testIgnore)) continue;
     if (!(await deps.storage.exists(testPath))) {
       orphanFindings.push({
         id: testPath,
@@ -524,19 +590,47 @@ export async function check(deps: CheckDeps, options: CheckOptions): Promise<Che
   const groundingPaths = (await deps.discoverTestFiles({
     testDir: deps.config.testDir,
     testMatch: [`**/*${GROUNDING_SUFFIX}`],
-    testIgnore: artifactIgnore,
+    testIgnore: [],
   })).map((path) => joinPath(deps.config.testDir, path));
+  /*
+   * Grounding artifacts follow the same inverse-then-judge boundary as plans,
+   * rather than letting their filename decide configured ownership. An
+   * inverse-incapable name joins `orphanFindings` as an
+   * `invalid-artifact-name` row using the artifact as its only concrete
+   * identity, before this phase's asynchronous orphan checks.
+   */
   for (const [index, groundingPath] of groundingPaths.entries()) {
     const testPath = deps.layout.testPathForGrounding(groundingPath);
-    if (testPath !== undefined) tracker.addDiscovered(`grounding:${index}:${groundingPath}`, testPath);
+    if (testPath === undefined) {
+      orphanFindings.push({
+        id: groundingPath,
+        file: groundingPath,
+        status: 'invalid-artifact-name',
+        reason: 'The artifact name could not be inverse-derived into a corresponding test path.',
+        artifactFile: groundingPath,
+      });
+      continue;
+    }
+    const relativeTestPath = relativeWithin(deps.config.testDir, testPath)!;
+    if (matchesTestPatterns(relativeTestPath, deps.config.testMatch, deps.config.testIgnore)) {
+      tracker.addDiscovered(`grounding:${index}:${groundingPath}`, testPath);
+    }
   }
   if (tracker.interrupted) {
     return { results: [...results, ...orphanFindings, ...tracker.pendingIdentities.map((file) => ({ id: file, file, status: 'skipped' as const }))], errors, noTestsFound: false, interrupted: true };
   }
 
+  /*
+   * The second grounding loop re-derives and re-judges before its
+   * existing terminal check. Keeping the two-loop shape makes interruption
+   * accounting identical across artifact kinds while preserving deterministic
+   * phase ordering without interleaved bookkeeping.
+   */
   for (const [index, groundingPath] of groundingPaths.entries()) {
     const testPath = deps.layout.testPathForGrounding(groundingPath);
     if (testPath === undefined) continue;
+    const relativeTestPath = relativeWithin(deps.config.testDir, testPath)!;
+    if (!matchesTestPatterns(relativeTestPath, deps.config.testMatch, deps.config.testIgnore)) continue;
     if (!(await deps.storage.exists(testPath))) {
       orphanFindings.push({
         id: testPath,
@@ -560,25 +654,4 @@ export async function check(deps: CheckDeps, options: CheckOptions): Promise<Che
   } finally {
     tracker.dispose();
   }
-}
-
-/**
- * Preserves configured ignores except companions that would hide their own
- * orphan scans.
- *
- * @param testIgnore - Project-configured ignore patterns for ordinary test
- * discovery.
- * @returns The ignore list plan and grounding scans use.
- * @remarks
- * Exact-match removal limits the exception to the two known self-excluding
- * patterns. A broader predicate could override a project's intentional ignore
- * for run output, fixtures, or another artifact namespace.
- */
-function artifactTestIgnore(testIgnore: readonly string[]): readonly string[] {
-  const selfIgnore = new Set([
-    `**/*${PLAN_SUFFIX}`,
-    `**/*${GROUNDING_SUFFIX}`,
-  ]);
-
-  return testIgnore.filter((pattern) => !selfIgnore.has(pattern));
 }
