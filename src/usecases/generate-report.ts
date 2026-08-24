@@ -11,7 +11,9 @@
 
 import type { AmbercastError, ExitCode } from '#core/errors/types.js';
 import { reportError } from '#report/error-mapping.js';
-import type { GenerateResult, ReportEnvelope } from '#report/schema.js';
+import { REPORT_SCHEMA_VERSION, type GenerateResult, type ReportEnvelope } from '#report/schema.js';
+import { summarizeReport } from '#report/summarize.js';
+import { InterruptedError } from '#core/errors/interrupted-error.js';
 import { selectExitCode } from './exit-code-priority.js';
 import type { GenerateOptions, GenerateOutcome } from './generate.js';
 
@@ -30,6 +32,8 @@ function reportResult(
       return { ...identity, status: result.status, dryRun, planFile: result.planFile! };
     case 'listed':
       return { ...identity, status: result.status, dryRun: false };
+    case 'skipped':
+      return { ...identity, status: result.status };
     case 'failed':
       return { ...identity, status: result.status, dryRun };
   }
@@ -87,10 +91,13 @@ export interface GenerateReportOutput {
  * @param input - Outcome or error together with timing and reporting policy.
  * @returns A complete generate report paired with its process exit code.
  * @remarks
- * This helper owns only serializable reporting policy. Its summary has one
- * result per resolved file: `total` is `results.length`; generated, fresh,
- * previewed, and listed results are `passed`; failed results are `failed`; and
- * `errored` and `skipped` remain zero because generate has neither outcome.
+ * This helper owns only serializable reporting policy. It uses the shared
+ * report-version constant and delegates accounting to the identity-set
+ * summarizer after results and case errors are assembled. `generated`,
+ * `would-generate`, and `skipped-fresh` rows classify as passed; failed rows classify as
+ * failed unless a matching case error promotes the same identity to errored;
+ * listed and interruption-skipped rows classify as skipped. Duplicate rows and
+ * result/error pairs never inflate `total`.
  *
  * Every failed file becomes one case-scoped `ReportError` whose `caseId` is
  * the file path. The error-kind correspondence selects its usage or
@@ -99,12 +106,18 @@ export interface GenerateReportOutput {
  * instead becomes one run-scoped error with an empty result list.
  *
  * A top-level thrown error retains its own exit code because no completed batch
- * exists. For a completed batch, this builder contributes every applicable
+ * exists and its empty result set yields an all-zero shared summary. For a
+ * completed batch, this builder contributes every applicable
  * code to `selectExitCode()`: failures contribute their classified code or the
  * generic exit-3 fallback when malformed input supplies no classification, and
  * strict ambiguities contribute exit 1. The shared 2, 3, 4, 1, 5, 0 order then
  * selects the highest-priority condition across the batch, independent of
  * file order.
+ *
+ * When the completed outcome is interrupted, the builder appends exactly one
+ * run-scoped `INTERRUPTED` environment error and contributes exit 3. The error
+ * has no `caseId`, so it does not change case counts; a higher-priority exit 2
+ * condition still wins through the common selector.
  *
  * A disallowed zero-match condition contributes exit 5 to that same list,
  * instead of returning early. The normal zero-match outcome has no results,
@@ -116,15 +129,16 @@ export interface GenerateReportOutput {
  */
 export function buildGenerateReport(input: GenerateReportInput): GenerateReportOutput {
   if ('error' in input && input.error !== undefined) {
+    const errors = [reportError(input.error, { scope: 'run' })];
     return {
       exitCode: input.error.exitCode,
       envelope: {
-        schemaVersion: '1.0',
+        schemaVersion: REPORT_SCHEMA_VERSION,
         command: 'generate',
         startedAt: input.startedAt,
         durationMs: input.durationMs,
-        summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 },
-        errors: [reportError(input.error, { scope: 'run' })],
+        summary: summarizeReport({ command: 'generate', results: [], errors }),
+        errors,
         results: [],
       },
     };
@@ -137,8 +151,9 @@ export function buildGenerateReport(input: GenerateReportInput): GenerateReportO
       ? [reportError(result.error, { scope: 'case', caseId: result.file })]
       : []
   ));
+  const interrupted = outcome.interrupted;
+  if (interrupted) errors.push(reportError(new InterruptedError(), { scope: 'run' }));
   const failed = outcome.results.filter((result) => result.status === 'failed');
-  const passed = outcome.results.length - failed.length;
   const candidates: ExitCode[] = failed.map<ExitCode>((result) => result.error?.exitCode ?? 3);
   const hasStrictAmbiguities = input.options.strict && outcome.results.some((result) => (
     (result.status === 'generated' || result.status === 'would-generate')
@@ -151,17 +166,18 @@ export function buildGenerateReport(input: GenerateReportInput): GenerateReportO
   if (outcome.noTestsFound && !input.options.allowEmpty && !input.options.list) {
     candidates.push(5);
   }
+  if (interrupted) candidates.push(3);
 
   const exitCode = selectExitCode(candidates);
 
   return {
     exitCode,
     envelope: {
-      schemaVersion: '1.0',
+      schemaVersion: REPORT_SCHEMA_VERSION,
       command: 'generate',
       startedAt: input.startedAt,
       durationMs: input.durationMs,
-      summary: { total: outcome.results.length, passed, failed: failed.length, errored: 0, skipped: 0 },
+      summary: summarizeReport({ command: 'generate', results, errors }),
       errors,
       results,
     },

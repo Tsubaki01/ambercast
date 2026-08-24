@@ -13,6 +13,8 @@ import {
 } from '#core/ir/schema.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
 import { check, type CheckDeps, type CheckOptions } from '#usecases/check.js';
+import { BatchInterruptionTracker } from '#usecases/batch-interruption.js';
+import { buildCheckReport } from '#usecases/check-report.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
 
 const TEST_DIR = '/workspace/tests';
@@ -380,7 +382,7 @@ describe('check', () => {
     });
   });
 
-  it('reports an orphaned grounding with the expected plan path and grounding path in its reason', async () => {
+  it('reports an orphaned grounding with a path-free reason and retains its path only in groundingFile', async () => {
     const orphanPath = `${TEST_DIR}/removed.test.md`;
     const { storage, layout, deps } = createScenario({
       discoverTestFiles: createDiscovery([], [], ['removed.ambercast.grounding.json']),
@@ -393,8 +395,9 @@ describe('check', () => {
         id: orphanPath,
         file: orphanPath,
         planFile: layout.planPathFor(orphanPath),
+        groundingFile: groundingPath,
         status: 'orphaned-grounding',
-        reason: `No corresponding test file exists for the grounding artifact at ${groundingPath}.`,
+        reason: 'No corresponding test file exists for this grounding artifact.',
       }],
     });
   });
@@ -698,7 +701,7 @@ describe('check', () => {
   it('returns a genuine empty outcome when no tests and no orphaned artifacts exist', async () => {
     const { deps } = createScenario();
 
-    await expect(check(deps, OPTIONS)).resolves.toEqual({ results: [], errors: [], noTestsFound: true });
+    await expect(check(deps, OPTIONS)).resolves.toEqual({ results: [], errors: [], noTestsFound: true, interrupted: false });
   });
 
   it('does not call an orphan-only tree a genuine empty outcome', async () => {
@@ -726,7 +729,7 @@ describe('check', () => {
     });
     await storage.writeText(layout.planPathFor(ignoredPath), '{}');
 
-    await expect(check(deps, OPTIONS)).resolves.toEqual({ results: [], errors: [], noTestsFound: true });
+    await expect(check(deps, OPTIONS)).resolves.toEqual({ results: [], errors: [], noTestsFound: true, interrupted: false });
   });
 
   it.each([
@@ -774,7 +777,7 @@ describe('check', () => {
     });
     await storage.writeText(layout.planPathFor(orphanPath), '{}');
 
-    await expect(check(deps, OPTIONS)).resolves.toEqual({ results: [], errors: [], noTestsFound: true });
+    await expect(check(deps, OPTIONS)).resolves.toEqual({ results: [], errors: [], noTestsFound: true, interrupted: false });
     expect(discoverTestFiles).toHaveBeenCalledWith({
       testDir: TEST_DIR,
       testMatch: ['**/*.ambercast.plan.json'],
@@ -841,19 +844,21 @@ describe('check', () => {
     await expect(check(deps, OPTIONS)).rejects.toThrow('test directory is unreadable');
   });
 
-  it('stops before the first selected file when cancellation is already requested', async () => {
+  it('turns a pre-aborted selected occurrence into a pending skipped row and suppresses orphan discovery', async () => {
     const controller = new AbortController();
     controller.abort(new Error('stop'));
     const { deps } = createScenario({ signal: controller.signal });
+    const selectedPath = `${TEST_DIR}/login.test.md`;
 
-    await expect(check(deps, { ...OPTIONS, files: [`${TEST_DIR}/login.test.md`] })).resolves.toEqual({
-      results: [],
+    await expect(check(deps, { ...OPTIONS, files: [selectedPath] })).resolves.toEqual({
+      results: [{ id: selectedPath, file: selectedPath, status: 'skipped' }],
       errors: [],
       noTestsFound: false,
+      interrupted: true,
     });
   });
 
-  it('continues the independent ordered orphan scan after pre-aborted selected work', async () => {
+  it('does not inspect orphan phases once pre-aborted selected work has latched interruption', async () => {
     const selectedPath = `${TEST_DIR}/selected.test.md`;
     const orphanedPlanPath = `${TEST_DIR}/deleted-plan.test.md`;
     const orphanedGroundingPath = `${TEST_DIR}/deleted-grounding.test.md`;
@@ -874,13 +879,10 @@ describe('check', () => {
 
     const outcome = await check(deps, { ...OPTIONS, files: [selectedPath] });
 
-    expect(outcome.results).toEqual([
-      expect.objectContaining({ id: orphanedPlanPath, status: 'orphaned-plan' }),
-      expect.objectContaining({ id: orphanedGroundingPath, status: 'orphaned-grounding' }),
-    ]);
-    expect(outcome.results).not.toContainEqual(expect.objectContaining({ id: selectedPath }));
+    expect(outcome.results).toEqual([{ id: selectedPath, file: selectedPath, status: 'skipped' }]);
     expect(outcome.errors).toEqual([]);
     expect(outcome.noTestsFound).toBe(false);
+    expect(outcome.interrupted).toBe(true);
   });
 
   it('retains completed findings and stops before a later stale file after cancellation', async () => {
@@ -904,7 +906,7 @@ describe('check', () => {
       ...OPTIONS,
       files: [freshPath, stalePath],
     })).resolves.toMatchObject({
-      results: [{ id: freshPath, status: 'fresh' }],
+      results: [{ id: freshPath, status: 'fresh' }, { id: stalePath, status: 'skipped' }],
       errors: [],
       noTestsFound: false,
     });
@@ -939,6 +941,33 @@ describe('check', () => {
       });
     },
   );
+
+  it.each([
+    ['plan', ['first.ambercast.plan.json', 'second.ambercast.plan.json'], [], `${TEST_DIR}/first.test.md`, `${TEST_DIR}/second.test.md`, 'orphaned-plan'],
+    ['grounding', [], ['first.ambercast.grounding.json', 'second.ambercast.grounding.json'], `${TEST_DIR}/first.test.md`, `${TEST_DIR}/second.test.md`, 'orphaned-grounding'],
+  ] as const)('stops the %s orphan loop after an interrupted inspection without further storage reads', async (_phase, plans, groundings, first, second, status) => {
+    const controller = new AbortController();
+    const storage = createInMemoryStorage();
+    const exists = vi.fn(async (path: string) => {
+      if (path === first) controller.abort(new Error('stop'));
+      return false;
+    });
+    const { deps } = createScenario({
+      signal: controller.signal,
+      storage: { ...storage, exists },
+      discoverTestFiles: createDiscovery([], plans, groundings),
+    });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: first, status }),
+      { id: second, file: second, status: 'skipped' },
+    ]);
+    expect(exists).toHaveBeenCalledOnce();
+    expect(exists).toHaveBeenCalledWith(first);
+    expect(outcome.interrupted).toBe(true);
+  });
 
   it.each([
     ['fresh with cold grounding', 'cold'],
@@ -1018,5 +1047,247 @@ describe('check', () => {
     expectTypeOf<keyof CheckDeps>().toEqualTypeOf<
       'storage' | 'layout' | 'discoverTestFiles' | 'config' | 'signal'
     >();
+  });
+});
+
+describe('check interruption contract', () => {
+  it('retains raw-abort phase continuation for an empty selected phase and reports the final interruption fact', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { deps } = createScenario({ signal: controller.signal, discoverTestFiles: createDiscovery([], [], ['orphan.ambercast.grounding.json']) });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(outcome.interrupted).toBe(true);
+    expect(outcome.noTestsFound).toBe(false);
+    expect(outcome.results).toEqual([expect.objectContaining({ status: 'skipped', id: expect.any(String), file: expect.any(String) })]);
+  });
+
+  it.each([
+    ['pre-aborted empty selection and empty plan still inspect grounding', [], [], ['deleted.ambercast.grounding.json'], ['tests', 'plans', 'grounding'], false, true],
+    ['pre-aborted empty plan and grounding stay a genuine zero match', [], [], [], ['tests', 'plans', 'grounding'], true, false],
+    ['latched plan work suppresses grounding discovery', [], ['deleted.ambercast.plan.json'], ['deleted.ambercast.grounding.json'], ['tests', 'plans'], false, true],
+  ] as const)('%s with exact phase calls and noTestsFound result', async (_name, tests, plans, groundings, expectedCalls, noTestsFound, interrupted) => {
+    const controller = new AbortController();
+    controller.abort();
+    const calls: string[] = [];
+    const discoverTestFiles = vi.fn<CheckDeps['discoverTestFiles']>(async ({ testMatch }) => {
+      if (testMatch[0] === '**/*.test.md') { calls.push('tests'); return tests; }
+      if (testMatch[0] === '**/*.ambercast.plan.json') { calls.push('plans'); return plans; }
+      calls.push('grounding');
+      return groundings;
+    });
+    const { deps } = createScenario({ signal: controller.signal, discoverTestFiles });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(calls).toEqual(expectedCalls);
+    expect(outcome.noTestsFound).toBe(noTestsFound);
+    expect(outcome.interrupted).toBe(interrupted);
+  });
+
+  it('atomically registers every grounding response before evaluating an abort and keeps each skipped identity ordered', async () => {
+    const controller = new AbortController();
+    const calls: string[] = [];
+    const discoverTestFiles = vi.fn<CheckDeps['discoverTestFiles']>(async ({ testMatch }) => {
+      if (testMatch[0] === '**/*.test.md') { calls.push('tests'); return []; }
+      if (testMatch[0] === '**/*.ambercast.plan.json') { calls.push('plans'); return []; }
+      calls.push('grounding');
+      controller.abort();
+      return ['first.ambercast.grounding.json', 'second.ambercast.grounding.json'];
+    });
+    const { deps } = createScenario({ signal: controller.signal, discoverTestFiles });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(calls).toEqual(['tests', 'plans', 'grounding']);
+    expect(outcome.interrupted).toBe(true);
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: `${TEST_DIR}/first.test.md`, status: 'skipped' }),
+      expect.objectContaining({ id: `${TEST_DIR}/second.test.md`, status: 'skipped' }),
+    ]);
+  });
+
+  it('keeps healthy plan and grounding inspections terminal without emitting rows or suppressing grounding discovery', async () => {
+    const calls: string[] = [];
+    const exists = vi.fn(async () => true);
+    const discoverTestFiles = vi.fn<CheckDeps['discoverTestFiles']>(async ({ testMatch }) => {
+      if (testMatch[0] === '**/*.test.md') { calls.push('tests'); return []; }
+      if (testMatch[0] === '**/*.ambercast.plan.json') { calls.push('plans'); return ['healthy.ambercast.plan.json']; }
+      calls.push('grounding');
+      return ['healthy.ambercast.grounding.json'];
+    });
+    const { deps } = createScenario({ storage: { ...createInMemoryStorage(), exists }, discoverTestFiles });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(calls).toEqual(['tests', 'plans', 'grounding']);
+    expect(exists).toHaveBeenCalledTimes(2);
+    expect(outcome).toEqual({ results: [], errors: [], noTestsFound: true, interrupted: false });
+  });
+
+  it('retains plan and grounding orphan rows for one identity while summarizing it once', async () => {
+    const identity = `${TEST_DIR}/deleted.test.md`;
+    const { deps } = createScenario({
+      discoverTestFiles: createDiscovery([], ['deleted.ambercast.plan.json'], ['deleted.ambercast.grounding.json']),
+    });
+
+    const outcome = await check(deps, OPTIONS);
+    const report = buildCheckReport({
+      startedAt: '2026-08-17T00:00:00Z', durationMs: 1, options: { allowEmpty: false, list: false }, outcome,
+    });
+
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: identity, status: 'orphaned-plan' }),
+      expect.objectContaining({ id: identity, status: 'orphaned-grounding' }),
+    ]);
+    expect(report.envelope.summary).toEqual({ total: 1, passed: 0, failed: 1, errored: 0, skipped: 0 });
+  });
+
+  it('keeps a terminal orphan and a pending same-identity sibling as separate rows, then promotes their summary to skipped', async () => {
+    const controller = new AbortController();
+    const identity = `${TEST_DIR}/deleted.test.md`;
+    const calls: string[] = [];
+    const exists = vi.fn(async () => {
+      controller.abort();
+      return false;
+    });
+    const discoverTestFiles = vi.fn<CheckDeps['discoverTestFiles']>(async ({ testMatch }) => {
+      if (testMatch[0] === '**/*.test.md') { calls.push('tests'); return []; }
+      if (testMatch[0] === '**/*.ambercast.plan.json') { calls.push('plans'); return ['deleted.ambercast.plan.json', 'deleted.ambercast.plan.json']; }
+      calls.push('grounding');
+      throw new Error('grounding discovery must be suppressed after interruption');
+    });
+    const { deps } = createScenario({ signal: controller.signal, storage: { ...createInMemoryStorage(), exists }, discoverTestFiles });
+
+    const outcome = await check(deps, OPTIONS);
+    const report = buildCheckReport({
+      startedAt: '2026-08-17T00:00:00Z', durationMs: 1, options: { allowEmpty: false, list: false }, outcome,
+    });
+
+    expect(calls).toEqual(['tests', 'plans']);
+    expect(exists).toHaveBeenCalledOnce();
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: identity, status: 'orphaned-plan' }),
+      { id: identity, file: identity, status: 'skipped' },
+    ]);
+    expect(outcome.interrupted).toBe(true);
+    expect(report.exitCode).toBe(3);
+    expect(report.envelope.summary).toEqual({ total: 1, passed: 0, failed: 0, errored: 0, skipped: 1 });
+    expect(report.envelope.errors).toEqual([expect.objectContaining({ scope: 'run', code: 'INTERRUPTED' })]);
+  });
+
+  it('retains a selected case error and a later orphan finding with the same public identity, then summarizes that identity once as errored', async () => {
+    const testPath = `${TEST_DIR}/same.test.md`;
+    const { storage, layout, deps } = createScenario({
+      discoverTestFiles: createDiscovery([], ['same.ambercast.plan.json']),
+    });
+    await storage.writeText(testPath, PROMPT);
+    await storage.writeText(layout.planPathFor(testPath), '{invalid JSON');
+
+    const readText = vi.fn(async (path: string) => {
+      if (path === layout.planPathFor(testPath)) throw new Error('read failure');
+      return storage.readText(path);
+    });
+    const exists = vi.fn(async (path: string) => path === layout.planPathFor(testPath));
+    const outcome = await check({ ...deps, storage: { readText, exists } }, { ...OPTIONS, files: [testPath] });
+
+    expect(outcome.results).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: testPath, status: 'orphaned-plan' }),
+    ]));
+    expect(outcome.errors).toEqual(expect.arrayContaining([expect.objectContaining({ file: testPath })]));
+  });
+
+  it('retains the terminal selected result, skips only its pending selected suffix, and suppresses later orphan discovery after abort during selected work', async () => {
+    const controller = new AbortController();
+    const first = `${TEST_DIR}/first.test.md`;
+    const second = `${TEST_DIR}/second.test.md`;
+    const storage = createInMemoryStorage();
+    const exists = vi.fn(async (path: string) => {
+      if (path === `${TEST_DIR}/first.ambercast.plan.json`) {
+        controller.abort();
+      }
+      return false;
+    });
+    const discover = vi.fn<CheckDeps['discoverTestFiles']>(async () => {
+      throw new Error('later orphan discovery must be suppressed');
+    });
+    const { deps } = createScenario({ signal: controller.signal, storage: { ...storage, exists }, discoverTestFiles: discover });
+
+    const outcome = await check(deps, { ...OPTIONS, files: [first, second] });
+
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: first, status: 'missing-plan' }),
+      { id: second, file: second, status: 'skipped' },
+    ]);
+    expect(exists).toHaveBeenCalledTimes(1);
+    expect(discover).not.toHaveBeenCalled();
+    expect(outcome.interrupted).toBe(true);
+  });
+
+  it.each([
+    ['plan orphan', ['deleted.ambercast.plan.json'], [], `${TEST_DIR}/deleted.test.md`, 'orphaned-plan'],
+    ['grounding orphan', [], ['deleted.ambercast.grounding.json'], `${TEST_DIR}/deleted.test.md`, 'orphaned-grounding'],
+  ] as const)('keeps the current %s inspection terminal when abort arrives during it, without inspecting a later artifact', async (_name, plans, groundings, identity, status) => {
+    const controller = new AbortController();
+    const storage = createInMemoryStorage();
+    const exists = vi.fn(async (path: string) => {
+      if (path === identity) controller.abort();
+      return false;
+    });
+    const calls: string[] = [];
+    const discover = vi.fn<CheckDeps['discoverTestFiles']>(async ({ testMatch }) => {
+      if (testMatch[0] === '**/*.test.md') { calls.push('tests'); return []; }
+      if (testMatch[0] === '**/*.ambercast.plan.json') { calls.push('plans'); return plans; }
+      calls.push('grounding');
+      return groundings;
+    });
+    const { deps } = createScenario({ signal: controller.signal, storage: { ...storage, exists }, discoverTestFiles: discover });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(outcome.results).toEqual([expect.objectContaining({ id: identity, status })]);
+    expect(exists).toHaveBeenCalledOnce();
+    expect(outcome.interrupted).toBe(true);
+    expect(calls).toEqual(status === 'orphaned-plan' ? ['tests', 'plans'] : ['tests', 'plans', 'grounding']);
+  });
+
+  it('keeps selected case-error and later plan-orphan rows sharing an identity without a terminal-mark collision', async () => {
+    const testPath = `${TEST_DIR}/same.test.md`;
+    const planPath = `${TEST_DIR}/same.ambercast.plan.json`;
+    const storage = createInMemoryStorage();
+    const readText = vi.fn(async (path: string) => {
+      if (path === planPath) throw new Error('read failure');
+      return storage.readText(path);
+    });
+    const exists = vi.fn(async (path: string) => path === planPath);
+    const { deps } = createScenario({
+      storage: { ...storage, readText, exists },
+      discoverTestFiles: createDiscovery([], ['same.ambercast.plan.json']),
+    });
+
+    const outcome = await check(deps, { ...OPTIONS, files: [testPath] });
+
+    expect(outcome.errors).toEqual([expect.objectContaining({ file: testPath })]);
+    expect(outcome.results).toEqual([expect.objectContaining({ id: testPath, status: 'orphaned-plan' })]);
+    expect(buildCheckReport({
+      startedAt: '2026-08-17T00:00:00Z', durationMs: 1, options: { allowEmpty: false, list: false }, outcome,
+    }).envelope.summary).toEqual({ total: 1, passed: 0, failed: 0, errored: 1, skipped: 0 });
+  });
+
+  it.each(['normal return', 'discovery rejection'] as const)('disposes the tracker in check finally after %s', async (mode) => {
+    const dispose = vi.spyOn(BatchInterruptionTracker.prototype, 'dispose');
+    const discover = mode === 'normal return'
+      ? createDiscovery()
+      : vi.fn<CheckDeps['discoverTestFiles']>(async () => { throw new Error('discovery failed'); });
+    const { deps } = createScenario({ discoverTestFiles: discover });
+
+    if (mode === 'normal return') {
+      await expect(check(deps, OPTIONS)).resolves.toBeDefined();
+    } else {
+      await expect(check(deps, OPTIONS)).rejects.toThrow('discovery failed');
+    }
+    expect(dispose).toHaveBeenCalledOnce();
+    dispose.mockRestore();
   });
 });

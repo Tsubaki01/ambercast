@@ -1,6 +1,8 @@
 import type { AmbercastError, ExitCode } from '#core/errors/types.js';
 import { reportError } from '#report/error-mapping.js';
-import type { ReportEnvelope, RunResult } from '#report/schema.js';
+import { REPORT_SCHEMA_VERSION, type ReportEnvelope, type RunResult } from '#report/schema.js';
+import { summarizeReport } from '#report/summarize.js';
+import { InterruptedError } from '#core/errors/interrupted-error.js';
 import { selectExitCode } from './exit-code-priority.js';
 import type { RunOptions, RunOutcome } from './run.js';
 
@@ -99,24 +101,34 @@ export interface RunReportOutput {
  * errors have no suitable reserved `ErrorKind`, yet a batch containing only
  * those aborts must not appear successful.
  *
- * Summary accounting counts every public result by its run status: `total`
- * covers executed cases and listed files; `passed` includes executed passes
- * and listed discovery results; while `failed`, `errored`, and `skipped`
- * remain execution-only. Listed files enter the envelope here rather than
- * through case outcomes, preserving the execution evidence required by the
- * runtime's report-safe path handling.
+ * The builder uses the shared report-version constant and identity-set
+ * summarizer. Passed execution rows classify as passed, failed assertions as
+ * failed, execution errors and matching case errors as errored, and listed or
+ * interruption-skipped identities as skipped. Duplicate identities and a
+ * result/error pair contribute once to `total`; run-scoped errors never enter
+ * case accounting. Listed and skipped rows enter the envelope separately from
+ * case outcomes, preserving the evidence requirements of execution-backed
+ * results.
+ *
+ * An interrupted outcome appends exactly one run-scoped `INTERRUPTED`
+ * environment error and contributes exit 3 without a `caseId`. This batch fact
+ * does not replace terminal case evidence or the existing unclassified
+ * case-abort fallback, and the shared selector preserves every higher-priority
+ * condition. A command-level error has no results and therefore retains an
+ * all-zero shared summary.
  */
 export function buildRunReport(input: RunReportInput): RunReportOutput {
   if ('error' in input && input.error !== undefined) {
+    const errors = [reportError(input.error, { scope: 'run' })];
     return {
       exitCode: input.error.exitCode,
       envelope: {
-        schemaVersion: '1.0',
+        schemaVersion: REPORT_SCHEMA_VERSION,
         command: 'run',
         startedAt: input.startedAt,
         durationMs: input.durationMs,
-        summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 },
-        errors: [reportError(input.error, { scope: 'run' })],
+        summary: summarizeReport({ command: 'run', results: [], errors }),
+        errors,
         results: [],
         reportPersistence: 'not-attempted',
       },
@@ -127,10 +139,14 @@ export function buildRunReport(input: RunReportInput): RunReportOutput {
   const results: RunResult[] = [
     ...outcome.results.map(({ result }) => result),
     ...outcome.listed.map(({ file }): RunResult => ({ id: file, file, status: 'listed' })),
+    ...outcome.skipped
+      .map(({ file }): RunResult => ({ id: file, file, status: 'skipped' })),
   ];
   const errors = outcome.results.flatMap(({ result, error }) => (
     error === undefined ? [] : [reportError(error, { scope: 'case', caseId: result.id })]
   ));
+  const interrupted = outcome.interrupted;
+  if (interrupted) errors.push(reportError(new InterruptedError(), { scope: 'run' }));
   const candidates: ExitCode[] = outcome.results.flatMap<ExitCode>(({ result, error }) => {
     const resultCandidates: ExitCode[] = [];
 
@@ -149,32 +165,15 @@ export function buildRunReport(input: RunReportInput): RunReportOutput {
   if (outcome.noTestsFound && !input.options.allowEmpty && !input.options.list) {
     candidates.push(5);
   }
-  const summary = { total: results.length, passed: 0, failed: 0, errored: 0, skipped: 0 };
-
-  for (const result of results) {
-    switch (result.status) {
-      case 'passed':
-      case 'listed':
-        summary.passed += 1;
-        break;
-      case 'failed':
-        summary.failed += 1;
-        break;
-      case 'error':
-        summary.errored += 1;
-        break;
-      case 'skipped':
-        summary.skipped += 1;
-        break;
-    }
-  }
+  if (interrupted) candidates.push(3);
+  const summary = summarizeReport({ command: 'run', results, errors });
 
   const exitCode = selectExitCode(candidates);
 
   return {
     exitCode,
     envelope: {
-      schemaVersion: '1.0',
+      schemaVersion: REPORT_SCHEMA_VERSION,
       command: 'run',
       startedAt: input.startedAt,
       durationMs: input.durationMs,

@@ -108,8 +108,10 @@ const USAGE = `Usage: ambercast <command> [options]\n\nCommands:\n  generate [fi
 
 /*
  * Human rendering remains command-agnostic: only known healthy states are
- * green. An unknown or non-healthy status defaults to failure styling, so a
- * report vocabulary extension cannot acquire success styling accidentally.
+ * green. A skipped row records work with no execution or inspection evidence,
+ * so green styling would misrepresent the command outcome. An unknown status
+ * also defaults to failure styling, preventing a report vocabulary extension
+ * from acquiring success styling accidentally.
  */
 const HEALTHY_REPORT_STATUSES = new Set(['generated', 'skipped-fresh', 'listed', 'fresh', 'passed']);
 
@@ -143,8 +145,11 @@ function colorize(value: string, color: string, enabled: boolean): string {
  * @remarks
  * Status styling is data-driven rather than command-specific so a report
  * vocabulary extension must opt into healthy green styling explicitly. The
- * renderer also preserves a result's optional `reason`, which makes check
- * findings actionable without changing the stable JSON envelope.
+ * renderer appends a result's optional `reason`; check supplies only its fixed,
+ * path-free reason. The displayed identity comes from `file`, never
+ * `groundingFile` or `artifactFile`, so artifact evidence cannot be rendered as
+ * an explanatory host path. A `skipped` row has no reason or artifact evidence
+ * and retains the generic non-healthy styling.
  */
 function renderHumanReport(envelope: unknown, color: boolean): string {
   if (envelope === null || typeof envelope !== 'object' || Array.isArray(envelope)) {

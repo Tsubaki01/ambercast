@@ -12,6 +12,7 @@ import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
 import { AmbercastError } from '#core/errors/types.js';
 import { isAbsolutePath, joinPath } from '#core/paths.js';
 import { generate } from '#usecases/generate.js';
+import { normalizeReportEnvelope } from '#usecases/report-normalization.js';
 import {
   buildGenerateReport,
   type GenerateReportOutput,
@@ -77,8 +78,18 @@ export interface GenerateCommandOutput {
  * unexpected dependency rejection is classified as `unexpected-crash`, so a
  * normal command invocation always resolves within the documented report and
  * exit-code contract.
+ *
+ * Report identity normalization occurs once at this runtime boundary after
+ * report construction. The working directory is the initial project-root
+ * fallback for failures before configuration resolves; successful loading
+ * replaces it with `ResolvedConfig.projectRoot`. The shared normalizer rewrites
+ * only `id`, `file`, `planFile`, `caseId`, `groundingFile`, and `artifactFile`,
+ * then recomputes summary from the final visible identities. Both completed
+ * and command-error envelopes follow one contract without rewriting messages,
+ * hints, reasons, or other diagnostic text.
  */
 export async function runGenerateCommand(input: GenerateCommandInput): Promise<GenerateCommandOutput> {
+  let projectRoot = input.cwd;
   const clock = createSystemClock();
   const startedAt = reportTimestamp(clock.now());
   const startedMs = clock.monotonicMs();
@@ -100,6 +111,7 @@ export async function runGenerateCommand(input: GenerateCommandInput): Promise<G
       configEnv: readConfigEnvironment(),
       ...(input.configPathOverride === undefined ? {} : { configPathOverride: input.configPathOverride }),
     });
+    projectRoot = config.projectRoot;
     const aiProvider = await resolveAiProvider(config.ai.provider, input.aiProviderOverride, input.signal);
     const events = createNoopEventSink();
     const ambercast = createAmbercast({ config, aiProvider, events });
@@ -121,11 +133,13 @@ export async function runGenerateCommand(input: GenerateCommandInput): Promise<G
       list: input.list,
     });
 
-    return buildGenerateReport({ ...reportContext(), outcome });
+    const output = buildGenerateReport({ ...reportContext(), outcome });
+    return { ...output, envelope: normalizeReportEnvelope(output.envelope, projectRoot) };
   } catch (error) {
     const classified = error instanceof AmbercastError
       ? error
       : new UnexpectedCrashError('The generate command crashed unexpectedly.', undefined, { cause: error });
-    return buildGenerateReport({ ...reportContext(), error: classified });
+    const output = buildGenerateReport({ ...reportContext(), error: classified });
+    return { ...output, envelope: normalizeReportEnvelope(output.envelope, projectRoot) };
   }
 }

@@ -113,7 +113,7 @@ function without(value: Record<string, unknown>, key: string): Record<string, un
 
 function reportEnvelope(command: string, results: unknown[], overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    schemaVersion: '1.0',
+    schemaVersion: '2.0',
     command,
     startedAt: STARTED_AT,
     durationMs: 42,
@@ -332,11 +332,11 @@ describe('run result status branches', () => {
     ['passed', { ...RUN_RESULT, status: 'passed' }],
     ['failed', { ...RUN_RESULT, status: 'failed' }],
     ['error', { ...RUN_RESULT, status: 'error' }],
-    ['skipped', { ...RUN_RESULT, status: 'skipped' }],
     ['listed', LISTED_RUN_RESULT],
+    ['skipped', { id: 'login-succeeds', file: 'tests/login.test.md', status: 'skipped' }],
   ] as const)('accepts the %s branch through the public ReportEnvelope', (_status, result) => {
     expectAccepted(ReportEnvelope, reportEnvelope('run', [result], {
-      summary: { total: 1, passed: result.status === 'listed' || result.status === 'passed' ? 1 : 0, failed: 0, errored: 0, skipped: 0 },
+      summary: { total: 1, passed: result.status === 'listed' || result.status === 'passed' ? 1 : 0, failed: 0, errored: 0, skipped: Number(result.status === 'skipped') },
     }));
   });
 
@@ -455,7 +455,7 @@ describe('field boundaries', () => {
   });
 
   it.each([
-    ['run', RunResult, RUN_RESULT, ['passed', 'failed', 'error', 'skipped']],
+    ['run', RunResult, RUN_RESULT, ['passed', 'failed', 'error']],
     ['heal', HealResult, HEAL_RESULT, ['healed', 'partially-healed', 'unresolved', 'no-changes-needed']],
     ['check', CheckResult, CHECK_RESULT, ['fresh', 'stale', 'orphaned-plan', 'orphaned-grounding', 'missing-plan']],
     ['review', ReviewResult, REVIEW_RESULT, ['sufficient', 'insufficient']],
@@ -615,4 +615,69 @@ describe('ReportEnvelope command/result and error correlation', () => {
   it('accepts a non-empty errors array containing a valid ReportError', () => {
     expectAccepted(ReportEnvelope, reportEnvelope('run', [RUN_RESULT], { errors: [CASE_USAGE_ERROR] }));
   });
+});
+
+describe('report schema v2 interruption contract', () => {
+  const skipped = { id: 'case-a', file: 'tests/case-a.test.md', status: 'skipped' };
+  const skippedForbiddenEvidence = {
+    planFile: 'tests/case-a.ambercast.plan.json',
+    groundingFile: 'tests/case-a.ambercast.grounding.json',
+    artifactFile: 'tests/case-a.artifact.json',
+    dryRun: false,
+    reason: 'The inspection reason.',
+    durationMs: 42,
+    steps: [STEP_RESULT],
+    explanation: 'The execution explanation.',
+    ambiguities: ['The prompt has an ambiguity.'],
+    concerns: [REVIEW_CONCERN],
+  } as const;
+
+  it.each(['generate', 'run', 'check', 'heal', 'review'] as const)('accepts a v2 %s envelope with the shared strict skipped shape and rejects v1', (command) => {
+    const value = reportEnvelope(command, [skipped], {
+      schemaVersion: '2.0',
+      summary: { total: 1, passed: 0, failed: 0, errored: 0, skipped: 1 },
+      ...(command === 'run' ? { reportPersistence: 'not-attempted' } : {}),
+    });
+
+    expectAccepted(ReportEnvelope, value);
+    expectRejected(ReportEnvelope, { ...value, schemaVersion: '1.0' });
+    expect(ReportEnvelope.parse(value)).toEqual(value);
+  });
+
+  it.each([
+    'planFile', 'groundingFile', 'artifactFile', 'dryRun', 'reason', 'durationMs', 'steps', 'explanation', 'ambiguities', 'concerns',
+  ] as const)('rejects forbidden %s evidence on every skipped branch', (field) => {
+    for (const command of ['generate', 'run', 'check', 'heal', 'review'] as const) {
+      expectRejected(ReportEnvelope, reportEnvelope(command, [{ ...skipped, [field]: skippedForbiddenEvidence[field] }], {
+        schemaVersion: '2.0', summary: { total: 1, passed: 0, failed: 0, errored: 0, skipped: 1 },
+        ...(command === 'run' ? { reportPersistence: 'not-attempted' } : {}),
+      }));
+    }
+  });
+
+  it('accepts all scheduled check statuses and path fields while rejecting blank paths and unknown values', () => {
+    for (const status of ['fresh', 'stale', 'missing-plan', 'missing-grounding', 'stale-grounding', 'invalid-grounding', 'fresh-without-grounding', 'orphaned-plan', 'orphaned-grounding', 'invalid-artifact-name', 'listed'] as const) {
+      expectAccepted(CheckResult, {
+        id: 'case-a', file: 'case-a.test.md', planFile: 'case-a.plan.json', status, reason: 'checked',
+        groundingFile: 'case-a.grounding.json', artifactFile: 'case-a.artifact.json',
+      });
+    }
+    expectRejected(CheckResult, { ...CHECK_RESULT, groundingFile: '  ' });
+    expectRejected(CheckResult, { ...CHECK_RESULT, artifactFile: '  ' });
+    expectRejected(CheckResult, { ...CHECK_RESULT, status: 'unknown' });
+    expectRejected(CheckResult, { ...CHECK_RESULT, unexpected: true });
+  });
+
+  it.each(['', '  ', '\t\n'])(
+    'rejects a non-skipped result with a blank mandatory planFile (%j)',
+    (planFile) => {
+      for (const variant of COMMAND_VARIANTS) {
+        const value = reportEnvelope(variant.command, [{ ...variant.result, planFile }]);
+        const restored = reportEnvelope(variant.command, [variant.result]);
+
+        expectRejected(ReportEnvelope, value);
+        expectAccepted(ReportEnvelope, restored);
+      }
+    },
+  );
 });

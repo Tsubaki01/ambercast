@@ -81,6 +81,7 @@ import {
   classifyPreScannedTraceCoverage,
   validateCommittedInstructionCoverage,
 } from './instruction-coverage-policy.js';
+import { BatchInterruptionTracker } from './batch-interruption.js';
 
 /**
  * Execution evidence while a case is still in progress.
@@ -2747,8 +2748,11 @@ function skippedSteps(steps: readonly Step[], after: number): StepResult[] {
  * a pre-launch failure retains no synthetic step. This preserves the report's
  * distinction between a live-session dispatch failure and work that never
  * reached the browser. Its identity is deliberately restricted to
- * {@link ExecutedRunResult}, because only an interrupted replay can produce
- * the partial step evidence this helper assembles.
+ * {@link ExecutedRunResult}, because only a case-dispatch abort can produce the
+ * partial executed-step evidence this helper assembles. This helper does not
+ * represent batch interruption; batch-level skipped identities and the
+ * run-scoped interruption error are carried outside execution-backed case
+ * results.
  */
 function resultForAbort(
   identity: Pick<ExecutedRunResult, 'id' | 'file' | 'planFile'>,
@@ -2929,11 +2933,12 @@ export interface RunDeps {
   >;
 
   /**
-   * Caller cancellation that stops scheduling later cases.
+   * Caller cancellation observed at the sequential case boundary.
    *
-   * Completed case outcomes are retained, matching `generate()`'s partial
-   * outcome contract rather than treating cancellation as permission to erase
-   * work that has already completed.
+   * Completed case outcomes remain execution-backed. Discovered identities
+   * that never become terminal are retained separately as evidence-free
+   * skipped rows, matching `generate()` without weakening
+   * {@link RunCaseOutcome}.
    */
   readonly signal?: AbortSignal;
 }
@@ -2961,15 +2966,18 @@ export interface RunCaseOutcome {
 }
 
 /**
- * Ordered replay outcomes, discovery-only listed files, and the structural
- * zero-match fact.
+ * Ordered replay outcomes, discovery-only listed files, interruption-only
+ * skipped identities, and the structural zero-match fact.
  *
  * The separate flag distinguishes an empty discovery result from a batch that
  * ran and happened to produce no passing cases, which matters to report exit
- * selection.
+ * selection. Unprocessed identities stay outside {@link RunCaseOutcome}
+ * because a skipped batch item has no duration, plan, or step evidence. A
+ * batch-level interruption fact tells report construction to emit one
+ * run-scoped error without pretending those identities failed as cases.
  */
 export interface RunOutcome {
-  /** Completed cases in literal or deterministic discovery order. */
+  /** Terminal execution-backed cases in literal or deterministic discovery order. */
   readonly results: readonly RunCaseOutcome[];
 
   /** Whether discovery resolved no prompt files before case work began. */
@@ -2978,12 +2986,20 @@ export interface RunOutcome {
   /**
    * Files selected for discovery-only reporting.
    *
-   * This field is always present and is empty outside list mode. It remains
+   * This field is always present and is empty outside list mode. Listing is an
+   * atomic post-selection result and therefore remains non-interrupted even
+   * for an already-aborted caller signal. It remains
    * separate from {@link results} because each case outcome promises executed
    * duration and step evidence, while a listed file has intentionally not
    * entered replay.
    */
   readonly listed: readonly RunListedFile[];
+
+  /** Pending identities that have no execution evidence. */
+  readonly skipped: readonly RunListedFile[];
+
+  /** Whether cancellation intersected discovered nonterminal work. */
+  readonly interrupted: boolean;
 }
 
 /**
@@ -3000,19 +3016,23 @@ export type RunListedFile = { readonly file: string };
  * @param deps - Replay I/O, target, clock, browser, secret, event, discovery,
  * and cancellation dependencies.
  * @param options - Batch selection and replay policy.
- * @returns Completed per-case outcomes, discovery-only listed files, and the
- * zero-match fact needed by the command report.
+ * @returns Completed per-case outcomes, discovery-only listed files, ordered
+ * unprocessed identities, the interruption fact, and the zero-match fact
+ * needed by the command report.
  * @remarks
  * Literal files retain caller order and discovered files retain the injected
- * discovery order after duplicate literal paths are collapsed in first-seen
- * order. Cases run sequentially. A caller `AbortSignal` stops the scheduler
- * before another case starts, but returns the outcomes already completed; it
- * does not discard them.
+ * discovery order after grep filtering and first-seen deduplication. Cases run
+ * sequentially. A synchronous tracker marks a case terminal after its result
+ * or case-scoped error is retained; caller cancellation stops later scheduling
+ * and exposes every remaining identity in the same deterministic order. The
+ * tracker is disposed in `finally` even when case execution rejects, so a late
+ * signal cannot mutate a completed outcome.
  *
- * List mode stops after the same discovery, grep, and deduplication phase.
- * Its separate listed-file collection guarantees that this inspection path
- * cannot be treated as execution evidence by callers that consume case
- * outcomes.
+ * List mode stops atomically after the same discovery, grep, and deduplication
+ * phase. Its separate listed-file collection guarantees that this inspection
+ * path cannot be treated as execution evidence, while an already-aborted
+ * signal cannot split one deterministic selection into listed and skipped
+ * subsets.
  *
  * Each result uses a monotonic per-case duration so elapsed time remains
  * meaningful when wall-clock time changes. Replay validates the plan before
@@ -3050,6 +3070,8 @@ export type RunListedFile = { readonly file: string };
  * an error kind that misrepresents those conditions.
  */
 export async function run(deps: RunDeps, options: RunOptions): Promise<RunOutcome> {
+  const tracker = new BatchInterruptionTracker(deps.signal);
+  try {
   const discovered = options.files.length === 0
     ? (await deps.discoverTestFiles({
       testDir: deps.config.testDir,
@@ -3062,19 +3084,26 @@ export async function run(deps: RunDeps, options: RunOptions): Promise<RunOutcom
     : discovered.filter((path) => grepMatches(options.grep!, path, deps.config.testDir));
   const files = [...new Set(filteredFiles)];
 
-  if (files.length === 0) { return { results: [], noTestsFound: true, listed: [] }; }
-  if (options.list) { return { results: [], noTestsFound: false, listed: files.map((file) => ({ file })) }; }
+  if (files.length === 0) return { results: [], noTestsFound: true, listed: [], skipped: [], interrupted: false };
+  if (options.list) return { results: [], noTestsFound: false, listed: files.map((file) => ({ file })), skipped: [], interrupted: false };
 
+  for (const file of files) tracker.addDiscovered(file, file);
   const results: RunCaseOutcome[] = [];
   for (const file of files) {
-    if (deps.signal?.aborted) {
+    if (tracker.interrupted) {
       break;
     }
-
-    results.push(await runCase(deps, options, file));
+    try {
+      results.push(await runCase(deps, options, file));
+    } finally {
+      tracker.markTerminal(file);
+    }
   }
 
-  return { results, noTestsFound: false, listed: [] };
+  return { results, noTestsFound: false, listed: [], skipped: tracker.pendingIdentities.map((file) => ({ file })), interrupted: tracker.interrupted };
+  } finally {
+    tracker.dispose();
+  }
 }
 
 /**

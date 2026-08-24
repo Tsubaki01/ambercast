@@ -1,14 +1,18 @@
 import { z } from 'zod';
 
 /*
- * Defines the versioned structured-report contract for CLI JSON and MCP
- * structured responses. Each object boundary rejects unknown fields so machine
- * consumers receive a deliberate, stable shape rather than permissive
- * diagnostic objects.
+ * Defines the versioned structured-report contract shared by CLI JSON and MCP
+ * structured responses. A single exported version constant pins every command
+ * envelope to the same major contract, and strict object boundaries reject
+ * unknown evidence fields instead of silently weakening machine-consumer
+ * guarantees.
  */
 
 const NON_WHITESPACE_STRING_PATTERN = /\S/;
 const UTC_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+
+/** Version shared by every structured report envelope. */
+export const REPORT_SCHEMA_VERSION = '2.0' as const;
 /**
  * Fixed disclaimer required on accessibility evidence in a structured report.
  *
@@ -38,6 +42,7 @@ const ENVIRONMENT_REPORT_ERROR_CODES = [
   'AI_RESPONSE_INVALID',
   'FS_IO_ERROR',
   'UNEXPECTED_CRASH',
+  'INTERRUPTED',
 ] as const;
 
 /**
@@ -59,6 +64,7 @@ export type ReportErrorCode = z.infer<typeof ReportErrorCode>;
 
 const UsageReportErrorCode = z.enum(USAGE_REPORT_ERROR_CODES);
 const EnvironmentReportErrorCode = z.enum(ENVIRONMENT_REPORT_ERROR_CODES);
+const CaseEnvironmentReportErrorCode = z.enum(ENVIRONMENT_REPORT_ERROR_CODES.filter((code) => code !== 'INTERRUPTED'));
 const ReportErrorMessageFields = {
   message: z.string(),
   hint: z.string().optional(),
@@ -89,7 +95,7 @@ const CaseUsageReportError = z.strictObject({
 const CaseEnvironmentReportError = z.strictObject({
   scope: z.literal('case'),
   kind: z.literal('environment'),
-  code: EnvironmentReportErrorCode,
+  code: CaseEnvironmentReportErrorCode,
   ...ReportErrorMessageFields,
   caseId: NonWhitespaceString,
 });
@@ -100,9 +106,12 @@ const CaseEnvironmentReportError = z.strictObject({
  *
  * @remarks
  * The four branches encode scope and classification kind together, making
- * their code correlation structural. A `z.discriminatedUnion` cannot express
- * this because `scope` repeats across the branches, while a case-specific
- * error needs an identifying case reference.
+ * their code correlation structural. `INTERRUPTED` belongs only to the
+ * run-scoped environment branch: cancellation describes an incomplete batch,
+ * while skipped rows identify the affected cases without fabricating a
+ * case-level failure. A `z.discriminatedUnion` cannot express the remaining
+ * correlation because `scope` repeats across branches and case errors require
+ * an identifying case reference.
  */
 export const ReportError = z.union([
   RunUsageReportError,
@@ -119,8 +128,10 @@ export type ReportError = z.infer<typeof ReportError>;
 /**
  * Zod schema for command-level outcome counts.
  *
- * It does not enforce an accounting formula because command-specific status
- * vocabularies differ, so no universal formula exists.
+ * The schema validates the shape but leaves accounting to the shared
+ * identity-set summarizer. Command vocabularies differ, and duplicate result
+ * rows or matching case errors mean an array-length formula would not preserve
+ * the public denominator.
  */
 export const Summary = z.strictObject({
   total: NonNegativeInteger,
@@ -201,14 +212,42 @@ export type StepResult = z.infer<typeof StepResult>;
 const ResultIdentityFields = {
   id: NonWhitespaceString,
   file: NonWhitespaceString,
-  planFile: z.string(),
+  planFile: NonWhitespaceString,
 };
+
+/*
+ * Every mandatory public identity and path (`id`, `file`, `planFile`, and
+ * `caseId`) rejects empty or whitespace-only values. Optional
+ * `groundingFile` and `artifactFile` fields apply the same rule whenever they
+ * are present, keeping normalization and identity-set accounting well-defined.
+ */
 
 const ExecutedResultFields = {
   durationMs: NonNegativeInteger,
   steps: z.array(StepResult),
   explanation: z.string(),
 };
+
+/**
+ * Zod schema for discovered work that does not reach a terminal state.
+ *
+ * @remarks
+ * This named, strict cross-command branch contains exactly non-whitespace
+ * `id`, non-whitespace `file`, and `status: 'skipped'`. It rejects
+ * `planFile`, `groundingFile`, `artifactFile`, `dryRun`, `reason`,
+ * `durationMs`, `steps`, `explanation`, `ambiguities`, and `concerns`, as well
+ * as every other unknown property. The absence of generation, execution,
+ * inspection, healing, and review evidence prevents interruption from being
+ * mistaken for completed work.
+ */
+export const SkippedResult = z.strictObject({
+  id: NonWhitespaceString,
+  file: NonWhitespaceString,
+  status: z.literal('skipped'),
+});
+
+/** An identity-only row for discovered work left incomplete by interruption. */
+export type SkippedResult = z.infer<typeof SkippedResult>;
 
 /**
  * Zod schema for an execution-backed result produced by the `run` command.
@@ -218,11 +257,14 @@ const ExecutedResultFields = {
  * outcome without reconstructing it from unstructured logs. Its separate
  * branch keeps execution-backed cases distinct from discovery-only rows in the
  * public run-result union, so consumers can rely on the presence of execution
- * evidence here.
+ * evidence here. Its status vocabulary is exactly `passed`, `failed`, and
+ * `error`; `skipped` is invalid for this execution-backed shape. Skipped batch
+ * work uses the shared identity-only {@link SkippedResult} branch and never
+ * enters this execution-backed shape.
  */
 export const ExecutedRunResult = z.strictObject({
   ...ResultIdentityFields,
-  status: z.enum(['passed', 'failed', 'error', 'skipped']),
+  status: z.enum(['passed', 'failed', 'error']),
   ...ExecutedResultFields,
 });
 
@@ -255,12 +297,12 @@ export type ListedRunResult = z.infer<typeof ListedRunResult>;
 /**
  * Zod schema for one result produced by the `run` command.
  *
- * The status discriminant separates execution-backed results from `--list`
- * discovery rows, mirroring the public generation-report pattern. This gives
- * report consumers one result array without implying that listed files carry
- * execution duration or step evidence.
+ * The status discriminant separates execution-backed results, `--list`
+ * discovery rows, and interruption-only skipped rows. This gives consumers
+ * one result array without implying that listed or skipped identities carry
+ * duration, plan, or step evidence.
  */
-export const RunResult = z.discriminatedUnion('status', [ExecutedRunResult, ListedRunResult]);
+export const RunResult = z.discriminatedUnion('status', [ExecutedRunResult, ListedRunResult, SkippedResult]);
 
 /**
  * A per-case execution result or a discovery-only result emitted by a `run` report.
@@ -270,15 +312,18 @@ export type RunResult = z.infer<typeof RunResult>;
 /**
  * Zod schema for one result produced by the `heal` command.
  *
- * It shares {@link ExecutedRunResult}'s identity and execution evidence so consumers
- * can process per-case outcomes consistently. Its healing-specific status
- * vocabulary distinguishes a repair outcome from an ordinary execution.
+ * Its execution-backed branch shares {@link ExecutedRunResult}'s identity and
+ * evidence so consumers can process completed cases consistently. The union
+ * also accepts the shared identity-only skipped branch without weakening the
+ * evidence promised by a completed healing status.
  */
-export const HealResult = z.strictObject({
+const CompletedHealResult = z.strictObject({
   ...ResultIdentityFields,
   status: z.enum(['healed', 'partially-healed', 'unresolved', 'no-changes-needed']),
   ...ExecutedResultFields,
 });
+
+export const HealResult = z.discriminatedUnion('status', [CompletedHealResult, SkippedResult]);
 
 /**
  * A per-case result emitted by a `heal` report.
@@ -291,17 +336,20 @@ export type HealResult = z.infer<typeof HealResult>;
  * This variant gives plan generation its own result vocabulary instead of
  * overloading execution-oriented step results. `would-generate` previews a
  * validated write during dry-run mode, while `listed` reports discovery only.
- * Listed, skipped-fresh, and failed results omit `ambiguities` because no newly
- * generated provider response exists; listed and failed results also omit
- * `planFile`. Generated and previewed results retain both, with an empty
+ * Listed, skipped-fresh, failed, and interruption-skipped results omit
+ * `ambiguities` because no newly generated provider response exists; listed
+ * and failed results also omit
+ * `planFile`. Generated and `would-generate` results retain both, with an empty
  * ambiguity list when the provider supplied none. Ambiguities are restricted to
- * JSON values so every report remains serializable across CLI and MCP boundaries.
+ * JSON values so every report remains serializable across CLI and MCP
+ * boundaries. Interruption uses the shared strict identity-only branch and
+ * therefore carries neither dry-run nor generation evidence.
  */
 export const GenerateResult = z.discriminatedUnion('status', [
   z.strictObject({
     id: NonWhitespaceString,
     file: NonWhitespaceString,
-    planFile: z.string(),
+    planFile: NonWhitespaceString,
     status: z.literal('generated'),
     dryRun: z.literal(false),
     ambiguities: z.array(z.json()),
@@ -309,7 +357,7 @@ export const GenerateResult = z.discriminatedUnion('status', [
   z.strictObject({
     id: NonWhitespaceString,
     file: NonWhitespaceString,
-    planFile: z.string(),
+    planFile: NonWhitespaceString,
     status: z.literal('would-generate'),
     dryRun: z.literal(true),
     ambiguities: z.array(z.json()),
@@ -317,7 +365,7 @@ export const GenerateResult = z.discriminatedUnion('status', [
   z.strictObject({
     id: NonWhitespaceString,
     file: NonWhitespaceString,
-    planFile: z.string(),
+    planFile: NonWhitespaceString,
     status: z.literal('skipped-fresh'),
     dryRun: z.boolean(),
   }),
@@ -333,6 +381,7 @@ export const GenerateResult = z.discriminatedUnion('status', [
     status: z.literal('failed'),
     dryRun: z.boolean(),
   }),
+  SkippedResult,
 ]);
 
 /**
@@ -343,14 +392,34 @@ export type GenerateResult = z.infer<typeof GenerateResult>;
 /**
  * Zod schema for one result produced by the `check` command.
  *
- * A dedicated variant keeps validation outcomes machine-readable without
- * implying that every command operates on executable steps.
+ * Dedicated status branches keep validation outcomes machine-readable without
+ * implying executable work. An inspected finding contains non-whitespace
+ * `id`, `file`, and `planFile`, its status and fixed `reason`, plus a
+ * non-whitespace `groundingFile` or `artifactFile` only when that artifact is
+ * the finding's evidence. The represented vocabulary includes `fresh`,
+ * `stale`, `orphaned-plan`, `orphaned-grounding`, `missing-plan`,
+ * `missing-grounding`, `stale-grounding`, `invalid-grounding`,
+ * `fresh-without-grounding`, and `invalid-artifact-name`. Representation does
+ * not imply grounding lifecycle or artifact inverse-scan behavior in the check
+ * inspector.
+ *
+ * A `listed` row is an inspection result like every other check status, not
+ * the discovery-only list-mode row used by generate and run. It therefore
+ * carries non-whitespace `id`, `file`, `planFile`, status, and `reason`, with
+ * optional artifact paths when available. An interruption-only `skipped` row
+ * instead uses the shared strict {@link SkippedResult} declaration. Keeping
+ * paths in typed fields and reasons fixed and path-free prevents diagnostic
+ * text from disclosing a host path.
  */
-export const CheckResult = z.strictObject({
+const CompletedCheckResult = z.strictObject({
   ...ResultIdentityFields,
-  status: z.enum(['fresh', 'stale', 'orphaned-plan', 'orphaned-grounding', 'missing-plan']),
+  status: z.enum(['fresh', 'stale', 'orphaned-plan', 'orphaned-grounding', 'missing-plan', 'missing-grounding', 'stale-grounding', 'invalid-grounding', 'fresh-without-grounding', 'invalid-artifact-name', 'listed']),
   reason: z.string(),
+  groundingFile: NonWhitespaceString.optional(),
+  artifactFile: NonWhitespaceString.optional(),
 });
+
+export const CheckResult = z.discriminatedUnion('status', [CompletedCheckResult, SkippedResult]);
 
 /**
  * A result item emitted by a `check` report.
@@ -366,14 +435,18 @@ const ReviewConcern = z.strictObject({
 /**
  * Zod schema for one result produced by the `review` command.
  *
- * This fixed result shape keeps review concerns in the same report contract as
- * the other command outcomes.
+ * Completed review branches keep concerns in the same report contract as other
+ * command outcomes. An interrupted review accepts only the shared skipped
+ * identity branch, so absence of concerns cannot be mistaken for a completed
+ * sufficiency judgment.
  */
-export const ReviewResult = z.strictObject({
+const CompletedReviewResult = z.strictObject({
   ...ResultIdentityFields,
   status: z.enum(['sufficient', 'insufficient']),
   concerns: z.array(ReviewConcern),
 });
+
+export const ReviewResult = z.discriminatedUnion('status', [CompletedReviewResult, SkippedResult]);
 
 /**
  * A result item emitted by a `review` report.
@@ -381,7 +454,7 @@ export const ReviewResult = z.strictObject({
 export type ReviewResult = z.infer<typeof ReviewResult>;
 
 const ReportEnvelopeFields = {
-  schemaVersion: z.literal('1.0'),
+  schemaVersion: z.literal(REPORT_SCHEMA_VERSION),
   startedAt: z.string().regex(UTC_TIMESTAMP_PATTERN),
   durationMs: NonNegativeInteger,
   summary: Summary,
@@ -392,10 +465,12 @@ const ReportEnvelopeFields = {
  * Zod schema for the complete versioned output of a reporting command.
  *
  * @remarks
- * The command discriminant couples each branch to its matching result schema,
- * rather than allowing a loose result union. `init` is excluded because it has
- * no structured output, while the fixed review branch keeps all command
- * results centralized in one contract.
+ * One exported schema-version constant is the sole literal used by every
+ * branch, preventing individual builders from drifting across report
+ * generations. The command discriminant couples each branch to its matching
+ * result schema rather than allowing a loose result union. `init` is excluded
+ * because it has no structured output, while the fixed review branch keeps all
+ * command results centralized in one contract.
  *
  * `startedAt` validates the exact `YYYY-MM-DDTHH:mm:ssZ` character shape, not
  * calendar or clock semantics. This follows the portable-but-shallow regex

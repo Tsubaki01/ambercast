@@ -53,6 +53,7 @@ import {
   validateCommittedInstructionCoverage,
   type InstructionCoverageResult,
 } from './instruction-coverage-policy.js';
+import { BatchInterruptionTracker } from './batch-interruption.js';
 
 const GENERATED_PLAN_RESPONSE_SCHEMA = typedJsonSchema(GeneratedPlanResponse);
 
@@ -294,14 +295,22 @@ export interface GenerateDeps {
     'testDir' | 'testMatch' | 'testIgnore' | 'targets' | 'defaultTarget' | 'ai'
   >;
 
-  /** Caller cancellation that stops scheduling further files. */
+  /**
+   * Caller cancellation observed at the sequential scheduling boundary.
+   *
+   * Cancellation retains terminal outcomes and turns every discovered but
+   * nonterminal identity into an evidence-free skipped row.
+   */
   readonly signal?: AbortSignal;
 }
 
 /**
  * The per-file state represented in a generation outcome.
+ *
+ * Interrupted work uses the shared identity-only skipped state; it never
+ * borrows plan, provider, ambiguity, or dry-run evidence from completed work.
  */
-export type GenerateFileStatus = 'generated' | 'skipped-fresh' | 'would-generate' | 'listed' | 'failed';
+export type GenerateFileStatus = 'generated' | 'skipped-fresh' | 'would-generate' | 'listed' | 'skipped' | 'failed';
 
 /**
  * Serializable-identifying data plus any live error for one prompt path.
@@ -324,7 +333,12 @@ export interface GenerateFileOutcome {
 }
 
 /**
- * Ordered results of one generation invocation.
+ * Ordered terminal and interruption results of one generation invocation.
+ *
+ * The batch interruption fact is distinct from any individual result. It is
+ * true only when caller cancellation was observed while a discovered work key
+ * remained nonterminal, allowing report construction to add one run-scoped
+ * interruption error without converting skipped identities into case errors.
  */
 export interface GenerateOutcome {
   /** Per-file results in literal or deterministic discovery order. */
@@ -332,6 +346,9 @@ export interface GenerateOutcome {
 
   /** Whether resolution found no files before any per-file work began. */
   readonly noTestsFound: boolean;
+
+  /** Whether cancellation intersected discovered nonterminal work. */
+  readonly interrupted: boolean;
 }
 
 /**
@@ -340,17 +357,21 @@ export interface GenerateOutcome {
  * @param deps - I/O, layout, provider, event delivery, discovery,
  * configuration, and optional cancellation dependencies.
  * @param options - Batch selection and generation policy.
- * @returns Ordered file outcomes and the zero-match fact needed by the command
- * layer's exit policy.
+ * @returns Ordered file outcomes, the zero-match fact, and whether cancellation
+ * intersected incomplete discovered work.
  * @remarks
- * Literal paths retain caller order; discovered paths retain the order supplied
- * by the injected discovery seam, which owns sorting and deduplication. List
- * mode performs that filesystem discovery but does not read prompt files,
- * invoke AI, emit lifecycle events, or write artifacts. Every attempted
+ * Literal paths retain caller order and discovered paths retain the injected
+ * discovery order, including duplicate occurrences. Each occurrence receives
+ * a key such as `generate:<index>:<file>`, so duplicate public identities keep
+ * their existing visible result rows without sharing scheduling terminality.
+ * List mode is an atomic boundary after selection: it returns every listed row
+ * and `GenerateOutcome.interrupted` is false even when its caller signal is
+ * already aborted. It does not read prompt files, invoke AI, emit lifecycle
+ * events, or write artifacts. Every attempted
  * provider invocation emits one `ai-call` event; paths that avoid the
  * provider emit none. Other files run sequentially, so a caller cancellation
- * prevents new work without discarding earlier outcomes, while an individual
- * file failure does not block later files.
+ * prevents new work without discarding earlier terminal outcomes, while an
+ * individual file failure does not block later files.
  *
  * Freshness requires both semantic validity and canonical artifact bytes,
  * preventing malformed or reformatted plans from skipping generation. A
@@ -366,14 +387,21 @@ export interface GenerateOutcome {
  * plan inspection, provider invocation, or artifact writes. Later prompts
  * retain the same isolation as other generation failures.
  *
- * The caller signal is distinct from the per-call timeout. Caller cancellation
- * stops scheduling and returns the completed partial outcome, while a timeout
- * fails only the current file as an unavailable executor. Plan text precedes
- * grounding text so a grounding write failure leaves a repairable fresh plan
- * rather than a partial plan. Cross-process generation against the same prompt
- * is undefined behavior.
+ * The caller signal is distinct from the per-call timeout. A synchronous
+ * tracker records discovered work keys and their public identities. A work key
+ * becomes terminal whenever its scheduled file processing completes,
+ * independently of whether completion creates a public row. Cancellation
+ * leaves every still-pending public identity as an ordered, deduplicated,
+ * identity-only skipped row and latches even when in-flight work later
+ * completes; the listener is disposed in `finally` on success or rejection. A
+ * timeout instead fails only the current file as an unavailable executor. Plan
+ * text precedes grounding text so a grounding write failure leaves a
+ * repairable fresh plan rather than a partial plan. Cross-process generation
+ * against the same prompt is undefined behavior.
  */
 export async function generate(deps: GenerateDeps, options: GenerateOptions): Promise<GenerateOutcome> {
+  const tracker = new BatchInterruptionTracker(deps.signal);
+  try {
   const discovered = options.files.length === 0
     ? (await deps.discoverTestFiles({
       testDir: deps.config.testDir,
@@ -383,21 +411,26 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
     : [...options.files];
 
   if (discovered.length === 0) {
-    return { results: [], noTestsFound: true };
+    return { results: [], noTestsFound: true, interrupted: false };
   }
 
   if (options.list) {
     return {
       results: discovered.map((file) => ({ file, status: 'listed' })),
       noTestsFound: false,
+      interrupted: false,
     };
   }
 
+  for (const [index, file] of discovered.entries()) tracker.addDiscovered(`generate:${index}:${file}`, file);
   const results: GenerateFileOutcome[] = [];
-  for (const file of discovered) {
-    if (deps.signal?.aborted) {
+  for (const [index, file] of discovered.entries()) {
+    const workKey = `generate:${index}:${file}`;
+    let interruptedDuringAi = false;
+    if (tracker.interrupted) {
       break;
     }
+    try {
 
     let testMd: string;
     try {
@@ -462,11 +495,17 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
       const isTimeout = isAiDeadlineTimeout(deadline, error);
 
       if (!isTimeout && deps.signal?.aborted) {
+        interruptedDuringAi = true;
         break;
       }
 
       results.push({ file, status: 'failed', error: aiFailure(error, isTimeout) });
       continue;
+    }
+
+    if (tracker.interrupted) {
+      interruptedDuringAi = true;
+      break;
     }
 
     const parsedResponse = GENERATED_PLAN_RESPONSE_FOR_POLICY.safeParse(response.data);
@@ -557,7 +596,14 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
     } catch (error) {
       results.push({ file, status: 'failed', error: fsIoError('The generated artifacts could not be written.', error) });
     }
+    } finally {
+      if (!interruptedDuringAi) tracker.markTerminal(workKey);
+    }
   }
 
-  return { results, noTestsFound: false };
+  if (tracker.interrupted) results.push(...tracker.pendingIdentities.map((file) => ({ file, status: 'skipped' as const })));
+  return { results, noTestsFound: false, interrupted: tracker.interrupted };
+  } finally {
+    tracker.dispose();
+  }
 }

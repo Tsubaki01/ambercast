@@ -129,6 +129,7 @@ describe('bin/ambercast.js (e2e)', () => {
     expect(result.exitCode).toBe(0);
     const envelope = JSON.parse(result.stdout);
     expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
+    expect(envelope.schemaVersion).toBe('2.0');
     expect(envelope.results).toEqual([expect.objectContaining({ file: expect.stringContaining('test.test.md'), status: 'listed' })]);
   });
 
@@ -183,7 +184,7 @@ describe('bin/ambercast.js (e2e)', () => {
     expect(envelope).toMatchObject({
       command: 'run',
       reportPersistence: 'persisted',
-      summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 },
+      summary: { total: 1, passed: 0, failed: 0, errored: 0, skipped: 1 },
       results: [expect.objectContaining({ file: expect.stringContaining('test.test.md'), status: 'listed' })],
     });
     const reportDirectories = await readdir(join(project, 'tests', '.runs'));

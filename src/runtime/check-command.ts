@@ -17,6 +17,7 @@ import { AmbercastError } from '#core/errors/types.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
 import { isAbsolutePath, joinPath } from '#core/paths.js';
 import { check } from '#usecases/check.js';
+import { normalizeReportEnvelope } from '#usecases/report-normalization.js';
 import { buildCheckReport, type CheckReportOutput } from '#usecases/check-report.js';
 import { createFsTestFileDiscovery } from './test-file-discovery.js';
 
@@ -77,8 +78,17 @@ export interface CheckCommandOutput {
  * Known ambercast errors stay classified, while an unexpected rejection becomes
  * an unexpected-crash report so valid invocations still resolve to the command
  * report and exit-code contract.
+ *
+ * Report identity normalization occurs once after report construction. The
+ * runtime begins with `cwd` as the root for failures before configuration is
+ * available and replaces it with `ResolvedConfig.projectRoot` once loading
+ * succeeds. The shared normalizer converts only `id`, `file`, `planFile`,
+ * `caseId`, `groundingFile`, and `artifactFile`, then recomputes summary from
+ * their final visible values. Reasons and other free text remain untouched,
+ * preserving the fixed path-free orphan-grounding contract.
  */
 export async function runCheckCommand(input: CheckCommandInput): Promise<CheckCommandOutput> {
+  let projectRoot = input.cwd;
   const clock = createSystemClock();
   const startedAt = reportTimestamp(clock.now());
   const startedMs = clock.monotonicMs();
@@ -96,6 +106,7 @@ export async function runCheckCommand(input: CheckCommandInput): Promise<CheckCo
       configEnv: readConfigEnvironment(),
       ...(input.configPathOverride === undefined ? {} : { configPathOverride: input.configPathOverride }),
     });
+    projectRoot = config.projectRoot;
     const outcome = await check({
       storage,
       layout: createLayoutResolver(config),
@@ -109,11 +120,13 @@ export async function runCheckCommand(input: CheckCommandInput): Promise<CheckCo
       list: input.list,
     });
 
-    return buildCheckReport({ ...reportContext(), outcome });
+    const output = buildCheckReport({ ...reportContext(), outcome });
+    return { ...output, envelope: normalizeReportEnvelope(output.envelope, projectRoot) };
   } catch (error) {
     const classified = error instanceof AmbercastError
       ? error
       : new UnexpectedCrashError('The check command crashed unexpectedly.', undefined, { cause: error });
-    return buildCheckReport({ ...reportContext(), error: classified });
+    const output = buildCheckReport({ ...reportContext(), error: classified });
+    return { ...output, envelope: normalizeReportEnvelope(output.envelope, projectRoot) };
   }
 }

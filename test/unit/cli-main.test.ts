@@ -27,7 +27,7 @@ class MemoryWritable extends Writable {
 }
 
 const ENVELOPE = {
-  schemaVersion: '1.0' as const,
+  schemaVersion: '2.0' as const,
   command: 'generate' as const,
   startedAt: '2026-08-08T00:00:00Z',
   durationMs: 0,
@@ -37,7 +37,7 @@ const ENVELOPE = {
 };
 
 const RUN_ENVELOPE = {
-  schemaVersion: '1.0' as const,
+  schemaVersion: '2.0' as const,
   command: 'run' as const,
   startedAt: '2026-08-09T00:00:00Z',
   durationMs: 0,
@@ -48,7 +48,7 @@ const RUN_ENVELOPE = {
 };
 
 const CHECK_ENVELOPE = {
-  schemaVersion: '1.0' as const,
+  schemaVersion: '2.0' as const,
   command: 'check' as const,
   startedAt: '2026-08-17T00:00:00Z',
   durationMs: 0,
@@ -99,6 +99,43 @@ async function run(argv: readonly string[]) {
 }
 
 describe('main()', () => {
+  it('renders skipped rows as non-healthy without fabricating execution or inspection evidence', async () => {
+    runCheckCommand.mockResolvedValue({
+      exitCode: 3,
+      envelope: {
+        schemaVersion: '2.0', command: 'check', startedAt: '2026-08-17T00:00:00Z', durationMs: 0,
+        summary: { total: 1, passed: 0, failed: 0, errored: 0, skipped: 1 },
+        errors: [{ scope: 'run', kind: 'environment', code: 'INTERRUPTED', message: 'The command was interrupted before all discovered cases reached a terminal state.' }],
+        results: [{ id: 'pending.test.md', file: 'pending.test.md', status: 'skipped' }],
+      },
+    } as never);
+
+    const result = await run(['check', '--no-color']);
+
+    expect(result.stdout).toContain('skipped pending.test.md');
+    expect(result.stdout).not.toContain('fresh');
+    expect(result.stdout).not.toContain('duration');
+    expect(result.stdout).not.toContain('inspection');
+    expect(result.exitCode).toBe(3);
+  });
+
+  it('renders the fixed orphan-grounding reason without exposing its artifact path', async () => {
+    const artifactPath = '/workspace/tests/private/deleted.ambercast.grounding.json';
+    runCheckCommand.mockResolvedValue({
+      exitCode: 4,
+      envelope: {
+        schemaVersion: '2.0', command: 'check', startedAt: '2026-08-17T00:00:00Z', durationMs: 0,
+        summary: { total: 1, passed: 0, failed: 1, errored: 0, skipped: 0 }, errors: [],
+        results: [{ id: 'deleted.test.md', file: 'deleted.test.md', planFile: 'deleted.ambercast.plan.json', groundingFile: artifactPath, status: 'orphaned-grounding', reason: 'No corresponding test file exists for this grounding artifact.' }],
+      },
+    } as never);
+
+    const result = await run(['check', '--no-color']);
+
+    expect(result.stdout).toContain('No corresponding test file exists for this grounding artifact.');
+    expect(result.stdout).not.toContain(artifactPath);
+  });
+
   it('prints usage and exits 0 when no command is supplied', async () => {
     const result = await run([]);
 
