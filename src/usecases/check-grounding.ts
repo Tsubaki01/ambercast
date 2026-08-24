@@ -1,4 +1,4 @@
-import { computePlanDigest } from '#core/ir/digest.js';
+import { computePlanDigest, isPlanDigestCurrent } from '#core/ir/digest.js';
 import { GroundingDocument, type PlanDocument } from '#core/ir/schema.js';
 import type { StorageAdapter } from '#ports/storage.js';
 
@@ -56,7 +56,7 @@ export async function inspectGroundingArtifact(
     return { kind: 'invalid' };
   }
 
-  return grounding.data.planDigest === computePlanDigest(plan)
+  return isPlanDigestCurrent(grounding.data, computePlanDigest(plan))
     ? { kind: 'valid' }
     : { kind: 'stale' };
 }

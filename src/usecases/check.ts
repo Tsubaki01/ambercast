@@ -419,11 +419,12 @@ export async function check(deps: CheckDeps, options: CheckOptions): Promise<Che
          * withholds its identity. Fixed path-free reasons keep the status
          * mapping reportable without disclosing a host path.
          */
+        const groundingPath = deps.layout.groundingPathFor(file);
         let groundingInspection;
         try {
           groundingInspection = await inspectGroundingArtifact(
             deps.storage,
-            deps.layout.groundingPathFor(file),
+            groundingPath,
             parsedPlan.data,
           );
         } catch (error) {
@@ -450,14 +451,14 @@ export async function check(deps: CheckDeps, options: CheckOptions): Promise<Che
           } else if (groundingInspection.kind === 'invalid') {
             results.push({
               ...identity,
-              groundingFile: deps.layout.groundingPathFor(file),
+              groundingFile: groundingPath,
               status: 'invalid-grounding',
               reason: 'The grounding cache is not valid or does not match the grounding schema.',
             });
           } else {
             results.push({
               ...identity,
-              groundingFile: deps.layout.groundingPathFor(file),
+              groundingFile: groundingPath,
               status: 'stale-grounding',
               reason: 'The grounding cache does not match the current plan.',
             });
