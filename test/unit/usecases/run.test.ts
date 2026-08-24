@@ -2016,7 +2016,7 @@ describe('run interruption contract', () => {
     const outcome = await run(deps, { ...DEFAULT_OPTIONS, files: [`${TEST_DIR}/a.test.md`, `${TEST_DIR}/b.test.md`], list: true });
 
     expect(outcome.interrupted).toBe(false);
-    expect((outcome as unknown as { skipped: readonly { file: string }[] }).skipped).toEqual([]);
+    expect(outcome.skipped).toEqual([]);
     expect(outcome.listed).toEqual([{ file: `${TEST_DIR}/a.test.md` }, { file: `${TEST_DIR}/b.test.md` }]);
   });
 
