@@ -62,6 +62,54 @@ async function useRealCheckComposition(): Promise<void> {
 }
 
 describe('runCheckCommand', () => {
+  it('returns identities relative to the config-resolved root rather than cwd', async () => {
+    const storage = createInMemoryStorage();
+    const projectRoot = '/workspace/config-parent';
+    const cwd = `${projectRoot}/nested-cwd`;
+    const output = {
+      exitCode: 5 as const,
+      envelope: { schemaVersion: '2.0' as const, command: 'check' as const, startedAt: '2026-08-01T00:00:00Z', durationMs: 1, summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 }, errors: [], results: [{ id: `${cwd}/tests/login.test.md`, file: `${cwd}/tests/login.test.md`, planFile: `${cwd}/tests/login.ambercast.plan.json`, status: 'fresh', reason: 'fresh' }] },
+    };
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue({ ...CONFIG, projectRoot, testDir: `${projectRoot}/tests`, runsDir: `${projectRoot}/tests/.runs` });
+    mocks.createFsTestFileDiscovery.mockReturnValue(async () => []);
+    mocks.check.mockResolvedValue({ results: [], errors: [], noTestsFound: true });
+    mocks.buildCheckReport.mockReturnValue(output);
+
+    const returned = await runCheckCommand(input({ cwd }));
+
+    expect(returned.envelope.results).toMatchObject([{
+      id: 'nested-cwd/tests/login.test.md',
+      file: 'nested-cwd/tests/login.test.md',
+      planFile: 'nested-cwd/tests/login.ambercast.plan.json',
+    }]);
+    expect(returned.envelope.results[0]).not.toMatchObject({ id: `${cwd}/tests/login.test.md` });
+    expect(returned.envelope.results[0]).not.toMatchObject({ id: 'tests/login.test.md' });
+  });
+
+  it('uses cwd as project root after a successful no-config resolution', async () => {
+    const storage = createInMemoryStorage();
+    const cwd = '/workspace/no-config-project';
+    const config = { ...CONFIG, projectRoot: cwd, testDir: `${cwd}/tests`, runsDir: `${cwd}/tests/.runs` };
+    const output = { exitCode: 0 as const, envelope: { schemaVersion: '2.0', command: 'check', startedAt: '2026-08-01T00:00:00Z', durationMs: 1, summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 }, errors: [], results: [{ id: `${cwd}/tests/login.test.md`, file: `${cwd}/tests/login.test.md`, planFile: `${cwd}/tests/login.ambercast.plan.json`, status: 'fresh', reason: 'fresh' }] } };
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(config);
+    mocks.createFsTestFileDiscovery.mockReturnValue(async () => []);
+    mocks.check.mockResolvedValue({ results: [], errors: [], noTestsFound: false });
+    mocks.buildCheckReport.mockReturnValue(output);
+
+    const returned = await runCheckCommand(input({ cwd }));
+
+    expect(config.projectRoot).toBe(cwd);
+    expect(mocks.loadConfig).toHaveBeenCalledWith(expect.objectContaining({ cwd }));
+    expect(mocks.loadConfig.mock.calls[0]?.[0]).not.toHaveProperty('configPathOverride');
+    expect(returned.envelope.results).toMatchObject([{
+      id: 'tests/login.test.md',
+      file: 'tests/login.test.md',
+      planFile: 'tests/login.ambercast.plan.json',
+    }]);
+  });
+
   it('translates a configuration-load failure into a run-scoped report', async () => {
     await useRealCheckComposition();
     mocks.createFsStorage.mockReturnValue(createInMemoryStorage());
@@ -109,9 +157,9 @@ describe('runCheckCommand', () => {
       summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 },
       errors: [],
       results: [{
-        id: testPath,
-        file: testPath,
-        planFile: layout.planPathFor(testPath),
+        id: 'tests/login.test.md',
+        file: 'tests/login.test.md',
+        planFile: 'tests/login.ambercast.plan.json',
         status: 'fresh',
       }],
     });
@@ -135,7 +183,7 @@ describe('runCheckCommand', () => {
     const report = {
       exitCode: 0 as const,
       envelope: {
-        schemaVersion: '1.0' as const,
+        schemaVersion: '2.0' as const,
         command: 'check' as const,
         startedAt: '2026-08-17T00:00:00Z',
         durationMs: 0,

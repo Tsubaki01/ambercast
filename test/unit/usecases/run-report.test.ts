@@ -14,7 +14,7 @@ import type { AmbercastError } from '#core/errors/types.js';
 import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
 import type { ExecutedRunResult } from '#report/schema.js';
 import { buildRunReport, type RunReportInput } from '#usecases/run-report.js';
-import type { RunCaseOutcome } from '#usecases/run.js';
+import type { RunCaseOutcome, RunOutcome } from '#usecases/run.js';
 
 const BASE = {
   startedAt: '2026-08-08T00:00:00Z',
@@ -22,10 +22,24 @@ const BASE = {
   options: { allowEmpty: false, list: false },
 } as const;
 
-function report(
-  input: Omit<RunReportInput, keyof typeof BASE> & { readonly options?: RunReportInput['options'] },
-): ReturnType<typeof buildRunReport> {
-  return buildRunReport({ ...BASE, ...input } as RunReportInput);
+function report(input: {
+  readonly outcome?: Omit<RunOutcome, 'listed' | 'skipped' | 'interrupted'> & {
+    readonly listed?: RunOutcome['listed'];
+    readonly skipped?: RunOutcome['skipped'];
+    readonly interrupted?: boolean;
+  };
+  readonly error?: AmbercastError;
+  readonly options?: RunReportInput['options'];
+}): ReturnType<typeof buildRunReport> {
+  const outcome = 'outcome' in input && input.outcome !== undefined
+    ? {
+        ...input.outcome,
+        listed: input.outcome.listed ?? [],
+        skipped: input.outcome.skipped ?? [],
+        interrupted: input.outcome.interrupted ?? false,
+      }
+    : undefined;
+  return buildRunReport({ ...BASE, ...input, ...(outcome === undefined ? {} : { outcome }) } as RunReportInput);
 }
 
 function caseOutcome(
@@ -266,7 +280,7 @@ describe('buildRunReport', () => {
     ]);
   });
 
-  it('counts listed rows as passed without changing execution-only summary categories', () => {
+  it('counts listed rows as skipped without changing execution-backed classifications', () => {
     const output = report({
       outcome: {
         noTestsFound: false,
@@ -274,13 +288,13 @@ describe('buildRunReport', () => {
           caseOutcome('passed', 'passed.test.md'),
           caseOutcome('failed', 'failed.test.md'),
           caseOutcome('error', 'errored.test.md'),
-          caseOutcome('skipped', 'skipped.test.md'),
         ],
+        skipped: [{ file: 'skipped.test.md' }],
         listed: [{ file: 'listed-a.test.md' }, { file: 'listed-b.test.md' }],
       },
     });
 
-    expect(output.envelope.summary).toEqual({ total: 6, passed: 3, failed: 1, errored: 1, skipped: 1 });
+    expect(output.envelope.summary).toEqual({ total: 6, passed: 1, failed: 1, errored: 1, skipped: 3 });
   });
 
   it('does not let allow-empty suppress a classified error from a matched case', () => {
@@ -306,13 +320,62 @@ describe('buildRunReport', () => {
           caseOutcome('passed', 'passed.test.md'),
           caseOutcome('failed', 'failed.test.md'),
           caseOutcome('error', 'errored.test.md', new BrowserLaunchFailedError('browser did not launch')),
-          caseOutcome('skipped', 'skipped.test.md'),
         ],
+        skipped: [{ file: 'skipped.test.md' }],
         listed: [],
       },
     });
 
     expect(output.envelope.summary).toEqual({ total: 4, passed: 1, failed: 1, errored: 1, skipped: 1 });
     expect(output.envelope.results.map((result) => result.status)).toEqual(['passed', 'failed', 'error', 'skipped']);
+  });
+});
+
+describe('buildRunReport v2 interruption accounting', () => {
+  it('keeps execution evidence terminal, emits only pending identity-only rows, and lets exit 2 outrank interruption', () => {
+    const output = report({ outcome: {
+      noTestsFound: false, interrupted: true, skipped: [{ file: 'pending.test.md' }], listed: [],
+      results: [caseOutcome('error', 'done.test.md', new ConfigInvalidError('invalid'))],
+    } } as unknown as Omit<RunReportInput, keyof typeof BASE>);
+
+    expect(output.exitCode).toBe(2);
+    expect(output.envelope.schemaVersion).toBe('2.0');
+    expect(output.envelope.summary).toEqual({ total: 2, passed: 0, failed: 0, errored: 1, skipped: 1 });
+    expect(output.envelope.results).toContainEqual({ id: 'pending.test.md', file: 'pending.test.md', status: 'skipped' });
+    expect(output.envelope.errors).toContainEqual(expect.objectContaining({ scope: 'run', code: 'INTERRUPTED' }));
+  });
+
+  it.each([
+    ['usage 2', caseOutcome('error', 'usage.test.md', new ConfigInvalidError('usage')), false, 2],
+    ['artifact 4', caseOutcome('error', 'artifact.test.md', new MissingPlanError('artifact')), false, 3],
+    ['failed assertion 1', caseOutcome('failed', 'failed.test.md'), false, 3],
+    ['zero match 5', undefined, true, 3],
+    ['success 0', undefined, false, 3],
+  ] as const)('emits one run interruption error and pins 2/4/1/5/0 priority against %s', (_name, caseResult, noTestsFound, expectedExitCode) => {
+    const output = report({ outcome: {
+      noTestsFound,
+      interrupted: true,
+      skipped: [],
+      listed: [],
+      results: caseResult === undefined ? [] : [caseResult],
+    } } as unknown as Omit<RunReportInput, keyof typeof BASE>);
+    const interruptions = (output.envelope.errors as readonly { readonly code: string }[]).filter((entry) => entry.code === 'INTERRUPTED');
+
+    expect(interruptions).toEqual([expect.objectContaining({ scope: 'run', kind: 'environment', code: 'INTERRUPTED' })]);
+    expect(interruptions[0]).not.toHaveProperty('caseId');
+    expect(output.exitCode).toBe(expectedExitCode);
+  });
+
+  it('counts an execution error and its matching case error as one errored public identity', () => {
+    const output = report({ outcome: {
+      noTestsFound: false, listed: [],
+      results: [caseOutcome('error', 'same.test.md', new FsIoError('failed'))],
+    } });
+    expect(output.envelope.summary).toEqual({ total: 1, passed: 0, failed: 0, errored: 1, skipped: 0 });
+  });
+
+  it('keeps a command-error envelope all-zero', () => {
+    expect(report({ error: new ConfigInvalidError('invalid command') }).envelope.summary)
+      .toEqual({ total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 });
   });
 });

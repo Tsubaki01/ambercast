@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { AmbercastError, type ErrorKind } from '#core/errors/types.js';
 import * as errorMapping from '#report/error-mapping.js';
+import { InterruptedError } from '#core/errors/interrupted-error.js';
 
 const EXPECTED_REPORT_ERROR_DETAILS = {
   'config-invalid': { kind: 'usage', code: 'CONFIG_INVALID' },
@@ -16,6 +17,7 @@ const EXPECTED_REPORT_ERROR_DETAILS = {
   'ai-response-invalid': { kind: 'environment', code: 'AI_RESPONSE_INVALID' },
   'fs-io-error': { kind: 'environment', code: 'FS_IO_ERROR' },
   'unexpected-crash': { kind: 'environment', code: 'UNEXPECTED_CRASH' },
+  'interrupted': { kind: 'environment', code: 'INTERRUPTED' },
 } as const;
 
 type ReportableErrorKind = keyof typeof EXPECTED_REPORT_ERROR_DETAILS;
@@ -41,8 +43,8 @@ describe('REPORT_ERROR_DETAILS', () => {
 });
 
 describe('reportError', () => {
-  it.each(REPORTABLE_ERROR_DETAILS)('serializes a %s classified error at case scope', (kind, details) => {
-    const error = new ClassifiedError(kind, `The ${kind} failure occurred.`);
+  it.each(REPORTABLE_ERROR_DETAILS.filter(([kind]) => kind !== 'interrupted'))('serializes a %s classified error at case scope', (kind, details) => {
+    const error = new ClassifiedError(kind as ErrorKind, `The ${kind} failure occurred.`);
 
     expect(errorMapping.reportError(error, { scope: 'case', caseId: 'login-succeeds' })).toEqual({
       scope: 'case',
@@ -68,5 +70,14 @@ describe('reportError', () => {
 
     expect(() => errorMapping.reportError(error, { scope: 'run' }))
       .toThrow('Error kind assertion-failed cannot be serialized as a report error.');
+  });
+
+  it('serializes interruption only at run scope', () => {
+    const error = new InterruptedError();
+
+    expect(errorMapping.reportError(error, { scope: 'run' })).toMatchObject({
+      scope: 'run', kind: 'environment', code: 'INTERRUPTED',
+    });
+    expect(() => errorMapping.reportError(error, { scope: 'case', caseId: 'case-a' })).toThrow();
   });
 });

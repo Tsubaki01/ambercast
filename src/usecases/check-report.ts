@@ -10,7 +10,9 @@
 
 import type { AmbercastError, ExitCode } from '#core/errors/types.js';
 import { reportError } from '#report/error-mapping.js';
-import type { ReportEnvelope } from '#report/schema.js';
+import { REPORT_SCHEMA_VERSION, type ReportEnvelope } from '#report/schema.js';
+import { summarizeReport } from '#report/summarize.js';
+import { InterruptedError } from '#core/errors/interrupted-error.js';
 import { selectExitCode } from './exit-code-priority.js';
 import type { CheckOptions, CheckOutcome } from './check.js';
 
@@ -66,26 +68,39 @@ export interface CheckReportOutput {
  * @param input - Outcome or error together with timing and zero-match policy.
  * @returns A complete check report paired with its process exit code.
  * @remarks
- * `errored` remains zero because check I/O failures are case-scoped errors,
- * not freshness statuses. Results need no per-item transform because the
- * inspection and report contracts deliberately share their result shape.
+ * The builder uses the shared report-version constant and identity-set
+ * summarizer after results and errors are assembled. Fresh and
+ * fresh-without-grounding rows classify as passed; stale, missing, invalid,
+ * and orphaned states classify as failed; listed and interruption-skipped rows
+ * classify as skipped. A case-error-only identity contributes to both `total`
+ * and `errored`, and a result with a matching case error is promoted without
+ * being counted twice. Results need no per-item transform because inspection
+ * and report contracts deliberately share their result shape.
  *
  * Exit candidates preserve the shared priority table: integrity findings,
  * disallowed zero-match inspections, and isolated I/O failures can coexist
  * without giving this report a command-specific precedence rule. A classified
- * command-level failure instead follows the common run-scoped error boundary.
+ * command-level failure instead follows the common run-scoped error boundary
+ * and retains an all-zero summary. An interrupted completed outcome appends
+ * exactly one run-scoped `INTERRUPTED` environment error and contributes exit
+ * 3. That error has no `caseId`, so interruption alone never increases
+ * `total` or `errored`. Exit 4 is driven by the presence of failed finding
+ * rows, independently of summary promotion: the same public identity may
+ * summarize as skipped or errored while its retained integrity finding still
+ * contributes exit 4.
  */
 export function buildCheckReport(input: CheckReportInput): CheckReportOutput {
   if ('error' in input && input.error !== undefined) {
+    const errors = [reportError(input.error, { scope: 'run' })];
     return {
       exitCode: input.error.exitCode,
       envelope: {
-        schemaVersion: '1.0',
+        schemaVersion: REPORT_SCHEMA_VERSION,
         command: 'check',
         startedAt: input.startedAt,
         durationMs: input.durationMs,
-        summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 },
-        errors: [reportError(input.error, { scope: 'run' })],
+        summary: summarizeReport({ command: 'check', results: [], errors }),
+        errors,
         results: [],
       },
     };
@@ -94,25 +109,26 @@ export function buildCheckReport(input: CheckReportInput): CheckReportOutput {
   const outcome = input.outcome!;
   const results = [...outcome.results];
   const errors = outcome.errors.map(({ file, error }) => reportError(error, { scope: 'case', caseId: file }));
-  const passed = results.filter(({ status }) => status === 'fresh').length;
-  const failed = results.length - passed;
+  const interrupted = outcome.interrupted;
+  if (interrupted) errors.push(reportError(new InterruptedError(), { scope: 'run' }));
   const candidates: ExitCode[] = outcome.errors.map(({ error }) => error.exitCode);
 
-  if (failed > 0) {
+  if (results.some(({ status }) => status !== 'fresh' && status !== 'fresh-without-grounding' && status !== 'listed' && status !== 'skipped')) {
     candidates.push(4);
   }
   if (outcome.noTestsFound && !input.options.allowEmpty && !input.options.list) {
     candidates.push(5);
   }
+  if (interrupted) candidates.push(3);
 
   return {
     exitCode: selectExitCode(candidates),
     envelope: {
-      schemaVersion: '1.0',
+      schemaVersion: REPORT_SCHEMA_VERSION,
       command: 'check',
       startedAt: input.startedAt,
       durationMs: input.durationMs,
-      summary: { total: results.length, passed, failed, errored: 0, skipped: 0 },
+      summary: summarizeReport({ command: 'check', results, errors }),
       errors,
       results,
     },

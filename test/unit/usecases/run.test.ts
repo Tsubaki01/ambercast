@@ -41,6 +41,7 @@ import type { StorageAdapter } from '#ports/storage.js';
 import type { Clock, RunEvent } from '#ports/system.js';
 import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/generate.js';
 import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
+import { BatchInterruptionTracker } from '#usecases/batch-interruption.js';
 import { validateCommittedInstructionCoverage } from '#usecases/instruction-coverage-policy.js';
 import { buildRunReport } from '#usecases/run-report.js';
 import { OBSERVED_NOTE, RunResult } from '#report/schema.js';
@@ -1911,7 +1912,7 @@ describe('run', () => {
 
       expect(report.exitCode).toBe(exitCode);
       if (noTestsFound) {
-        expect(outcome).toEqual({ results: [], noTestsFound: true, listed: [] });
+        expect(outcome).toEqual({ results: [], noTestsFound: true, listed: [], skipped: [], interrupted: false });
         return;
       }
       if (list) {
@@ -1919,6 +1920,8 @@ describe('run', () => {
           results: [],
           noTestsFound: false,
           listed: [{ file: testPath }],
+          skipped: [],
+          interrupted: false,
         });
         return;
       }
@@ -1940,6 +1943,8 @@ describe('run', () => {
       results: [],
       noTestsFound: false,
       listed: [{ file: `${TEST_DIR}/login.test.md` }],
+      skipped: [],
+      interrupted: false,
     });
     expect(discoverTestFiles).toHaveBeenCalledTimes(1);
     expect(resolveAiExecutor).not.toHaveBeenCalled();
@@ -1967,6 +1972,8 @@ describe('run', () => {
       results: [],
       noTestsFound: false,
       listed: [{ file: gamma }, { file: alpha }],
+      skipped: [],
+      interrupted: false,
     });
     expect(recordingStorage.reads).toEqual([]);
     expect(recordingStorage.exists).toEqual([]);
@@ -1979,9 +1986,87 @@ describe('run', () => {
 
     const outcome = await run(deps, { ...DEFAULT_OPTIONS, grep: /^other\//, list: true });
 
-    expect(outcome).toEqual({ results: [], noTestsFound: true, listed: [] });
+    expect(outcome).toEqual({ results: [], noTestsFound: true, listed: [], skipped: [], interrupted: false });
     expect(recordingStorage.reads).toEqual([]);
     expect(recordingStorage.exists).toEqual([]);
+  });
+});
+
+describe('run interruption contract', () => {
+  it('turns a pre-aborted execution batch into ordered pending identities without launching browser work', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { deps, browserDriver, recordingStorage } = createScenario({ signal: controller.signal });
+
+    const outcome = await run(deps, { ...DEFAULT_OPTIONS, files: [`${TEST_DIR}/first.test.md`, `${TEST_DIR}/second.test.md`] });
+
+    expect(outcome.interrupted).toBe(true);
+    expect(outcome.skipped).toEqual([
+      { file: `${TEST_DIR}/first.test.md` }, { file: `${TEST_DIR}/second.test.md` },
+    ]);
+    expect(browserDriver).not.toHaveBeenCalled();
+    expect(recordingStorage.reads).toEqual([]);
+  });
+
+  it('keeps list mode atomic for an already aborted signal and exposes empty skipped work', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { deps } = createScenario({ signal: controller.signal });
+
+    const outcome = await run(deps, { ...DEFAULT_OPTIONS, files: [`${TEST_DIR}/a.test.md`, `${TEST_DIR}/b.test.md`], list: true });
+
+    expect(outcome.interrupted).toBe(false);
+    expect(outcome.skipped).toEqual([]);
+    expect(outcome.listed).toEqual([{ file: `${TEST_DIR}/a.test.md` }, { file: `${TEST_DIR}/b.test.md` }]);
+  });
+
+  it('retains an in-flight terminal result and skips only the remaining suffix without later browser or storage work', async () => {
+    const controller = new AbortController();
+    let releaseLaunch: ((session: BrowserSession) => void) | undefined;
+    let started: (() => void) | undefined;
+    const firstLaunchStarted = new Promise<void>((resolve) => { started = resolve; });
+    const browserDriver = vi.fn<RunDeps['browserDriver']>(() => ({
+      engine: 'chromium',
+      launch: () => new Promise<BrowserSession>((resolve) => { releaseLaunch = resolve; started?.(); }),
+    }));
+    const { deps, recordingStorage } = createScenario({ signal: controller.signal, browserDriver });
+    const first = await writePrompt(recordingStorage.storage, 'first.test.md');
+    const second = await writePrompt(recordingStorage.storage, 'second.test.md');
+    await seedFreshArtifacts(recordingStorage.storage, first);
+    await seedFreshArtifacts(recordingStorage.storage, second);
+    recordingStorage.reads.splice(0);
+
+    const running = run(deps, { ...DEFAULT_OPTIONS, files: [first, second] });
+    await firstLaunchStarted;
+    controller.abort();
+    releaseLaunch?.(createFakeBrowserSession(new Map()));
+
+    await expect(running).resolves.toMatchObject({
+      interrupted: true,
+      results: [expect.objectContaining({ result: expect.objectContaining({ id: first, status: 'passed' }) })],
+      skipped: [{ file: second }],
+    });
+    expect(browserDriver).toHaveBeenCalledOnce();
+    expect(recordingStorage.reads).not.toContain(second);
+  });
+
+  it.each(['normal return', 'discovery rejection'] as const)('disposes the interruption tracker from run finally after %s', async (mode) => {
+    const dispose = vi.spyOn(BatchInterruptionTracker.prototype, 'dispose');
+    const controller = new AbortController();
+    const { deps } = createScenario({
+      signal: controller.signal,
+      discoverTestFiles: mode === 'normal return'
+        ? vi.fn(async () => [])
+        : vi.fn(async () => { throw new Error('discovery failed'); }),
+    });
+
+    if (mode === 'normal return') {
+      await expect(run(deps, DEFAULT_OPTIONS)).resolves.toBeDefined();
+    } else {
+      await expect(run(deps, DEFAULT_OPTIONS)).rejects.toThrow('discovery failed');
+    }
+    expect(dispose).toHaveBeenCalledOnce();
+    dispose.mockRestore();
   });
 });
 

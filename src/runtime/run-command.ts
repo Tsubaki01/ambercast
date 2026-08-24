@@ -20,8 +20,9 @@ import { loadConfig } from '#config/load.js';
 import { ConfigInvalidError } from '#core/errors/config-invalid-error.js';
 import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
 import { AmbercastError, type ExitCode } from '#core/errors/types.js';
-import { isAbsolutePath, joinPath, relativeWithin, relativeWithinOrOriginal } from '#core/paths.js';
+import { isAbsolutePath, joinPath, relativeWithin } from '#core/paths.js';
 import { buildRunReport, type RunReportOutput } from '#usecases/run-report.js';
+import { normalizeReportEnvelope } from '#usecases/report-normalization.js';
 import { run, type RunOutcome } from '#usecases/run.js';
 import { createAmbercast } from './create-ambercast.js';
 import { resolveAiProvider } from './resolve-ai-provider.js';
@@ -53,10 +54,8 @@ function runIdFor(startedAt: string, uuid: string): string {
 }
 
 /**
- * Produces a report-safe view with schema-valid durations, portable evidence
- * paths, and project-root-relative executed `id`, `file`, and `planFile`
- * identities plus `listed[]` files, retaining the original absolute identity
- * when relativization is impossible.
+ * Produces a report-safe replay-evidence view with schema-valid durations and
+ * portable screenshot paths.
  *
  * @remarks
  * The system monotonic clock retains sub-millisecond precision for replay, but
@@ -70,24 +69,20 @@ function runIdFor(startedAt: string, uuid: string): string {
  * but one bad evidence field must not replace a completed replay outcome with
  * a crash report.
  *
- * Executed-result identities are relativized against the project
- * root: `id`, `file`, and `planFile` each retain their own transformed value,
- * and listed files receive the same treatment. A plan file follows its test
- * file's directory, so it shares that identity boundary rather than the run
- * storage directory. Unlike optional screenshot evidence, these schema-
- * required identity fields cannot be omitted; a path that cannot be
- * relativized retains its original absolute value instead.
+ * Identity conversion does not belong here. The shared envelope normalizer is
+ * the sole owner of `id`, `file`, `planFile`, `caseId`, `groundingFile`, and
+ * `artifactFile`, and it recomputes summary after those visible keys settle.
+ * Keeping duration rounding and screenshot privacy in this run-only helper
+ * prevents command-independent normalization from traversing execution
+ * evidence or acquiring screenshot omission policy.
  *
- * @param outcome - The completed replay outcome whose executed identities,
- *   listed files, and optional screenshots may contain absolute paths.
- * @param projectRoot - The resolved absolute root used to determine reportable
- *   executed `id`, `file`, and `planFile` identities, `listed[]` files, and
- *   screenshot paths. An identity that is not contained by this root keeps
- *   its original absolute value.
- * @returns A copy suitable for the public report contract, with executed
- *   `id`, `file`, and `planFile` identities and `listed[]` files relativized when
- *   possible; required identities otherwise retain their original absolute
- *   value, while any uncontained screenshot field is omitted.
+ * @param outcome - The completed replay outcome whose durations and optional
+ * screenshots require public-report presentation policy.
+ * @param projectRoot - The resolved absolute root used only to contain and
+ * relativize screenshot evidence.
+ * @returns A copy with finite non-negative whole-millisecond durations and
+ * contained screenshot paths; an uncontained screenshot is omitted without
+ * changing the case outcome.
  */
 function reportableOutcome(outcome: RunOutcome, projectRoot: string): RunOutcome {
   return {
@@ -96,9 +91,9 @@ function reportableOutcome(outcome: RunOutcome, projectRoot: string): RunOutcome
       ...caseOutcome,
       result: {
         ...caseOutcome.result,
-        id: relativeWithinOrOriginal(projectRoot, caseOutcome.result.id),
-        file: relativeWithinOrOriginal(projectRoot, caseOutcome.result.file),
-        planFile: relativeWithinOrOriginal(projectRoot, caseOutcome.result.planFile),
+        id: caseOutcome.result.id,
+        file: caseOutcome.result.file,
+        planFile: caseOutcome.result.planFile,
         durationMs: Number.isFinite(caseOutcome.result.durationMs)
           ? Math.max(0, Math.round(caseOutcome.result.durationMs))
           : 0,
@@ -119,10 +114,7 @@ function reportableOutcome(outcome: RunOutcome, projectRoot: string): RunOutcome
         }),
       },
     })),
-    listed: outcome.listed.map((listed) => ({
-      ...listed,
-      file: relativeWithinOrOriginal(projectRoot, listed.file),
-    })),
+    listed: outcome.listed,
   };
 }
 
@@ -221,8 +213,17 @@ export interface RunCommandOutput {
  * configuration establishes the runs root, it supplies that unchanged ID to
  * every case for evidence paths and then uses it for the single batch report
  * path.
+ *
+ * Runtime initializes the report-normalization root from `cwd` so failures
+ * before configuration still cross the same boundary, then replaces it with
+ * `ResolvedConfig.projectRoot` after loading succeeds. Completed replay first
+ * applies the run-only duration and screenshot view, then the shared envelope
+ * normalizer converts approved identities and recomputes summary. The returned
+ * and persisted envelopes are the same normalized value; persistence status
+ * changes do not trigger a second normalization pass.
  */
 export async function runRunCommand(input: RunCommandInput): Promise<RunCommandOutput> {
+  let projectRoot = input.cwd;
   const clock = createSystemClock();
   const startedAt = reportTimestamp(clock.now());
   const runId = runIdFor(startedAt, createCryptoRandom().uuid());
@@ -251,6 +252,7 @@ export async function runRunCommand(input: RunCommandInput): Promise<RunCommandO
       storage: createFsStorage(),
       configEnv: readConfigEnvironment(),
     });
+    projectRoot = config.projectRoot;
     const browserDriver = createBrowserDriverResolver({ headed: input.headed });
     const secrets = createEnvSecretsProvider();
     const events = createNoopEventSink();
@@ -289,7 +291,8 @@ export async function runRunCommand(input: RunCommandInput): Promise<RunCommandO
       stale: input.stale,
     });
 
-    const report = buildRunReport({ ...reportContext(), outcome: reportableOutcome(outcome, config.projectRoot) });
+    const built = buildRunReport({ ...reportContext(), outcome: reportableOutcome(outcome, config.projectRoot) });
+    const report = { ...built, envelope: normalizeReportEnvelope(built.envelope, projectRoot) };
     // The persisted candidate keeps an attempted write from reaching disk as not-attempted.
     const persistedEnvelope = { ...report.envelope, reportPersistence: 'persisted' as const };
     try {
@@ -307,6 +310,7 @@ export async function runRunCommand(input: RunCommandInput): Promise<RunCommandO
     const classified = error instanceof AmbercastError
       ? error
       : new UnexpectedCrashError('The run command crashed unexpectedly.', undefined, { cause: error });
-    return buildRunReport({ ...reportContext(), error: classified });
+    const report = buildRunReport({ ...reportContext(), error: classified });
+    return { ...report, envelope: normalizeReportEnvelope(report.envelope, projectRoot) };
   }
 }

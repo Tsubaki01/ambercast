@@ -70,10 +70,10 @@ const CONFIG: ResolvedConfig = {
 };
 
 function reportOutput(exitCode: RunCommandOutput['exitCode'], errors: ReportError[] = []): RunCommandOutput {
-  const output: RunCommandOutput = {
+  const output = {
     exitCode,
     envelope: {
-      schemaVersion: '1.0',
+      schemaVersion: '2.0' as const,
       command: 'run',
       startedAt: '2026-08-09T00:00:00Z',
       durationMs: 1,
@@ -82,7 +82,7 @@ function reportOutput(exitCode: RunCommandOutput['exitCode'], errors: ReportErro
       results: [],
       reportPersistence: 'not-attempted',
     },
-  };
+  } as unknown as RunCommandOutput;
 
   expect(ReportEnvelope.safeParse(output.envelope).success).toBe(true);
   return output;
@@ -126,6 +126,75 @@ beforeEach(() => {
 });
 
 describe('runRunCommand', () => {
+  it('returns and persists identities relative to the config-resolved root rather than cwd', async () => {
+    const storage = createInMemoryStorage();
+    const projectRoot = '/workspace/config-parent';
+    const cwd = `${projectRoot}/nested-cwd`;
+    const baseOutput = reportOutput(0);
+    const output = {
+      ...baseOutput,
+      envelope: {
+        ...baseOutput.envelope,
+        schemaVersion: '2.0',
+        results: [{ id: `${cwd}/tests/login.test.md`, file: `${cwd}/tests/login.test.md`, planFile: `${cwd}/tests/login.ambercast.plan.json`, status: 'passed', durationMs: 1, explanation: 'passed', steps: [] }],
+        summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 },
+      },
+    } as unknown as RunCommandOutput;
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue({ ...CONFIG, projectRoot, testDir: `${projectRoot}/tests`, runsDir: `${projectRoot}/tests/.runs` });
+    mocks.createBrowserDriverResolver.mockReturnValue(createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
+    mocks.createEnvSecretsProvider.mockReturnValue(createFakeSecretsProvider(new Map()));
+    mocks.createNoopEventSink.mockReturnValue(createRecordingEventSink().sink);
+    mocks.createAmbercast.mockReturnValue({ storage, layout: { runReportPathFor: () => '/workspace/tests/.runs/report.json' }, clock: createFixedClock(new Date(), 1), discoverTestFiles: vi.fn(async () => []) });
+    mocks.run.mockResolvedValue({ results: [], noTestsFound: false, listed: [] });
+    mocks.buildRunReport.mockReturnValue(output);
+
+    const returned = await runRunCommand(input({ cwd }));
+
+    expect(returned.envelope.results).toMatchObject([{
+      id: 'nested-cwd/tests/login.test.md',
+      file: 'nested-cwd/tests/login.test.md',
+      planFile: 'nested-cwd/tests/login.ambercast.plan.json',
+    }]);
+    expect(returned.envelope.results[0]).not.toMatchObject({ id: `${cwd}/tests/login.test.md` });
+    expect(returned.envelope.results[0]).not.toMatchObject({ id: 'tests/login.test.md' });
+    expect(JSON.parse(await storage.readText('/workspace/tests/.runs/report.json'))).toEqual(returned.envelope);
+  });
+
+  it('uses cwd as project root after successful no-config resolution', async () => {
+    const storage = createInMemoryStorage();
+    const cwd = '/workspace/no-config-project';
+    const baseOutput = reportOutput(0);
+    const output = {
+      ...baseOutput,
+      envelope: {
+        ...baseOutput.envelope,
+        schemaVersion: '2.0',
+        results: [{ id: `${cwd}/tests/login.test.md`, file: `${cwd}/tests/login.test.md`, planFile: `${cwd}/tests/login.ambercast.plan.json`, status: 'passed', durationMs: 1, explanation: 'passed', steps: [] }],
+        summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 },
+      },
+    } as unknown as RunCommandOutput;
+    const config = { ...CONFIG, projectRoot: cwd, testDir: `${cwd}/tests`, runsDir: `${cwd}/tests/.runs` };
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(config);
+    mocks.createBrowserDriverResolver.mockReturnValue(createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
+    mocks.createEnvSecretsProvider.mockReturnValue(createFakeSecretsProvider(new Map()));
+    mocks.createNoopEventSink.mockReturnValue(createRecordingEventSink().sink);
+    mocks.createAmbercast.mockReturnValue({ storage, layout: { runReportPathFor: () => `${cwd}/tests/.runs/report.json` }, clock: createFixedClock(new Date(), 1), discoverTestFiles: vi.fn(async () => []) });
+    mocks.run.mockResolvedValue({ results: [], noTestsFound: false, listed: [] });
+    mocks.buildRunReport.mockReturnValue(output);
+
+    const returned = await runRunCommand(input({ cwd }));
+
+    expect(config.projectRoot).toBe(cwd);
+    expect(mocks.loadConfig).toHaveBeenCalledWith(expect.objectContaining({ cwd }));
+    expect(returned.envelope.results).toMatchObject([{
+      id: 'tests/login.test.md',
+      file: 'tests/login.test.md',
+      planFile: 'tests/login.ambercast.plan.json',
+    }]);
+  });
+
   it('persists a report-safe failing outcome under the invocation path without leaking an absolute screenshot path', async () => {
     const storage = createInMemoryStorage();
     const browserDriver = vi.fn(() => createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
@@ -180,14 +249,14 @@ describe('runRunCommand', () => {
           : { ...step, screenshot: `tests/.runs/${runId}/login/assert-dashboard.png` }
       )),
     }));
-    const output: RunCommandOutput = {
+    const output = {
       exitCode: 1,
       envelope: {
-        schemaVersion: '1.0', command: 'run', startedAt: '2026-08-09T00:00:00Z', durationMs: 1,
+        schemaVersion: '2.0' as const, command: 'run', startedAt: '2026-08-09T00:00:00Z', durationMs: 1,
         summary: { total: 2, passed: 1, failed: 1, errored: 0, skipped: 0 }, errors: [], results: persistedResults,
         reportPersistence: 'not-attempted',
       },
-    };
+    } as unknown as RunCommandOutput;
     const persistedOutput: RunCommandOutput = {
       ...output,
       envelope: { ...output.envelope, reportPersistence: 'persisted' },
@@ -209,13 +278,13 @@ describe('runRunCommand', () => {
     expect(mocks.buildRunReport).toHaveBeenCalledWith(expect.objectContaining({
       outcome: expect.objectContaining({ results: expect.arrayContaining([expect.objectContaining({
         result: expect.objectContaining({
-          id: 'tests/login.test.md',
+          id: '/workspace/tests/login.test.md',
           steps: expect.arrayContaining([expect.objectContaining({ screenshot: `tests/.runs/${runId}/login/assert-dashboard.png` })]),
         }),
       })]) }),
     }));
     const reportInput = mocks.buildRunReport.mock.calls[0]?.[0];
-    expect(reportInput?.outcome?.results[1]?.result.id).toBe('tests/settings.test.md');
+    expect(reportInput?.outcome?.results[1]?.result.id).toBe('/workspace/tests/settings.test.md');
     expect(layout.runReportPathFor).toHaveBeenCalledWith(runId);
     expect(writeText).toHaveBeenCalledWith(`${CONFIG.runsDir}/${runId}/report.json`, JSON.stringify(persistedOutput.envelope));
     const persistedEnvelope = JSON.parse(await storage.readText(`${CONFIG.runsDir}/${runId}/report.json`));
@@ -251,10 +320,10 @@ describe('runRunCommand', () => {
         },
       }],
     };
-    const output: RunCommandOutput = {
+    const output = {
       exitCode: 1,
       envelope: {
-        schemaVersion: '1.0', command: 'run', startedAt: '2026-08-09T00:00:00Z', durationMs: 1,
+        schemaVersion: '2.0' as const, command: 'run', startedAt: '2026-08-09T00:00:00Z', durationMs: 1,
         summary: { total: 1, passed: 0, failed: 1, errored: 0, skipped: 0 }, errors: [],
         results: [{
           id: 'tests/login.test.md',
@@ -270,7 +339,7 @@ describe('runRunCommand', () => {
         }],
         reportPersistence: 'not-attempted',
       },
-    };
+    } as unknown as RunCommandOutput;
     const persistedOutput: RunCommandOutput = {
       ...output,
       envelope: { ...output.envelope, reportPersistence: 'persisted' },
@@ -295,7 +364,7 @@ describe('runRunCommand', () => {
       id: 'assert-dashboard', status: 'failed', kind: 'assertion',
       expected: 'Text "Dashboard" is visible.', actual: 'The dashboard is absent.',
     });
-    expect(reportInput?.outcome?.results[0]?.result.id).toBe('tests/login.test.md');
+    expect(reportInput?.outcome?.results[0]?.result.id).toBe('/workspace/tests/login.test.md');
     expect(reportStep).not.toHaveProperty('screenshot');
     expect(mocks.buildRunReport).not.toHaveBeenCalledWith(expect.objectContaining({ error: expect.any(Error) }));
     const persistedEnvelope = JSON.parse(await storage.readText(`${CONFIG.runsDir}/${runId}/report.json`));
@@ -329,10 +398,10 @@ describe('runRunCommand', () => {
         },
       }],
     };
-    const output: RunCommandOutput = {
+    const output = {
       exitCode: 1,
       envelope: {
-        schemaVersion: '1.0', command: 'run', startedAt: '2026-08-09T00:00:00Z', durationMs: 1,
+        schemaVersion: '2.0' as const, command: 'run', startedAt: '2026-08-09T00:00:00Z', durationMs: 1,
         summary: { total: 1, passed: 0, failed: 1, errored: 0, skipped: 0 }, errors: [],
         results: [{
           id: 'tests/login.test.md', file: 'tests/login.test.md', planFile: 'tests/login.ambercast.plan.json',
@@ -344,7 +413,7 @@ describe('runRunCommand', () => {
         }],
         reportPersistence: 'not-attempted',
       },
-    };
+    } as unknown as RunCommandOutput;
     const persistedOutput: RunCommandOutput = {
       ...output,
       envelope: { ...output.envelope, reportPersistence: 'persisted' },
@@ -362,7 +431,7 @@ describe('runRunCommand', () => {
     const result = await runRunCommand(input());
 
     const reportInput = mocks.buildRunReport.mock.calls[0]?.[0];
-    expect(reportInput?.outcome?.results[0]?.result.id).toBe('tests/login.test.md');
+    expect(reportInput?.outcome?.results[0]?.result.id).toBe('/workspace/tests/login.test.md');
     expect(reportInput?.outcome?.results[0]?.result.steps[0]).not.toHaveProperty('screenshot');
     expect(writeText).toHaveBeenCalledWith(reportPath, JSON.stringify(persistedOutput.envelope));
     expect(result).toEqual(persistedOutput);
@@ -429,6 +498,8 @@ describe('runRunCommand', () => {
     ['a case-scoped usage error', 2, {
       noTestsFound: false,
       listed: [],
+      skipped: [],
+      interrupted: false,
       results: [{
         result: {
           id: 'configuration.test.md',
@@ -445,6 +516,8 @@ describe('runRunCommand', () => {
     ['an unclassified aborted case', 3, {
       noTestsFound: false,
       listed: [],
+      skipped: [],
+      interrupted: false,
       results: [{
         result: {
           id: 'aborted.test.md',
@@ -460,6 +533,8 @@ describe('runRunCommand', () => {
     ['an empty selection', 5, {
       noTestsFound: true,
       listed: [],
+      skipped: [],
+      interrupted: false,
       results: [],
     } satisfies RunOutcome],
   ] as const)('persists a completed outcome from %s with semantic exit %i', async (_description, semanticExitCode, outcome) => {
@@ -490,8 +565,8 @@ describe('runRunCommand', () => {
         ...caseOutcome,
         result: {
           ...caseOutcome.result,
-          file: caseOutcome.result.file.replace(`${CONFIG.projectRoot}/`, ''),
-          planFile: caseOutcome.result.planFile.replace(`${CONFIG.projectRoot}/`, ''),
+          file: caseOutcome.result.file,
+          planFile: caseOutcome.result.planFile,
         },
       })),
     };
@@ -572,7 +647,7 @@ describe('runRunCommand', () => {
     mocks.loadConfig.mockRejectedValue(error);
     mocks.buildRunReport.mockReturnValue(output);
 
-    await expect(runRunCommand(input({ allowEmpty: true, list: true }))).resolves.toBe(output);
+    await expect(runRunCommand(input({ allowEmpty: true, list: true }))).resolves.toEqual(output);
 
     expect(mocks.run).not.toHaveBeenCalled();
     expect(mocks.buildRunReport).toHaveBeenCalledWith(expect.objectContaining({
@@ -819,6 +894,8 @@ describe('runRunCommand', () => {
     const outcome = {
       noTestsFound: false,
       listed: [],
+      skipped: [],
+      interrupted: false,
       results: [{
         result: {
           id: '/elsewhere/tests/case.test.md',
@@ -831,14 +908,14 @@ describe('runRunCommand', () => {
         },
       }],
     } satisfies RunOutcome;
-    const output: RunCommandOutput = {
+    const output = {
       exitCode: 0,
       envelope: {
-        schemaVersion: '1.0', command: 'run', startedAt: '2026-08-09T00:00:00Z', durationMs: 1,
+        schemaVersion: '2.0' as const, command: 'run', startedAt: '2026-08-09T00:00:00Z', durationMs: 1,
         summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 }, errors: [],
         results: [outcome.results[0]!.result], reportPersistence: 'not-attempted',
       },
-    };
+    } as unknown as RunCommandOutput;
     const persistedOutput: RunCommandOutput = {
       ...output,
       envelope: { ...output.envelope, reportPersistence: 'persisted' },
@@ -875,6 +952,8 @@ describe('runRunCommand', () => {
     const outcome = {
       noTestsFound: false,
       listed: [],
+      skipped: [],
+      interrupted: false,
       results: [{
         result: {
           id: '/workspace/identities/inside.test.md',
@@ -917,9 +996,9 @@ describe('runRunCommand', () => {
     const reportInput = mocks.buildRunReport.mock.calls[0]?.[0];
     const inProjectResult = reportInput?.outcome?.results[0]?.result;
     const outsideProjectResult = reportInput?.outcome?.results[1]?.result;
-    expect(inProjectResult?.id).toBe('identities/inside.test.md');
-    expect(inProjectResult?.file).toBe('tests/inside.test.md');
-    expect(inProjectResult?.planFile).toBe('plans/inside.ambercast.plan.json');
+    expect(inProjectResult?.id).toBe('/workspace/identities/inside.test.md');
+    expect(inProjectResult?.file).toBe('/workspace/tests/inside.test.md');
+    expect(inProjectResult?.planFile).toBe('/workspace/plans/inside.ambercast.plan.json');
     expect(outsideProjectResult?.id).toBe('/elsewhere/identities/outside.test.md');
     expect(outsideProjectResult?.file).toBe('/elsewhere/tests/outside.test.md');
     expect(outsideProjectResult?.planFile).toBe('/elsewhere/plans/outside.ambercast.plan.json');
@@ -932,6 +1011,8 @@ describe('runRunCommand', () => {
     const outcome = {
       noTestsFound: false,
       listed: [{ file: '/workspace/tests/listed.test.md' }],
+      skipped: [],
+      interrupted: false,
       results: [{
         result: {
           id: '/workspace/identities/executed.test.md',
@@ -975,6 +1056,8 @@ describe('runRunCommand', () => {
     const outcome = {
       noTestsFound: false,
       listed: [{ file: '/workspace/tests/inside.test.md' }, { file: '/elsewhere/tests/outside.test.md' }],
+      skipped: [],
+      interrupted: false,
       results: [],
     } satisfies RunOutcome;
 
@@ -1009,6 +1092,8 @@ describe('runRunCommand', () => {
     const outcome = {
       noTestsFound: false,
       listed: [],
+      skipped: [],
+      interrupted: false,
       results: [{
         result: {
           id: '/elsewhere/tests/outside.test.md',

@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { FsIoError } from '#core/errors/fs-io-error.js';
 import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
+import type { AmbercastError } from '#core/errors/types.js';
 import { CheckResult, ReportEnvelope } from '#report/schema.js';
 import { buildCheckReport, type CheckReportInput } from '#usecases/check-report.js';
+import type { CheckOutcome } from '#usecases/check.js';
 
 const BASE = {
   startedAt: '2026-08-17T00:00:00Z',
@@ -20,8 +22,15 @@ function result(status: CheckResult['status'], name = status): CheckResult {
   };
 }
 
-function report(input: Omit<CheckReportInput, keyof typeof BASE>): ReturnType<typeof buildCheckReport> {
-  return buildCheckReport({ ...BASE, ...input } as CheckReportInput);
+function report(input: {
+  readonly outcome?: Omit<CheckOutcome, 'interrupted'> & { readonly interrupted?: boolean };
+  readonly error?: AmbercastError;
+  readonly options?: CheckReportInput['options'];
+}): ReturnType<typeof buildCheckReport> {
+  const outcome = 'outcome' in input && input.outcome !== undefined
+    ? { ...input.outcome, interrupted: input.outcome.interrupted ?? false }
+    : undefined;
+  return buildCheckReport({ ...BASE, ...input, ...(outcome === undefined ? {} : { outcome }) } as CheckReportInput);
 }
 
 describe('buildCheckReport', () => {
@@ -50,7 +59,7 @@ describe('buildCheckReport', () => {
     const output = report({ outcome: { noTestsFound: false, results, errors: [] } });
 
     expect(ReportEnvelope.parse(output.envelope)).toEqual({
-      schemaVersion: '1.0',
+      schemaVersion: '2.0',
       command: 'check',
       startedAt: BASE.startedAt,
       durationMs: BASE.durationMs,
@@ -77,8 +86,8 @@ describe('buildCheckReport', () => {
       caseId: 'broken.test.md',
       message: error.message,
     }]);
-    expect(output.envelope.summary.errored).toBe(0);
-    expect(output.envelope.summary.total).toBe(output.envelope.results.length);
+    expect(output.envelope.summary.errored).toBe(1);
+    expect(output.envelope.summary.total).toBe(2);
   });
 
   it('keeps an errors-only outcome summary bound exclusively to result rows', () => {
@@ -95,8 +104,8 @@ describe('buildCheckReport', () => {
       code: 'FS_IO_ERROR',
       caseId: 'broken.test.md',
     })]);
-    expect(output.envelope.summary.errored).toBe(0);
-    expect(output.envelope.summary.total).toBe(output.envelope.results.length);
+    expect(output.envelope.summary.errored).toBe(1);
+    expect(output.envelope.summary.total).toBe(1);
   });
 
   it('maps a top-level target error to a run-scoped empty report and exit 2', () => {
@@ -120,14 +129,14 @@ describe('buildCheckReport', () => {
     ['an allowed genuine zero match', 0, { noTestsFound: true, results: [], errors: [] }, { allowEmpty: true, list: false }],
     ['a listed genuine zero match', 0, { noTestsFound: true, results: [], errors: [] }, { allowEmpty: false, list: true }],
   ] as const)('%s selects exit %i', (_name, exitCode, outcome, options) => {
-    const output = buildCheckReport({ ...BASE, options, outcome });
+    const output = buildCheckReport({ ...BASE, options, outcome: { ...outcome, interrupted: false } });
 
     expect(output.exitCode).toBe(exitCode);
   });
 
   it('makes the non-fresh and zero-results candidates mutually exclusive by outcome construction', () => {
-    const nonFreshOutcome = { noTestsFound: false, results: [result('stale')], errors: [] };
-    const zeroMatchOutcome = { noTestsFound: true, results: [], errors: [] };
+    const nonFreshOutcome = { noTestsFound: false, results: [result('stale')], errors: [], interrupted: false };
+    const zeroMatchOutcome = { noTestsFound: true, results: [], errors: [], interrupted: false };
 
     expect(nonFreshOutcome.results).not.toHaveLength(0);
     expect(zeroMatchOutcome.results).toHaveLength(0);
@@ -157,5 +166,49 @@ describe('buildCheckReport', () => {
     });
 
     expect(output.exitCode).toBe(3);
+  });
+});
+
+describe('buildCheckReport v2 interruption accounting', () => {
+  it('retains failed evidence for exit 4 while summary promotion and interruption select exit 3', () => {
+    const output = report({ outcome: {
+      noTestsFound: false, interrupted: true,
+      results: [result('orphaned-grounding'), { id: 'orphaned-grounding.test.md', file: 'orphaned-grounding.test.md', status: 'skipped' }], errors: [],
+    } } as unknown as Omit<CheckReportInput, keyof typeof BASE>);
+
+    expect(output.exitCode).toBe(3);
+    expect(output.envelope.schemaVersion).toBe('2.0');
+    expect(output.envelope.summary).toEqual({ total: 1, passed: 0, failed: 0, errored: 0, skipped: 1 });
+    expect(output.envelope.errors).toContainEqual(expect.objectContaining({ scope: 'run', code: 'INTERRUPTED' }));
+  });
+
+  const exitOneError = new FsIoError('assertion-like candidate');
+  Object.defineProperty(exitOneError, 'exitCode', { value: 1 });
+
+  it.each([
+    ['usage 2', { errors: [{ file: 'usage.test.md', error: new TargetUnresolvedError('usage') }], results: [], noTestsFound: false }, 2],
+    ['integrity 4', { errors: [], results: [result('stale')], noTestsFound: false }, 3],
+    ['assertion-like 1', { errors: [{ file: 'assertion.test.md', error: exitOneError }], results: [], noTestsFound: false }, 3],
+    ['zero match 5', { errors: [], results: [], noTestsFound: true }, 3],
+    ['success 0', { errors: [], results: [], noTestsFound: false }, 3],
+  ] as const)('emits one run interruption error and pins 2/4/1/5/0 priority against %s', (_name, partialOutcome, expectedExitCode) => {
+    const output = report({ outcome: { ...partialOutcome, interrupted: true } } as unknown as Omit<CheckReportInput, keyof typeof BASE>);
+    const interruptions = (output.envelope.errors as readonly { readonly code: string }[]).filter((entry) => entry.code === 'INTERRUPTED');
+
+    expect(interruptions).toEqual([expect.objectContaining({ scope: 'run', kind: 'environment', code: 'INTERRUPTED' })]);
+    expect(interruptions[0]).not.toHaveProperty('caseId');
+    expect(output.exitCode).toBe(expectedExitCode);
+  });
+
+  it('counts a case-error-only identity as one errored case', () => {
+    const output = report({ outcome: {
+      noTestsFound: false, results: [], errors: [{ file: 'broken.test.md', error: new FsIoError('broken') }],
+    } });
+    expect(output.envelope.summary).toEqual({ total: 1, passed: 0, failed: 0, errored: 1, skipped: 0 });
+  });
+
+  it('keeps a command-error envelope all-zero', () => {
+    expect(report({ error: new TargetUnresolvedError('invalid command') }).envelope.summary)
+      .toEqual({ total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 });
   });
 });
