@@ -655,8 +655,8 @@ describe('report schema v2 interruption contract', () => {
     }
   });
 
-  it('accepts all scheduled check statuses and path fields while rejecting blank paths and unknown values', () => {
-    for (const status of ['fresh', 'stale', 'missing-plan', 'missing-grounding', 'stale-grounding', 'invalid-grounding', 'fresh-without-grounding', 'orphaned-plan', 'orphaned-grounding', 'invalid-artifact-name', 'listed'] as const) {
+  it('accepts completed check statuses and path fields while rejecting blank paths and unknown values', () => {
+    for (const status of ['fresh', 'stale', 'missing-plan', 'missing-grounding', 'stale-grounding', 'invalid-grounding', 'fresh-without-grounding', 'orphaned-plan', 'orphaned-grounding'] as const) {
       expectAccepted(CheckResult, {
         id: 'case-a', file: 'case-a.test.md', planFile: 'case-a.plan.json', status, reason: 'checked',
         groundingFile: 'case-a.grounding.json', artifactFile: 'case-a.artifact.json',
@@ -666,6 +666,33 @@ describe('report schema v2 interruption contract', () => {
     expectRejected(CheckResult, { ...CHECK_RESULT, artifactFile: '  ' });
     expectRejected(CheckResult, { ...CHECK_RESULT, status: 'unknown' });
     expectRejected(CheckResult, { ...CHECK_RESULT, unexpected: true });
+  });
+
+  it('accepts the minimal invalid-artifact-name shape and rejects unrelated artifact evidence', () => {
+    const result = {
+      id: 'tests/.ambercast.plan.json',
+      file: 'tests/.ambercast.plan.json',
+      status: 'invalid-artifact-name',
+      reason: 'The artifact name could not be inverse-derived into a corresponding test path.',
+      artifactFile: 'tests/.ambercast.plan.json',
+    } as const;
+
+    expectAccepted(CheckResult, result);
+    expectRejected(CheckResult, { ...result, planFile: 'tests/imaginary.ambercast.plan.json' });
+    expectRejected(CheckResult, { ...result, groundingFile: 'tests/imaginary.ambercast.grounding.json' });
+    const { artifactFile: _artifactFile, ...withoutArtifactFile } = result;
+    expectRejected(CheckResult, withoutArtifactFile);
+    expectRejected(CheckResult, { ...result, artifactFile: '  ' });
+  });
+
+  it('accepts the minimal listed shape and rejects inspection evidence', () => {
+    const result = { id: 'tests/literal-path', file: 'tests/literal-path', status: 'listed' } as const;
+
+    expectAccepted(CheckResult, result);
+    expectRejected(CheckResult, { ...result, planFile: 'tests/literal-path.ambercast.plan.json' });
+    expectRejected(CheckResult, { ...result, reason: 'checked' });
+    expectRejected(CheckResult, { ...result, groundingFile: 'tests/literal-path.ambercast.grounding.json' });
+    expectRejected(CheckResult, { ...result, artifactFile: 'tests/literal-path.artifact.json' });
   });
 
   it.each(['', '  ', '\t\n'])(

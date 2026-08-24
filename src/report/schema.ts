@@ -398,28 +398,64 @@ export type GenerateResult = z.infer<typeof GenerateResult>;
  * non-whitespace `groundingFile` or `artifactFile` only when that artifact is
  * the finding's evidence. The represented vocabulary includes `fresh`,
  * `stale`, `orphaned-plan`, `orphaned-grounding`, `missing-plan`,
- * `missing-grounding`, `stale-grounding`, `invalid-grounding`,
- * `fresh-without-grounding`, and `invalid-artifact-name`. Representation does
- * not imply grounding lifecycle or artifact inverse-scan behavior in the check
- * inspector.
+ * `missing-grounding`, `stale-grounding`, `invalid-grounding`, and
+ * `fresh-without-grounding`. Representation does not imply grounding lifecycle
+ * or artifact inverse-scan behavior in the check inspector.
  *
- * A `listed` row is an inspection result like every other check status, not
- * the discovery-only list-mode row used by generate and run. It therefore
- * carries non-whitespace `id`, `file`, `planFile`, status, and `reason`, with
- * optional artifact paths when available. An interruption-only `skipped` row
- * instead uses the shared strict {@link SkippedResult} declaration. Keeping
- * paths in typed fields and reasons fixed and path-free prevents diagnostic
- * text from disclosing a host path.
+ * The check union adds dedicated minimal branches for discovery-only `listed`
+ * rows and artifacts whose names cannot be inverse-derived. An
+ * interruption-only `skipped` row instead uses the shared strict
+ * {@link SkippedResult} declaration. Keeping paths in typed fields and reasons
+ * fixed and path-free prevents diagnostic text from disclosing a host path.
  */
 const CompletedCheckResult = z.strictObject({
   ...ResultIdentityFields,
-  status: z.enum(['fresh', 'stale', 'orphaned-plan', 'orphaned-grounding', 'missing-plan', 'missing-grounding', 'stale-grounding', 'invalid-grounding', 'fresh-without-grounding', 'invalid-artifact-name', 'listed']),
+  status: z.enum(['fresh', 'stale', 'orphaned-plan', 'orphaned-grounding', 'missing-plan', 'missing-grounding', 'stale-grounding', 'invalid-grounding', 'fresh-without-grounding']),
   reason: z.string(),
   groundingFile: NonWhitespaceString.optional(),
   artifactFile: NonWhitespaceString.optional(),
 });
 
-export const CheckResult = z.discriminatedUnion('status', [CompletedCheckResult, SkippedResult]);
+/**
+ * Preserves an artifact finding when no corresponding virtual test identity
+ * can be derived.
+ *
+ * This cannot share the completed branch because that branch promises a
+ * `planFile`, while inverse derivation provides no truthful plan identity.
+ * Reusing a grounding artifact path as `planFile` would make the field mean
+ * different things for the two artifact kinds. `id`, `file`, and
+ * `artifactFile` therefore all retain the one concrete identity: the
+ * artifact's own path.
+ */
+const InvalidArtifactNameResult = z.strictObject({
+  id: NonWhitespaceString,
+  file: NonWhitespaceString,
+  status: z.literal('invalid-artifact-name'),
+  reason: z.string(),
+  artifactFile: NonWhitespaceString,
+});
+
+/**
+ * Represents selection during discovery-only check listing without inspecting
+ * the selected path.
+ *
+ * Keeping this branch bare avoids deriving `planFile` from a literal selection
+ * that need not have a `.test.md` name; that derivation could throw instead of
+ * listing the selection. Its identity-only shape follows the established
+ * `ListedRunResult` and generate `listed` branches.
+ */
+const ListedCheckResult = z.strictObject({
+  id: NonWhitespaceString,
+  file: NonWhitespaceString,
+  status: z.literal('listed'),
+});
+
+export const CheckResult = z.discriminatedUnion('status', [
+  CompletedCheckResult,
+  InvalidArtifactNameResult,
+  ListedCheckResult,
+  SkippedResult,
+]);
 
 /**
  * A result item emitted by a `check` report.

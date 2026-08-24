@@ -6,18 +6,23 @@ const EMPTY = { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 };
 function summary(command: string, statuses: readonly string[], errors: readonly unknown[] = []) {
   return summarizeReport({
     command,
-    results: statuses.map((status, index) => ({
-      id: `case-${index}`,
-      file: `case-${index}.test.md`,
-      status,
-      planFile: `case-${index}.ambercast.plan.json`,
-      dryRun: false,
-      durationMs: 1,
-      steps: [],
-      explanation: 'completed',
-      reason: 'completed',
-      concerns: [],
-    })),
+    results: statuses.map((status, index) => {
+      const identity = { id: `case-${index}`, file: `case-${index}.test.md`, status };
+      if (command === 'check' && status === 'listed') return identity;
+      if (command === 'check' && status === 'invalid-artifact-name') {
+        return { ...identity, reason: 'completed', artifactFile: `case-${index}.ambercast.plan.json` };
+      }
+      return {
+        ...identity,
+        planFile: `case-${index}.ambercast.plan.json`,
+        dryRun: false,
+        durationMs: 1,
+        steps: [],
+        explanation: 'completed',
+        reason: 'completed',
+        concerns: [],
+      };
+    }),
     errors,
   } as unknown as ReportSummaryInput);
 }

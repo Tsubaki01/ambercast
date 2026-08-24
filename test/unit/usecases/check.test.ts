@@ -479,7 +479,7 @@ describe('check', () => {
     expect(outcome.noTestsFound).toBe(false);
   });
 
-  it('keeps non-empty check results and errors byte-identical in list mode', async () => {
+  it('returns bare listed rows rather than ordinary inspection results in list mode', async () => {
     const testPath = `${TEST_DIR}/listed.test.md`;
     const { storage, layout, deps } = createScenario();
     await storage.writeText(testPath, PROMPT);
@@ -488,8 +488,80 @@ describe('check', () => {
     const ordinary = await check(deps, { ...OPTIONS, files: [testPath] });
     const listed = await check(deps, { ...OPTIONS, files: [testPath], list: true });
 
-    expect(JSON.stringify(listed.results)).toBe(JSON.stringify(ordinary.results));
-    expect(JSON.stringify(listed.errors)).toBe(JSON.stringify(ordinary.errors));
+    expect(listed.results).toEqual([{ id: testPath, file: testPath, status: 'listed' }]);
+    expect(listed.results).not.toEqual(ordinary.results);
+    expect(listed.errors).toEqual([]);
+  });
+
+  it('ends an empty list after selection without declaring an ordinary empty outcome', async () => {
+    const { deps } = createScenario();
+
+    await expect(check(deps, { ...OPTIONS, list: true })).resolves.toEqual({
+      results: [], errors: [], noTestsFound: false, interrupted: false,
+    });
+  });
+
+  it('validates an explicit list target before discovery', async () => {
+    const discoverTestFiles = vi.fn<CheckDeps['discoverTestFiles']>(createDiscovery());
+    const { deps } = createScenario({ discoverTestFiles });
+
+    await expect(check(deps, { ...OPTIONS, list: true, target: 'bogus-nonexistent-target' }))
+      .rejects.toBeInstanceOf(TargetUnresolvedError);
+    expect(discoverTestFiles).not.toHaveBeenCalled();
+  });
+
+  it('lists a literal path without requiring the .test.md layout shape', async () => {
+    const literalPath = `${TEST_DIR}/literal-input`;
+    const { deps } = createScenario();
+
+    await expect(check(deps, { ...OPTIONS, files: [literalPath], list: true })).resolves.toEqual({
+      results: [{ id: literalPath, file: literalPath, status: 'listed' }],
+      errors: [], noTestsFound: false, interrupted: false,
+    });
+  });
+
+  it('uses discovery only for selection in list mode and never scans artifacts', async () => {
+    const discoverTestFiles = vi.fn<CheckDeps['discoverTestFiles']>(createDiscovery(['listed.test.md']));
+    const { deps } = createScenario({ discoverTestFiles });
+
+    await check(deps, { ...OPTIONS, list: true });
+
+    expect(discoverTestFiles).toHaveBeenCalledTimes(1);
+    expect(discoverTestFiles).toHaveBeenCalledWith({
+      testDir: TEST_DIR, testMatch: ['**/*.test.md'], testIgnore: ['**/.runs/**'],
+    });
+    expect(discoverTestFiles.mock.calls.some(([input]) => (
+      input.testMatch.includes('**/*.ambercast.plan.json')
+      || input.testMatch.includes('**/*.ambercast.grounding.json')
+    ))).toBe(false);
+  });
+
+  it('does not read or probe storage in list mode', async () => {
+    const testPath = `${TEST_DIR}/listed.test.md`;
+    const { storage, deps } = createScenario({ discoverTestFiles: createDiscovery(['listed.test.md']) });
+    const readText = vi.spyOn(storage, 'readText');
+    const exists = vi.spyOn(storage, 'exists');
+
+    await check(deps, { ...OPTIONS, list: true });
+
+    expect(readText).not.toHaveBeenCalled();
+    expect(exists).not.toHaveBeenCalled();
+    expect(testPath).toBe(`${TEST_DIR}/listed.test.md`);
+  });
+
+  it('keeps an already-aborted list operation outside interruption tracking', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const listedPath = `${TEST_DIR}/listed.test.md`;
+    const { deps } = createScenario({
+      signal: controller.signal,
+      discoverTestFiles: createDiscovery(['listed.test.md']),
+    });
+
+    await expect(check(deps, { ...OPTIONS, list: true })).resolves.toEqual({
+      results: [{ id: listedPath, file: listedPath, status: 'listed' }],
+      errors: [], noTestsFound: false, interrupted: false,
+    });
   });
 
   it('makes the selected target participate in freshness but ignores unrelated targets', async () => {
@@ -715,7 +787,7 @@ describe('check', () => {
     await expect(check(deps, OPTIONS)).resolves.toEqual({ results: [], errors: [], noTestsFound: true, interrupted: false });
   });
 
-  it('does not call an orphan-only tree a genuine empty outcome', async () => {
+  it('keeps orphan scanning for a non-list zero-selection invocation', async () => {
     const orphanPath = `${TEST_DIR}/orphan.test.md`;
     const { storage, layout, deps } = createScenario({
       discoverTestFiles: createDiscovery([], ['orphan.ambercast.plan.json']),
@@ -733,7 +805,7 @@ describe('check', () => {
     const { storage, layout, deps } = createScenario({
       config: createConfig({ testIgnore: ['**/.runs/**', '**/fixtures/**'] }),
       discoverTestFiles: async ({ testMatch, testIgnore }) => (
-        testMatch[0] === '**/*.ambercast.plan.json' && !testIgnore.includes('**/fixtures/**')
+        testMatch[0] === '**/*.ambercast.plan.json' && testIgnore.length === 0
           ? ['fixtures/removed.ambercast.plan.json']
           : []
       ),
@@ -743,10 +815,26 @@ describe('check', () => {
     await expect(check(deps, OPTIONS)).resolves.toEqual({ results: [], errors: [], noTestsFound: true, interrupted: false });
   });
 
+  it('keeps an artifact whose derived test path misses testMatch out of artifact findings', async () => {
+    const { deps } = createScenario({
+      config: createConfig({ testMatch: ['ui/**/*.test.md'] }),
+      discoverTestFiles: async ({ testMatch }) => {
+        if (testMatch[0] === 'ui/**/*.test.md') return [];
+        if (testMatch[0] === '**/*.ambercast.plan.json') return ['other/place.ambercast.plan.json'];
+        if (testMatch[0] === '**/*.ambercast.grounding.json') return [];
+        throw new Error(`Unexpected test-match pattern: ${testMatch[0]}`);
+      },
+    });
+
+    await expect(check(deps, OPTIONS)).resolves.toEqual({
+      results: [], errors: [], noTestsFound: true, interrupted: false,
+    });
+  });
+
   it.each([
     ['plan', 'removed.ambercast.plan.json', 'orphaned-plan'],
     ['grounding', 'removed.ambercast.grounding.json', 'orphaned-grounding'],
-  ] as const)('removes both self-referential default ignores so orphaned %ss are still discovered', async (
+  ] as const)('enumerates orphaned %ss without configured ignores before judging their virtual paths', async (
     _artifact,
     artifactFile,
     status,
@@ -770,15 +858,15 @@ describe('check', () => {
     expect(discoverTestFiles).toHaveBeenCalledWith({
       testDir: TEST_DIR,
       testMatch: [planArtifact ? '**/*.ambercast.plan.json' : '**/*.ambercast.grounding.json'],
-      testIgnore: ['**/.runs/**'],
+      testIgnore: [],
     });
     expect(outcome.results).toEqual([expect.objectContaining({ id: orphanPath, status })]);
   });
 
-  it('keeps the unrelated default .runs ignore during artifact discovery', async () => {
+  it('keeps the default .runs ignore during virtual test-path judgment', async () => {
     const orphanPath = `${RUNS_DIR}/removed.test.md`;
     const discoverTestFiles = vi.fn<CheckDeps['discoverTestFiles']>(async ({ testMatch, testIgnore }) => (
-      testMatch[0] === '**/*.ambercast.plan.json' && !testIgnore.includes('**/.runs/**')
+      testMatch[0] === '**/*.ambercast.plan.json' && testIgnore.length === 0
         ? ['.runs/removed.ambercast.plan.json']
         : []
     ));
@@ -792,8 +880,121 @@ describe('check', () => {
     expect(discoverTestFiles).toHaveBeenCalledWith({
       testDir: TEST_DIR,
       testMatch: ['**/*.ambercast.plan.json'],
-      testIgnore: ['**/.runs/**'],
+      testIgnore: [],
     });
+  });
+
+  it.each([
+    ['plan', '.ambercast.plan.json'],
+    ['grounding', '.ambercast.grounding.json'],
+  ] as const)('reports an inverse-incapable %s artifact as invalid-artifact-name', async (_kind, artifactName) => {
+    const artifactPath = `${TEST_DIR}/${artifactName}`;
+    const { deps } = createScenario({
+      discoverTestFiles: createDiscovery(
+        [],
+        artifactName.endsWith('.plan.json') ? [artifactName] : [],
+        artifactName.endsWith('.grounding.json') ? [artifactName] : [],
+      ),
+    });
+
+    await expect(check(deps, OPTIONS)).resolves.toEqual(expect.objectContaining({
+      results: [{
+        id: artifactPath,
+        file: artifactPath,
+        status: 'invalid-artifact-name',
+        reason: 'The artifact name could not be inverse-derived into a corresponding test path.',
+        artifactFile: artifactPath,
+      }],
+      errors: [],
+      noTestsFound: false,
+      interrupted: false,
+    }));
+  });
+
+  it('orders an invalid plan artifact before an ordinary orphaned plan', async () => {
+    const invalidArtifact = `${TEST_DIR}/.ambercast.plan.json`;
+    const orphanPath = `${TEST_DIR}/orphan.test.md`;
+    const { deps } = createScenario({
+      discoverTestFiles: createDiscovery([], ['.ambercast.plan.json', 'orphan.ambercast.plan.json']),
+    });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: invalidArtifact, status: 'invalid-artifact-name', artifactFile: invalidArtifact }),
+      expect.objectContaining({ id: orphanPath, status: 'orphaned-plan' }),
+    ]);
+  });
+
+  it('retains an invalid plan artifact when a pre-aborted manageable artifact latches interruption', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const invalidArtifact = `${TEST_DIR}/.ambercast.plan.json`;
+    const pendingPath = `${TEST_DIR}/pending.test.md`;
+    const { deps } = createScenario({
+      signal: controller.signal,
+      discoverTestFiles: createDiscovery([], ['.ambercast.plan.json', 'pending.ambercast.plan.json']),
+    });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: invalidArtifact, status: 'invalid-artifact-name', artifactFile: invalidArtifact }),
+      { id: pendingPath, file: pendingPath, status: 'skipped' },
+    ]);
+    expect(outcome.interrupted).toBe(true);
+  });
+
+  it('orders an invalid grounding artifact before an ordinary orphaned grounding', async () => {
+    const invalidArtifact = `${TEST_DIR}/.ambercast.grounding.json`;
+    const orphanPath = `${TEST_DIR}/orphan.test.md`;
+    const { deps } = createScenario({
+      discoverTestFiles: createDiscovery([], [], ['.ambercast.grounding.json', 'orphan.ambercast.grounding.json']),
+    });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: invalidArtifact, status: 'invalid-artifact-name', artifactFile: invalidArtifact }),
+      expect.objectContaining({ id: orphanPath, status: 'orphaned-grounding' }),
+    ]);
+  });
+
+  it('reports every repeated inverse-incapable plan artifact without tracker registration', async () => {
+    const invalidArtifact = `${TEST_DIR}/.ambercast.plan.json`;
+    const orphanPath = `${TEST_DIR}/orphan.test.md`;
+    const addDiscovered = vi.spyOn(BatchInterruptionTracker.prototype, 'addDiscovered');
+    const { deps } = createScenario({
+      discoverTestFiles: createDiscovery([], [
+        '.ambercast.plan.json',
+        'orphan.ambercast.plan.json',
+        '.ambercast.plan.json',
+      ]),
+    });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: invalidArtifact, status: 'invalid-artifact-name', artifactFile: invalidArtifact }),
+      expect.objectContaining({ id: invalidArtifact, status: 'invalid-artifact-name', artifactFile: invalidArtifact }),
+      expect.objectContaining({ id: orphanPath, status: 'orphaned-plan' }),
+    ]);
+    expect(addDiscovered).toHaveBeenCalledExactlyOnceWith(
+      `plan:1:${orphanPath.replace('.test.md', '.ambercast.plan.json')}`,
+      orphanPath,
+    );
+  });
+
+  it('maps an invalid-artifact-name-only outcome to exit 4', async () => {
+    const artifactPath = `${TEST_DIR}/.ambercast.plan.json`;
+    const { deps } = createScenario({ discoverTestFiles: createDiscovery([], ['.ambercast.plan.json']) });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(buildCheckReport({
+      startedAt: '2026-08-24T00:00:00Z', durationMs: 1, options: OPTIONS, outcome,
+    }).exitCode).toBe(4);
+    expect(outcome.results).toEqual([expect.objectContaining({ id: artifactPath, status: 'invalid-artifact-name' })]);
   });
 
   it('records a plan read rejection as a case-scoped FS_IO_ERROR', async () => {

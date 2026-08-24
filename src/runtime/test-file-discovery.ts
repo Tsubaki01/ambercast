@@ -5,33 +5,8 @@
 
 import { readdir } from 'node:fs/promises';
 import { join, relative, sep } from 'node:path';
+import { matchesTestPatterns } from '#core/discovery/pattern-match.js';
 import { FsIoError } from '#core/errors/fs-io-error.js';
-
-function compilePattern(pattern: string): RegExp {
-  let expression = '^';
-
-  for (let index = 0; index < pattern.length; index += 1) {
-    const character = pattern[index]!;
-    if (character === '*' && pattern[index + 1] === '*') {
-      if (pattern[index + 2] === '/') {
-        expression += '(?:.*/)?';
-        index += 2;
-      } else {
-        expression += '.*';
-        index += 1;
-      }
-      continue;
-    }
-    if (character === '*') {
-      expression += '[^/]*';
-      continue;
-    }
-
-    expression += '\\^$+?.()|[]{}'.includes(character) ? `\\${character}` : character;
-  }
-
-  return new RegExp(`${expression}$`);
-}
 
 /**
  * Discovers configured Markdown test files in deterministic path order.
@@ -54,20 +29,12 @@ export type TestFileDiscovery = (config: {
  * paths. This makes its result a stable execution order for the use case that
  * receives this injected seam.
  *
- * Its intentionally bounded matcher treats `**` as zero or more complete path
- * segments, including the empty case, and `*` as zero or more characters within
- * one segment. Thus the default recursive test-file pattern also matches
- * `login.test.md` at the test root. Before those substitutions, every other
- * regular-expression metacharacter
- * in a configured pattern is escaped literally; matching is anchored against
- * the complete relative path. The shipped configuration needs only this shape,
- * so the seam deliberately excludes character classes, braces, extglobs, and
- * general glob-language behavior.
+ * Match-testing delegates to `#core/discovery/pattern-match.js`, whose
+ * canonical documentation defines the bounded glob contract
+ * shared with inverse-derived artifact-path judgment.
  */
 export function createFsTestFileDiscovery(): TestFileDiscovery {
   return async ({ testDir, testMatch, testIgnore }) => {
-    const matches = testMatch.map(compilePattern);
-    const ignored = testIgnore.map(compilePattern);
     let entries;
     try {
       entries = await readdir(testDir, { recursive: true, withFileTypes: true });
@@ -86,7 +53,7 @@ export function createFsTestFileDiscovery(): TestFileDiscovery {
       }
 
       const path = relative(testDir, join(entry.parentPath, entry.name)).split(sep).join('/');
-      if (matches.some((pattern) => pattern.test(path)) && !ignored.some((pattern) => pattern.test(path))) {
+      if (matchesTestPatterns(path, testMatch, testIgnore)) {
         files.add(path);
       }
     }
