@@ -1285,6 +1285,7 @@ describe('check grounding lifecycle integration', () => {
     ['invalid JSON', 'invalid-grounding', 'The grounding cache is not valid or does not match the grounding schema.'],
     ['schema-invalid JSON', 'invalid-grounding', 'The grounding cache is not valid or does not match the grounding schema.'],
     ['a mismatched plan digest', 'stale-grounding', 'The grounding cache does not match the current plan.'],
+    ['noncanonical coverage claim', 'invalid-grounding', 'The grounding cache is not valid or does not match the grounding schema.'],
   ] as const)('routes committed %s grounding through the full check usecase', async (kind, status, reason) => {
     const { storage, layout, deps } = createScenario();
     const testPath = `${TEST_DIR}/committed-${kind}.test.md`;
@@ -1294,6 +1295,20 @@ describe('check grounding lifecycle integration', () => {
     if (kind === 'invalid JSON') await storage.writeText(groundingPath, '{not JSON');
     if (kind === 'schema-invalid JSON') await storage.writeText(groundingPath, '{"schemaVersion":999}');
     if (kind === 'a mismatched plan digest') await writeGrounding(storage, layout, testPath, plan, {}, 'b'.repeat(64));
+    if (kind === 'noncanonical coverage claim') await storage.writeText(groundingPath, JSON.stringify({
+      schemaVersion: 1,
+      planDigest: computePlanDigest(plan),
+      entries: {
+        'reach-dashboard': {
+          kind: 'ai',
+          trace: {
+            events: [],
+            verification: [{ type: 'assert', check: 'text-visible', text: 'Dashboard' }],
+            verificationCoverage: { 'dashboard-reached': 0 },
+          },
+        },
+      },
+    }, null, 4));
 
     const outcome = await check(deps, { ...OPTIONS, files: [testPath] });
     const row = outcome.results.find((result) => result.id === testPath);
@@ -1305,9 +1320,12 @@ describe('check grounding lifecycle integration', () => {
     } else {
       expect(row).toMatchObject({ groundingFile: groundingPath });
     }
-    expect(buildCheckReport({
+    expect(outcome.errors).toEqual([]);
+    const report = buildCheckReport({
       startedAt: '2026-08-24T00:00:00Z', durationMs: 1, options: OPTIONS, outcome,
-    }).exitCode).toBe(4);
+    });
+    expect(report.exitCode).toBe(4);
+    expect(report.envelope.summary).toEqual({ total: 1, passed: 0, failed: 1, errored: 0, skipped: 0 });
   });
 
   it.each([

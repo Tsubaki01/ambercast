@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
+import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computePlanDigest } from '#core/ir/digest.js';
+import { rawGroundingHasCoverageClaim } from '#core/ir/grounding-coverage-claim.js';
 import {
   GroundingDocument,
+  type JsonValueT,
   PlanDocument,
   type GroundingDocument as GroundingDocumentType,
 } from '#core/ir/schema.js';
@@ -113,6 +116,75 @@ describe('inspectGroundingArtifact', () => {
         },
       },
     })))).resolves.toEqual({ kind: 'valid' });
+  });
+
+  it('classifies a canonical matching coverage-bearing grounding document as valid', async () => {
+    const grounding = validGrounding({
+      entries: {
+        'reach-dashboard': {
+          kind: 'ai',
+          trace: {
+            events: [],
+            verification: [{ type: 'assert', check: 'text-visible', text: 'Dashboard' }],
+            verificationCoverage: { 'dashboard-reached': 0 },
+          },
+        },
+      },
+    });
+
+    await expect(inspectStoredText(toCanonicalArtifactText(grounding as unknown as JsonValueT)))
+      .resolves.toEqual({ kind: 'valid' });
+  });
+
+  it('classifies a noncanonical matching coverage-bearing grounding document as invalid', async () => {
+    const grounding = validGrounding({
+      entries: {
+        'reach-dashboard': {
+          kind: 'ai',
+          trace: {
+            events: [],
+            verification: [{ type: 'assert', check: 'text-visible', text: 'Dashboard' }],
+            verificationCoverage: { 'dashboard-reached': 0 },
+          },
+        },
+      },
+    });
+
+    await expect(inspectStoredText(JSON.stringify(grounding, null, 4))).resolves.toEqual({ kind: 'invalid' });
+  });
+
+  it('classifies a noncanonical matching coverage-free grounding document as valid', async () => {
+    const grounding = validGrounding({
+      entries: {
+        'click-submit': {
+          kind: 'element',
+          fingerprint: { algorithm: 'a11y-neighborhood-v2', hash: 'a'.repeat(64) },
+        },
+      },
+    });
+
+    await expect(inspectStoredText(JSON.stringify(grounding, null, 4))).resolves.toEqual({ kind: 'valid' });
+  });
+
+  it('classifies a coverage-bearing grounding whose canonicalization throws as invalid', async () => {
+    const grounding = validGrounding({
+      entries: {
+        'reach-dashboard': {
+          kind: 'ai',
+          trace: {
+            events: [],
+            verification: [{ type: 'assert', check: 'text-visible', text: '\uD800' }],
+            verificationCoverage: { 'dashboard-reached': 0 },
+          },
+        },
+      },
+    });
+
+    await expect(inspectStoredText(JSON.stringify(grounding))).resolves.toEqual({ kind: 'invalid' });
+  });
+
+  it('keeps raw coverage-claim scanning malformed-JSON failures observable', () => {
+    expect(() => rawGroundingHasCoverageClaim('{"entries":"unterminated}')).toThrow(SyntaxError);
   });
 
   it('propagates a storage read failure instead of classifying it as invalid', async () => {
