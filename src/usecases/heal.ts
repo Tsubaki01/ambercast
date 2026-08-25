@@ -773,7 +773,7 @@ export async function heal(
           file,
           error: error instanceof AmbercastErrorClass
             ? error
-            : new FsIoErrorClass('Healing preflight failed.', undefined, { cause: error }),
+            : new FsIoErrorClass('Healing failed for this case.', undefined, { cause: error }),
         });
       } finally {
         tracker.markTerminal(file);
