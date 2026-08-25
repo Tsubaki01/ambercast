@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { normalizeTestMd } from '#core/ir/normalize.js';
+import { extractSecretGrants } from '#core/ir/secret-grant-source.js';
 import type { GeneratedStep, PlanDocument, Step } from '#core/ir/schema.js';
 import { SecretGrantUnattributableError } from '#core/errors/secret-grant-unattributable-error.js';
 import { SecretLiteralRejectedError } from '#core/errors/secret-literal-rejected-error.js';
@@ -239,6 +240,21 @@ describe('attributeSecretGrants', () => {
 
   it('attributes a fill-secret action to the locally computed grant span', () => {
     expect(attributeSecretGrants([generatedFill()], prompt(FIRST_REF))).toEqual([committedFill(FIRST_REF, 3)]);
+  });
+
+  it('accepts prefix-owned grant offsets only when explicitly pre-seeded', () => {
+    const testMd = prompt(FIRST_REF, SECOND_REF);
+    const replacement = [generatedFill(SECOND_REF, grantLine(SECOND_REF), 'replace-tail')];
+    const firstGrantOffset = extractSecretGrants(testMd).find((grant) => grant.ref === FIRST_REF)?.offsetStart;
+
+    expect(firstGrantOffset).toBeDefined();
+    expect(attributeSecretGrants(replacement, testMd, new Set([firstGrantOffset!]))).toEqual([
+      committedFill(SECOND_REF, 4, 'replace-tail'),
+    ]);
+    expectAttributionFailure(
+      () => attributeSecretGrants(replacement, testMd),
+      { reason: 'uncovered-grant', secretRef: FIRST_REF, sourceSpan: { startLine: 3, endLine: 3 } },
+    );
   });
 
   it('accepts AI steps with zero, one, and multiple independently cited grants', () => {
