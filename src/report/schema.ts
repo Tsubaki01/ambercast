@@ -310,20 +310,48 @@ export const RunResult = z.discriminatedUnion('status', [ExecutedRunResult, List
 export type RunResult = z.infer<typeof RunResult>;
 
 /**
- * Zod schema for one result produced by the `heal` command.
+ * Zod schema for an execution-backed result produced by the `heal` command.
  *
- * Its execution-backed branch shares {@link ExecutedRunResult}'s identity and
- * evidence so consumers can process completed cases consistently. The union
- * also accepts the shared identity-only skipped branch without weakening the
- * evidence promised by a completed healing status.
+ * This branch shares {@link ExecutedRunResult}'s identity and evidence so
+ * consumers can process completed cases consistently. `dryRun` records
+ * whether that evidence came from a preview, allowing consumers to distinguish
+ * a simulated heal from one that may have changed artifacts without inferring
+ * it from the healing status.
  */
 const CompletedHealResult = z.strictObject({
   ...ResultIdentityFields,
   status: z.enum(['healed', 'partially-healed', 'unresolved', 'no-changes-needed']),
+  dryRun: z.boolean(),
   ...ExecutedResultFields,
 });
 
-export const HealResult = z.discriminatedUnion('status', [CompletedHealResult, SkippedResult]);
+/**
+ * Zod schema for a prompt path reported by `heal --list`.
+ *
+ * Listing confirms deterministic file selection but deliberately supplies no
+ * plan or execution evidence. Keeping that distinction explicit prevents a
+ * discovery result from being mistaken for a healed case.
+ */
+export const ListedHealResult = z.strictObject({
+  id: NonWhitespaceString,
+  file: NonWhitespaceString,
+  status: z.literal('listed'),
+});
+
+/**
+ * A discovery-only result emitted by a `heal --list` report.
+ */
+export type ListedHealResult = z.infer<typeof ListedHealResult>;
+
+/**
+ * Zod schema for one result produced by the `heal` command.
+ *
+ * The status discriminant separates execution-backed healing results,
+ * `--list` discovery rows, and interruption-only skipped rows. This gives
+ * consumers one result array without implying that listed or skipped
+ * identities carry dry-run, duration, plan, or step evidence.
+ */
+export const HealResult = z.discriminatedUnion('status', [CompletedHealResult, ListedHealResult, SkippedResult]);
 
 /**
  * A per-case result emitted by a `heal` report.
