@@ -90,6 +90,8 @@ type GeneratedPlanResponseForPolicy = Omit<
  *
  * @param response - Strict provider response with citations and full intents.
  * @param normalizedTestMd - Canonical prompt used for local attribution.
+ * @param alreadyClaimedOffsets - Prompt-grant offsets already owned by
+ * committed steps outside this provider response.
  * @returns Committed-shape steps without citation or intent data, or the
  * complete deterministic provider issue list.
  * @remarks
@@ -98,14 +100,17 @@ type GeneratedPlanResponseForPolicy = Omit<
  * for every AI step, requires exact step-local success/intent bijections, and
  * discards transient fields before Plan construction. Failure maps to
  * `AiResponseInvalidError` with raw provider output and performs no artifact
- * write.
+ * write. The default empty set keeps whole-response generation unchanged;
+ * replacement-tail callers seed prefix-owned grants so the same prompt-wide
+ * secret policy does not mistake them for uncovered.
  */
 export function prepareInstructionCoveredSteps(
   response: GeneratedPlanResponseForPolicy,
   normalizedTestMd: NormalizedTestMd,
+  alreadyClaimedOffsets: ReadonlySet<number> = new Set(),
 ): InstructionCoverageResult<InstructionCoveredStep[]> {
   try {
-    return { success: true, data: attributeSecretGrants(response.steps, normalizedTestMd) };
+    return { success: true, data: attributeSecretGrants(response.steps, normalizedTestMd, alreadyClaimedOffsets) };
   } catch (error) {
     if (error instanceof InstructionCoverageAttributionError) {
       return { success: false, issues: error.issues };

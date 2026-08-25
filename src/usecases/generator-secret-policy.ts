@@ -120,12 +120,32 @@ export class InstructionCoverageAttributionError extends Error {
   }
 }
 
+/**
+ * Converts provider secret citations into committed prompt-grant spans.
+ *
+ * @param steps - Provider-shaped steps whose secret citations need attribution.
+ * @param normalizedTestMd - Canonical prompt containing every declared grant.
+ * @param alreadyClaimedOffsets - Grant offsets owned by committed steps outside
+ * the supplied provider subset.
+ * @returns Committed-shape steps whose declared grants are covered exactly once.
+ * @throws {SecretGrantUsageError} When a citation is ambiguous, invalid, or
+ * reuses a claimed grant.
+ * @throws {SecretGrantUncoveredError} When the supplied and seeded ownership
+ * does not cover every prompt grant.
+ * @remarks
+ * Fresh generation supplies the whole provider response and uses the default
+ * empty seed, preserving its established validation exactly. Partial repair
+ * supplies only a tail of replacement steps; offsets already owned by an
+ * untouched prefix are seeded so prompt-wide coverage remains valid without
+ * reconstructing provider citations from committed line spans.
+ */
 export function attributeSecretGrants(
   steps: readonly InstructionPolicyGeneratedStep[],
   normalizedTestMd: NormalizedTestMd,
+  alreadyClaimedOffsets: ReadonlySet<number> = new Set(),
 ): Step[] {
   const grants = extractSecretGrants(normalizedTestMd);
-  const claimed = new Set<number>();
+  const claimed = new Set<number>(alreadyClaimedOffsets);
   const claim = (grant: SecretGrant, ref: string, stepId: string) => {
     if (claimed.has(grant.offsetStart)) {
       throwSecretGrantUsageError('multiply-attributed-grant', ref, stepId);
