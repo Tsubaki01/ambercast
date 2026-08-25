@@ -13,6 +13,10 @@ import { AmbercastError, type AmbercastError as AmbercastErrorType } from '#core
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
+import {
+  isGroundingCanonicalForClaim,
+  rawGroundingHasCoverageClaim,
+} from '#core/ir/grounding-coverage-claim.js';
 import { normalizeTestMd, type NormalizedTestMd } from '#core/ir/normalize.js';
 import { isSnapshotInvalid } from '#core/ir/aria-snapshot.js';
 import {
@@ -424,142 +428,6 @@ export type GroundingCoverageSourceInspection =
     readonly reason: 'coverage-structure-invalid' | 'coverage-canonical-invalid';
   };
 
-type RawJsonNode =
-  | { readonly kind: 'object'; readonly entries: readonly (readonly [string, RawJsonNode])[] }
-  | { readonly kind: 'array'; readonly items: readonly RawJsonNode[] }
-  | { readonly kind: 'scalar' };
-
-/**
- * Parses JSON without collapsing repeated object members.
- *
- * JSON.parse remains the runtime schema input, while this narrow reader keeps
- * every raw member occurrence long enough to recognize an exact-path coverage
- * claim that a later duplicate key could otherwise hide. It assigns no trust
- * to values and exposes only object structure needed by the staged loader.
- */
-class DuplicatePreservingJsonReader {
-  #offset = 0;
-
-  constructor(private readonly source: string) {}
-
-  parse(): RawJsonNode {
-    const value = this.#parseValue();
-    this.#skipWhitespace();
-    if (this.#offset !== this.source.length) throw new SyntaxError('Unexpected trailing JSON data.');
-    return value;
-  }
-
-  #skipWhitespace(): void {
-    while (/\s/u.test(this.source[this.#offset] ?? '')) this.#offset += 1;
-  }
-
-  #parseValue(): RawJsonNode {
-    this.#skipWhitespace();
-    switch (this.source[this.#offset]) {
-      case '{':
-        return this.#parseObject();
-      case '[':
-        return this.#parseArray();
-      case '"':
-        this.#parseString();
-        return { kind: 'scalar' };
-      default:
-        this.#parseScalar();
-        return { kind: 'scalar' };
-    }
-  }
-
-  #parseObject(): RawJsonNode {
-    this.#offset += 1;
-    const entries: Array<readonly [string, RawJsonNode]> = [];
-    this.#skipWhitespace();
-    if (this.source[this.#offset] === '}') {
-      this.#offset += 1;
-      return { kind: 'object', entries };
-    }
-    while (true) {
-      this.#skipWhitespace();
-      const key = this.#parseString();
-      this.#skipWhitespace();
-      if (this.source[this.#offset] !== ':') throw new SyntaxError('Expected a JSON member separator.');
-      this.#offset += 1;
-      entries.push([key, this.#parseValue()]);
-      this.#skipWhitespace();
-      const delimiter = this.source[this.#offset];
-      if (delimiter === '}') {
-        this.#offset += 1;
-        return { kind: 'object', entries };
-      }
-      if (delimiter !== ',') throw new SyntaxError('Expected another JSON object member.');
-      this.#offset += 1;
-    }
-  }
-
-  #parseArray(): RawJsonNode {
-    this.#offset += 1;
-    const items: RawJsonNode[] = [];
-    this.#skipWhitespace();
-    if (this.source[this.#offset] === ']') {
-      this.#offset += 1;
-      return { kind: 'array', items };
-    }
-    while (true) {
-      items.push(this.#parseValue());
-      this.#skipWhitespace();
-      const delimiter = this.source[this.#offset];
-      if (delimiter === ']') {
-        this.#offset += 1;
-        return { kind: 'array', items };
-      }
-      if (delimiter !== ',') throw new SyntaxError('Expected another JSON array item.');
-      this.#offset += 1;
-    }
-  }
-
-  #parseString(): string {
-    const start = this.#offset;
-    if (this.source[this.#offset] !== '"') throw new SyntaxError('Expected a JSON string.');
-    this.#offset += 1;
-    while (this.#offset < this.source.length) {
-      const character = this.source[this.#offset];
-      if (character === '\\') {
-        this.#offset += 2;
-        continue;
-      }
-      this.#offset += 1;
-      if (character === '"') {
-        return JSON.parse(this.source.slice(start, this.#offset)) as string;
-      }
-    }
-    throw new SyntaxError('Unterminated JSON string.');
-  }
-
-  #parseScalar(): void {
-    const start = this.#offset;
-    while (this.#offset < this.source.length && !/[\s,\]}]/u.test(this.source[this.#offset]!)) {
-      this.#offset += 1;
-    }
-    if (start === this.#offset) throw new SyntaxError('Expected a JSON value.');
-    JSON.parse(this.source.slice(start, this.#offset));
-  }
-}
-
-function rawGroundingHasCoverageClaim(sourceText: string): boolean {
-  const root = new DuplicatePreservingJsonReader(sourceText).parse();
-  if (root.kind !== 'object') return false;
-  for (const [rootKey, entries] of root.entries) {
-    if (rootKey !== 'entries' || entries.kind !== 'object') continue;
-    for (const [, entry] of entries.entries) {
-      if (entry.kind !== 'object') continue;
-      for (const [entryKey, trace] of entry.entries) {
-        if (entryKey !== 'trace' || trace.kind !== 'object') continue;
-        if (trace.entries.some(([traceKey]) => traceKey === 'verificationCoverage')) return true;
-      }
-    }
-  }
-  return false;
-}
-
 /**
  * Classifies raw grounding using staged provenance and coverage checks.
  *
@@ -617,7 +485,7 @@ export function inspectGroundingCoverageSource(
       ? { kind: 'integrity-failure', reason: 'coverage-structure-invalid' }
       : { kind: 'cache-miss' };
   }
-  if (hasClaim && toCanonicalArtifactText(parsed.data as unknown as JsonValueT) !== sourceText) {
+  if (hasClaim && !isGroundingCanonicalForClaim(sourceText, parsed.data)) {
     return { kind: 'integrity-failure', reason: 'coverage-canonical-invalid' };
   }
   const coverageClaimStepIds = Object.entries(parsed.data.entries)

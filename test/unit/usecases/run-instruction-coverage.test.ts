@@ -560,6 +560,36 @@ describe('run instruction coverage trust boundary', () => {
     },
   );
 
+  it.each([false, true])(
+    'fails a current-provenance coverage claim whose canonicalization throws before fallback in cacheOnly=%s',
+    async (cacheOnly) => {
+      const recording = recordingStorage();
+      await arrangeArtifacts(
+        recording.storage,
+        coveredTrace({
+          verification: [{ ...READY_ASSERTION, text: '\uD800' }],
+        }),
+        (grounding) => JSON.stringify(grounding),
+      );
+      recording.resetMutations();
+      const arranged = scenario(recording);
+
+      const outcome = await run(arranged.deps, { ...OPTIONS, cacheOnly });
+
+      expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+      expect(outcome.results[0]?.error).toMatchObject({
+        details: { reason: 'coverage-canonical-invalid' },
+      });
+      expect(outcome.results[0]?.error?.message).toMatch(/coverage|canonical/i);
+      expect(arranged.resolveAiExecutor).not.toHaveBeenCalled();
+      expect(arranged.browserDriver).not.toHaveBeenCalled();
+      expect(arranged.session.operations()).toEqual([]);
+      expect(recording.writes).toEqual([]);
+      expect(recording.binaryWrites).toEqual([]);
+      expect(recording.ensuredDirectories).toEqual([]);
+    },
+  );
+
   it.each([
     ['missing claim value', { verificationCoverage: {} }],
     ['wrong claim kind', { verificationCoverage: { 'dashboard-reached': '0' } }],

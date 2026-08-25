@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
 import { SecretGrantUnattributableError } from '#core/errors/secret-grant-unattributable-error.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computePlanDigest } from '#core/ir/digest.js';
@@ -14,6 +15,7 @@ import {
 import { createLayoutResolver } from '#core/layout/resolve.js';
 import type { AiActionController } from '#ports/ai.js';
 import { check, type CheckDeps, type CheckOptions } from '#usecases/check.js';
+import { buildCheckReport } from '#usecases/check-report.js';
 import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/generate.js';
 import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
 import { createFixedClock } from '../../doubles/create-fixed-clock.js';
@@ -197,6 +199,191 @@ describe('fake vertical slice', () => {
       errors: [],
       noTestsFound: false,
     });
+  });
+
+  it('keeps a canonical coverage-bearing grounding fresh and replays it without AI calls', async () => {
+    const generatedResponse = {
+      steps: [{
+        id: 'recorded-ai',
+        kind: 'ai',
+        instruction: 'Reach the dashboard.',
+        secrets: [],
+        instructionCoverage: [{ id: SUCCESS_INTENT.criterionId, kind: 'success', citation: SUCCESS_CITATION }],
+        verificationIntent: [SUCCESS_INTENT],
+      }],
+      ambiguities: [],
+    } as unknown as GeneratedPlanResponse;
+    const storage = createInMemoryStorage();
+    const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
+    await storage.writeText(TEST_PATH, PROMPT);
+    await generate({
+      storage,
+      layout,
+      aiExecutor: createFakeAiExecutor({
+        execute: async () => ({ data: generatedResponse, raw: JSON.stringify(generatedResponse) }),
+      }),
+      events: createRecordingEventSink().sink,
+      discoverTestFiles: async () => [],
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: ['**/.runs/**'],
+        targets: TARGETS,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 100 },
+      },
+    }, GENERATE_OPTIONS);
+
+    const recordingSession = createFakeBrowserSession(new Map(), {
+      baseUrl: TARGETS.web.baseUrl,
+      currentUrl: TARGETS.web.baseUrl,
+    });
+    const initialRunDeps: RunDeps = {
+      storage,
+      layout,
+      clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 0),
+      runId: '2026-08-09T000000Z-550e8400-e29b-41d4-a716-446655440000',
+      browserDriver: () => createFakeBrowserDriver(() => recordingSession),
+      secrets: createFakeSecretsProvider(new Map()),
+      resolveAiExecutor: async () => createFakeAiExecutor({
+        async executeAgentic(request) {
+          await request.controller.perform({ type: 'navigate', url: '/dashboard' });
+          await evaluateTerminal(request.controller, { type: 'assert', check: 'text-visible', text: 'Dashboard' });
+          return { outcome: 'success' };
+        },
+      }),
+      events: createRecordingEventSink().sink,
+      discoverTestFiles: async () => [],
+      isCI: false,
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: ['**/.runs/**'],
+        targets: TARGETS,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 120_000 },
+        ci: { heal: false, updateGroundingCache: false },
+        grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
+      },
+    };
+    await expect(run(initialRunDeps, RUN_OPTIONS)).resolves.toMatchObject({
+      results: [{ result: { status: 'passed' } }],
+    });
+
+    await expect(check(checkDeps(storage, layout), CHECK_OPTIONS)).resolves.toMatchObject({
+      results: [{ id: TEST_PATH, status: 'fresh' }],
+      errors: [],
+      noTestsFound: false,
+    });
+
+    const replaySession = createFakeBrowserSession(new Map(), {
+      baseUrl: TARGETS.web.baseUrl,
+      currentUrl: TARGETS.web.baseUrl,
+    });
+    const events = createRecordingEventSink();
+    const replay = await run({
+      ...initialRunDeps,
+      browserDriver: () => createFakeBrowserDriver(() => replaySession),
+      resolveAiExecutor: async () => {
+        throw new Error('The coverage-grounded vertical slice must not resolve an AI executor.');
+      },
+      events: events.sink,
+    }, RUN_OPTIONS);
+
+    expect(replay.results).toMatchObject([{ result: { status: 'passed' } }]);
+    expect(replay.results).toHaveLength(1);
+    expect(replay.results[0]?.error).toBeUndefined();
+    expect(events.emitted().filter((event) => event.type === 'ai-call')).toEqual([]);
+  });
+
+  it('rejects a noncanonical coverage-bearing grounding consistently in check and run', async () => {
+    const generatedResponse = {
+      steps: [{
+        id: 'recorded-ai',
+        kind: 'ai',
+        instruction: 'Reach the dashboard.',
+        secrets: [],
+        instructionCoverage: [{ id: SUCCESS_INTENT.criterionId, kind: 'success', citation: SUCCESS_CITATION }],
+        verificationIntent: [SUCCESS_INTENT],
+      }],
+      ambiguities: [],
+    } as unknown as GeneratedPlanResponse;
+    const storage = createInMemoryStorage();
+    const layout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
+    await storage.writeText(TEST_PATH, PROMPT);
+    await generate({
+      storage,
+      layout,
+      aiExecutor: createFakeAiExecutor({
+        execute: async () => ({ data: generatedResponse, raw: JSON.stringify(generatedResponse) }),
+      }),
+      events: createRecordingEventSink().sink,
+      discoverTestFiles: async () => [],
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: ['**/.runs/**'],
+        targets: TARGETS,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 100 },
+      },
+    }, GENERATE_OPTIONS);
+
+    const session = createFakeBrowserSession(new Map(), {
+      baseUrl: TARGETS.web.baseUrl,
+      currentUrl: TARGETS.web.baseUrl,
+    });
+    const runDeps: RunDeps = {
+      storage,
+      layout,
+      clock: createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 0),
+      runId: '2026-08-09T000000Z-550e8400-e29b-41d4-a716-446655440000',
+      browserDriver: () => createFakeBrowserDriver(() => session),
+      secrets: createFakeSecretsProvider(new Map()),
+      resolveAiExecutor: async () => createFakeAiExecutor({
+        async executeAgentic(request) {
+          await request.controller.perform({ type: 'navigate', url: '/dashboard' });
+          await evaluateTerminal(request.controller, { type: 'assert', check: 'text-visible', text: 'Dashboard' });
+          return { outcome: 'success' };
+        },
+      }),
+      events: createRecordingEventSink().sink,
+      discoverTestFiles: async () => [],
+      isCI: false,
+      config: {
+        testDir: TEST_DIR,
+        testMatch: ['**/*.test.md'],
+        testIgnore: ['**/.runs/**'],
+        targets: TARGETS,
+        defaultTarget: 'web',
+        ai: { provider: 'codex', timeoutMs: 120_000 },
+        ci: { heal: false, updateGroundingCache: false },
+        grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
+      },
+    };
+    await expect(run(runDeps, RUN_OPTIONS)).resolves.toMatchObject({
+      results: [{ result: { status: 'passed' } }],
+    });
+
+    const groundingPath = layout.groundingPathFor(TEST_PATH);
+    const grounding = JSON.parse(await storage.readText(groundingPath));
+    await storage.writeText(groundingPath, JSON.stringify(grounding, null, 4));
+
+    const checkOutcome = await check(checkDeps(storage, layout), CHECK_OPTIONS);
+
+    expect(checkOutcome).toMatchObject({
+      results: [{ id: TEST_PATH, status: 'invalid-grounding' }],
+      errors: [],
+      noTestsFound: false,
+    });
+    expect(buildCheckReport({
+      startedAt: '2026-08-24T00:00:00Z', durationMs: 1, options: CHECK_OPTIONS, outcome: checkOutcome,
+    }).exitCode).toBe(4);
+
+    const outcome = await run(runDeps, RUN_OPTIONS);
+
+    expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+    expect(outcome.results[0]?.error).toMatchObject({ details: { reason: 'coverage-canonical-invalid' } });
   });
 
   it('replays a generated plan from pre-seeded grounding without AI calls', async () => {

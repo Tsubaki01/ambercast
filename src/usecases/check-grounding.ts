@@ -1,4 +1,8 @@
 import { computePlanDigest, isPlanDigestCurrent } from '#core/ir/digest.js';
+import {
+  isGroundingCanonicalForClaim,
+  rawGroundingHasCoverageClaim,
+} from '#core/ir/grounding-coverage-claim.js';
 import { GroundingDocument, type PlanDocument } from '#core/ir/schema.js';
 import type { ReadStorageAdapter } from '#ports/storage.js';
 
@@ -10,15 +14,18 @@ import type { ReadStorageAdapter } from '#ports/storage.js';
  * that collapsed vocabulary here would lose the distinction check must report.
  */
 
-/*
+/**
  * `missing` denotes an absent companion, `invalid` content that cannot be
- * parsed or satisfy the grounding schema, `stale` a valid document for another
- * plan, and `valid` a matching companion. The inspection recognizes absence;
- * for an existing file it rejects JSON or schema failures before comparing the
- * plan digest, leaving a match as valid. A
- * storage read failure is deliberately not another kind: the caller already
- * owns the CheckFileError path for I/O failures and must retain that error
- * rather than recast it as an invalid artifact.
+ * parsed or satisfy the grounding schema, a coverage-bearing document whose
+ * bytes are not its canonical serialization, `stale` a valid document for
+ * another plan, and `valid` a matching companion.
+ *
+ * @remarks
+ * The inspection rejects JSON or schema failures before comparing the plan
+ * digest, then applies the canonicality requirement only to a matching
+ * coverage claim. A storage read failure is deliberately not another kind:
+ * the caller already owns the CheckFileError path for I/O failures and must
+ * retain that error rather than recast it as an invalid artifact.
  */
 export type GroundingInspection =
   | { readonly kind: 'missing' }
@@ -44,7 +51,14 @@ export type GroundingInspection =
  * owns report-status selection; parsed content and parse diagnostics do not
  * cross that boundary. A named read port also keeps this check-closure helper
  * consistent with its parent use case instead of encoding the same capability
- * as an ad hoc structural `Pick`.
+ * as an ad hoc structural `Pick`. Digest equality is the provenance gate for
+ * coverage inspection: a document for another plan remains stale without
+ * canonical scanning, because its bytes cannot establish usable current
+ * grounding. The raw scan is caught here so malformed artifact structure is
+ * classified as invalid rather than escaping into the caller's storage-I/O
+ * error path. Once a claim is found, the shared canonicality primitive already
+ * converts a serialization failure into an invalid result, so a second local
+ * exception boundary would only duplicate and risk weakening that contract.
  */
 export async function inspectGroundingArtifact(
   storage: ReadStorageAdapter,
@@ -69,7 +83,19 @@ export async function inspectGroundingArtifact(
     return { kind: 'invalid' };
   }
 
-  return isPlanDigestCurrent(grounding.data, computePlanDigest(plan))
-    ? { kind: 'valid' }
-    : { kind: 'stale' };
+  if (!isPlanDigestCurrent(grounding.data, computePlanDigest(plan))) {
+    return { kind: 'stale' };
+  }
+
+  let hasClaim: boolean;
+  try {
+    hasClaim = rawGroundingHasCoverageClaim(text);
+  } catch {
+    return { kind: 'invalid' };
+  }
+  if (hasClaim && !isGroundingCanonicalForClaim(text, grounding.data)) {
+    return { kind: 'invalid' };
+  }
+
+  return { kind: 'valid' };
 }
