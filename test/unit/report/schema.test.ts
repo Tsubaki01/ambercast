@@ -3,6 +3,7 @@ import {
   CheckResult,
   GenerateResult,
   HealResult,
+  ListedHealResult,
   Observed,
   ReportEnvelope,
   ReportError,
@@ -57,6 +58,7 @@ const HEAL_RESULT = {
   file: 'tests/login.test.md',
   planFile: 'tests/login.ambercast.plan.json',
   status: 'healed',
+  dryRun: false,
   durationMs: 42,
   steps: [STEP_RESULT],
   explanation: 'The updated locator was grounded successfully.',
@@ -187,6 +189,7 @@ const COMMAND_VARIANTS: ReadonlyArray<{
       ['file', 1],
       ['planFile', 1],
       ['status', 1],
+      ['dryRun', 'false'],
       ['durationMs', '42'],
       ['steps', 'not steps'],
       ['explanation', 1],
@@ -357,6 +360,63 @@ describe('run result status branches', () => {
     const roundTripped = ReportEnvelope.parse(JSON.parse(JSON.stringify(envelope)));
 
     expect(roundTripped).toEqual(envelope);
+  });
+});
+
+describe('heal result status branches', () => {
+  const listedHealResult = {
+    id: 'login-succeeds',
+    file: 'tests/login.test.md',
+    status: 'listed',
+  } as const;
+
+  it('parses the minimal listed shape', () => {
+    expectAccepted(ListedHealResult, listedHealResult);
+    expectAccepted(HealResult, listedHealResult);
+  });
+
+  it.each([
+    ['id', '', '  ', '\t\n'],
+    ['file', '', '  ', '\t\n'],
+    ['status', '', '  ', '\t\n'],
+  ] as const)('rejects a missing, empty, or whitespace-only listed %s field', (field, empty, whitespace, controlWhitespace) => {
+    expectRejected(ListedHealResult, without(listedHealResult, field));
+    expectRejected(ListedHealResult, { ...listedHealResult, [field]: empty });
+    expectRejected(ListedHealResult, { ...listedHealResult, [field]: whitespace });
+    expectRejected(ListedHealResult, { ...listedHealResult, [field]: controlWhitespace });
+  });
+
+  it('rejects unknown fields on a listed result', () => {
+    expectRejected(ListedHealResult, { ...listedHealResult, unexpected: true });
+  });
+
+  it('requires listed results to use the literal listed status', () => {
+    expectRejected(ListedHealResult, { ...listedHealResult, status: 'discovered' });
+  });
+
+  it('rejects dryRun outside completed heal results', () => {
+    expectRejected(RunResult, { ...RUN_RESULT, dryRun: false });
+    expectRejected(ListedHealResult, { ...listedHealResult, dryRun: false });
+  });
+
+  it.each([true, false])('accepts completed heal results with dryRun %s', (dryRun) => {
+    expectAccepted(HealResult, { ...HEAL_RESULT, dryRun });
+  });
+
+  it('requires completed heal results to include a boolean dryRun field', () => {
+    expectRejected(HealResult, without(HEAL_RESULT, 'dryRun'));
+    expectRejected(HealResult, { ...HEAL_RESULT, dryRun: 'false' });
+    expectRejected(HealResult, { ...HEAL_RESULT, dryRun: 0 });
+    expectRejected(HealResult, { ...HEAL_RESULT, dryRun: null });
+  });
+
+  it('discriminates listed and completed heal result shapes', () => {
+    expectRejected(HealResult, { ...HEAL_RESULT, status: 'listed' });
+    expectRejected(HealResult, { ...listedHealResult, status: 'healed' });
+  });
+
+  it('rejects an unrecognized heal status', () => {
+    expectRejected(HealResult, { ...HEAL_RESULT, status: 'not-healed' });
   });
 });
 

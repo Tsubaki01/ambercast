@@ -92,7 +92,7 @@ export function summarizeReport(input: ReportSummaryInput): Summary {
   const classifyHeal = (result: HealResult): Classification => {
     switch (result.status) {
       case 'healed': case 'no-changes-needed': return 'passed';
-      case 'partially-healed': case 'unresolved': return 'failed'; case 'skipped': return 'skipped';
+      case 'partially-healed': case 'unresolved': return 'failed'; case 'listed': case 'skipped': return 'skipped';
       default: return assertNever(result);
     }
   };

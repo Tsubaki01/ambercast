@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { summarizeReport, type ReportSummaryInput } from '#report/summarize.js';
+import type { HealResult } from '#report/schema.js';
 
 const EMPTY = { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 };
 
@@ -56,6 +57,7 @@ describe('summarizeReport', () => {
     ['heal', 'no-changes-needed', 'passed'],
     ['heal', 'partially-healed', 'failed'],
     ['heal', 'unresolved', 'failed'],
+    ['heal', 'listed', 'skipped'],
     ['heal', 'skipped', 'skipped'],
     ['review', 'sufficient', 'passed'],
     ['review', 'insufficient', 'failed'],
@@ -67,6 +69,22 @@ describe('summarizeReport', () => {
       failed: Number(classification === 'failed'),
       errored: Number(classification === 'errored'),
       skipped: Number(classification === 'skipped'),
+    });
+  });
+
+  it('includes a listed heal result in set-based totals as skipped', () => {
+    const result: HealResult = {
+      id: 'listed-heal',
+      file: 'listed-heal.test.md',
+      status: 'listed',
+    };
+
+    expect(summarizeReport({ command: 'heal', results: [result], errors: [] })).toEqual({
+      total: 1,
+      passed: 0,
+      failed: 0,
+      errored: 0,
+      skipped: 1,
     });
   });
 
