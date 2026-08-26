@@ -12,7 +12,8 @@ import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
 import { AmbercastError } from '#core/errors/types.js';
 import { isAbsolutePath, joinPath } from '#core/paths.js';
 import { generate } from '#usecases/generate.js';
-import { normalizeReportEnvelope } from '#usecases/report-normalization.js';
+import type { FinalizedReportEnvelope } from '#usecases/report-finalization.js';
+import { finalizeReportEnvelope, isEmergencyFinalizedEnvelope } from '#usecases/report-finalization.js';
 import {
   buildGenerateReport,
   type GenerateReportOutput,
@@ -60,7 +61,7 @@ export interface GenerateCommandOutput {
   readonly exitCode: GenerateReportOutput['exitCode'];
 
   /** Structured report for either JSON serialization or text rendering. */
-  readonly envelope: GenerateReportOutput['envelope'];
+  readonly envelope: FinalizedReportEnvelope;
 }
 
 /**
@@ -79,14 +80,14 @@ export interface GenerateCommandOutput {
  * normal command invocation always resolves within the documented report and
  * exit-code contract.
  *
- * Report identity normalization occurs once at this runtime boundary after
- * report construction. The working directory is the initial project-root
- * fallback for failures before configuration resolves; successful loading
- * replaces it with `ResolvedConfig.projectRoot`. The shared normalizer rewrites
- * only `id`, `file`, `planFile`, `caseId`, `groundingFile`, and `artifactFile`,
- * then recomputes summary from the final visible identities. Both completed
- * and command-error envelopes follow one contract without rewriting messages,
- * hints, reasons, or other diagnostic text.
+ * Report finalization occurs once at this runtime boundary after report
+ * construction. The working directory is the initial project-root fallback
+ * for failures before configuration resolves; successful loading replaces it
+ * with `ResolvedConfig.projectRoot`. The shared finalizer makes public
+ * identities portable, recomputes summary from the completed report, and
+ * validates the result before either completed or command-error envelopes
+ * reach CLI consumers. Messages, hints, reasons, and other diagnostic text
+ * remain untouched.
  */
 export async function runGenerateCommand(input: GenerateCommandInput): Promise<GenerateCommandOutput> {
   let projectRoot = input.cwd;
@@ -134,12 +135,14 @@ export async function runGenerateCommand(input: GenerateCommandInput): Promise<G
     });
 
     const output = buildGenerateReport({ ...reportContext(), outcome });
-    return { ...output, envelope: normalizeReportEnvelope(output.envelope, projectRoot) };
+    const finalized = finalizeReportEnvelope(output.envelope, projectRoot);
+    return { exitCode: isEmergencyFinalizedEnvelope(finalized) ? 3 : output.exitCode, envelope: finalized };
   } catch (error) {
     const classified = error instanceof AmbercastError
       ? error
       : new UnexpectedCrashError('The generate command crashed unexpectedly.', undefined, { cause: error });
     const output = buildGenerateReport({ ...reportContext(), error: classified });
-    return { ...output, envelope: normalizeReportEnvelope(output.envelope, projectRoot) };
+    const finalized = finalizeReportEnvelope(output.envelope, projectRoot);
+    return { exitCode: isEmergencyFinalizedEnvelope(finalized) ? 3 : output.exitCode, envelope: finalized };
   }
 }

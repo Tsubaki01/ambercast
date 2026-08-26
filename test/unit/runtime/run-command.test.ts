@@ -33,6 +33,8 @@ const mocks = vi.hoisted(() => ({
   resolveAiProvider: vi.fn(),
   run: vi.fn(),
   buildRunReport: vi.fn(),
+  finalizeReportEnvelope: vi.fn(),
+  isEmergencyFinalizedEnvelope: vi.fn(),
 }));
 
 vi.mock('#adapters/ai/registry.js', () => ({
@@ -57,6 +59,10 @@ vi.mock('#runtime/create-ambercast.js', () => ({ createAmbercast: mocks.createAm
 vi.mock('#runtime/resolve-ai-provider.js', () => ({ resolveAiProvider: mocks.resolveAiProvider }));
 vi.mock('#usecases/run.js', () => ({ run: mocks.run }));
 vi.mock('#usecases/run-report.js', () => ({ buildRunReport: mocks.buildRunReport }));
+vi.mock('#usecases/report-finalization.js', () => ({
+  finalizeReportEnvelope: mocks.finalizeReportEnvelope,
+  isEmergencyFinalizedEnvelope: mocks.isEmergencyFinalizedEnvelope,
+}));
 
 const CONFIG: ResolvedConfig = {
   testDir: '/workspace/tests',
@@ -89,6 +95,21 @@ function reportOutput(exitCode: RunCommandOutput['exitCode'], errors: ReportErro
 
   expect(ReportEnvelope.safeParse(output.envelope).success).toBe(true);
   return output;
+}
+
+const rawRunEnvelopeForRendererBoundary = ReportEnvelope.parse({
+  schemaVersion: '2.0', command: 'run', startedAt: '2026-08-09T00:00:00Z', durationMs: 0,
+  summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 }, errors: [], results: [], reportPersistence: 'not-attempted',
+}) as Extract<ReportEnvelope, { command: 'run' }>;
+// @ts-expect-error The renderer-derived run output cannot carry an unbranded envelope.
+const rawRunCommandOutput: RunCommandOutput = { exitCode: 0, envelope: rawRunEnvelopeForRendererBoundary };
+void rawRunCommandOutput;
+
+function runEnvelope(output: RunCommandOutput): Extract<RunCommandOutput['envelope'], { command: 'run' }> {
+  if (output.envelope.command !== 'run') {
+    throw new Error('Expected a run report envelope.');
+  }
+  return output.envelope;
 }
 
 function input(overrides: Partial<RunCommandInput> = {}): RunCommandInput {
@@ -124,13 +145,104 @@ afterEach(() => {
   vi.doMock('#usecases/run-report.js', () => ({ buildRunReport: mocks.buildRunReport }));
 });
 
-beforeEach(() => {
+beforeEach(async () => {
+  const actual = await vi.importActual<typeof import('#usecases/report-finalization.js')>(
+    '#usecases/report-finalization.js',
+  );
+  mocks.finalizeReportEnvelope.mockImplementation(actual.finalizeReportEnvelope);
+  mocks.isEmergencyFinalizedEnvelope.mockImplementation(actual.isEmergencyFinalizedEnvelope);
   mocks.createSystemClock.mockReturnValue(createFixedClock(new Date('2026-08-09T00:00:00.000Z'), 10));
   mocks.createCryptoRandom.mockReturnValue({ uuid: () => '550e8400-e29b-41d4-a716-446655440000' });
   mocks.createProcessEnvironmentInfo.mockReturnValue({ isCI: () => false });
 });
 
 describe('runRunCommand', () => {
+  it('finalizes the persisted candidate before writing and skips the write for the emergency singleton', async () => {
+    const storage = createInMemoryStorage();
+    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => '/workspace/tests/.runs/report.json') };
+    const emergency = reportOutput(3).envelope;
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.createBrowserDriverResolver.mockReturnValue(createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
+    mocks.createEnvSecretsProvider.mockReturnValue(createFakeSecretsProvider(new Map()));
+    mocks.createNoopEventSink.mockReturnValue(createRecordingEventSink().sink);
+    mocks.createAmbercast.mockReturnValue({ storage, layout, clock: createFixedClock(new Date(), 1), discoverTestFiles: vi.fn(async () => []) });
+    mocks.run.mockResolvedValue({ results: [], noTestsFound: false, listed: [] });
+    mocks.buildRunReport.mockReturnValue(reportOutput(0));
+    mocks.finalizeReportEnvelope.mockReturnValue(emergency);
+    mocks.isEmergencyFinalizedEnvelope.mockReturnValue(true);
+    const writeText = vi.spyOn(storage, 'writeText');
+
+    await expect(runRunCommand(input())).resolves.toEqual({ exitCode: 3, envelope: emergency });
+
+    expect(mocks.finalizeReportEnvelope).toHaveBeenCalledOnce();
+    expect(mocks.finalizeReportEnvelope).toHaveBeenCalledWith(expect.objectContaining({ reportPersistence: 'persisted' }), CONFIG.projectRoot);
+    expect(writeText).not.toHaveBeenCalled();
+  });
+
+  it('finalizes the ordinary persisted-success candidate exactly once', async () => {
+    const storage = createInMemoryStorage();
+    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => '/workspace/tests/.runs/report.json') };
+    const built = reportOutput(0);
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.createBrowserDriverResolver.mockReturnValue(createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
+    mocks.createEnvSecretsProvider.mockReturnValue(createFakeSecretsProvider(new Map()));
+    mocks.createNoopEventSink.mockReturnValue(createRecordingEventSink().sink);
+    mocks.createAmbercast.mockReturnValue({ storage, layout, clock: createFixedClock(new Date(), 1), discoverTestFiles: vi.fn(async () => []) });
+    mocks.run.mockResolvedValue({ results: [], noTestsFound: false, listed: [] });
+    mocks.buildRunReport.mockReturnValue(built);
+    mocks.finalizeReportEnvelope.mockImplementation((raw) => raw);
+    mocks.isEmergencyFinalizedEnvelope.mockReturnValue(false);
+
+    await runRunCommand(input());
+
+    expect(mocks.finalizeReportEnvelope).toHaveBeenCalledTimes(1);
+    expect(mocks.finalizeReportEnvelope).toHaveBeenCalledWith(expect.objectContaining({ reportPersistence: 'persisted' }), CONFIG.projectRoot);
+  });
+
+  it('finalizes the top-level catch-all envelope before returning it', async () => {
+    const storage = createInMemoryStorage();
+    const error = new ConfigInvalidError('Configuration is invalid.');
+    const built = reportOutput(2, [{ scope: 'run', kind: 'usage', code: 'CONFIG_INVALID', message: 'Configuration is invalid.' }]);
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockRejectedValue(error);
+    mocks.buildRunReport.mockReturnValue(built);
+    mocks.finalizeReportEnvelope.mockReturnValue(built.envelope);
+    mocks.isEmergencyFinalizedEnvelope.mockReturnValue(false);
+
+    await expect(runRunCommand(input())).resolves.toEqual(built);
+
+    expect(mocks.finalizeReportEnvelope).toHaveBeenCalledOnce();
+    expect(mocks.finalizeReportEnvelope).toHaveBeenCalledWith(built.envelope, '/workspace');
+  });
+
+  it('finalizes both raw persistence candidates when writing the first candidate fails', async () => {
+    const storage = createInMemoryStorage();
+    const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => '/workspace/tests/.runs/report.json') };
+    const built = reportOutput(1);
+    const emergency = reportOutput(3).envelope;
+    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.createBrowserDriverResolver.mockReturnValue(createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
+    mocks.createEnvSecretsProvider.mockReturnValue(createFakeSecretsProvider(new Map()));
+    mocks.createNoopEventSink.mockReturnValue(createRecordingEventSink().sink);
+    mocks.createAmbercast.mockReturnValue({ storage, layout, clock: createFixedClock(new Date(), 1), discoverTestFiles: vi.fn(async () => []) });
+    mocks.run.mockResolvedValue({ results: [], noTestsFound: false, listed: [] });
+    mocks.buildRunReport.mockReturnValue(built);
+    mocks.finalizeReportEnvelope
+      .mockImplementationOnce((raw) => raw)
+      .mockReturnValueOnce(emergency);
+    mocks.isEmergencyFinalizedEnvelope.mockReturnValueOnce(false).mockReturnValueOnce(true);
+    vi.spyOn(storage, 'writeText').mockRejectedValueOnce(new Error('disk full'));
+
+    await expect(runRunCommand(input())).resolves.toEqual({ exitCode: 3, envelope: emergency });
+
+    expect(mocks.finalizeReportEnvelope).toHaveBeenCalledTimes(2);
+    expect(mocks.finalizeReportEnvelope).toHaveBeenNthCalledWith(1, expect.objectContaining({ reportPersistence: 'persisted' }), CONFIG.projectRoot);
+    expect(mocks.finalizeReportEnvelope).toHaveBeenNthCalledWith(2, expect.objectContaining({ reportPersistence: 'failed' }), CONFIG.projectRoot);
+  });
+
   it.each([
     ['active CI', true, true],
     ['active CI without cache updates', true, false],
@@ -329,7 +441,7 @@ describe('runRunCommand', () => {
     } as unknown as RunCommandOutput;
     const persistedOutput: RunCommandOutput = {
       ...output,
-      envelope: { ...output.envelope, reportPersistence: 'persisted' },
+      envelope: { ...runEnvelope(output), reportPersistence: 'persisted' },
     };
 
     mocks.createFsStorage.mockReturnValue(storage);
@@ -349,7 +461,7 @@ describe('runRunCommand', () => {
       outcome: expect.objectContaining({ results: expect.arrayContaining([expect.objectContaining({
         result: expect.objectContaining({
           id: '/workspace/tests/login.test.md',
-          steps: expect.arrayContaining([expect.objectContaining({ screenshot: `tests/.runs/${runId}/login/assert-dashboard.png` })]),
+          steps: expect.arrayContaining([expect.objectContaining({ screenshot: `${CONFIG.projectRoot}/tests/.runs/${runId}/login/assert-dashboard.png` })]),
         }),
       })]) }),
     }));
@@ -412,7 +524,7 @@ describe('runRunCommand', () => {
     } as unknown as RunCommandOutput;
     const persistedOutput: RunCommandOutput = {
       ...output,
-      envelope: { ...output.envelope, reportPersistence: 'persisted' },
+      envelope: { ...runEnvelope(output), reportPersistence: 'persisted' },
     };
 
     mocks.createFsStorage.mockReturnValue(storage);
@@ -435,7 +547,7 @@ describe('runRunCommand', () => {
       expected: 'Text "Dashboard" is visible.', actual: 'The dashboard is absent.',
     });
     expect(reportInput?.outcome?.results[0]?.result.id).toBe('/workspace/tests/login.test.md');
-    expect(reportStep).not.toHaveProperty('screenshot');
+    expect(reportStep).toHaveProperty('screenshot', '/host/diagnostics/assert-dashboard.png');
     expect(mocks.buildRunReport).not.toHaveBeenCalledWith(expect.objectContaining({ error: expect.any(Error) }));
     const persistedEnvelope = JSON.parse(await storage.readText(`${CONFIG.runsDir}/${runId}/report.json`));
     expect(persistedEnvelope.results[0].steps[0]).not.toHaveProperty('screenshot');
@@ -486,7 +598,7 @@ describe('runRunCommand', () => {
     } as unknown as RunCommandOutput;
     const persistedOutput: RunCommandOutput = {
       ...output,
-      envelope: { ...output.envelope, reportPersistence: 'persisted' },
+      envelope: { ...runEnvelope(output), reportPersistence: 'persisted' },
     };
 
     mocks.createFsStorage.mockReturnValue(storage);
@@ -502,7 +614,10 @@ describe('runRunCommand', () => {
 
     const reportInput = mocks.buildRunReport.mock.calls[0]?.[0];
     expect(reportInput?.outcome?.results[0]?.result.id).toBe('/workspace/tests/login.test.md');
-    expect(reportInput?.outcome?.results[0]?.result.steps[0]).not.toHaveProperty('screenshot');
+    expect(reportInput?.outcome?.results[0]?.result.steps[0]).toHaveProperty(
+      'screenshot',
+      `${config.runsDir}/${runId}/login/assert-dashboard.png`,
+    );
     expect(writeText).toHaveBeenCalledWith(reportPath, JSON.stringify(persistedOutput.envelope));
     expect(result).toEqual(persistedOutput);
     expect(result.envelope.results[0]).not.toHaveProperty('steps.0.screenshot');
@@ -514,7 +629,7 @@ describe('runRunCommand', () => {
     const output = reportOutput(1);
     const failedOutput: RunCommandOutput = {
       ...output,
-      envelope: { ...output.envelope, reportPersistence: 'failed' },
+      envelope: { ...runEnvelope(output), reportPersistence: 'failed' },
     };
 
     mocks.createFsStorage.mockReturnValue(storage);
@@ -548,7 +663,7 @@ describe('runRunCommand', () => {
     const failedOutput: RunCommandOutput = {
       ...output,
       exitCode: expectedExitCode,
-      envelope: { ...output.envelope, reportPersistence: 'failed' },
+      envelope: { ...runEnvelope(output), reportPersistence: 'failed' },
     };
 
     mocks.createFsStorage.mockReturnValue(storage);
@@ -615,7 +730,7 @@ describe('runRunCommand', () => {
     const output = reportOutput(semanticExitCode);
     const persistedOutput: RunCommandOutput = {
       ...output,
-      envelope: { ...output.envelope, reportPersistence: 'persisted' },
+      envelope: { ...runEnvelope(output), reportPersistence: 'persisted' },
     };
 
     mocks.createFsStorage.mockReturnValue(storage);
@@ -663,7 +778,7 @@ describe('runRunCommand', () => {
     expect(output.envelope.errors).toEqual([expect.objectContaining({
       scope: 'run', code: 'CONFIG_INVALID',
     })]);
-    expect(output.envelope.reportPersistence).toBe('not-attempted');
+    expect(runEnvelope(output).reportPersistence).toBe('not-attempted');
     expect(output.exitCode).toBe(2);
   });
 
@@ -676,7 +791,7 @@ describe('runRunCommand', () => {
     const output = reportOutput(0);
     const persistedOutput: RunCommandOutput = {
       ...output,
-      envelope: { ...output.envelope, reportPersistence: 'persisted' },
+      envelope: { ...runEnvelope(output), reportPersistence: 'persisted' },
     };
 
     mocks.createFsStorage.mockReturnValue(storage);
@@ -768,7 +883,7 @@ describe('runRunCommand', () => {
     const output = reportOutput(0);
     const persistedOutput: RunCommandOutput = {
       ...output,
-      envelope: { ...output.envelope, reportPersistence: 'persisted' },
+      envelope: { ...runEnvelope(output), reportPersistence: 'persisted' },
     };
     const grep = /login/;
     const commandEnvironment = {
@@ -871,7 +986,7 @@ describe('runRunCommand', () => {
     const output = reportOutput(0);
     const persistedOutput: RunCommandOutput = {
       ...output,
-      envelope: { ...output.envelope, reportPersistence: 'persisted' },
+      envelope: { ...runEnvelope(output), reportPersistence: 'persisted' },
     };
 
     mocks.createFsStorage.mockReturnValue(storage);
@@ -935,7 +1050,7 @@ describe('runRunCommand', () => {
     const output = reportOutput(0);
     const persistedOutput: RunCommandOutput = {
       ...output,
-      envelope: { ...output.envelope, reportPersistence: 'persisted' },
+      envelope: { ...runEnvelope(output), reportPersistence: 'persisted' },
     };
 
     mocks.createFsStorage.mockReturnValue(storage);
@@ -990,7 +1105,7 @@ describe('runRunCommand', () => {
     } as unknown as RunCommandOutput;
     const persistedOutput: RunCommandOutput = {
       ...output,
-      envelope: { ...output.envelope, reportPersistence: 'persisted' },
+      envelope: { ...runEnvelope(output), reportPersistence: 'persisted' },
     };
 
     mocks.createFsStorage.mockReturnValue(storage);
@@ -1051,7 +1166,7 @@ describe('runRunCommand', () => {
     const output = reportOutput(0);
     const persistedOutput: RunCommandOutput = {
       ...output,
-      envelope: { ...output.envelope, reportPersistence: 'persisted' },
+      envelope: { ...runEnvelope(output), reportPersistence: 'persisted' },
     };
 
     mocks.createFsStorage.mockReturnValue(storage);
@@ -1112,7 +1227,7 @@ describe('runRunCommand', () => {
     const output = await runRunCommandWithRealReport(input());
 
     expect(output.exitCode).toBe(0);
-    expect(output.envelope.reportPersistence).toBe('persisted');
+    expect(runEnvelope(output).reportPersistence).toBe('persisted');
     const persistedEnvelope = JSON.parse(await storage.readText(reportPath));
     expect(persistedEnvelope.results[0].id).toBe('identities/executed.test.md');
     expect(persistedEnvelope.results[0].file).toBe('tests/executed.test.md');
@@ -1147,7 +1262,7 @@ describe('runRunCommand', () => {
     const output = await runRunCommandWithRealReport(input({ list: true }));
 
     expect(output.exitCode).toBe(0);
-    expect(output.envelope.reportPersistence).toBe('persisted');
+    expect(runEnvelope(output).reportPersistence).toBe('persisted');
     const persistedEnvelope = JSON.parse(await storage.readText(reportPath));
     expect(persistedEnvelope.results[0].id).toBe('tests/inside.test.md');
     expect(persistedEnvelope.results[0].file).toBe('tests/inside.test.md');
@@ -1205,7 +1320,7 @@ describe('runRunCommand', () => {
     const output = await runRunCommandWithRealReport(input());
 
     expect(output.exitCode).toBe(2);
-    expect(output.envelope.reportPersistence).toBe('persisted');
+    expect(runEnvelope(output).reportPersistence).toBe('persisted');
     const persistedEnvelope = JSON.parse(await storage.readText(reportPath));
     expect(persistedEnvelope.errors[0].caseId).toBe('/elsewhere/tests/outside.test.md');
     expect(persistedEnvelope.errors[1].caseId).toBe('tests/inside.test.md');

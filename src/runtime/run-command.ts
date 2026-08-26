@@ -21,10 +21,11 @@ import { loadConfig } from '#config/load.js';
 import { ConfigInvalidError } from '#core/errors/config-invalid-error.js';
 import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
 import { AmbercastError, type ExitCode } from '#core/errors/types.js';
-import { isAbsolutePath, joinPath, relativeWithin } from '#core/paths.js';
-import { buildRunReport, type RunReportOutput } from '#usecases/run-report.js';
-import { normalizeReportEnvelope } from '#usecases/report-normalization.js';
-import { run, type RunOutcome } from '#usecases/run.js';
+import { isAbsolutePath, joinPath } from '#core/paths.js';
+import { buildRunReport } from '#usecases/run-report.js';
+import type { FinalizedReportEnvelope } from '#usecases/report-finalization.js';
+import { finalizeReportEnvelope, isEmergencyFinalizedEnvelope } from '#usecases/report-finalization.js';
+import { run } from '#usecases/run.js';
 import { createAmbercast } from './create-ambercast.js';
 import { resolveAiProvider } from './resolve-ai-provider.js';
 
@@ -52,71 +53,6 @@ function reportTimestamp(date: Date): string {
  */
 function runIdFor(startedAt: string, uuid: string): string {
   return `${startedAt.replaceAll(':', '')}-${uuid}`;
-}
-
-/**
- * Produces a report-safe replay-evidence view with schema-valid durations and
- * portable screenshot paths.
- *
- * @remarks
- * The system monotonic clock retains sub-millisecond precision for replay, but
- * the public report schema reserves duration fields for non-negative whole
- * milliseconds. Runtime leaves `RunDeps.clock` untouched and rounds only this
- * report-boundary view, preserving the use case's measurement while ensuring
- * CLI JSON always satisfies its published schema. Screenshot paths are also
- * made relative to the project root here, where a report consumer can
- * resolve them without exposing a host filesystem prefix. An uncontained path
- * is omitted from only its diagnostic step: it must never reach the report,
- * but one bad evidence field must not replace a completed replay outcome with
- * a crash report.
- *
- * Identity conversion does not belong here. The shared envelope normalizer is
- * the sole owner of `id`, `file`, `planFile`, `caseId`, `groundingFile`, and
- * `artifactFile`, and it recomputes summary after those visible keys settle.
- * Keeping duration rounding and screenshot privacy in this run-only helper
- * prevents command-independent normalization from traversing execution
- * evidence or acquiring screenshot omission policy.
- *
- * @param outcome - The completed replay outcome whose durations and optional
- * screenshots require public-report presentation policy.
- * @param projectRoot - The resolved absolute root used only to contain and
- * relativize screenshot evidence.
- * @returns A copy with finite non-negative whole-millisecond durations and
- * contained screenshot paths; an uncontained screenshot is omitted without
- * changing the case outcome.
- */
-function reportableOutcome(outcome: RunOutcome, projectRoot: string): RunOutcome {
-  return {
-    ...outcome,
-    results: outcome.results.map((caseOutcome) => ({
-      ...caseOutcome,
-      result: {
-        ...caseOutcome.result,
-        id: caseOutcome.result.id,
-        file: caseOutcome.result.file,
-        planFile: caseOutcome.result.planFile,
-        durationMs: Number.isFinite(caseOutcome.result.durationMs)
-          ? Math.max(0, Math.round(caseOutcome.result.durationMs))
-          : 0,
-        steps: caseOutcome.result.steps.map((step) => {
-          if (step.screenshot === undefined) {
-            return step;
-          }
-
-          const screenshot = relativeWithin(projectRoot, step.screenshot);
-          if (screenshot === undefined) {
-            // Do not leak a host path or let one diagnostic field crash a completed replay.
-            const withoutScreenshot = { ...step };
-            delete withoutScreenshot.screenshot;
-            return withoutScreenshot;
-          }
-
-          return { ...step, screenshot };
-        }),
-      },
-    })),
-    listed: outcome.listed,
-  };
 }
 
 /**
@@ -194,7 +130,7 @@ export interface RunCommandOutput {
   readonly exitCode: ExitCode;
 
   /** Structured report for either JSON serialization or text rendering. */
-  readonly envelope: RunReportOutput['envelope'];
+  readonly envelope: FinalizedReportEnvelope;
 }
 
 /**
@@ -224,13 +160,13 @@ export interface RunCommandOutput {
  * every case for evidence paths and then uses it for the single batch report
  * path.
  *
- * Runtime initializes the report-normalization root from `cwd` so failures
+ * Runtime initializes the report-finalization root from `cwd` so failures
  * before configuration still cross the same boundary, then replaces it with
  * `ResolvedConfig.projectRoot` after loading succeeds. Completed replay first
- * applies the run-only duration and screenshot view, then the shared envelope
- * normalizer converts approved identities and recomputes summary. The returned
- * and persisted envelopes are the same normalized value; persistence status
- * changes do not trigger a second normalization pass.
+ * finalizes the persisted candidate before writing it. The returned and
+ * persisted envelopes are the same finalized value, and an invalid candidate
+ * short-circuits before I/O so the emergency report accurately remains
+ * `not-attempted`.
  */
 export async function runRunCommand(input: RunCommandInput): Promise<RunCommandOutput> {
   let projectRoot = input.cwd;
@@ -310,26 +246,30 @@ export async function runRunCommand(input: RunCommandInput): Promise<RunCommandO
       stale: input.stale,
     });
 
-    const built = buildRunReport({ ...reportContext(), outcome: reportableOutcome(outcome, config.projectRoot) });
-    const report = { ...built, envelope: normalizeReportEnvelope(built.envelope, projectRoot) };
-    // The persisted candidate keeps an attempted write from reaching disk as not-attempted.
-    const persistedEnvelope = { ...report.envelope, reportPersistence: 'persisted' as const };
+    const built = buildRunReport({ ...reportContext(), outcome });
+    const rawPersisted = { ...built.envelope, reportPersistence: 'persisted' as const };
+    const rawFailed = { ...built.envelope, reportPersistence: 'failed' as const };
+    const finalizedPersisted = finalizeReportEnvelope(rawPersisted, projectRoot);
+    if (isEmergencyFinalizedEnvelope(finalizedPersisted)) {
+      return { exitCode: 3, envelope: finalizedPersisted };
+    }
     try {
       await ambercast.storage.writeText(
         ambercast.layout.runReportPathFor(runId),
-        JSON.stringify(persistedEnvelope),
+        JSON.stringify(finalizedPersisted),
       );
-      return { exitCode: report.exitCode, envelope: persistedEnvelope };
+      return { exitCode: built.exitCode, envelope: finalizedPersisted };
     } catch {
-      // Preserve every semantic failure's selected priority over a diagnostic write failure.
-      const envelope = { ...report.envelope, reportPersistence: 'failed' as const };
-      return { exitCode: report.exitCode === 0 ? 3 : report.exitCode, envelope };
+      const finalizedFailed = finalizeReportEnvelope(rawFailed, projectRoot);
+      const exitCode = isEmergencyFinalizedEnvelope(finalizedFailed) || built.exitCode === 0 ? 3 : built.exitCode;
+      return { exitCode, envelope: finalizedFailed };
     }
   } catch (error) {
     const classified = error instanceof AmbercastError
       ? error
       : new UnexpectedCrashError('The run command crashed unexpectedly.', undefined, { cause: error });
     const report = buildRunReport({ ...reportContext(), error: classified });
-    return { ...report, envelope: normalizeReportEnvelope(report.envelope, projectRoot) };
+    const finalized = finalizeReportEnvelope(report.envelope, projectRoot);
+    return { exitCode: isEmergencyFinalizedEnvelope(finalized) ? 3 : report.exitCode, envelope: finalized };
   }
 }

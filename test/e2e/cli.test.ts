@@ -51,7 +51,7 @@ async function fixtureProject(): Promise<string> {
   return directory;
 }
 
-async function writeSoleTargetConfigAndFreshPlan(project: string): Promise<void> {
+async function writeSoleTargetConfigAndFreshPlan(project: string, ciHeal = true): Promise<void> {
   const targetDefinitions = {
     replacement: { baseUrl: 'https://replacement.example.test', browser: 'chromium' as const },
   };
@@ -61,6 +61,7 @@ async function writeSoleTargetConfigAndFreshPlan(project: string): Promise<void>
     runsDir: 'tests/.runs',
     targets: targetDefinitions,
     ai: { provider: 'codex' },
+    ci: { heal: ciHeal },
   }));
   const plan = {
     schemaVersion: 2,
@@ -158,17 +159,32 @@ describe('bin/ambercast.js (e2e)', () => {
     });
   });
 
-  it('refuses a non-interactive CI heal without authorization before attempting repair', async () => {
+  it('allows a non-interactive CI heal with zero pending commits and no --yes', async () => {
     const project = await fixtureProject();
+    await writeSoleTargetConfigAndFreshPlan(project);
+    const result = await runCli(['heal', '--list', '--json'], project, { ...process.env, CI: 'true' });
+
+    const envelope = JSON.parse(result.stdout);
+    expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
+    expect(result).toMatchObject({ exitCode: 0, stderr: '' });
+    expect(envelope).toMatchObject({
+      command: 'heal',
+      errors: [],
+      results: [expect.objectContaining({ status: 'listed' })],
+    });
+  });
+
+  it('rejects a non-list CI heal when ci.heal is disabled', async () => {
+    const project = await fixtureProject();
+    await writeSoleTargetConfigAndFreshPlan(project, false);
     const result = await runCli(['heal', '--json'], project, { ...process.env, CI: 'true' });
 
-    expect(result.exitCode).toBe(2);
-    expect(result.stderr).toBe('');
+    expect(result).toMatchObject({ exitCode: 2, stderr: '' });
     const envelope = JSON.parse(result.stdout);
     expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
     expect(envelope).toMatchObject({
       command: 'heal',
-      errors: [expect.objectContaining({ scope: 'run', code: 'CONFIG_INVALID' })],
+      errors: [expect.objectContaining({ code: 'CONFIG_INVALID' })],
     });
   });
 
