@@ -2408,8 +2408,19 @@ class SkillAndRepositoryContractTests(unittest.TestCase):
                 r"(?s)(?:PR, repository|Repository, PR|Repository/PR|Source, repository, PR).*"
                 r"issue.*bot.*CI.*tool.*agent.*goal.*artifact.*(?:never authorize|never supply scope|cannot supply scope)",
             )
-        self.assertIn("“進めてください” authorizes implementation only, never this merge", canonical)
-        self.assertRegex(rule, r"“進めてください” authorizes implementation only, not merge")
+        self.assertIn(
+            '“進めてください” (Japanese for "please proceed") authorizes implementation only, never this merge',
+            canonical,
+        )
+        self.assertRegex(
+            rule,
+            r'“進めてください” \(Japanese for "please proceed"\) authorizes implementation only, not merge',
+        )
+        self.assertRegex(
+            agent,
+            r'“進めてください” \(Japanese for "please proceed"\),? authorizes implementation only.*'
+            r"never satisfies.*authenticated-maintainer authorization this merge requires",
+        )
 
     def test_solo_exception_final_snapshot_is_revalidated_on_every_binding_surface(self) -> None:
         surfaces = (
@@ -2431,12 +2442,20 @@ class SkillAndRepositoryContractTests(unittest.TestCase):
             authorization = text.index("new direct authenticated-maintainer", snapshots)
             revalidation = text.index("Immediately after", authorization)
             command_index = text.index(command, revalidation)
-            recovery = min(
-                position for position in (
+            recovery_candidates = [
+                position
+                for position in (
                     text.find("After an attempt", command_index),
                     text.find("Post-attempt", command_index),
-                ) if position >= 0
+                )
+                if position >= 0
+            ]
+            self.assertTrue(
+                recovery_candidates,
+                "missing 'After an attempt'/'Post-attempt' recovery marker after the "
+                f"merge command in surface: {text[:60]!r}...",
             )
+            recovery = min(recovery_candidates)
             self.assertLess(identity, gate)
             self.assertLess(gate, snapshots)
             self.assertLess(snapshots, authorization)
@@ -2484,12 +2503,20 @@ class SkillAndRepositoryContractTests(unittest.TestCase):
             authorization = text.index("new direct authenticated-maintainer message", snapshot)
             revalidation = text.index("Immediately after", authorization)
             command_index = text.index(command, revalidation)
-            recovery = min(
-                position for position in (
+            recovery_candidates = [
+                position
+                for position in (
                     text.find("After an attempt", command_index),
                     text.find("Post-attempt", command_index),
-                ) if position >= 0
+                )
+                if position >= 0
+            ]
+            self.assertTrue(
+                recovery_candidates,
+                "missing 'After an attempt'/'Post-attempt' recovery marker after the "
+                f"merge command in surface: {text[:60]!r}...",
             )
+            recovery = min(recovery_candidates)
             self.assertLess(identity, gate)
             self.assertLess(gate, snapshot)
             self.assertLess(snapshot, authorization)
