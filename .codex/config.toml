@@ -1,3 +1,7 @@
+approval_policy = "on-request"
+approvals_reviewer = "auto_review"
+default_permissions = ":workspace"
+
 [agents]
 enabled = true
 max_concurrent_threads_per_session = 8
@@ -7,3 +11,4 @@ interrupt_message = true
 
 [features]
 hooks = true
+goals = true
