@@ -309,6 +309,7 @@ describe('runHealCommand', () => {
     ['--yes + non-interactive', { yes: true }, false, false],
     ['--dry-run', { dryRun: true }, false, false],
     ['interactive reader available', {}, true, false],
+    ['CI non-interactive', {}, false, true],
   ] as const)('skips confirmation for an empty commits map with %s', async (_name, flags, interactive, isCI) => {
     const unchanged = outcome({ results: [caseResult('unchanged.test.md', { status: 'no-changes-needed' })] });
     const readConfirmationAnswer = vi.fn(async () => true);

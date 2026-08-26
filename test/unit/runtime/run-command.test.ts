@@ -220,7 +220,8 @@ describe('runRunCommand', () => {
   it('finalizes both raw persistence candidates when writing the first candidate fails', async () => {
     const storage = createInMemoryStorage();
     const layout = { planPathFor: vi.fn(), groundingPathFor: vi.fn(), runReportPathFor: vi.fn(() => '/workspace/tests/.runs/report.json') };
-    const built = reportOutput(0);
+    const built = reportOutput(1);
+    const emergency = reportOutput(3).envelope;
     mocks.createFsStorage.mockReturnValue(storage);
     mocks.loadConfig.mockResolvedValue(CONFIG);
     mocks.createBrowserDriverResolver.mockReturnValue(createFakeBrowserDriver(() => createFakeBrowserSession(new Map())));
@@ -229,11 +230,13 @@ describe('runRunCommand', () => {
     mocks.createAmbercast.mockReturnValue({ storage, layout, clock: createFixedClock(new Date(), 1), discoverTestFiles: vi.fn(async () => []) });
     mocks.run.mockResolvedValue({ results: [], noTestsFound: false, listed: [] });
     mocks.buildRunReport.mockReturnValue(built);
-    mocks.finalizeReportEnvelope.mockImplementation((raw) => raw);
-    mocks.isEmergencyFinalizedEnvelope.mockReturnValue(false);
+    mocks.finalizeReportEnvelope
+      .mockImplementationOnce((raw) => raw)
+      .mockReturnValueOnce(emergency);
+    mocks.isEmergencyFinalizedEnvelope.mockReturnValueOnce(false).mockReturnValueOnce(true);
     vi.spyOn(storage, 'writeText').mockRejectedValueOnce(new Error('disk full'));
 
-    await runRunCommand(input());
+    await expect(runRunCommand(input())).resolves.toEqual({ exitCode: 3, envelope: emergency });
 
     expect(mocks.finalizeReportEnvelope).toHaveBeenCalledTimes(2);
     expect(mocks.finalizeReportEnvelope).toHaveBeenNthCalledWith(1, expect.objectContaining({ reportPersistence: 'persisted' }), CONFIG.projectRoot);

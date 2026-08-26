@@ -261,7 +261,8 @@ export async function runRunCommand(input: RunCommandInput): Promise<RunCommandO
       return { exitCode: built.exitCode, envelope: finalizedPersisted };
     } catch {
       const finalizedFailed = finalizeReportEnvelope(rawFailed, projectRoot);
-      return { exitCode: built.exitCode === 0 ? 3 : built.exitCode, envelope: finalizedFailed };
+      const exitCode = isEmergencyFinalizedEnvelope(finalizedFailed) || built.exitCode === 0 ? 3 : built.exitCode;
+      return { exitCode, envelope: finalizedFailed };
     }
   } catch (error) {
     const classified = error instanceof AmbercastError
