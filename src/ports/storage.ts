@@ -4,31 +4,61 @@
  */
 
 /**
- * Storage operations for ambercast artifacts and run data.
+ * Read-only storage operations for ambercast artifacts.
  *
- * Text operations always use UTF-8. Paths and directory names are opaque
- * strings: this port does not resolve `.` or `..`, or canonicalize separators,
- * so callers must supply paths already valid for their chosen layout.
+ * Consumers that only inspect committed inputs use this narrower port so
+ * their dependency boundary cannot acquire mutation authority incidentally.
+ *
+ * Text operations use UTF-8. Paths are opaque strings: this port does not
+ * resolve `.` or `..`, or canonicalize separators, so callers must supply
+ * paths already valid for their chosen layout.
  *
  * @remarks
  * Path construction belongs to the layout resolver. Keeping this boundary as
  * a thin I/O primitive avoids creating a second, potentially divergent set of
  * path-normalization rules in every storage adapter.
  *
- * Names starting with `.ambercast-tmp-` are reserved by the Storage layer for
- * staging. Implementations that stage writes use this prefix, and callers must
- * not create paths using it. The prefix may appear in `listFiles` results and,
- * after abrupt termination of a write, may persist; callers must ignore it.
+ * `StorageAdapter` extends this interface: the explicit hierarchy documents
+ * that relationship and makes TypeScript reject a full storage contract that
+ * drifts from its read capability, rather than relying on matching `Pick`
+ * expressions at unrelated call sites.
+ *
  */
-export interface StorageAdapter {
+export interface ReadStorageAdapter {
   /**
-   * Reads a UTF-8 regular file.
+   * Reads a regular file as UTF-8 text.
    *
    * @param path - Opaque path of the file to read.
-   * @returns The decoded text content.
-   * @throws An `Error` if `path` is missing or names a directory.
+   * @returns The decoded file text.
+   * @throws An `Error` if the path is missing, names a directory, or cannot be
+   * read.
    */
   readText(path: string): Promise<string>;
+
+  /**
+   * Determines whether a path names an existing regular file.
+   *
+   * @param path - Opaque path to inspect.
+   * @returns `true` only for an existing regular file; missing paths,
+   * directories, and inspection failures return `false`.
+   */
+  exists(path: string): Promise<boolean>;
+}
+
+/**
+ * Storage operations for ambercast artifacts and run data.
+ *
+ * @remarks
+ * This extends `ReadStorageAdapter` instead of repeating its read members.
+ * That first-class hierarchy keeps capability narrowing self-documenting and
+ * gives compile-time drift protection if the read contract changes.
+ *
+ * Names starting with `.ambercast-tmp-` are reserved for write staging.
+ * Implementations that stage writes use this prefix, and callers must not
+ * create paths using it. The prefix may appear in `listFiles` results and,
+ * after abrupt termination of a write, may persist; callers must ignore it.
+ */
+export interface StorageAdapter extends ReadStorageAdapter {
 
   /**
    * Writes UTF-8 text to a file with atomic visibility.
@@ -92,15 +122,6 @@ export interface StorageAdapter {
    * and deployers, not a runtime-checked invariant.
    */
   writeBinary(path: string, content: Uint8Array): Promise<void>;
-
-  /**
-   * Checks whether a path names a regular file.
-   *
-   * @param path - Opaque path to inspect.
-   * @returns `true` only for an existing regular file. Missing paths and
-   * directories both resolve to `false`; this method never rejects.
-   */
-  exists(path: string): Promise<boolean>;
 
   /**
    * Lists regular files directly inside a directory.

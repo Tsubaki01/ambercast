@@ -3,7 +3,7 @@ import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { ConfigInvalidError } from '#core/errors/config-invalid-error.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
-import { computeInputsDigest } from '#core/ir/digest.js';
+import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import type { JsonValueT, PlanDocument } from '#core/ir/schema.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
@@ -13,14 +13,14 @@ import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js
 
 const mocks = vi.hoisted(() => ({
   loadConfig: vi.fn(),
-  createFsStorage: vi.fn(),
+  createFsReadStorage: vi.fn(),
   createFsTestFileDiscovery: vi.fn(),
   check: vi.fn(),
   buildCheckReport: vi.fn(),
 }));
 
 vi.mock('#config/load.js', () => ({ loadConfig: mocks.loadConfig }));
-vi.mock('#adapters/storage/fs-storage.js', () => ({ createFsStorage: mocks.createFsStorage }));
+vi.mock('#adapters/storage/fs-read-storage.js', () => ({ createFsReadStorage: mocks.createFsReadStorage }));
 vi.mock('#runtime/test-file-discovery.js', () => ({ createFsTestFileDiscovery: mocks.createFsTestFileDiscovery }));
 vi.mock('#usecases/check.js', async (importOriginal) => ({
   ...await importOriginal<typeof import('#usecases/check.js')>(),
@@ -42,6 +42,7 @@ const CONFIG: ResolvedConfig = {
   ai: { provider: 'auto', timeoutMs: 120_000 },
   viewer: { port: 4600 },
   ci: { heal: false, updateGroundingCache: false },
+  grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
 };
 
 function input(overrides: Partial<CheckCommandInput> = {}): CheckCommandInput {
@@ -62,9 +63,57 @@ async function useRealCheckComposition(): Promise<void> {
 }
 
 describe('runCheckCommand', () => {
+  it('returns identities relative to the config-resolved root rather than cwd', async () => {
+    const storage = createInMemoryStorage();
+    const projectRoot = '/workspace/config-parent';
+    const cwd = `${projectRoot}/nested-cwd`;
+    const output = {
+      exitCode: 5 as const,
+      envelope: { schemaVersion: '2.0' as const, command: 'check' as const, startedAt: '2026-08-01T00:00:00Z', durationMs: 1, summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 }, errors: [], results: [{ id: `${cwd}/tests/login.test.md`, file: `${cwd}/tests/login.test.md`, planFile: `${cwd}/tests/login.ambercast.plan.json`, status: 'fresh', reason: 'fresh' }] },
+    };
+    mocks.createFsReadStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue({ ...CONFIG, projectRoot, testDir: `${projectRoot}/tests`, runsDir: `${projectRoot}/tests/.runs` });
+    mocks.createFsTestFileDiscovery.mockReturnValue(async () => []);
+    mocks.check.mockResolvedValue({ results: [], errors: [], noTestsFound: true });
+    mocks.buildCheckReport.mockReturnValue(output);
+
+    const returned = await runCheckCommand(input({ cwd }));
+
+    expect(returned.envelope.results).toMatchObject([{
+      id: 'nested-cwd/tests/login.test.md',
+      file: 'nested-cwd/tests/login.test.md',
+      planFile: 'nested-cwd/tests/login.ambercast.plan.json',
+    }]);
+    expect(returned.envelope.results[0]).not.toMatchObject({ id: `${cwd}/tests/login.test.md` });
+    expect(returned.envelope.results[0]).not.toMatchObject({ id: 'tests/login.test.md' });
+  });
+
+  it('uses cwd as project root after a successful no-config resolution', async () => {
+    const storage = createInMemoryStorage();
+    const cwd = '/workspace/no-config-project';
+    const config = { ...CONFIG, projectRoot: cwd, testDir: `${cwd}/tests`, runsDir: `${cwd}/tests/.runs` };
+    const output = { exitCode: 0 as const, envelope: { schemaVersion: '2.0', command: 'check', startedAt: '2026-08-01T00:00:00Z', durationMs: 1, summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 }, errors: [], results: [{ id: `${cwd}/tests/login.test.md`, file: `${cwd}/tests/login.test.md`, planFile: `${cwd}/tests/login.ambercast.plan.json`, status: 'fresh', reason: 'fresh' }] } };
+    mocks.createFsReadStorage.mockReturnValue(storage);
+    mocks.loadConfig.mockResolvedValue(config);
+    mocks.createFsTestFileDiscovery.mockReturnValue(async () => []);
+    mocks.check.mockResolvedValue({ results: [], errors: [], noTestsFound: false });
+    mocks.buildCheckReport.mockReturnValue(output);
+
+    const returned = await runCheckCommand(input({ cwd }));
+
+    expect(config.projectRoot).toBe(cwd);
+    expect(mocks.loadConfig).toHaveBeenCalledWith(expect.objectContaining({ cwd }));
+    expect(mocks.loadConfig.mock.calls[0]?.[0]).not.toHaveProperty('configPathOverride');
+    expect(returned.envelope.results).toMatchObject([{
+      id: 'tests/login.test.md',
+      file: 'tests/login.test.md',
+      planFile: 'tests/login.ambercast.plan.json',
+    }]);
+  });
+
   it('translates a configuration-load failure into a run-scoped report', async () => {
     await useRealCheckComposition();
-    mocks.createFsStorage.mockReturnValue(createInMemoryStorage());
+    mocks.createFsReadStorage.mockReturnValue(createInMemoryStorage());
     mocks.loadConfig.mockRejectedValue(new ConfigInvalidError('invalid config'));
 
     await expect(runCheckCommand(input())).resolves.toMatchObject({
@@ -98,7 +147,12 @@ describe('runCheckCommand', () => {
     } as unknown as PlanDocument;
     await storage.writeText(testPath, prompt);
     await storage.writeText(layout.planPathFor(testPath), toCanonicalArtifactText(plan as unknown as JsonValueT));
-    mocks.createFsStorage.mockReturnValue(storage);
+    await storage.writeText(layout.groundingPathFor(testPath), toCanonicalArtifactText({
+      schemaVersion: 1,
+      planDigest: computePlanDigest(plan),
+      entries: {},
+    }));
+    mocks.createFsReadStorage.mockReturnValue(storage);
     mocks.loadConfig.mockResolvedValue(CONFIG);
     mocks.createFsTestFileDiscovery.mockReturnValue(async () => []);
 
@@ -109,9 +163,9 @@ describe('runCheckCommand', () => {
       summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 },
       errors: [],
       results: [{
-        id: testPath,
-        file: testPath,
-        planFile: layout.planPathFor(testPath),
+        id: 'tests/login.test.md',
+        file: 'tests/login.test.md',
+        planFile: 'tests/login.ambercast.plan.json',
         status: 'fresh',
       }],
     });
@@ -135,7 +189,7 @@ describe('runCheckCommand', () => {
     const report = {
       exitCode: 0 as const,
       envelope: {
-        schemaVersion: '1.0' as const,
+        schemaVersion: '2.0' as const,
         command: 'check' as const,
         startedAt: '2026-08-17T00:00:00Z',
         durationMs: 0,
@@ -144,7 +198,7 @@ describe('runCheckCommand', () => {
         results: [],
       },
     };
-    mocks.createFsStorage.mockReturnValue(storage);
+    mocks.createFsReadStorage.mockReturnValue(storage);
     mocks.loadConfig.mockResolvedValue(config);
     mocks.createFsTestFileDiscovery.mockReturnValue(discoverTestFiles);
     mocks.check.mockResolvedValue(outcome);
@@ -183,7 +237,7 @@ describe('runCheckCommand', () => {
 
   it('wraps an unclassified composition failure as an unexpected-crash report', async () => {
     await useRealCheckComposition();
-    mocks.createFsStorage.mockReturnValue(createInMemoryStorage());
+    mocks.createFsReadStorage.mockReturnValue(createInMemoryStorage());
     mocks.loadConfig.mockResolvedValue(CONFIG);
     mocks.createFsTestFileDiscovery.mockReturnValue(async () => []);
     mocks.check.mockRejectedValue(new Error('unclassified failure'));

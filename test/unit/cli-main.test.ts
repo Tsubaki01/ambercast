@@ -3,13 +3,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ReportEnvelope } from '#report/schema.js';
 import type { GenerateCommandInput } from '#runtime/generate-command.js';
 import type { CheckCommandInput } from '#runtime/check-command.js';
+import type { HealCommandInput } from '#runtime/heal-command.js';
 
 const runGenerateCommand = vi.hoisted(() => vi.fn());
 const runRunCommand = vi.hoisted(() => vi.fn());
 const runCheckCommand = vi.hoisted(() => vi.fn());
+const runHealCommand = vi.hoisted(() => vi.fn());
 vi.mock('#runtime/generate-command.js', () => ({ runGenerateCommand }));
 vi.mock('#runtime/run-command.js', () => ({ runRunCommand }));
 vi.mock('#runtime/check-command.js', () => ({ runCheckCommand }));
+vi.mock('#runtime/heal-command.js', () => ({ runHealCommand }));
 
 import { main, REPORT_PERSISTENCE_FAILED_WARNING } from '../../src/cli/main.js';
 
@@ -27,7 +30,7 @@ class MemoryWritable extends Writable {
 }
 
 const ENVELOPE = {
-  schemaVersion: '1.0' as const,
+  schemaVersion: '2.0' as const,
   command: 'generate' as const,
   startedAt: '2026-08-08T00:00:00Z',
   durationMs: 0,
@@ -37,7 +40,7 @@ const ENVELOPE = {
 };
 
 const RUN_ENVELOPE = {
-  schemaVersion: '1.0' as const,
+  schemaVersion: '2.0' as const,
   command: 'run' as const,
   startedAt: '2026-08-09T00:00:00Z',
   durationMs: 0,
@@ -48,7 +51,7 @@ const RUN_ENVELOPE = {
 };
 
 const CHECK_ENVELOPE = {
-  schemaVersion: '1.0' as const,
+  schemaVersion: '2.0' as const,
   command: 'check' as const,
   startedAt: '2026-08-17T00:00:00Z',
   durationMs: 0,
@@ -72,6 +75,16 @@ const CHECK_ENVELOPE = {
   ],
 };
 
+const HEAL_ENVELOPE = {
+  schemaVersion: '2.0' as const,
+  command: 'heal' as const,
+  startedAt: '2026-08-25T00:00:00Z',
+  durationMs: 0,
+  summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 },
+  errors: [],
+  results: [],
+};
+
 let cwdSpy: ReturnType<typeof vi.spyOn> | undefined;
 let initialExitCode: typeof process.exitCode;
 
@@ -87,6 +100,7 @@ afterEach(() => {
   runGenerateCommand.mockReset();
   runRunCommand.mockReset();
   runCheckCommand.mockReset();
+  runHealCommand.mockReset();
 });
 
 async function run(argv: readonly string[]) {
@@ -99,6 +113,43 @@ async function run(argv: readonly string[]) {
 }
 
 describe('main()', () => {
+  it('renders skipped rows as non-healthy without fabricating execution or inspection evidence', async () => {
+    runCheckCommand.mockResolvedValue({
+      exitCode: 3,
+      envelope: {
+        schemaVersion: '2.0', command: 'check', startedAt: '2026-08-17T00:00:00Z', durationMs: 0,
+        summary: { total: 1, passed: 0, failed: 0, errored: 0, skipped: 1 },
+        errors: [{ scope: 'run', kind: 'environment', code: 'INTERRUPTED', message: 'The command was interrupted before all discovered cases reached a terminal state.' }],
+        results: [{ id: 'pending.test.md', file: 'pending.test.md', status: 'skipped' }],
+      },
+    } as never);
+
+    const result = await run(['check', '--no-color']);
+
+    expect(result.stdout).toContain('skipped pending.test.md');
+    expect(result.stdout).not.toContain('fresh');
+    expect(result.stdout).not.toContain('duration');
+    expect(result.stdout).not.toContain('inspection');
+    expect(result.exitCode).toBe(3);
+  });
+
+  it('renders the fixed orphan-grounding reason without exposing its artifact path', async () => {
+    const artifactPath = '/workspace/tests/private/deleted.ambercast.grounding.json';
+    runCheckCommand.mockResolvedValue({
+      exitCode: 4,
+      envelope: {
+        schemaVersion: '2.0', command: 'check', startedAt: '2026-08-17T00:00:00Z', durationMs: 0,
+        summary: { total: 1, passed: 0, failed: 1, errored: 0, skipped: 0 }, errors: [],
+        results: [{ id: 'deleted.test.md', file: 'deleted.test.md', planFile: 'deleted.ambercast.plan.json', groundingFile: artifactPath, status: 'orphaned-grounding', reason: 'No corresponding test file exists for this grounding artifact.' }],
+      },
+    } as never);
+
+    const result = await run(['check', '--no-color']);
+
+    expect(result.stdout).toContain('No corresponding test file exists for this grounding artifact.');
+    expect(result.stdout).not.toContain(artifactPath);
+  });
+
   it('prints usage and exits 0 when no command is supplied', async () => {
     const result = await run([]);
 
@@ -251,6 +302,7 @@ describe('main()', () => {
       '--headed',
       '--json',
       '--cache-only',
+      '--update-cache',
       '--stale',
       'regenerate',
       '--ai',
@@ -263,6 +315,7 @@ describe('main()', () => {
       target: 'web',
       headed: true,
       cacheOnly: true,
+      updateCache: true,
       stale: 'regenerate',
       aiProviderOverride: 'claude',
     }));
@@ -313,7 +366,26 @@ describe('main()', () => {
 
     await run(['run', '--stale', 'fail']);
 
-    expect(runRunCommand).toHaveBeenCalledWith(expect.objectContaining({ stale: 'fail' }));
+    expect(runRunCommand).toHaveBeenCalledWith(expect.objectContaining({ stale: 'fail', updateCache: false }));
+  });
+
+  it('renders --update-cache in the actual usage text', async () => {
+    const result = await run(['--help']);
+
+    expect(result.stdout).toContain('--update-cache');
+  });
+
+  it.each(['generate', 'check'] as const)('rejects --update-cache for %s before runtime composition', async (command) => {
+    const result = await run([command, '--update-cache']);
+
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain(`Unknown ${command} option: --update-cache.`);
+    expect(result.exitCode).toBe(2);
+    if (command === 'generate') {
+      expect(runGenerateCommand).not.toHaveBeenCalled();
+    } else {
+      expect(runCheckCommand).not.toHaveBeenCalled();
+    }
   });
 
   it.each([
@@ -390,7 +462,7 @@ describe('main()', () => {
     const result = await run(['run', '--help']);
 
     expect(result.stdout).toMatch(/run \[files\.\.\.\].*replay deterministic plans/i);
-    const runOptions = result.stdout.slice(result.stdout.indexOf('Run options:'));
+    const runOptions = result.stdout.slice(result.stdout.indexOf('Run options:'), result.stdout.indexOf('Check options:'));
     expect(runOptions).toContain('--stale <fail>');
     expect(runOptions).toContain('--no-color');
     expect(runOptions).not.toContain('--stale <fail|regenerate>');
@@ -460,6 +532,7 @@ describe('main()', () => {
     '--headed',
     '--cache-only',
     '--stale',
+    '--update-cache',
   ] as const)('rejects the generate/run-only %s flag before runtime composition', async (flag) => {
     const result = await run(['check', flag]);
 
@@ -512,6 +585,26 @@ describe('main()', () => {
     expect(result.exitCode).toBe(4);
   });
 
+  it('renders the uncommitted grounding waiver as a healthy green check row', async () => {
+    runCheckCommand.mockResolvedValue({
+      exitCode: 0,
+      envelope: {
+        ...CHECK_ENVELOPE,
+        summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 },
+        results: [{
+          id: 'fresh.test.md', file: 'fresh.test.md', planFile: 'fresh.ambercast.plan.json',
+          status: 'fresh-without-grounding',
+          reason: "The plan is fresh; a grounding cache is not required by this project's repository policy.",
+        }],
+      },
+    } as never);
+
+    const result = await run(['check']);
+
+    expect(result.stdout).toContain('\u001B[32mfresh-without-grounding\u001B[0m fresh.test.md');
+    expect(result.exitCode).toBe(0);
+  });
+
   it('passes a check runtime exit code through unchanged', async () => {
     runCheckCommand.mockResolvedValue({ exitCode: 3, envelope: { ...CHECK_ENVELOPE, errors: [{
       scope: 'case', kind: 'environment', code: 'FS_IO_ERROR', caseId: 'broken.test.md', message: 'read failed',
@@ -525,5 +618,108 @@ describe('main()', () => {
     } satisfies Partial<CheckCommandInput>));
     expect(result.stdout).not.toContain('\u001B[');
     expect(result.exitCode).toBe(3);
+  });
+
+  it.each([
+    ['dry-run', ['heal', '--dry-run'], { dryRun: true }],
+    ['target', ['heal', '--target', 'web'], { target: 'web' }],
+    ['Claude provider', ['heal', '--ai', 'claude'], { aiProviderOverride: 'claude' }],
+    ['Codex provider', ['heal', '--ai', 'codex'], { aiProviderOverride: 'codex' }],
+    ['allow-empty', ['heal', '--allow-empty'], { allowEmpty: true }],
+    ['list', ['heal', '--list'], { list: true }],
+  ] as const)('parses the documented heal %s flag', async (_description, argv, expectedInput) => {
+    runHealCommand.mockResolvedValue({ exitCode: 0, envelope: HEAL_ENVELOPE });
+
+    await run(argv);
+
+    expect(runHealCommand).toHaveBeenCalledWith(expect.objectContaining(expectedInput));
+  });
+
+  it('treats --yes and -y as interchangeable through the real heal parser', async () => {
+    runHealCommand.mockResolvedValue({ exitCode: 0, envelope: HEAL_ENVELOPE });
+
+    await run(['heal', '--yes']);
+    const longForm = runHealCommand.mock.calls[0]?.[0] as HealCommandInput;
+    runHealCommand.mockClear();
+
+    await run(['heal', '-y']);
+    const shortForm = runHealCommand.mock.calls[0]?.[0] as HealCommandInput;
+
+    expect(longForm).toMatchObject({ yes: true });
+    expect(shortForm).toMatchObject({ yes: true });
+    expect({ ...shortForm, signal: undefined }).toEqual({ ...longForm, signal: undefined });
+  });
+
+  it('passes literal heal paths and option-shaped paths after -- to runtime', async () => {
+    runHealCommand.mockResolvedValue({ exitCode: 0, envelope: HEAL_ENVELOPE });
+
+    await run(['heal', 'login.test.md', 'checkout.test.md']);
+    expect(runHealCommand).toHaveBeenLastCalledWith(expect.objectContaining({
+      files: ['login.test.md', 'checkout.test.md'],
+    }));
+
+    await run(['heal', '--', '--not-an-option.test.md']);
+    expect(runHealCommand).toHaveBeenLastCalledWith(expect.objectContaining({
+      files: ['--not-an-option.test.md'],
+    }));
+  });
+
+  it.each([
+    ['unknown heal flag even with JSON requested', ['heal', '--json', '--unknown']],
+    ['missing target value', ['heal', '--target']],
+    ['missing AI provider value', ['heal', '--ai']],
+    ['unsupported provider', ['heal', '--ai', 'other']],
+  ] as const)('writes plain usage to stderr and exits 2 for %s', async (_description, argv) => {
+    const result = await run(argv);
+
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/usage|unknown|missing|must be/i);
+    expect(result.stderr.trim().startsWith('{')).toBe(false);
+    expect(result.exitCode).toBe(2);
+    expect(runHealCommand).not.toHaveBeenCalled();
+  });
+
+  it('short-circuits command-local heal help before calling runtime', async () => {
+    const result = await run(['heal', '--help']);
+
+    expect(result.stdout).toMatch(/heal \[files\.\.\.\].*repair deterministic plans/i);
+    expect(result.stdout).toContain('--yes, -y');
+    expect(result.stderr).toBe('');
+    expect(result.exitCode).toBe(0);
+    expect(runHealCommand).not.toHaveBeenCalled();
+  });
+
+  it('renders exactly one JSON heal envelope and forwards target selection to runtime', async () => {
+    runHealCommand.mockResolvedValue({ exitCode: 1, envelope: HEAL_ENVELOPE });
+
+    const result = await run(['heal', '--json', '--target', 'web']);
+
+    expect(runHealCommand).toHaveBeenCalledWith(expect.objectContaining({
+      target: 'web',
+    } satisfies Partial<HealCommandInput>));
+    expect(ReportEnvelope.parse(JSON.parse(result.stdout))).toEqual(HEAL_ENVELOPE);
+    expect(result.stderr).toBe('');
+    expect(result.exitCode).toBe(1);
+  });
+
+  it('disables ANSI styling for human heal output with --no-color', async () => {
+    runHealCommand.mockResolvedValue({
+      exitCode: 1,
+      envelope: {
+        ...HEAL_ENVELOPE,
+        summary: { total: 1, passed: 0, failed: 1, errored: 0, skipped: 0 },
+        results: [{
+          id: 'login.test.md', file: 'login.test.md', planFile: 'login.ambercast.plan.json',
+          status: 'unresolved', steps: [], explanation: 'The repair did not resolve the case.',
+          durationMs: 0, dryRun: false,
+        }],
+      },
+    });
+
+    const result = await run(['heal', '--no-color']);
+
+    expect(runHealCommand).toHaveBeenCalledOnce();
+    expect(result.stdout).toContain('unresolved login.test.md');
+    expect(result.stdout).not.toMatch(/\u001B\[/);
   });
 });

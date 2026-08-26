@@ -43,16 +43,17 @@ const CONFIG: ResolvedConfig = {
   ai: { provider: 'auto', timeoutMs: 120_000 },
   viewer: { port: 4600 },
   ci: { heal: false, updateGroundingCache: false },
+  grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
 };
 
 function reportOutput(
   exitCode: GenerateCommandOutput['exitCode'],
   errors: ReportError[] = [],
 ): GenerateCommandOutput {
-  const output: GenerateCommandOutput = {
+  const output = {
     exitCode,
     envelope: {
-      schemaVersion: '1.0',
+      schemaVersion: '2.0' as const,
       command: 'generate',
       startedAt: '2026-08-08T00:00:00Z',
       durationMs: 1,
@@ -60,7 +61,7 @@ function reportOutput(
       errors,
       results: [],
     },
-  };
+  } as unknown as GenerateCommandOutput;
 
   expect(ReportEnvelope.safeParse(output.envelope).success).toBe(true);
   return output;
@@ -115,6 +116,50 @@ beforeEach(() => {
 });
 
 describe('runGenerateCommand', () => {
+  it('returns identities relative to the config-resolved root rather than cwd', async () => {
+    const { output } = arrangeSuccessfulCommand('codex', 'codex');
+    const projectRoot = '/workspace/config-parent';
+    const cwd = `${projectRoot}/nested-cwd`;
+    const rawEnvelope = {
+      ...output.envelope,
+      schemaVersion: '2.0',
+      results: [{ id: `${cwd}/tests/login.test.md`, file: `${cwd}/tests/login.test.md`, planFile: `${cwd}/tests/login.ambercast.plan.json`, status: 'generated', dryRun: false, ambiguities: [] }],
+      summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 },
+    } as unknown as GenerateCommandOutput['envelope'];
+    mocks.loadConfig.mockResolvedValue({ ...CONFIG, projectRoot, testDir: `${projectRoot}/tests`, runsDir: `${projectRoot}/tests/.runs` });
+    mocks.buildGenerateReport.mockReturnValue({ ...output, envelope: rawEnvelope });
+
+    const returned = await runGenerateCommand(input({ cwd }));
+
+    expect(returned.envelope.results).toMatchObject([{
+      id: 'nested-cwd/tests/login.test.md',
+      file: 'nested-cwd/tests/login.test.md',
+      planFile: 'nested-cwd/tests/login.ambercast.plan.json',
+    }]);
+    expect(returned.envelope.results[0]).not.toMatchObject({ id: `${cwd}/tests/login.test.md` });
+    expect(returned.envelope.results[0]).not.toMatchObject({ id: 'tests/login.test.md' });
+  });
+
+  it('uses cwd as the resolved project root for a successful no-config invocation', async () => {
+    const { output } = arrangeSuccessfulCommand('codex', 'codex');
+    const cwd = '/workspace/no-config-project';
+    const config = { ...CONFIG, projectRoot: cwd, testDir: `${cwd}/tests`, runsDir: `${cwd}/tests/.runs` };
+    const rawEnvelope = { ...output.envelope, schemaVersion: '2.0', results: [{ id: `${cwd}/tests/login.test.md`, file: `${cwd}/tests/login.test.md`, planFile: `${cwd}/tests/login.ambercast.plan.json`, status: 'generated', dryRun: false, ambiguities: [] }], summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 } } as unknown as GenerateCommandOutput['envelope'];
+    mocks.loadConfig.mockResolvedValue(config);
+    mocks.buildGenerateReport.mockReturnValue({ ...output, envelope: rawEnvelope });
+
+    const returned = await runGenerateCommand(input({ cwd }));
+
+    expect(config.projectRoot).toBe(cwd);
+    expect(mocks.loadConfig).toHaveBeenCalledWith(expect.objectContaining({ cwd }));
+    expect(mocks.loadConfig.mock.calls[0]?.[0]).not.toHaveProperty('configPathOverride');
+    expect(returned.envelope.results).toMatchObject([{
+      id: 'tests/login.test.md',
+      file: 'tests/login.test.md',
+      planFile: 'tests/login.ambercast.plan.json',
+    }]);
+  });
+
   it('loads config, lets an explicit provider override win, composes, and generates', async () => {
     const { events, selected, output } = arrangeSuccessfulCommand('auto', 'codex');
 

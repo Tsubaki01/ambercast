@@ -33,15 +33,19 @@ describe('RawConfig', () => {
       ai: { provider: 'codex' },
       viewer: { port: 4_321 },
       ci: { heal: true, updateGroundingCache: false },
+      grounding: { repositoryPolicy: 'uncommitted', localWriteBack: 'explicit' },
     });
     expectAccepted(RawConfig, {
       $schema: CONFIG_SCHEMA_URL,
       ai: {},
       viewer: {},
       ci: {},
+      grounding: {},
     });
     expectAccepted(RawConfig, { $schema: CONFIG_SCHEMA_URL, ci: { heal: true } });
     expectAccepted(RawConfig, { $schema: CONFIG_SCHEMA_URL, ci: { updateGroundingCache: false } });
+    expectAccepted(RawConfig, { $schema: CONFIG_SCHEMA_URL, grounding: { repositoryPolicy: 'committed' } });
+    expectAccepted(RawConfig, { $schema: CONFIG_SCHEMA_URL, grounding: { localWriteBack: 'auto' } });
   });
 
   it('accepts empty collection overrides at the raw-schema boundary', () => {
@@ -63,6 +67,7 @@ describe('RawConfig', () => {
     ['ai', { $schema: CONFIG_SCHEMA_URL, ai: { provider: 'auto', unexpected: true } }],
     ['viewer', { $schema: CONFIG_SCHEMA_URL, viewer: { port: 3_000, unexpected: true } }],
     ['ci', { $schema: CONFIG_SCHEMA_URL, ci: { heal: true, unexpected: true } }],
+    ['grounding', { $schema: CONFIG_SCHEMA_URL, grounding: { repositoryPolicy: 'committed', unexpected: true } }],
     ['target definition', { $schema: CONFIG_SCHEMA_URL, targets: { app: { ...TARGET, unexpected: true } } }],
   ] as const)('rejects an unknown %s key', (_level, value) => {
     expectRejected(RawConfig, value);
@@ -87,6 +92,9 @@ describe('RawConfig', () => {
     ['ci', { $schema: CONFIG_SCHEMA_URL, ci: true }],
     ['ci.heal', { $schema: CONFIG_SCHEMA_URL, ci: { heal: 'yes' } }],
     ['ci.updateGroundingCache', { $schema: CONFIG_SCHEMA_URL, ci: { updateGroundingCache: 1 } }],
+    ['grounding', { $schema: CONFIG_SCHEMA_URL, grounding: true }],
+    ['grounding.repositoryPolicy', { $schema: CONFIG_SCHEMA_URL, grounding: { repositoryPolicy: 'local' } }],
+    ['grounding.localWriteBack', { $schema: CONFIG_SCHEMA_URL, grounding: { localWriteBack: 'manual' } }],
   ] as const)('rejects a wrong type for %s', (_field, value) => {
     expectRejected(RawConfig, value);
   });
@@ -124,6 +132,14 @@ describe('RawConfig', () => {
 
   it.each([1, 65_535])('accepts viewer port %d at the inclusive boundary', (port) => {
     expectAccepted(RawConfig, { $schema: CONFIG_SCHEMA_URL, viewer: { port } });
+  });
+
+  it.each(['committed', 'uncommitted'] as const)('accepts %s as a grounding repository policy', (repositoryPolicy) => {
+    expectAccepted(RawConfig, { $schema: CONFIG_SCHEMA_URL, grounding: { repositoryPolicy } });
+  });
+
+  it.each(['auto', 'explicit'] as const)('accepts %s as a grounding write-back posture', (localWriteBack) => {
+    expectAccepted(RawConfig, { $schema: CONFIG_SCHEMA_URL, grounding: { localWriteBack } });
   });
 
   it.each([0, 65_536, 1.5])('rejects viewer port %d outside the integer range', (port) => {

@@ -5,10 +5,12 @@
  * This runtime path intentionally has no provider, browser, secrets, or event
  * composition. Its dependencies prove that checking committed artifact
  * freshness is independent from the execution machinery used by generation
- * and replay.
+ * and replay. It composes the filesystem read factory for both config
+ * loading and checking, so this entry point cannot introduce the write-capable
+ * storage factory into the check dependency closure.
  */
 
-import { createFsStorage } from '#adapters/storage/fs-storage.js';
+import { createFsReadStorage } from '#adapters/storage/fs-read-storage.js';
 import { readConfigEnvironment } from '#adapters/system/process-config-environment.js';
 import { createSystemClock } from '#adapters/system/system-clock.js';
 import { loadConfig } from '#config/load.js';
@@ -17,6 +19,7 @@ import { AmbercastError } from '#core/errors/types.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
 import { isAbsolutePath, joinPath } from '#core/paths.js';
 import { check } from '#usecases/check.js';
+import { normalizeReportEnvelope } from '#usecases/report-normalization.js';
 import { buildCheckReport, type CheckReportOutput } from '#usecases/check-report.js';
 import { createFsTestFileDiscovery } from './test-file-discovery.js';
 
@@ -37,7 +40,13 @@ export interface CheckCommandInput {
   /** Whether a genuinely empty inspection is accepted. */
   readonly allowEmpty: boolean;
 
-  /** Whether an empty inspection suppresses exit 5 without changing inspection work. */
+  /**
+   * Whether listing ends after selection with identity-only `listed` rows.
+   *
+   * The command does not inspect plans or grounding, validate freshness, or
+   * scan artifacts in this mode, so an empty selection is a successful list
+   * result rather than an ordinary empty-inspection outcome.
+   */
   readonly list: boolean;
 
   /** Optional explicit configuration path. */
@@ -77,8 +86,17 @@ export interface CheckCommandOutput {
  * Known ambercast errors stay classified, while an unexpected rejection becomes
  * an unexpected-crash report so valid invocations still resolve to the command
  * report and exit-code contract.
+ *
+ * Report identity normalization occurs once after report construction. The
+ * runtime begins with `cwd` as the root for failures before configuration is
+ * available and replaces it with `ResolvedConfig.projectRoot` once loading
+ * succeeds. The shared normalizer converts only `id`, `file`, `planFile`,
+ * `caseId`, `groundingFile`, and `artifactFile`, then recomputes summary from
+ * their final visible values. Reasons and other free text remain untouched,
+ * preserving the fixed path-free orphan-grounding contract.
  */
 export async function runCheckCommand(input: CheckCommandInput): Promise<CheckCommandOutput> {
+  let projectRoot = input.cwd;
   const clock = createSystemClock();
   const startedAt = reportTimestamp(clock.now());
   const startedMs = clock.monotonicMs();
@@ -89,13 +107,14 @@ export async function runCheckCommand(input: CheckCommandInput): Promise<CheckCo
   });
 
   try {
-    const storage = createFsStorage();
+    const storage = createFsReadStorage();
     const config = await loadConfig({
       cwd: input.cwd,
       storage,
       configEnv: readConfigEnvironment(),
       ...(input.configPathOverride === undefined ? {} : { configPathOverride: input.configPathOverride }),
     });
+    projectRoot = config.projectRoot;
     const outcome = await check({
       storage,
       layout: createLayoutResolver(config),
@@ -109,11 +128,13 @@ export async function runCheckCommand(input: CheckCommandInput): Promise<CheckCo
       list: input.list,
     });
 
-    return buildCheckReport({ ...reportContext(), outcome });
+    const output = buildCheckReport({ ...reportContext(), outcome });
+    return { ...output, envelope: normalizeReportEnvelope(output.envelope, projectRoot) };
   } catch (error) {
     const classified = error instanceof AmbercastError
       ? error
       : new UnexpectedCrashError('The check command crashed unexpectedly.', undefined, { cause: error });
-    return buildCheckReport({ ...reportContext(), error: classified });
+    const output = buildCheckReport({ ...reportContext(), error: classified });
+    return { ...output, envelope: normalizeReportEnvelope(output.envelope, projectRoot) };
   }
 }

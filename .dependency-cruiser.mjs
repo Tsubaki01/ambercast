@@ -44,10 +44,17 @@
  * `core-external-allowlist`, `usecases-no-concrete-adapters`,
  * `cli-must-go-through-runtime`, `adapters-no-sibling-reachover`,
  * `adapters-http-runtime-only`, `ports-core-types-only`,
- * `usecases-ports-types-only`, `report-core-types-only`, and
- * `config-ports-types-only`. Fixture tests assert these alongside generated
- * boundary names, so changing either convention is an intentional contract
- * change.
+ * `usecases-ports-types-only`, `report-core-types-only`,
+ * `config-ports-types-only`, and `check-no-write-capable-dependencies`.
+ * Fixture tests assert these alongside generated boundary names, so changing
+ * either convention is an intentional contract change.
+ *
+ * The check-specific rule uses reachability because its purpose is to
+ * keep write-capable dependencies out of the whole check closure, not merely
+ * to reject direct imports. Its system-adapter targets remain individual:
+ * check-command legitimately needs the clock and configuration-environment
+ * adapters in that shared family, so forbidding all of `adapters/system/**`
+ * would overreach the read-only capability boundary.
  */
 
 /**
@@ -249,6 +256,33 @@ export default {
       severity: 'error',
       from: { path: LAYERS.runtime.path },
       to: { path: httpAdapter.path },
+    },
+    {
+      /*
+       * Check's guarantee covers every dependency reachable from its three
+       * entry modules. The `reachable: true` restriction therefore
+       * guards the transitive closure; a direct-edge path rule would leave an
+       * intermediate module able to smuggle in a forbidden capability.
+       *
+       * Secrets and the event sink are listed as individual system adapters
+       * rather than banning their shared family. The command legitimately
+       * depends on system-clock and process-config-environment, so a family
+       * ban would reject required read-only composition along with the
+       * capabilities this rule is meant to exclude.
+       */
+      name: 'check-no-write-capable-dependencies',
+      severity: 'error',
+      from: { path: '^src/(usecases/check(?:-report)?\\.ts|runtime/check-command\\.ts)$' },
+      to: {
+        path: [
+          '^src/adapters/ai(?:/|$)',
+          '^src/adapters/browser(?:/|$)',
+          '^src/adapters/system/env-secrets-provider\\.ts$',
+          '^src/adapters/system/noop-event-sink\\.ts$',
+          '^src/adapters/storage/fs-storage\\.ts$',
+        ],
+        reachable: true,
+      },
     },
     ...typesOnlyRules,
     ...externalAllowlistRules,

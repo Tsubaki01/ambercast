@@ -34,7 +34,7 @@ const GENERATE_OPTIONS: GenerateOptions = {
   allowEmpty: false,
   list: false,
 };
-const RUN_OPTIONS: RunOptions = { files: [TEST_PATH], cacheOnly: false, allowEmpty: false, list: false, stale: 'fail' };
+const RUN_OPTIONS: RunOptions = { files: [TEST_PATH], cacheOnly: false, updateCache: false, allowEmpty: false, list: false, stale: 'fail' };
 
 registerUsecaseEmitsEventsContract([
   {
@@ -111,7 +111,10 @@ registerUsecaseEmitsEventsContract([
           targets: TARGETS,
           defaultTarget: 'web',
           ai: { provider: 'codex', timeoutMs: 120_000 },
+          ci: { heal: false, updateGroundingCache: false },
+          grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
         },
+        isCI: false,
       } satisfies RunDeps, RUN_OPTIONS);
 
       return { emitted: events.emitted() };

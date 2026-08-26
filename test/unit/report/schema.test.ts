@@ -3,6 +3,7 @@ import {
   CheckResult,
   GenerateResult,
   HealResult,
+  ListedHealResult,
   Observed,
   ReportEnvelope,
   ReportError,
@@ -57,6 +58,7 @@ const HEAL_RESULT = {
   file: 'tests/login.test.md',
   planFile: 'tests/login.ambercast.plan.json',
   status: 'healed',
+  dryRun: false,
   durationMs: 42,
   steps: [STEP_RESULT],
   explanation: 'The updated locator was grounded successfully.',
@@ -113,7 +115,7 @@ function without(value: Record<string, unknown>, key: string): Record<string, un
 
 function reportEnvelope(command: string, results: unknown[], overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    schemaVersion: '1.0',
+    schemaVersion: '2.0',
     command,
     startedAt: STARTED_AT,
     durationMs: 42,
@@ -187,6 +189,7 @@ const COMMAND_VARIANTS: ReadonlyArray<{
       ['file', 1],
       ['planFile', 1],
       ['status', 1],
+      ['dryRun', 'false'],
       ['durationMs', '42'],
       ['steps', 'not steps'],
       ['explanation', 1],
@@ -332,11 +335,11 @@ describe('run result status branches', () => {
     ['passed', { ...RUN_RESULT, status: 'passed' }],
     ['failed', { ...RUN_RESULT, status: 'failed' }],
     ['error', { ...RUN_RESULT, status: 'error' }],
-    ['skipped', { ...RUN_RESULT, status: 'skipped' }],
     ['listed', LISTED_RUN_RESULT],
+    ['skipped', { id: 'login-succeeds', file: 'tests/login.test.md', status: 'skipped' }],
   ] as const)('accepts the %s branch through the public ReportEnvelope', (_status, result) => {
     expectAccepted(ReportEnvelope, reportEnvelope('run', [result], {
-      summary: { total: 1, passed: result.status === 'listed' || result.status === 'passed' ? 1 : 0, failed: 0, errored: 0, skipped: 0 },
+      summary: { total: 1, passed: result.status === 'listed' || result.status === 'passed' ? 1 : 0, failed: 0, errored: 0, skipped: Number(result.status === 'skipped') },
     }));
   });
 
@@ -357,6 +360,63 @@ describe('run result status branches', () => {
     const roundTripped = ReportEnvelope.parse(JSON.parse(JSON.stringify(envelope)));
 
     expect(roundTripped).toEqual(envelope);
+  });
+});
+
+describe('heal result status branches', () => {
+  const listedHealResult = {
+    id: 'login-succeeds',
+    file: 'tests/login.test.md',
+    status: 'listed',
+  } as const;
+
+  it('parses the minimal listed shape', () => {
+    expectAccepted(ListedHealResult, listedHealResult);
+    expectAccepted(HealResult, listedHealResult);
+  });
+
+  it.each([
+    ['id', '', '  ', '\t\n'],
+    ['file', '', '  ', '\t\n'],
+    ['status', '', '  ', '\t\n'],
+  ] as const)('rejects a missing, empty, or whitespace-only listed %s field', (field, empty, whitespace, controlWhitespace) => {
+    expectRejected(ListedHealResult, without(listedHealResult, field));
+    expectRejected(ListedHealResult, { ...listedHealResult, [field]: empty });
+    expectRejected(ListedHealResult, { ...listedHealResult, [field]: whitespace });
+    expectRejected(ListedHealResult, { ...listedHealResult, [field]: controlWhitespace });
+  });
+
+  it('rejects unknown fields on a listed result', () => {
+    expectRejected(ListedHealResult, { ...listedHealResult, unexpected: true });
+  });
+
+  it('requires listed results to use the literal listed status', () => {
+    expectRejected(ListedHealResult, { ...listedHealResult, status: 'discovered' });
+  });
+
+  it('rejects dryRun outside completed heal results', () => {
+    expectRejected(RunResult, { ...RUN_RESULT, dryRun: false });
+    expectRejected(ListedHealResult, { ...listedHealResult, dryRun: false });
+  });
+
+  it.each([true, false])('accepts completed heal results with dryRun %s', (dryRun) => {
+    expectAccepted(HealResult, { ...HEAL_RESULT, dryRun });
+  });
+
+  it('requires completed heal results to include a boolean dryRun field', () => {
+    expectRejected(HealResult, without(HEAL_RESULT, 'dryRun'));
+    expectRejected(HealResult, { ...HEAL_RESULT, dryRun: 'false' });
+    expectRejected(HealResult, { ...HEAL_RESULT, dryRun: 0 });
+    expectRejected(HealResult, { ...HEAL_RESULT, dryRun: null });
+  });
+
+  it('discriminates listed and completed heal result shapes', () => {
+    expectRejected(HealResult, { ...HEAL_RESULT, status: 'listed' });
+    expectRejected(HealResult, { ...listedHealResult, status: 'healed' });
+  });
+
+  it('rejects an unrecognized heal status', () => {
+    expectRejected(HealResult, { ...HEAL_RESULT, status: 'not-healed' });
   });
 });
 
@@ -455,7 +515,7 @@ describe('field boundaries', () => {
   });
 
   it.each([
-    ['run', RunResult, RUN_RESULT, ['passed', 'failed', 'error', 'skipped']],
+    ['run', RunResult, RUN_RESULT, ['passed', 'failed', 'error']],
     ['heal', HealResult, HEAL_RESULT, ['healed', 'partially-healed', 'unresolved', 'no-changes-needed']],
     ['check', CheckResult, CHECK_RESULT, ['fresh', 'stale', 'orphaned-plan', 'orphaned-grounding', 'missing-plan']],
     ['review', ReviewResult, REVIEW_RESULT, ['sufficient', 'insufficient']],
@@ -615,4 +675,96 @@ describe('ReportEnvelope command/result and error correlation', () => {
   it('accepts a non-empty errors array containing a valid ReportError', () => {
     expectAccepted(ReportEnvelope, reportEnvelope('run', [RUN_RESULT], { errors: [CASE_USAGE_ERROR] }));
   });
+});
+
+describe('report schema v2 interruption contract', () => {
+  const skipped = { id: 'case-a', file: 'tests/case-a.test.md', status: 'skipped' };
+  const skippedForbiddenEvidence = {
+    planFile: 'tests/case-a.ambercast.plan.json',
+    groundingFile: 'tests/case-a.ambercast.grounding.json',
+    artifactFile: 'tests/case-a.artifact.json',
+    dryRun: false,
+    reason: 'The inspection reason.',
+    durationMs: 42,
+    steps: [STEP_RESULT],
+    explanation: 'The execution explanation.',
+    ambiguities: ['The prompt has an ambiguity.'],
+    concerns: [REVIEW_CONCERN],
+  } as const;
+
+  it.each(['generate', 'run', 'check', 'heal', 'review'] as const)('accepts a v2 %s envelope with the shared strict skipped shape and rejects v1', (command) => {
+    const value = reportEnvelope(command, [skipped], {
+      schemaVersion: '2.0',
+      summary: { total: 1, passed: 0, failed: 0, errored: 0, skipped: 1 },
+      ...(command === 'run' ? { reportPersistence: 'not-attempted' } : {}),
+    });
+
+    expectAccepted(ReportEnvelope, value);
+    expectRejected(ReportEnvelope, { ...value, schemaVersion: '1.0' });
+    expect(ReportEnvelope.parse(value)).toEqual(value);
+  });
+
+  it.each([
+    'planFile', 'groundingFile', 'artifactFile', 'dryRun', 'reason', 'durationMs', 'steps', 'explanation', 'ambiguities', 'concerns',
+  ] as const)('rejects forbidden %s evidence on every skipped branch', (field) => {
+    for (const command of ['generate', 'run', 'check', 'heal', 'review'] as const) {
+      expectRejected(ReportEnvelope, reportEnvelope(command, [{ ...skipped, [field]: skippedForbiddenEvidence[field] }], {
+        schemaVersion: '2.0', summary: { total: 1, passed: 0, failed: 0, errored: 0, skipped: 1 },
+        ...(command === 'run' ? { reportPersistence: 'not-attempted' } : {}),
+      }));
+    }
+  });
+
+  it('accepts completed check statuses and path fields while rejecting blank paths and unknown values', () => {
+    for (const status of ['fresh', 'stale', 'missing-plan', 'missing-grounding', 'stale-grounding', 'invalid-grounding', 'fresh-without-grounding', 'orphaned-plan', 'orphaned-grounding'] as const) {
+      expectAccepted(CheckResult, {
+        id: 'case-a', file: 'case-a.test.md', planFile: 'case-a.plan.json', status, reason: 'checked',
+        groundingFile: 'case-a.grounding.json', artifactFile: 'case-a.artifact.json',
+      });
+    }
+    expectRejected(CheckResult, { ...CHECK_RESULT, groundingFile: '  ' });
+    expectRejected(CheckResult, { ...CHECK_RESULT, artifactFile: '  ' });
+    expectRejected(CheckResult, { ...CHECK_RESULT, status: 'unknown' });
+    expectRejected(CheckResult, { ...CHECK_RESULT, unexpected: true });
+  });
+
+  it('accepts the minimal invalid-artifact-name shape and rejects unrelated artifact evidence', () => {
+    const result = {
+      id: 'tests/.ambercast.plan.json',
+      file: 'tests/.ambercast.plan.json',
+      status: 'invalid-artifact-name',
+      reason: 'The artifact name could not be inverse-derived into a corresponding test path.',
+      artifactFile: 'tests/.ambercast.plan.json',
+    } as const;
+
+    expectAccepted(CheckResult, result);
+    expectRejected(CheckResult, { ...result, planFile: 'tests/imaginary.ambercast.plan.json' });
+    expectRejected(CheckResult, { ...result, groundingFile: 'tests/imaginary.ambercast.grounding.json' });
+    const { artifactFile: _artifactFile, ...withoutArtifactFile } = result;
+    expectRejected(CheckResult, withoutArtifactFile);
+    expectRejected(CheckResult, { ...result, artifactFile: '  ' });
+  });
+
+  it('accepts the minimal listed shape and rejects inspection evidence', () => {
+    const result = { id: 'tests/literal-path', file: 'tests/literal-path', status: 'listed' } as const;
+
+    expectAccepted(CheckResult, result);
+    expectRejected(CheckResult, { ...result, planFile: 'tests/literal-path.ambercast.plan.json' });
+    expectRejected(CheckResult, { ...result, reason: 'checked' });
+    expectRejected(CheckResult, { ...result, groundingFile: 'tests/literal-path.ambercast.grounding.json' });
+    expectRejected(CheckResult, { ...result, artifactFile: 'tests/literal-path.artifact.json' });
+  });
+
+  it.each(['', '  ', '\t\n'])(
+    'rejects a non-skipped result with a blank mandatory planFile (%j)',
+    (planFile) => {
+      for (const variant of COMMAND_VARIANTS) {
+        const value = reportEnvelope(variant.command, [{ ...variant.result, planFile }]);
+        const restored = reportEnvelope(variant.command, [variant.result]);
+
+        expectRejected(ReportEnvelope, value);
+        expectAccepted(ReportEnvelope, restored);
+      }
+    },
+  );
 });

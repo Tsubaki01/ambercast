@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
-import { computeInputsDigest } from '#core/ir/digest.js';
+import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import type { JsonValueT, PlanDocument } from '#core/ir/schema.js';
 import { ReportEnvelope } from '#report/schema.js';
@@ -24,9 +24,14 @@ interface CliResult {
   readonly exitCode: number;
 }
 
-async function runCli(args: readonly string[], cwd = repoRoot): Promise<CliResult> {
+async function runCli(args: readonly string[], cwd = repoRoot, env?: NodeJS.ProcessEnv): Promise<CliResult> {
   try {
-    const { stdout, stderr } = await execFileAsync(process.execPath, [binPath, ...args], { cwd, encoding: 'utf8', timeout: 5_000 });
+    const { stdout, stderr } = await execFileAsync(process.execPath, [binPath, ...args], {
+      cwd,
+      encoding: 'utf8',
+      timeout: 5_000,
+      ...(env === undefined ? {} : { env }),
+    });
     return { stdout, stderr, exitCode: 0 };
   } catch (error) {
     const failure = error as { code?: number; stdout?: string; stderr?: string };
@@ -73,6 +78,10 @@ async function writeSoleTargetConfigAndFreshPlan(project: string): Promise<void>
   await writeFile(
     join(project, 'tests', 'test.ambercast.plan.json'),
     toCanonicalArtifactText(plan as unknown as JsonValueT),
+  );
+  await writeFile(
+    join(project, 'tests', 'test.ambercast.grounding.json'),
+    toCanonicalArtifactText({ schemaVersion: 1, planDigest: computePlanDigest(plan), entries: {} }),
   );
 }
 
@@ -129,7 +138,38 @@ describe('bin/ambercast.js (e2e)', () => {
     expect(result.exitCode).toBe(0);
     const envelope = JSON.parse(result.stdout);
     expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
+    expect(envelope.schemaVersion).toBe('2.0');
     expect(envelope.results).toEqual([expect.objectContaining({ file: expect.stringContaining('test.test.md'), status: 'listed' })]);
+  });
+
+  it('lists a matched heal file through the built dist CLI without attempting a repair', async () => {
+    const project = await fixtureProject();
+    const result = await runCli(['heal', '--list', '--json'], project);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe('');
+    const envelope = JSON.parse(result.stdout);
+    expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
+    expect(envelope).toMatchObject({
+      command: 'heal',
+      summary: { total: 1, passed: 0, failed: 0, errored: 0, skipped: 1 },
+      results: [expect.objectContaining({ file: expect.stringContaining('test.test.md'), status: 'listed' })],
+      errors: [],
+    });
+  });
+
+  it('refuses a non-interactive CI heal without authorization before attempting repair', async () => {
+    const project = await fixtureProject();
+    const result = await runCli(['heal', '--json'], project, { ...process.env, CI: 'true' });
+
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toBe('');
+    const envelope = JSON.parse(result.stdout);
+    expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
+    expect(envelope).toMatchObject({
+      command: 'heal',
+      errors: [expect.objectContaining({ scope: 'run', code: 'CONFIG_INVALID' })],
+    });
   });
 
   it.each(['generate', 'run', 'check'] as const)(
@@ -183,7 +223,7 @@ describe('bin/ambercast.js (e2e)', () => {
     expect(envelope).toMatchObject({
       command: 'run',
       reportPersistence: 'persisted',
-      summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 },
+      summary: { total: 1, passed: 0, failed: 0, errored: 0, skipped: 1 },
       results: [expect.objectContaining({ file: expect.stringContaining('test.test.md'), status: 'listed' })],
     });
     const reportDirectories = await readdir(join(project, 'tests', '.runs'));

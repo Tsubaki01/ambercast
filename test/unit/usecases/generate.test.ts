@@ -21,6 +21,7 @@ import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import type { AiExecuteRequest } from '#ports/ai.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/generate.js';
+import { BatchInterruptionTracker } from '#usecases/batch-interruption.js';
 import { validateCommittedInstructionCoverage } from '#usecases/instruction-coverage-policy.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
 import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
@@ -679,7 +680,7 @@ describe('generate', () => {
   ] as const)('reports a zero match for %s policy without calling AI', async (_policy, options) => {
     const { deps, execute } = createScenario({ discoverTestFiles: async () => [] });
 
-    await expect(generate(deps, options)).resolves.toEqual({ results: [], noTestsFound: true });
+    await expect(generate(deps, options)).resolves.toEqual({ results: [], noTestsFound: true, interrupted: false });
     expect(execute).not.toHaveBeenCalled();
   });
 
@@ -687,7 +688,7 @@ describe('generate', () => {
     const { deps, events, execute, recordingStorage } = createScenario({ discoverTestFiles: async () => ['login.test.md'] });
 
     await expect(generate(deps, { ...DEFAULT_OPTIONS, list: true, dryRun: true, force: true, strict: true }))
-      .resolves.toEqual({ results: [{ file: `${TEST_DIR}/login.test.md`, status: 'listed' }], noTestsFound: false });
+      .resolves.toEqual({ results: [{ file: `${TEST_DIR}/login.test.md`, status: 'listed' }], noTestsFound: false, interrupted: false });
     expect(execute).not.toHaveBeenCalled();
     expect(events.emitted()).toEqual([]);
     expect(recordingStorage.reads).toEqual([]);
@@ -1284,7 +1285,7 @@ describe('generate', () => {
     }
   });
 
-  it('does not mistake a caller TimeoutError for its local timeout after both signals abort', async () => {
+  it('preserves a caller TimeoutError rather than attributing it to the local timeout', async () => {
     const caller = new AbortController();
     const timeoutController = new AbortController();
     const callerReason = new DOMException('caller cancelled', 'TimeoutError');
@@ -1314,7 +1315,7 @@ describe('generate', () => {
       caller.abort(callerReason);
       timeoutController.abort(localReason);
 
-      await expect(running).resolves.toEqual({ results: [], noTestsFound: false });
+      await expect(running).resolves.toMatchObject({ interrupted: true, results: [{ file: `${TEST_DIR}/first.test.md`, status: 'skipped' }, { file: `${TEST_DIR}/second.test.md`, status: 'skipped' }], noTestsFound: false });
       expect(execute).toHaveBeenCalledOnce();
       expect(observedSignal).not.toBe(caller.signal);
       expect(observedSignal).not.toBe(timeoutController.signal);
@@ -1393,7 +1394,7 @@ describe('generate', () => {
     recordingStorage.reset();
     controller.abort(reason);
 
-    await expect(generate(deps, DEFAULT_OPTIONS)).resolves.toEqual({ results: [], noTestsFound: false });
+    await expect(generate(deps, DEFAULT_OPTIONS)).resolves.toEqual({ results: [{ file: `${TEST_DIR}/first.test.md`, status: 'skipped' }, { file: `${TEST_DIR}/second.test.md`, status: 'skipped' }], noTestsFound: false, interrupted: true });
     expect(execute).not.toHaveBeenCalled();
     expect(recordingStorage.reads).toEqual([]);
   });
@@ -1428,7 +1429,7 @@ describe('generate', () => {
     await started;
     controller.abort(reason);
 
-    await expect(running).resolves.toEqual({ results: [], noTestsFound: false });
+    await expect(running).resolves.toMatchObject({ interrupted: true, results: [{ file: `${TEST_DIR}/first.test.md`, status: 'skipped' }, { file: `${TEST_DIR}/second.test.md`, status: 'skipped' }], noTestsFound: false });
     expect(execute).toHaveBeenCalledTimes(1);
     expect(recordingStorage.reads).toContain(`${TEST_DIR}/first.test.md`);
     expect(recordingStorage.reads).not.toContain(`${TEST_DIR}/second.test.md`);
@@ -1773,5 +1774,154 @@ describe('generate', () => {
 
     expect(outcome.results[0]).toMatchObject({ status: 'generated' });
     expect(toCanonicalArtifactText(parsed as unknown as JsonValueT)).toBe(text);
+  });
+});
+
+describe('generate interruption contract', () => {
+  it('deduplicates pre-aborted non-list occurrences into one identity-only skipped row without starting I/O', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { deps, recordingStorage } = createScenario({ signal: controller.signal });
+
+    const outcome = await generate(deps, { ...DEFAULT_OPTIONS, files: [`${TEST_DIR}/same.test.md`, `${TEST_DIR}/same.test.md`] });
+
+    expect(outcome.interrupted).toBe(true);
+    expect(outcome.results).toEqual([
+      { file: `${TEST_DIR}/same.test.md`, status: 'skipped' },
+    ]);
+    expect(recordingStorage.reads).toEqual([]);
+  });
+
+  it('keeps list mode atomic for an already aborted signal and exposes a false interruption fact', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { deps, recordingStorage } = createScenario({ signal: controller.signal });
+
+    const outcome = await generate(deps, { ...DEFAULT_OPTIONS, files: [`${TEST_DIR}/a.test.md`, `${TEST_DIR}/b.test.md`], list: true });
+
+    expect(outcome.interrupted).toBe(false);
+    expect(outcome.results).toEqual([
+      { file: `${TEST_DIR}/a.test.md`, status: 'listed' },
+      { file: `${TEST_DIR}/b.test.md`, status: 'listed' },
+    ]);
+    expect(recordingStorage.reads).toEqual([]);
+  });
+
+  it('skips the interrupted provider work and pending suffix without later I/O or AI', async () => {
+    const controller = new AbortController();
+    let releaseFirst: ((value: { data: GeneratedPlanResponse; raw: string }) => void) | undefined;
+    let started: (() => void) | undefined;
+    const firstStarted = new Promise<void>((resolve) => { started = resolve; });
+    const execute = vi.fn(() => new Promise<{ data: GeneratedPlanResponse; raw: string }>((resolve) => {
+      releaseFirst = resolve;
+      started?.();
+    }));
+    const { deps, recordingStorage } = createScenario({
+      signal: controller.signal,
+      aiExecutor: createFakeAiExecutor({ execute }),
+      discoverTestFiles: vi.fn(async () => ['first.test.md', 'second.test.md', 'third.test.md']),
+    });
+    const first = await writePrompt(recordingStorage.storage, 'first.test.md');
+    const second = await writePrompt(recordingStorage.storage, 'second.test.md');
+    const third = await writePrompt(recordingStorage.storage, 'third.test.md');
+    recordingStorage.reset();
+
+    const running = generate(deps, DEFAULT_OPTIONS);
+    await firstStarted;
+    controller.abort();
+    releaseFirst?.({ data: RESPONSE, raw: JSON.stringify(RESPONSE) });
+
+    await expect(running).resolves.toMatchObject({
+      interrupted: true,
+      results: [
+        { file: first, status: 'skipped' },
+        { file: second, status: 'skipped' },
+        { file: third, status: 'skipped' },
+      ],
+    });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(recordingStorage.reads).toEqual(expect.arrayContaining([first]));
+    expect(recordingStorage.reads.filter((path) => path === second || path === third)).toEqual([]);
+  });
+
+  it('keeps a pending duplicate occurrence as its own skipped row after the first occurrence becomes terminal', async () => {
+    const controller = new AbortController();
+    const path = `${TEST_DIR}/same.test.md`;
+    const recordingStorage = createRecordingStorage();
+    const storage: StorageAdapter = {
+      ...recordingStorage.storage,
+      async writeText(writtenPath, content) {
+        await recordingStorage.storage.writeText(writtenPath, content);
+        if (writtenPath === `${TEST_DIR}/same.ambercast.plan.json`) controller.abort();
+      },
+    };
+    const { deps } = createScenario({
+      signal: controller.signal,
+      storage,
+      discoverTestFiles: vi.fn(async () => ['same.test.md', 'same.test.md']),
+    });
+    await writePrompt(storage, 'same.test.md');
+    recordingStorage.reset();
+
+    await expect(generate(deps, DEFAULT_OPTIONS)).resolves.toMatchObject({
+      interrupted: true,
+      results: [
+        { file: path, status: 'generated' },
+        { file: path, status: 'skipped' },
+      ],
+    });
+  });
+
+  it('cancels an in-flight provider request without writing artifacts and skips its pending work', async () => {
+    const controller = new AbortController();
+    let started: (() => void) | undefined;
+    const firstStarted = new Promise<void>((resolve) => { started = resolve; });
+    const execute = vi.fn((request: AiExecuteRequest<unknown>) => new Promise<never>((_resolve, reject) => {
+      const signal = request.signal;
+      if (signal === undefined) throw new Error('Expected provider cancellation signal.');
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      started?.();
+    }));
+    const { deps, recordingStorage } = createScenario({
+      signal: controller.signal,
+      aiExecutor: createFakeAiExecutor({ execute }),
+      discoverTestFiles: vi.fn(async () => ['first.test.md', 'second.test.md']),
+    });
+    const first = await writePrompt(recordingStorage.storage, 'first.test.md');
+    const second = await writePrompt(recordingStorage.storage, 'second.test.md');
+    recordingStorage.reset();
+
+    const running = generate(deps, DEFAULT_OPTIONS);
+    await firstStarted;
+    controller.abort(new Error('stop'));
+
+    await expect(running).resolves.toMatchObject({
+      interrupted: true,
+      results: [
+        { file: first, status: 'skipped' },
+        { file: second, status: 'skipped' },
+      ],
+    });
+    expect(recordingStorage.writes).toEqual([]);
+  });
+
+  it.each(['normal return', 'discovery rejection'] as const)('disposes the interruption tracker from generate finally after %s', async (mode) => {
+    const dispose = vi.spyOn(BatchInterruptionTracker.prototype, 'dispose');
+    const controller = new AbortController();
+    const { deps, recordingStorage } = createScenario({
+      signal: controller.signal,
+      discoverTestFiles: mode === 'normal return'
+        ? vi.fn(async () => ['login.test.md'])
+        : vi.fn(async () => { throw new Error('discovery failed'); }),
+    });
+    if (mode === 'normal return') await writePrompt(recordingStorage.storage);
+
+    if (mode === 'normal return') {
+      await expect(generate(deps, DEFAULT_OPTIONS)).resolves.toBeDefined();
+    } else {
+      await expect(generate(deps, DEFAULT_OPTIONS)).rejects.toThrow('discovery failed');
+    }
+    expect(dispose).toHaveBeenCalledOnce();
+    dispose.mockRestore();
   });
 });

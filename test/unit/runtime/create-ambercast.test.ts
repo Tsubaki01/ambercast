@@ -32,6 +32,7 @@ const CONFIG: ResolvedConfig = {
   ai: { provider: 'codex', timeoutMs: 120_000 },
   viewer: { port: 4600 },
   ci: { heal: false, updateGroundingCache: false },
+  grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
 };
 
 afterEach(() => {

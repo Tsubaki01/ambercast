@@ -10,7 +10,7 @@ interface SchemaUnderTest {
 type ReportErrorKind = 'usage' | 'environment';
 
 interface ErrorCodeCorrespondence {
-  readonly errorKind: ErrorKind;
+  readonly errorKind: ErrorKind | 'interrupted';
   readonly reportCode: string;
   readonly exitCode: ErrorExitCode;
   readonly reportKind: ReportErrorKind;
@@ -30,6 +30,7 @@ const ERROR_CODE_CORRESPONDENCE = [
   { errorKind: 'ai-response-invalid', reportCode: 'AI_RESPONSE_INVALID', exitCode: 3, reportKind: 'environment' },
   { errorKind: 'fs-io-error', reportCode: 'FS_IO_ERROR', exitCode: 3, reportKind: 'environment' },
   { errorKind: 'unexpected-crash', reportCode: 'UNEXPECTED_CRASH', exitCode: 3, reportKind: 'environment' },
+  { errorKind: 'interrupted', reportCode: 'INTERRUPTED', exitCode: 3, reportKind: 'environment' },
 ] as const satisfies readonly ErrorCodeCorrespondence[];
 
 const REPORTABLE_ERROR_KINDS = [
@@ -46,7 +47,8 @@ const REPORTABLE_ERROR_KINDS = [
   'ai-response-invalid',
   'fs-io-error',
   'unexpected-crash',
-] as const satisfies readonly ErrorKind[];
+  'interrupted',
+] as const;
 
 function expectAccepted(schema: SchemaUnderTest, value: unknown): void {
   expect(schema.safeParse(value).success).toBe(true);
@@ -54,7 +56,7 @@ function expectAccepted(schema: SchemaUnderTest, value: unknown): void {
 
 describe('ErrorKind and ReportErrorCode correspondence', () => {
   it.each(ERROR_CODE_CORRESPONDENCE)('maps $errorKind to $reportCode with its documented exit code', ({ errorKind, exitCode }) => {
-    expect(ERROR_EXIT_CODES[errorKind]).toBe(exitCode);
+    expect((ERROR_EXIT_CODES as Record<string, ErrorExitCode>)[errorKind]).toBe(exitCode);
   });
 
   it('keeps assertion-failed and no-tests-found out of the correspondence table', () => {
@@ -74,7 +76,7 @@ describe('ErrorKind and ReportErrorCode correspondence', () => {
     expect(new Set(mappedKinds)).toStrictEqual(new Set(REPORTABLE_ERROR_KINDS));
   });
 
-  it.each(ERROR_CODE_CORRESPONDENCE)('accepts $reportCode through both ReportError scopes', ({ reportCode, reportKind }) => {
+  it.each(ERROR_CODE_CORRESPONDENCE.filter(({ errorKind }) => errorKind !== 'interrupted'))('accepts $reportCode through both ReportError scopes', ({ reportCode, reportKind }) => {
     expectAccepted(ReportError, {
       scope: 'run',
       kind: reportKind,
@@ -88,5 +90,14 @@ describe('ErrorKind and ReportErrorCode correspondence', () => {
       message: 'The test case encountered a classified error.',
       caseId: 'login-succeeds',
     });
+  });
+
+  it('accepts INTERRUPTED only as a run-scoped environment error', () => {
+    expectAccepted(ReportError, {
+      scope: 'run', kind: 'environment', code: 'INTERRUPTED', message: 'The command was interrupted.',
+    });
+    expect(ReportError.safeParse({
+      scope: 'case', kind: 'environment', code: 'INTERRUPTED', message: 'The case was interrupted.', caseId: 'case-a',
+    }).success).toBe(false);
   });
 });

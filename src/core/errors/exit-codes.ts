@@ -38,6 +38,7 @@ export const ERROR_EXIT_CODES = {
   'ai-response-invalid': 3,
   'fs-io-error': 3,
   'unexpected-crash': 3,
+  interrupted: 3,
   // Zero-match runs are structural report outcomes, but this kind stays mapped
   // so process-status selection remains exhaustive.
   'no-tests-found': 5,

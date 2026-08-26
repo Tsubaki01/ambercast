@@ -1,5 +1,6 @@
 import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { DEFAULT_RAW_CONFIG } from '#config/defaults.js';
+import type { ResolvedConfig } from '#core/config/schema.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
@@ -12,7 +13,11 @@ import {
   type TargetDefinition,
 } from '#core/ir/schema.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
+import type { LayoutResolver } from '#core/layout/resolve.js';
+import type { ReadStorageAdapter } from '#ports/storage.js';
 import { check, type CheckDeps, type CheckOptions } from '#usecases/check.js';
+import { BatchInterruptionTracker } from '#usecases/batch-interruption.js';
+import { buildCheckReport } from '#usecases/check-report.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
 
 const TEST_DIR = '/workspace/tests';
@@ -30,6 +35,7 @@ function createConfig(overrides: Partial<TestConfig> = {}): TestConfig {
     testIgnore: ['**/.runs/**'],
     targets: TARGETS,
     defaultTarget: 'web',
+    grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
     ...overrides,
   };
 }
@@ -195,7 +201,8 @@ describe('check', () => {
     ));
     const { storage, layout, deps } = createScenario({ discoverTestFiles });
     await storage.writeText(testPath, PROMPT);
-    await writePlan(storage, layout, testPath);
+    const plan = await writePlan(storage, layout, testPath);
+    await writeGrounding(storage, layout, testPath, plan);
 
     const outcome = await check(deps, OPTIONS);
 
@@ -243,7 +250,7 @@ describe('check', () => {
     });
   });
 
-  it('keeps a digest-mismatched grounding fresh when the canonical plan matches inputs', async () => {
+  it('reports a digest-mismatched grounding as stale when the canonical plan matches inputs', async () => {
     const testPath = `${TEST_DIR}/grounding-digest.test.md`;
     const { storage, layout, deps } = createScenario({
       discoverTestFiles: createDiscovery([], [], ['grounding-digest.ambercast.grounding.json']),
@@ -254,14 +261,16 @@ describe('check', () => {
 
     const outcome = await check(deps, { ...OPTIONS, files: [testPath] });
 
-    expect(outcome.results).toEqual([expect.objectContaining({ id: testPath, status: 'fresh' })]);
+    expect(outcome.results).toEqual([expect.objectContaining({
+      id: testPath, status: 'stale-grounding', groundingFile: layout.groundingPathFor(testPath),
+    })]);
     expect(outcome.results).not.toContainEqual(expect.objectContaining({
       id: testPath,
       status: 'orphaned-grounding',
     }));
   });
 
-  it('keeps invalid JSON in a discovered grounding artifact from demoting a fresh plan', async () => {
+  it('reports invalid JSON in a discovered grounding artifact for a fresh plan', async () => {
     const testPath = `${TEST_DIR}/malformed-grounding.test.md`;
     const { storage, layout, deps } = createScenario({
       discoverTestFiles: createDiscovery([], [], ['malformed-grounding.ambercast.grounding.json']),
@@ -272,7 +281,9 @@ describe('check', () => {
 
     const outcome = await check(deps, { ...OPTIONS, files: [testPath] });
 
-    expect(outcome.results).toEqual([expect.objectContaining({ id: testPath, status: 'fresh' })]);
+    expect(outcome.results).toEqual([expect.objectContaining({
+      id: testPath, status: 'invalid-grounding', groundingFile: layout.groundingPathFor(testPath),
+    })]);
     expect(outcome.results).not.toContainEqual(expect.objectContaining({
       id: testPath,
       status: 'orphaned-grounding',
@@ -363,7 +374,8 @@ describe('check', () => {
       discoverTestFiles: createDiscovery([], ['removed.ambercast.plan.json']),
     });
     await storage.writeText(selectedPath, PROMPT);
-    await writePlan(storage, layout, selectedPath);
+    const selectedPlan = await writePlan(storage, layout, selectedPath);
+    await writeGrounding(storage, layout, selectedPath, selectedPlan);
     await storage.writeText(layout.planPathFor(orphanPath), '{}');
 
     await expect(check(deps, { ...OPTIONS, files: [selectedPath] })).resolves.toMatchObject({
@@ -380,7 +392,7 @@ describe('check', () => {
     });
   });
 
-  it('reports an orphaned grounding with the expected plan path and grounding path in its reason', async () => {
+  it('reports an orphaned grounding with a path-free reason and retains its path only in groundingFile', async () => {
     const orphanPath = `${TEST_DIR}/removed.test.md`;
     const { storage, layout, deps } = createScenario({
       discoverTestFiles: createDiscovery([], [], ['removed.ambercast.grounding.json']),
@@ -393,8 +405,9 @@ describe('check', () => {
         id: orphanPath,
         file: orphanPath,
         planFile: layout.planPathFor(orphanPath),
+        groundingFile: groundingPath,
         status: 'orphaned-grounding',
-        reason: `No corresponding test file exists for the grounding artifact at ${groundingPath}.`,
+        reason: 'No corresponding test file exists for this grounding artifact.',
       }],
     });
   });
@@ -412,7 +425,8 @@ describe('check', () => {
       ),
     });
     await storage.writeText(freshPath, PROMPT);
-    await writePlan(storage, layout, freshPath);
+    const freshPlanDocument = await writePlan(storage, layout, freshPath);
+    await writeGrounding(storage, layout, freshPath, freshPlanDocument);
     await storage.writeText(stalePath, PROMPT);
     await writePlan(storage, layout, stalePath, freshPlan(`${PROMPT}stale`));
     await storage.writeText(layout.planPathFor(orphanedPlanPath), '{}');
@@ -468,7 +482,7 @@ describe('check', () => {
     expect(outcome.noTestsFound).toBe(false);
   });
 
-  it('keeps non-empty check results and errors byte-identical in list mode', async () => {
+  it('returns bare listed rows rather than ordinary inspection results in list mode', async () => {
     const testPath = `${TEST_DIR}/listed.test.md`;
     const { storage, layout, deps } = createScenario();
     await storage.writeText(testPath, PROMPT);
@@ -477,8 +491,80 @@ describe('check', () => {
     const ordinary = await check(deps, { ...OPTIONS, files: [testPath] });
     const listed = await check(deps, { ...OPTIONS, files: [testPath], list: true });
 
-    expect(JSON.stringify(listed.results)).toBe(JSON.stringify(ordinary.results));
-    expect(JSON.stringify(listed.errors)).toBe(JSON.stringify(ordinary.errors));
+    expect(listed.results).toEqual([{ id: testPath, file: testPath, status: 'listed' }]);
+    expect(listed.results).not.toEqual(ordinary.results);
+    expect(listed.errors).toEqual([]);
+  });
+
+  it('ends an empty list after selection without declaring an ordinary empty outcome', async () => {
+    const { deps } = createScenario();
+
+    await expect(check(deps, { ...OPTIONS, list: true })).resolves.toEqual({
+      results: [], errors: [], noTestsFound: false, interrupted: false,
+    });
+  });
+
+  it('validates an explicit list target before discovery', async () => {
+    const discoverTestFiles = vi.fn<CheckDeps['discoverTestFiles']>(createDiscovery());
+    const { deps } = createScenario({ discoverTestFiles });
+
+    await expect(check(deps, { ...OPTIONS, list: true, target: 'bogus-nonexistent-target' }))
+      .rejects.toBeInstanceOf(TargetUnresolvedError);
+    expect(discoverTestFiles).not.toHaveBeenCalled();
+  });
+
+  it('lists a literal path without requiring the .test.md layout shape', async () => {
+    const literalPath = `${TEST_DIR}/literal-input`;
+    const { deps } = createScenario();
+
+    await expect(check(deps, { ...OPTIONS, files: [literalPath], list: true })).resolves.toEqual({
+      results: [{ id: literalPath, file: literalPath, status: 'listed' }],
+      errors: [], noTestsFound: false, interrupted: false,
+    });
+  });
+
+  it('uses discovery only for selection in list mode and never scans artifacts', async () => {
+    const discoverTestFiles = vi.fn<CheckDeps['discoverTestFiles']>(createDiscovery(['listed.test.md']));
+    const { deps } = createScenario({ discoverTestFiles });
+
+    await check(deps, { ...OPTIONS, list: true });
+
+    expect(discoverTestFiles).toHaveBeenCalledTimes(1);
+    expect(discoverTestFiles).toHaveBeenCalledWith({
+      testDir: TEST_DIR, testMatch: ['**/*.test.md'], testIgnore: ['**/.runs/**'],
+    });
+    expect(discoverTestFiles.mock.calls.some(([input]) => (
+      input.testMatch.includes('**/*.ambercast.plan.json')
+      || input.testMatch.includes('**/*.ambercast.grounding.json')
+    ))).toBe(false);
+  });
+
+  it('does not read or probe storage in list mode', async () => {
+    const testPath = `${TEST_DIR}/listed.test.md`;
+    const { storage, deps } = createScenario({ discoverTestFiles: createDiscovery(['listed.test.md']) });
+    const readText = vi.spyOn(storage, 'readText');
+    const exists = vi.spyOn(storage, 'exists');
+
+    await check(deps, { ...OPTIONS, list: true });
+
+    expect(readText).not.toHaveBeenCalled();
+    expect(exists).not.toHaveBeenCalled();
+    expect(testPath).toBe(`${TEST_DIR}/listed.test.md`);
+  });
+
+  it('keeps an already-aborted list operation outside interruption tracking', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const listedPath = `${TEST_DIR}/listed.test.md`;
+    const { deps } = createScenario({
+      signal: controller.signal,
+      discoverTestFiles: createDiscovery(['listed.test.md']),
+    });
+
+    await expect(check(deps, { ...OPTIONS, list: true })).resolves.toEqual({
+      results: [{ id: listedPath, file: listedPath, status: 'listed' }],
+      errors: [], noTestsFound: false, interrupted: false,
+    });
   });
 
   it('makes the selected target participate in freshness but ignores unrelated targets', async () => {
@@ -497,7 +583,8 @@ describe('check', () => {
     } as const;
     const { storage, layout } = createScenario();
     await storage.writeText(testPath, PROMPT);
-    await writePlan(storage, layout, testPath, freshPlan(PROMPT, { web: planTargets.web }));
+    const plan = await writePlan(storage, layout, testPath, freshPlan(PROMPT, { web: planTargets.web }));
+    await writeGrounding(storage, layout, testPath, plan);
 
     await expect(check({
       storage,
@@ -633,7 +720,8 @@ describe('check', () => {
       config: { ...configWithoutDefault, targets: soleTargets },
     });
     await storage.writeText(testPath, PROMPT);
-    await writePlan(storage, layout, testPath, freshPlan(PROMPT, soleTargets));
+    const plan = await writePlan(storage, layout, testPath, freshPlan(PROMPT, soleTargets));
+    await writeGrounding(storage, layout, testPath, plan);
 
     await expect(check(deps, { ...OPTIONS, files: [testPath] })).resolves.toMatchObject({
       results: [{ id: testPath, status: 'fresh' }],
@@ -658,12 +746,13 @@ describe('check', () => {
       config: createConfig({ targets, defaultTarget: 'web' }),
     });
     await storage.writeText(testPath, PROMPT);
-    await writePlan(
+    const plan = await writePlan(
       storage,
       layout,
       testPath,
       freshPlan(PROMPT, { [expectedName]: targets[expectedName] }),
     );
+    await writeGrounding(storage, layout, testPath, plan);
 
     await expect(check(deps, {
       ...OPTIONS,
@@ -698,10 +787,10 @@ describe('check', () => {
   it('returns a genuine empty outcome when no tests and no orphaned artifacts exist', async () => {
     const { deps } = createScenario();
 
-    await expect(check(deps, OPTIONS)).resolves.toEqual({ results: [], errors: [], noTestsFound: true });
+    await expect(check(deps, OPTIONS)).resolves.toEqual({ results: [], errors: [], noTestsFound: true, interrupted: false });
   });
 
-  it('does not call an orphan-only tree a genuine empty outcome', async () => {
+  it('keeps orphan scanning for a non-list zero-selection invocation', async () => {
     const orphanPath = `${TEST_DIR}/orphan.test.md`;
     const { storage, layout, deps } = createScenario({
       discoverTestFiles: createDiscovery([], ['orphan.ambercast.plan.json']),
@@ -719,20 +808,36 @@ describe('check', () => {
     const { storage, layout, deps } = createScenario({
       config: createConfig({ testIgnore: ['**/.runs/**', '**/fixtures/**'] }),
       discoverTestFiles: async ({ testMatch, testIgnore }) => (
-        testMatch[0] === '**/*.ambercast.plan.json' && !testIgnore.includes('**/fixtures/**')
+        testMatch[0] === '**/*.ambercast.plan.json' && testIgnore.length === 0
           ? ['fixtures/removed.ambercast.plan.json']
           : []
       ),
     });
     await storage.writeText(layout.planPathFor(ignoredPath), '{}');
 
-    await expect(check(deps, OPTIONS)).resolves.toEqual({ results: [], errors: [], noTestsFound: true });
+    await expect(check(deps, OPTIONS)).resolves.toEqual({ results: [], errors: [], noTestsFound: true, interrupted: false });
+  });
+
+  it('keeps an artifact whose derived test path misses testMatch out of artifact findings', async () => {
+    const { deps } = createScenario({
+      config: createConfig({ testMatch: ['ui/**/*.test.md'] }),
+      discoverTestFiles: async ({ testMatch }) => {
+        if (testMatch[0] === 'ui/**/*.test.md') return [];
+        if (testMatch[0] === '**/*.ambercast.plan.json') return ['other/place.ambercast.plan.json'];
+        if (testMatch[0] === '**/*.ambercast.grounding.json') return [];
+        throw new Error(`Unexpected test-match pattern: ${testMatch[0]}`);
+      },
+    });
+
+    await expect(check(deps, OPTIONS)).resolves.toEqual({
+      results: [], errors: [], noTestsFound: true, interrupted: false,
+    });
   });
 
   it.each([
     ['plan', 'removed.ambercast.plan.json', 'orphaned-plan'],
     ['grounding', 'removed.ambercast.grounding.json', 'orphaned-grounding'],
-  ] as const)('removes both self-referential default ignores so orphaned %ss are still discovered', async (
+  ] as const)('enumerates orphaned %ss without configured ignores before judging their virtual paths', async (
     _artifact,
     artifactFile,
     status,
@@ -756,15 +861,15 @@ describe('check', () => {
     expect(discoverTestFiles).toHaveBeenCalledWith({
       testDir: TEST_DIR,
       testMatch: [planArtifact ? '**/*.ambercast.plan.json' : '**/*.ambercast.grounding.json'],
-      testIgnore: ['**/.runs/**'],
+      testIgnore: [],
     });
     expect(outcome.results).toEqual([expect.objectContaining({ id: orphanPath, status })]);
   });
 
-  it('keeps the unrelated default .runs ignore during artifact discovery', async () => {
+  it('keeps the default .runs ignore during virtual test-path judgment', async () => {
     const orphanPath = `${RUNS_DIR}/removed.test.md`;
     const discoverTestFiles = vi.fn<CheckDeps['discoverTestFiles']>(async ({ testMatch, testIgnore }) => (
-      testMatch[0] === '**/*.ambercast.plan.json' && !testIgnore.includes('**/.runs/**')
+      testMatch[0] === '**/*.ambercast.plan.json' && testIgnore.length === 0
         ? ['.runs/removed.ambercast.plan.json']
         : []
     ));
@@ -774,12 +879,125 @@ describe('check', () => {
     });
     await storage.writeText(layout.planPathFor(orphanPath), '{}');
 
-    await expect(check(deps, OPTIONS)).resolves.toEqual({ results: [], errors: [], noTestsFound: true });
+    await expect(check(deps, OPTIONS)).resolves.toEqual({ results: [], errors: [], noTestsFound: true, interrupted: false });
     expect(discoverTestFiles).toHaveBeenCalledWith({
       testDir: TEST_DIR,
       testMatch: ['**/*.ambercast.plan.json'],
-      testIgnore: ['**/.runs/**'],
+      testIgnore: [],
     });
+  });
+
+  it.each([
+    ['plan', '.ambercast.plan.json'],
+    ['grounding', '.ambercast.grounding.json'],
+  ] as const)('reports an inverse-incapable %s artifact as invalid-artifact-name', async (_kind, artifactName) => {
+    const artifactPath = `${TEST_DIR}/${artifactName}`;
+    const { deps } = createScenario({
+      discoverTestFiles: createDiscovery(
+        [],
+        artifactName.endsWith('.plan.json') ? [artifactName] : [],
+        artifactName.endsWith('.grounding.json') ? [artifactName] : [],
+      ),
+    });
+
+    await expect(check(deps, OPTIONS)).resolves.toEqual(expect.objectContaining({
+      results: [{
+        id: artifactPath,
+        file: artifactPath,
+        status: 'invalid-artifact-name',
+        reason: 'The artifact name could not be inverse-derived into a corresponding test path.',
+        artifactFile: artifactPath,
+      }],
+      errors: [],
+      noTestsFound: false,
+      interrupted: false,
+    }));
+  });
+
+  it('orders an invalid plan artifact before an ordinary orphaned plan', async () => {
+    const invalidArtifact = `${TEST_DIR}/.ambercast.plan.json`;
+    const orphanPath = `${TEST_DIR}/orphan.test.md`;
+    const { deps } = createScenario({
+      discoverTestFiles: createDiscovery([], ['.ambercast.plan.json', 'orphan.ambercast.plan.json']),
+    });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: invalidArtifact, status: 'invalid-artifact-name', artifactFile: invalidArtifact }),
+      expect.objectContaining({ id: orphanPath, status: 'orphaned-plan' }),
+    ]);
+  });
+
+  it('retains an invalid plan artifact when a pre-aborted manageable artifact latches interruption', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const invalidArtifact = `${TEST_DIR}/.ambercast.plan.json`;
+    const pendingPath = `${TEST_DIR}/pending.test.md`;
+    const { deps } = createScenario({
+      signal: controller.signal,
+      discoverTestFiles: createDiscovery([], ['.ambercast.plan.json', 'pending.ambercast.plan.json']),
+    });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: invalidArtifact, status: 'invalid-artifact-name', artifactFile: invalidArtifact }),
+      { id: pendingPath, file: pendingPath, status: 'skipped' },
+    ]);
+    expect(outcome.interrupted).toBe(true);
+  });
+
+  it('orders an invalid grounding artifact before an ordinary orphaned grounding', async () => {
+    const invalidArtifact = `${TEST_DIR}/.ambercast.grounding.json`;
+    const orphanPath = `${TEST_DIR}/orphan.test.md`;
+    const { deps } = createScenario({
+      discoverTestFiles: createDiscovery([], [], ['.ambercast.grounding.json', 'orphan.ambercast.grounding.json']),
+    });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: invalidArtifact, status: 'invalid-artifact-name', artifactFile: invalidArtifact }),
+      expect.objectContaining({ id: orphanPath, status: 'orphaned-grounding' }),
+    ]);
+  });
+
+  it('reports every repeated inverse-incapable plan artifact without tracker registration', async () => {
+    const invalidArtifact = `${TEST_DIR}/.ambercast.plan.json`;
+    const orphanPath = `${TEST_DIR}/orphan.test.md`;
+    const addDiscovered = vi.spyOn(BatchInterruptionTracker.prototype, 'addDiscovered');
+    const { deps } = createScenario({
+      discoverTestFiles: createDiscovery([], [
+        '.ambercast.plan.json',
+        'orphan.ambercast.plan.json',
+        '.ambercast.plan.json',
+      ]),
+    });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: invalidArtifact, status: 'invalid-artifact-name', artifactFile: invalidArtifact }),
+      expect.objectContaining({ id: invalidArtifact, status: 'invalid-artifact-name', artifactFile: invalidArtifact }),
+      expect.objectContaining({ id: orphanPath, status: 'orphaned-plan' }),
+    ]);
+    expect(addDiscovered).toHaveBeenCalledExactlyOnceWith(
+      `plan:1:${orphanPath.replace('.test.md', '.ambercast.plan.json')}`,
+      orphanPath,
+    );
+  });
+
+  it('maps an invalid-artifact-name-only outcome to exit 4', async () => {
+    const artifactPath = `${TEST_DIR}/.ambercast.plan.json`;
+    const { deps } = createScenario({ discoverTestFiles: createDiscovery([], ['.ambercast.plan.json']) });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(buildCheckReport({
+      startedAt: '2026-08-24T00:00:00Z', durationMs: 1, options: OPTIONS, outcome,
+    }).exitCode).toBe(4);
+    expect(outcome.results).toEqual([expect.objectContaining({ id: artifactPath, status: 'invalid-artifact-name' })]);
   });
 
   it('records a plan read rejection as a case-scoped FS_IO_ERROR', async () => {
@@ -841,19 +1059,21 @@ describe('check', () => {
     await expect(check(deps, OPTIONS)).rejects.toThrow('test directory is unreadable');
   });
 
-  it('stops before the first selected file when cancellation is already requested', async () => {
+  it('turns a pre-aborted selected occurrence into a pending skipped row and suppresses orphan discovery', async () => {
     const controller = new AbortController();
     controller.abort(new Error('stop'));
     const { deps } = createScenario({ signal: controller.signal });
+    const selectedPath = `${TEST_DIR}/login.test.md`;
 
-    await expect(check(deps, { ...OPTIONS, files: [`${TEST_DIR}/login.test.md`] })).resolves.toEqual({
-      results: [],
+    await expect(check(deps, { ...OPTIONS, files: [selectedPath] })).resolves.toEqual({
+      results: [{ id: selectedPath, file: selectedPath, status: 'skipped' }],
       errors: [],
       noTestsFound: false,
+      interrupted: true,
     });
   });
 
-  it('continues the independent ordered orphan scan after pre-aborted selected work', async () => {
+  it('does not inspect orphan phases once pre-aborted selected work has latched interruption', async () => {
     const selectedPath = `${TEST_DIR}/selected.test.md`;
     const orphanedPlanPath = `${TEST_DIR}/deleted-plan.test.md`;
     const orphanedGroundingPath = `${TEST_DIR}/deleted-grounding.test.md`;
@@ -874,13 +1094,10 @@ describe('check', () => {
 
     const outcome = await check(deps, { ...OPTIONS, files: [selectedPath] });
 
-    expect(outcome.results).toEqual([
-      expect.objectContaining({ id: orphanedPlanPath, status: 'orphaned-plan' }),
-      expect.objectContaining({ id: orphanedGroundingPath, status: 'orphaned-grounding' }),
-    ]);
-    expect(outcome.results).not.toContainEqual(expect.objectContaining({ id: selectedPath }));
+    expect(outcome.results).toEqual([{ id: selectedPath, file: selectedPath, status: 'skipped' }]);
     expect(outcome.errors).toEqual([]);
     expect(outcome.noTestsFound).toBe(false);
+    expect(outcome.interrupted).toBe(true);
   });
 
   it('retains completed findings and stops before a later stale file after cancellation', async () => {
@@ -889,7 +1106,8 @@ describe('check', () => {
     const controller = new AbortController();
     const { storage, layout, deps } = createScenario({ signal: controller.signal });
     await storage.writeText(freshPath, PROMPT);
-    await writePlan(storage, layout, freshPath);
+    const freshPlanDocument = await writePlan(storage, layout, freshPath);
+    await writeGrounding(storage, layout, freshPath, freshPlanDocument);
     await storage.writeText(stalePath, PROMPT);
     await writePlan(storage, layout, stalePath, freshPlan(`${PROMPT}changed`));
     const readText = vi.fn(async (path: string) => {
@@ -904,7 +1122,7 @@ describe('check', () => {
       ...OPTIONS,
       files: [freshPath, stalePath],
     })).resolves.toMatchObject({
-      results: [{ id: freshPath, status: 'fresh' }],
+      results: [{ id: freshPath, status: 'fresh' }, { id: stalePath, status: 'skipped' }],
       errors: [],
       noTestsFound: false,
     });
@@ -939,6 +1157,33 @@ describe('check', () => {
       });
     },
   );
+
+  it.each([
+    ['plan', ['first.ambercast.plan.json', 'second.ambercast.plan.json'], [], `${TEST_DIR}/first.test.md`, `${TEST_DIR}/second.test.md`, 'orphaned-plan'],
+    ['grounding', [], ['first.ambercast.grounding.json', 'second.ambercast.grounding.json'], `${TEST_DIR}/first.test.md`, `${TEST_DIR}/second.test.md`, 'orphaned-grounding'],
+  ] as const)('stops the %s orphan loop after an interrupted inspection without further storage reads', async (_phase, plans, groundings, first, second, status) => {
+    const controller = new AbortController();
+    const storage = createInMemoryStorage();
+    const exists = vi.fn(async (path: string) => {
+      if (path === first) controller.abort(new Error('stop'));
+      return false;
+    });
+    const { deps } = createScenario({
+      signal: controller.signal,
+      storage: { ...storage, exists },
+      discoverTestFiles: createDiscovery([], plans, groundings),
+    });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: first, status }),
+      { id: second, file: second, status: 'skipped' },
+    ]);
+    expect(exists).toHaveBeenCalledOnce();
+    expect(exists).toHaveBeenCalledWith(first);
+    expect(outcome.interrupted).toBe(true);
+  });
 
   it.each([
     ['fresh with cold grounding', 'cold'],
@@ -1015,8 +1260,470 @@ describe('check', () => {
   });
 
   it('pins the read-only CheckDeps dependency surface at compile time', () => {
+    expectTypeOf<CheckDeps['storage']>().toEqualTypeOf<ReadStorageAdapter>();
+    expectTypeOf<CheckDeps['layout']>().toEqualTypeOf<LayoutResolver>();
+    expectTypeOf<CheckDeps['discoverTestFiles']>().toEqualTypeOf<
+      (config: {
+        readonly testDir: string;
+        readonly testMatch: readonly string[];
+        readonly testIgnore: readonly string[];
+      }) => Promise<readonly string[]>
+    >();
+    expectTypeOf<CheckDeps['config']>().toEqualTypeOf<
+      Pick<ResolvedConfig, 'testDir' | 'testMatch' | 'testIgnore' | 'targets' | 'defaultTarget' | 'grounding'>
+    >();
+    expectTypeOf<CheckDeps['signal']>().toEqualTypeOf<AbortSignal | undefined>();
     expectTypeOf<keyof CheckDeps>().toEqualTypeOf<
       'storage' | 'layout' | 'discoverTestFiles' | 'config' | 'signal'
     >();
+  });
+});
+
+describe('check grounding lifecycle integration', () => {
+  it.each([
+    ['missing', 'missing-grounding', 'The grounding cache does not exist.'],
+    ['invalid JSON', 'invalid-grounding', 'The grounding cache is not valid or does not match the grounding schema.'],
+    ['schema-invalid JSON', 'invalid-grounding', 'The grounding cache is not valid or does not match the grounding schema.'],
+    ['a mismatched plan digest', 'stale-grounding', 'The grounding cache does not match the current plan.'],
+    ['noncanonical coverage claim', 'invalid-grounding', 'The grounding cache is not valid or does not match the grounding schema.'],
+  ] as const)('routes committed %s grounding through the full check usecase', async (kind, status, reason) => {
+    const { storage, layout, deps } = createScenario();
+    const testPath = `${TEST_DIR}/committed-${kind}.test.md`;
+    await storage.writeText(testPath, PROMPT);
+    const plan = await writePlan(storage, layout, testPath);
+    const groundingPath = layout.groundingPathFor(testPath);
+    if (kind === 'invalid JSON') await storage.writeText(groundingPath, '{not JSON');
+    if (kind === 'schema-invalid JSON') await storage.writeText(groundingPath, '{"schemaVersion":999}');
+    if (kind === 'a mismatched plan digest') await writeGrounding(storage, layout, testPath, plan, {}, 'b'.repeat(64));
+    if (kind === 'noncanonical coverage claim') await storage.writeText(groundingPath, JSON.stringify({
+      schemaVersion: 1,
+      planDigest: computePlanDigest(plan),
+      entries: {
+        'reach-dashboard': {
+          kind: 'ai',
+          trace: {
+            events: [],
+            verification: [{ type: 'assert', check: 'text-visible', text: 'Dashboard' }],
+            verificationCoverage: { 'dashboard-reached': 0 },
+          },
+        },
+      },
+    }, null, 4));
+
+    const outcome = await check(deps, { ...OPTIONS, files: [testPath] });
+    const row = outcome.results.find((result) => result.id === testPath);
+
+    expect(outcome.results.filter((result) => result.id === testPath)).toHaveLength(1);
+    expect(row).toMatchObject({ id: testPath, status, reason });
+    if (status === 'missing-grounding') {
+      expect(row).not.toHaveProperty('groundingFile');
+    } else {
+      expect(row).toMatchObject({ groundingFile: groundingPath });
+    }
+    expect(outcome.errors).toEqual([]);
+    const report = buildCheckReport({
+      startedAt: '2026-08-24T00:00:00Z', durationMs: 1, options: OPTIONS, outcome,
+    });
+    expect(report.exitCode).toBe(4);
+    expect(report.envelope.summary).toEqual({ total: 1, passed: 0, failed: 1, errored: 0, skipped: 0 });
+  });
+
+  it.each([
+    ['empty entries', {}],
+    ['non-empty entries', {
+      'click-submit': { kind: 'element', fingerprint: { algorithm: 'a11y-neighborhood-v2', hash: 'a'.repeat(64) } },
+    }],
+  ] as const)('keeps committed matching grounding with %s fresh', async (_name, entries) => {
+    const { storage, layout, deps } = createScenario();
+    const testPath = `${TEST_DIR}/committed-valid-${_name}.test.md`;
+    await storage.writeText(testPath, PROMPT);
+    const plan = await writePlan(storage, layout, testPath);
+    await writeGrounding(storage, layout, testPath, plan, entries as GroundingDocument['entries']);
+
+    await expect(check(deps, { ...OPTIONS, files: [testPath] })).resolves.toMatchObject({
+      results: [{ id: testPath, status: 'fresh' }], errors: [],
+    });
+  });
+
+  it.each(['missing', 'invalid', 'stale'] as const)('collapses uncommitted %s grounding without leaking its cause', async (kind) => {
+    const { storage, layout, deps } = createScenario({
+      config: createConfig({ grounding: { repositoryPolicy: 'uncommitted', localWriteBack: 'auto' } }),
+    });
+    const testPath = `${TEST_DIR}/uncommitted-${kind}.test.md`;
+    await storage.writeText(testPath, PROMPT);
+    const plan = await writePlan(storage, layout, testPath);
+    if (kind === 'invalid') await storage.writeText(layout.groundingPathFor(testPath), '{not JSON');
+    if (kind === 'stale') await writeGrounding(storage, layout, testPath, plan, {}, 'b'.repeat(64));
+
+    const outcome = await check(deps, { ...OPTIONS, files: [testPath] });
+    const row = outcome.results.find((result) => result.id === testPath);
+
+    expect(outcome.results.filter((result) => result.id === testPath)).toHaveLength(1);
+    expect(row).toMatchObject({
+      id: testPath,
+      status: 'fresh-without-grounding',
+      reason: 'The plan is fresh; a grounding cache is not required by this project\'s repository policy.',
+    });
+    expect(row).not.toHaveProperty('groundingFile');
+    expect(buildCheckReport({
+      startedAt: '2026-08-24T00:00:00Z', durationMs: 1, options: OPTIONS, outcome,
+    }).exitCode).toBe(0);
+  });
+
+  it.each(['empty entries', 'non-empty entries'] as const)('keeps uncommitted matching grounding with %s fresh', async (kind) => {
+    const { storage, layout, deps } = createScenario({
+      config: createConfig({ grounding: { repositoryPolicy: 'uncommitted', localWriteBack: 'auto' } }),
+    });
+    const testPath = `${TEST_DIR}/uncommitted-valid-${kind}.test.md`;
+    await storage.writeText(testPath, PROMPT);
+    const plan = await writePlan(storage, layout, testPath);
+    await writeGrounding(storage, layout, testPath, plan, kind === 'empty entries' ? {} : {
+      'click-submit': { kind: 'element', fingerprint: { algorithm: 'a11y-neighborhood-v2', hash: 'a'.repeat(64) } },
+    } as GroundingDocument['entries']);
+
+    await expect(check(deps, { ...OPTIONS, files: [testPath] })).resolves.toMatchObject({
+      results: [{ id: testPath, status: 'fresh' }], errors: [],
+    });
+  });
+
+  it.each([
+    ['stale', 'stale'],
+    ['missing-plan', 'missing-plan'],
+    ['schema-invalid', 'stale'],
+  ] as const)('does not inspect grounding for a %s plan', async (kind, status) => {
+    const { storage, layout, deps } = createScenario();
+    const testPath = `${TEST_DIR}/no-grounding-${kind}.test.md`;
+    const groundingPath = layout.groundingPathFor(testPath);
+    await storage.writeText(testPath, PROMPT);
+    if (kind === 'stale') await writePlan(storage, layout, testPath, freshPlan(`${PROMPT}changed`));
+    if (kind === 'schema-invalid') await storage.writeText(layout.planPathFor(testPath), '{"schemaVersion":999}');
+    const exists = vi.fn(async (path: string) => {
+      if (path === groundingPath) throw new Error('stale and missing plans must not inspect grounding');
+      return storage.exists(path);
+    });
+    const readText = vi.fn(async (path: string) => {
+      if (path === groundingPath) throw new Error('stale and missing plans must not read grounding');
+      return storage.readText(path);
+    });
+
+    await expect(check({ ...deps, storage: { exists, readText } }, { ...OPTIONS, files: [testPath] })).resolves.toMatchObject({
+      results: [{ id: testPath, status }], errors: [],
+    });
+    expect(exists).not.toHaveBeenCalledWith(groundingPath);
+    expect(readText).not.toHaveBeenCalledWith(groundingPath);
+  });
+
+  it('emits exactly one grounding-derived row for each fresh selected occurrence', async () => {
+    const { storage, layout, deps } = createScenario();
+    const testPath = `${TEST_DIR}/duplicate-grounding.test.md`;
+    await storage.writeText(testPath, PROMPT);
+    await writePlan(storage, layout, testPath);
+    const groundingPathFor = vi.spyOn(layout, 'groundingPathFor');
+
+    const outcome = await check(deps, { ...OPTIONS, files: [testPath, testPath] });
+    const rows = outcome.results.filter((result) => result.id === testPath);
+
+    expect(rows).toHaveLength(2);
+    expect(rows).toEqual([
+      expect.objectContaining({ status: 'missing-grounding' }),
+      expect.objectContaining({ status: 'missing-grounding' }),
+    ]);
+    expect(groundingPathFor).toHaveBeenCalledTimes(2);
+    expect(groundingPathFor).toHaveBeenNthCalledWith(1, testPath);
+    expect(groundingPathFor).toHaveBeenNthCalledWith(2, testPath);
+  });
+
+  it('routes a grounding read failure to the file error without a fallback fresh row', async () => {
+    const { storage, layout, deps } = createScenario();
+    const testPath = `${TEST_DIR}/grounding-read-failure.test.md`;
+    const laterPath = `${TEST_DIR}/later-valid-grounding.test.md`;
+    await storage.writeText(testPath, PROMPT);
+    await storage.writeText(laterPath, PROMPT);
+    await writePlan(storage, layout, testPath);
+    const laterPlan = await writePlan(storage, layout, laterPath);
+    await writeGrounding(storage, layout, laterPath, laterPlan);
+    const groundingPath = layout.groundingPathFor(testPath);
+    const exists = vi.fn(async (path: string) => path === groundingPath || storage.exists(path));
+    const readText = vi.fn(async (path: string) => {
+      if (path === groundingPath) throw new Error('grounding read failure');
+      return storage.readText(path);
+    });
+
+    const outcome = await check({ ...deps, storage: { exists, readText } }, {
+      ...OPTIONS,
+      files: [testPath, laterPath],
+    });
+
+    expect(outcome.errors).toEqual([expect.objectContaining({ file: testPath, error: expect.objectContaining({ kind: 'fs-io-error' }) })]);
+    expect(outcome.results).not.toContainEqual(expect.objectContaining({ id: testPath }));
+    expect(outcome.results).toContainEqual(expect.objectContaining({ id: laterPath, status: 'fresh' }));
+  });
+});
+
+describe('check interruption contract', () => {
+  it('retains raw-abort phase continuation for an empty selected phase and reports the final interruption fact', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { deps } = createScenario({ signal: controller.signal, discoverTestFiles: createDiscovery([], [], ['orphan.ambercast.grounding.json']) });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(outcome.interrupted).toBe(true);
+    expect(outcome.noTestsFound).toBe(false);
+    expect(outcome.results).toEqual([expect.objectContaining({ status: 'skipped', id: expect.any(String), file: expect.any(String) })]);
+  });
+
+  it.each([
+    ['pre-aborted empty selection and empty plan still inspect grounding', [], [], ['deleted.ambercast.grounding.json'], ['tests', 'plans', 'grounding'], false, true],
+    ['pre-aborted empty plan and grounding stay a genuine zero match', [], [], [], ['tests', 'plans', 'grounding'], true, false],
+    ['latched plan work suppresses grounding discovery', [], ['deleted.ambercast.plan.json'], ['deleted.ambercast.grounding.json'], ['tests', 'plans'], false, true],
+  ] as const)('%s with exact phase calls and noTestsFound result', async (_name, tests, plans, groundings, expectedCalls, noTestsFound, interrupted) => {
+    const controller = new AbortController();
+    controller.abort();
+    const calls: string[] = [];
+    const discoverTestFiles = vi.fn<CheckDeps['discoverTestFiles']>(async ({ testMatch }) => {
+      if (testMatch[0] === '**/*.test.md') { calls.push('tests'); return tests; }
+      if (testMatch[0] === '**/*.ambercast.plan.json') { calls.push('plans'); return plans; }
+      calls.push('grounding');
+      return groundings;
+    });
+    const { deps } = createScenario({ signal: controller.signal, discoverTestFiles });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(calls).toEqual(expectedCalls);
+    expect(outcome.noTestsFound).toBe(noTestsFound);
+    expect(outcome.interrupted).toBe(interrupted);
+  });
+
+  it('atomically registers every grounding response before evaluating an abort and keeps each skipped identity ordered', async () => {
+    const controller = new AbortController();
+    const calls: string[] = [];
+    const discoverTestFiles = vi.fn<CheckDeps['discoverTestFiles']>(async ({ testMatch }) => {
+      if (testMatch[0] === '**/*.test.md') { calls.push('tests'); return []; }
+      if (testMatch[0] === '**/*.ambercast.plan.json') { calls.push('plans'); return []; }
+      calls.push('grounding');
+      controller.abort();
+      return ['first.ambercast.grounding.json', 'second.ambercast.grounding.json'];
+    });
+    const { deps } = createScenario({ signal: controller.signal, discoverTestFiles });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(calls).toEqual(['tests', 'plans', 'grounding']);
+    expect(outcome.interrupted).toBe(true);
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: `${TEST_DIR}/first.test.md`, status: 'skipped' }),
+      expect.objectContaining({ id: `${TEST_DIR}/second.test.md`, status: 'skipped' }),
+    ]);
+  });
+
+  it('keeps healthy plan and grounding inspections terminal without emitting rows or suppressing grounding discovery', async () => {
+    const calls: string[] = [];
+    const exists = vi.fn(async () => true);
+    const discoverTestFiles = vi.fn<CheckDeps['discoverTestFiles']>(async ({ testMatch }) => {
+      if (testMatch[0] === '**/*.test.md') { calls.push('tests'); return []; }
+      if (testMatch[0] === '**/*.ambercast.plan.json') { calls.push('plans'); return ['healthy.ambercast.plan.json']; }
+      calls.push('grounding');
+      return ['healthy.ambercast.grounding.json'];
+    });
+    const { deps } = createScenario({ storage: { ...createInMemoryStorage(), exists }, discoverTestFiles });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(calls).toEqual(['tests', 'plans', 'grounding']);
+    expect(exists).toHaveBeenCalledTimes(2);
+    expect(outcome).toEqual({ results: [], errors: [], noTestsFound: true, interrupted: false });
+  });
+
+  it('retains plan and grounding orphan rows for one identity while summarizing it once', async () => {
+    const identity = `${TEST_DIR}/deleted.test.md`;
+    const { deps } = createScenario({
+      discoverTestFiles: createDiscovery([], ['deleted.ambercast.plan.json'], ['deleted.ambercast.grounding.json']),
+    });
+
+    const outcome = await check(deps, OPTIONS);
+    const report = buildCheckReport({
+      startedAt: '2026-08-17T00:00:00Z', durationMs: 1, options: { allowEmpty: false, list: false }, outcome,
+    });
+
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: identity, status: 'orphaned-plan' }),
+      expect.objectContaining({ id: identity, status: 'orphaned-grounding' }),
+    ]);
+    expect(report.envelope.summary).toEqual({ total: 1, passed: 0, failed: 1, errored: 0, skipped: 0 });
+  });
+
+  it('keeps a terminal orphan and a pending same-identity sibling as separate rows, then promotes their summary to skipped', async () => {
+    const controller = new AbortController();
+    const identity = `${TEST_DIR}/deleted.test.md`;
+    const calls: string[] = [];
+    const exists = vi.fn(async () => {
+      controller.abort();
+      return false;
+    });
+    const discoverTestFiles = vi.fn<CheckDeps['discoverTestFiles']>(async ({ testMatch }) => {
+      if (testMatch[0] === '**/*.test.md') { calls.push('tests'); return []; }
+      if (testMatch[0] === '**/*.ambercast.plan.json') { calls.push('plans'); return ['deleted.ambercast.plan.json', 'deleted.ambercast.plan.json']; }
+      calls.push('grounding');
+      throw new Error('grounding discovery must be suppressed after interruption');
+    });
+    const { deps } = createScenario({ signal: controller.signal, storage: { ...createInMemoryStorage(), exists }, discoverTestFiles });
+
+    const outcome = await check(deps, OPTIONS);
+    const report = buildCheckReport({
+      startedAt: '2026-08-17T00:00:00Z', durationMs: 1, options: { allowEmpty: false, list: false }, outcome,
+    });
+
+    expect(calls).toEqual(['tests', 'plans']);
+    expect(exists).toHaveBeenCalledOnce();
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: identity, status: 'orphaned-plan' }),
+      { id: identity, file: identity, status: 'skipped' },
+    ]);
+    expect(outcome.interrupted).toBe(true);
+    expect(report.exitCode).toBe(3);
+    expect(report.envelope.summary).toEqual({ total: 1, passed: 0, failed: 0, errored: 0, skipped: 1 });
+    expect(report.envelope.errors).toEqual([expect.objectContaining({ scope: 'run', code: 'INTERRUPTED' })]);
+  });
+
+  it('retains a selected case error and a later orphan finding with the same public identity, then summarizes that identity once as errored', async () => {
+    const testPath = `${TEST_DIR}/same.test.md`;
+    const { storage, layout, deps } = createScenario({
+      discoverTestFiles: createDiscovery([], ['same.ambercast.plan.json']),
+    });
+    await storage.writeText(testPath, PROMPT);
+    await storage.writeText(layout.planPathFor(testPath), '{invalid JSON');
+
+    const readText = vi.fn(async (path: string) => {
+      if (path === layout.planPathFor(testPath)) throw new Error('read failure');
+      return storage.readText(path);
+    });
+    const exists = vi.fn(async (path: string) => path === layout.planPathFor(testPath));
+    const outcome = await check({ ...deps, storage: { readText, exists } }, { ...OPTIONS, files: [testPath] });
+
+    expect(outcome.results).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: testPath, status: 'orphaned-plan' }),
+    ]));
+    expect(outcome.errors).toEqual(expect.arrayContaining([expect.objectContaining({ file: testPath })]));
+  });
+
+  it('retains the terminal selected result, skips only its pending selected suffix, and suppresses later orphan discovery after abort during selected work', async () => {
+    const controller = new AbortController();
+    const first = `${TEST_DIR}/first.test.md`;
+    const second = `${TEST_DIR}/second.test.md`;
+    const storage = createInMemoryStorage();
+    const exists = vi.fn(async (path: string) => {
+      if (path === `${TEST_DIR}/first.ambercast.plan.json`) {
+        controller.abort();
+      }
+      return false;
+    });
+    const discover = vi.fn<CheckDeps['discoverTestFiles']>(async () => {
+      throw new Error('later orphan discovery must be suppressed');
+    });
+    const { deps } = createScenario({ signal: controller.signal, storage: { ...storage, exists }, discoverTestFiles: discover });
+
+    const outcome = await check(deps, { ...OPTIONS, files: [first, second] });
+
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: first, status: 'missing-plan' }),
+      { id: second, file: second, status: 'skipped' },
+    ]);
+    expect(exists).toHaveBeenCalledTimes(1);
+    expect(discover).not.toHaveBeenCalled();
+    expect(outcome.interrupted).toBe(true);
+  });
+
+  it('keeps the selected grounding inspection terminal and skips its pending selected suffix when abort arrives during it', async () => {
+    const controller = new AbortController();
+    const first = `${TEST_DIR}/first-grounding.test.md`;
+    const second = `${TEST_DIR}/second-grounding.test.md`;
+    const { storage, layout, deps } = createScenario({ signal: controller.signal });
+    await storage.writeText(first, PROMPT);
+    await storage.writeText(second, PROMPT);
+    const firstPlan = await writePlan(storage, layout, first);
+    await writeGrounding(storage, layout, first, firstPlan);
+    await writePlan(storage, layout, second);
+    const groundingPathFor = vi.fn((file: string) => {
+      const groundingPath = layout.groundingPathFor(file);
+      if (file === first) controller.abort();
+      return groundingPath;
+    });
+
+    const outcome = await check({ ...deps, layout: { ...layout, groundingPathFor } }, { ...OPTIONS, files: [first, second] });
+
+    expect(groundingPathFor).toHaveBeenCalledWith(first);
+    expect(outcome.results).toEqual([
+      expect.objectContaining({ id: first, status: 'fresh' }),
+      { id: second, file: second, status: 'skipped' },
+    ]);
+    expect(outcome.interrupted).toBe(true);
+  });
+
+  it.each([
+    ['plan orphan', ['deleted.ambercast.plan.json'], [], `${TEST_DIR}/deleted.test.md`, 'orphaned-plan'],
+    ['grounding orphan', [], ['deleted.ambercast.grounding.json'], `${TEST_DIR}/deleted.test.md`, 'orphaned-grounding'],
+  ] as const)('keeps the current %s inspection terminal when abort arrives during it, without inspecting a later artifact', async (_name, plans, groundings, identity, status) => {
+    const controller = new AbortController();
+    const storage = createInMemoryStorage();
+    const exists = vi.fn(async (path: string) => {
+      if (path === identity) controller.abort();
+      return false;
+    });
+    const calls: string[] = [];
+    const discover = vi.fn<CheckDeps['discoverTestFiles']>(async ({ testMatch }) => {
+      if (testMatch[0] === '**/*.test.md') { calls.push('tests'); return []; }
+      if (testMatch[0] === '**/*.ambercast.plan.json') { calls.push('plans'); return plans; }
+      calls.push('grounding');
+      return groundings;
+    });
+    const { deps } = createScenario({ signal: controller.signal, storage: { ...storage, exists }, discoverTestFiles: discover });
+
+    const outcome = await check(deps, OPTIONS);
+
+    expect(outcome.results).toEqual([expect.objectContaining({ id: identity, status })]);
+    expect(exists).toHaveBeenCalledOnce();
+    expect(outcome.interrupted).toBe(true);
+    expect(calls).toEqual(status === 'orphaned-plan' ? ['tests', 'plans'] : ['tests', 'plans', 'grounding']);
+  });
+
+  it('keeps selected case-error and later plan-orphan rows sharing an identity without a terminal-mark collision', async () => {
+    const testPath = `${TEST_DIR}/same.test.md`;
+    const planPath = `${TEST_DIR}/same.ambercast.plan.json`;
+    const storage = createInMemoryStorage();
+    const readText = vi.fn(async (path: string) => {
+      if (path === planPath) throw new Error('read failure');
+      return storage.readText(path);
+    });
+    const exists = vi.fn(async (path: string) => path === planPath);
+    const { deps } = createScenario({
+      storage: { ...storage, readText, exists },
+      discoverTestFiles: createDiscovery([], ['same.ambercast.plan.json']),
+    });
+
+    const outcome = await check(deps, { ...OPTIONS, files: [testPath] });
+
+    expect(outcome.errors).toEqual([expect.objectContaining({ file: testPath })]);
+    expect(outcome.results).toEqual([expect.objectContaining({ id: testPath, status: 'orphaned-plan' })]);
+    expect(buildCheckReport({
+      startedAt: '2026-08-17T00:00:00Z', durationMs: 1, options: { allowEmpty: false, list: false }, outcome,
+    }).envelope.summary).toEqual({ total: 1, passed: 0, failed: 0, errored: 1, skipped: 0 });
+  });
+
+  it.each(['normal return', 'discovery rejection'] as const)('disposes the tracker in check finally after %s', async (mode) => {
+    const dispose = vi.spyOn(BatchInterruptionTracker.prototype, 'dispose');
+    const discover = mode === 'normal return'
+      ? createDiscovery()
+      : vi.fn<CheckDeps['discoverTestFiles']>(async () => { throw new Error('discovery failed'); });
+    const { deps } = createScenario({ discoverTestFiles: discover });
+
+    if (mode === 'normal return') {
+      await expect(check(deps, OPTIONS)).resolves.toBeDefined();
+    } else {
+      await expect(check(deps, OPTIONS)).rejects.toThrow('discovery failed');
+    }
+    expect(dispose).toHaveBeenCalledOnce();
+    dispose.mockRestore();
   });
 });

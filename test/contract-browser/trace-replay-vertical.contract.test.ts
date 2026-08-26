@@ -28,6 +28,7 @@ const PROMPT = '# Replay a hand-authored trace\n\nVerify the fixture is ready.\n
 const RUN_OPTIONS: RunOptions = {
   files: [TEST_PATH],
   cacheOnly: false,
+  updateCache: false,
   allowEmpty: false,
   list: false,
   stale: 'fail',
@@ -159,7 +160,10 @@ describe('hand-authored trace replay against real Chromium', () => {
           targets,
           defaultTarget: 'fixture',
           ai: { provider: 'codex', timeoutMs: 120_000 },
+          ci: { heal: false, updateGroundingCache: false },
+          grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
         },
+        isCI: false,
       };
 
       const outcome = await run(deps, RUN_OPTIONS);

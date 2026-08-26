@@ -23,4 +23,8 @@ export const EXPECTED_DEFAULT_CONFIG = {
     heal: false,
     updateGroundingCache: false,
   },
+  grounding: {
+    repositoryPolicy: 'committed',
+    localWriteBack: 'auto',
+  },
 } as const satisfies Omit<ResolvedConfig, 'projectRoot'>;

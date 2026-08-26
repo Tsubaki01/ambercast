@@ -37,6 +37,7 @@ export type ErrorKind =
   | 'ai-response-invalid'
   | 'fs-io-error'
   | 'unexpected-crash'
+  | 'interrupted'
   | 'no-tests-found';
 
 /**

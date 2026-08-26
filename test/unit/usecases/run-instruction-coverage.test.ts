@@ -32,6 +32,7 @@ const TARGETS = { web: { baseUrl: 'https://example.test', browser: 'chromium' as
 const OPTIONS: RunOptions = {
   files: [TEST_PATH],
   cacheOnly: false,
+  updateCache: false,
   allowEmpty: false,
   list: false,
   stale: 'fail',
@@ -207,6 +208,7 @@ function scenario(
     resolveAiExecutor,
     events: events.sink,
     discoverTestFiles: async () => [],
+    isCI: false,
     config: {
       testDir: TEST_DIR,
       testMatch: ['**/*.test.md'],
@@ -214,6 +216,8 @@ function scenario(
       targets: TARGETS,
       defaultTarget: 'web',
       ai: { provider: 'codex', timeoutMs: 1000 },
+      ci: { heal: false, updateGroundingCache: false },
+      grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
     },
     ...overrides,
   };
@@ -546,6 +550,36 @@ describe('run instruction coverage trust boundary', () => {
       const outcome = await run(arranged.deps, { ...OPTIONS, cacheOnly });
 
       expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+      expect(outcome.results[0]?.error?.message).toMatch(/coverage|canonical/i);
+      expect(arranged.resolveAiExecutor).not.toHaveBeenCalled();
+      expect(arranged.browserDriver).not.toHaveBeenCalled();
+      expect(arranged.session.operations()).toEqual([]);
+      expect(recording.writes).toEqual([]);
+      expect(recording.binaryWrites).toEqual([]);
+      expect(recording.ensuredDirectories).toEqual([]);
+    },
+  );
+
+  it.each([false, true])(
+    'fails a current-provenance coverage claim whose canonicalization throws before fallback in cacheOnly=%s',
+    async (cacheOnly) => {
+      const recording = recordingStorage();
+      await arrangeArtifacts(
+        recording.storage,
+        coveredTrace({
+          verification: [{ ...READY_ASSERTION, text: '\uD800' }],
+        }),
+        (grounding) => JSON.stringify(grounding),
+      );
+      recording.resetMutations();
+      const arranged = scenario(recording);
+
+      const outcome = await run(arranged.deps, { ...OPTIONS, cacheOnly });
+
+      expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+      expect(outcome.results[0]?.error).toMatchObject({
+        details: { reason: 'coverage-canonical-invalid' },
+      });
       expect(outcome.results[0]?.error?.message).toMatch(/coverage|canonical/i);
       expect(arranged.resolveAiExecutor).not.toHaveBeenCalled();
       expect(arranged.browserDriver).not.toHaveBeenCalled();

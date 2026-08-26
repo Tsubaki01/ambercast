@@ -107,10 +107,11 @@ export interface Ambercast {
  * This is intentionally not a general ports factory. It serves the two real
  * callers, `generate` and `run`, and grows only with dependencies one of them
  * actually uses. Generation and replay both make `events` a real dependency;
- * random and environment ports remain outside this composer because neither
- * composed command depends on them. Keeping one composer instead of a speculative
- * `createRunAmbercast()` split preserves a single, visibly Ports-aligned
- * application boundary.
+ * command-specific random and environment adapters remain direct imports at
+ * their consuming runtime boundary, following the established randomness
+ * pattern instead of widening this shared composer. Keeping one composer
+ * instead of a speculative `createRunAmbercast()` split preserves a single,
+ * visibly Ports-aligned application boundary.
  *
  * `aiProvider` and the resulting `aiExecutor` remain required because
  * `generate-command.ts` reads `ambercast.aiExecutor` directly. To compose a

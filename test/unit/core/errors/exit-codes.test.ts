@@ -17,8 +17,9 @@ const ALL_ERROR_KINDS = [
   'ai-response-invalid',
   'fs-io-error',
   'unexpected-crash',
+  'interrupted',
   'no-tests-found',
-] as const satisfies readonly ErrorKind[];
+] as const;
 
 function assertNever(value: never): never {
   throw new Error(`Unexpected error kind: ${value}`);
@@ -28,7 +29,7 @@ function assertNever(value: never): never {
  * Deliberately independent from the production table so a future weakening of
  * its `satisfies` clause cannot also weaken this exhaustiveness check.
  */
-function exitCodeFor(kind: ErrorKind): ErrorExitCode {
+function exitCodeFor(kind: ErrorKind | 'interrupted'): ErrorExitCode {
   switch (kind) {
     case 'assertion-failed':
       return 1;
@@ -43,6 +44,7 @@ function exitCodeFor(kind: ErrorKind): ErrorExitCode {
     case 'ai-response-invalid':
     case 'fs-io-error':
     case 'unexpected-crash':
+    case 'interrupted':
       return 3;
     case 'missing-plan':
     case 'stale-ir':
@@ -58,7 +60,7 @@ function exitCodeFor(kind: ErrorKind): ErrorExitCode {
 describe('ERROR_EXIT_CODES', () => {
   it('matches the independently authored exhaustive exit-code switch for every error kind', () => {
     for (const kind of ALL_ERROR_KINDS) {
-      expect(ERROR_EXIT_CODES[kind]).toBe(exitCodeFor(kind));
+      expect((ERROR_EXIT_CODES as Record<string, ErrorExitCode>)[kind]).toBe(exitCodeFor(kind));
     }
 
     expect(new Set(ALL_ERROR_KINDS)).toStrictEqual(new Set(Object.keys(ERROR_EXIT_CODES)));

@@ -13,6 +13,10 @@ import { AmbercastError, type AmbercastError as AmbercastErrorType } from '#core
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
+import {
+  isGroundingCanonicalForClaim,
+  rawGroundingHasCoverageClaim,
+} from '#core/ir/grounding-coverage-claim.js';
 import { normalizeTestMd, type NormalizedTestMd } from '#core/ir/normalize.js';
 import { isSnapshotInvalid } from '#core/ir/aria-snapshot.js';
 import {
@@ -81,6 +85,7 @@ import {
   classifyPreScannedTraceCoverage,
   validateCommittedInstructionCoverage,
 } from './instruction-coverage-policy.js';
+import { BatchInterruptionTracker } from './batch-interruption.js';
 
 /**
  * Execution evidence while a case is still in progress.
@@ -423,142 +428,6 @@ export type GroundingCoverageSourceInspection =
     readonly reason: 'coverage-structure-invalid' | 'coverage-canonical-invalid';
   };
 
-type RawJsonNode =
-  | { readonly kind: 'object'; readonly entries: readonly (readonly [string, RawJsonNode])[] }
-  | { readonly kind: 'array'; readonly items: readonly RawJsonNode[] }
-  | { readonly kind: 'scalar' };
-
-/**
- * Parses JSON without collapsing repeated object members.
- *
- * JSON.parse remains the runtime schema input, while this narrow reader keeps
- * every raw member occurrence long enough to recognize an exact-path coverage
- * claim that a later duplicate key could otherwise hide. It assigns no trust
- * to values and exposes only object structure needed by the staged loader.
- */
-class DuplicatePreservingJsonReader {
-  #offset = 0;
-
-  constructor(private readonly source: string) {}
-
-  parse(): RawJsonNode {
-    const value = this.#parseValue();
-    this.#skipWhitespace();
-    if (this.#offset !== this.source.length) throw new SyntaxError('Unexpected trailing JSON data.');
-    return value;
-  }
-
-  #skipWhitespace(): void {
-    while (/\s/u.test(this.source[this.#offset] ?? '')) this.#offset += 1;
-  }
-
-  #parseValue(): RawJsonNode {
-    this.#skipWhitespace();
-    switch (this.source[this.#offset]) {
-      case '{':
-        return this.#parseObject();
-      case '[':
-        return this.#parseArray();
-      case '"':
-        this.#parseString();
-        return { kind: 'scalar' };
-      default:
-        this.#parseScalar();
-        return { kind: 'scalar' };
-    }
-  }
-
-  #parseObject(): RawJsonNode {
-    this.#offset += 1;
-    const entries: Array<readonly [string, RawJsonNode]> = [];
-    this.#skipWhitespace();
-    if (this.source[this.#offset] === '}') {
-      this.#offset += 1;
-      return { kind: 'object', entries };
-    }
-    while (true) {
-      this.#skipWhitespace();
-      const key = this.#parseString();
-      this.#skipWhitespace();
-      if (this.source[this.#offset] !== ':') throw new SyntaxError('Expected a JSON member separator.');
-      this.#offset += 1;
-      entries.push([key, this.#parseValue()]);
-      this.#skipWhitespace();
-      const delimiter = this.source[this.#offset];
-      if (delimiter === '}') {
-        this.#offset += 1;
-        return { kind: 'object', entries };
-      }
-      if (delimiter !== ',') throw new SyntaxError('Expected another JSON object member.');
-      this.#offset += 1;
-    }
-  }
-
-  #parseArray(): RawJsonNode {
-    this.#offset += 1;
-    const items: RawJsonNode[] = [];
-    this.#skipWhitespace();
-    if (this.source[this.#offset] === ']') {
-      this.#offset += 1;
-      return { kind: 'array', items };
-    }
-    while (true) {
-      items.push(this.#parseValue());
-      this.#skipWhitespace();
-      const delimiter = this.source[this.#offset];
-      if (delimiter === ']') {
-        this.#offset += 1;
-        return { kind: 'array', items };
-      }
-      if (delimiter !== ',') throw new SyntaxError('Expected another JSON array item.');
-      this.#offset += 1;
-    }
-  }
-
-  #parseString(): string {
-    const start = this.#offset;
-    if (this.source[this.#offset] !== '"') throw new SyntaxError('Expected a JSON string.');
-    this.#offset += 1;
-    while (this.#offset < this.source.length) {
-      const character = this.source[this.#offset];
-      if (character === '\\') {
-        this.#offset += 2;
-        continue;
-      }
-      this.#offset += 1;
-      if (character === '"') {
-        return JSON.parse(this.source.slice(start, this.#offset)) as string;
-      }
-    }
-    throw new SyntaxError('Unterminated JSON string.');
-  }
-
-  #parseScalar(): void {
-    const start = this.#offset;
-    while (this.#offset < this.source.length && !/[\s,\]}]/u.test(this.source[this.#offset]!)) {
-      this.#offset += 1;
-    }
-    if (start === this.#offset) throw new SyntaxError('Expected a JSON value.');
-    JSON.parse(this.source.slice(start, this.#offset));
-  }
-}
-
-function rawGroundingHasCoverageClaim(sourceText: string): boolean {
-  const root = new DuplicatePreservingJsonReader(sourceText).parse();
-  if (root.kind !== 'object') return false;
-  for (const [rootKey, entries] of root.entries) {
-    if (rootKey !== 'entries' || entries.kind !== 'object') continue;
-    for (const [, entry] of entries.entries) {
-      if (entry.kind !== 'object') continue;
-      for (const [entryKey, trace] of entry.entries) {
-        if (entryKey !== 'trace' || trace.kind !== 'object') continue;
-        if (trace.entries.some(([traceKey]) => traceKey === 'verificationCoverage')) return true;
-      }
-    }
-  }
-  return false;
-}
-
 /**
  * Classifies raw grounding using staged provenance and coverage checks.
  *
@@ -616,7 +485,7 @@ export function inspectGroundingCoverageSource(
       ? { kind: 'integrity-failure', reason: 'coverage-structure-invalid' }
       : { kind: 'cache-miss' };
   }
-  if (hasClaim && toCanonicalArtifactText(parsed.data as unknown as JsonValueT) !== sourceText) {
+  if (hasClaim && !isGroundingCanonicalForClaim(sourceText, parsed.data)) {
     return { kind: 'integrity-failure', reason: 'coverage-canonical-invalid' };
   }
   const coverageClaimStepIds = Object.entries(parsed.data.entries)
@@ -2747,8 +2616,11 @@ function skippedSteps(steps: readonly Step[], after: number): StepResult[] {
  * a pre-launch failure retains no synthetic step. This preserves the report's
  * distinction between a live-session dispatch failure and work that never
  * reached the browser. Its identity is deliberately restricted to
- * {@link ExecutedRunResult}, because only an interrupted replay can produce
- * the partial step evidence this helper assembles.
+ * {@link ExecutedRunResult}, because only a case-dispatch abort can produce the
+ * partial executed-step evidence this helper assembles. This helper does not
+ * represent batch interruption; batch-level skipped identities and the
+ * run-scoped interruption error are carried outside execution-backed case
+ * results.
  */
 function resultForAbort(
   identity: Pick<ExecutedRunResult, 'id' | 'file' | 'planFile'>,
@@ -2808,6 +2680,14 @@ export interface RunOptions {
 
   /** Whether grounding misses and trace misses must fail without an AI fallback. */
   readonly cacheOnly: boolean;
+
+  /*
+   * Records the caller's explicit request to persist grounding changes when
+   * the write-back posture would otherwise keep this invocation memory-only.
+   * Environment detection remains a dependency instead of becoming another
+   * command option, so the predicate can keep user intent and host facts apart.
+   */
+  readonly updateCache: boolean;
 
   /**
    * Lets reporting accept an empty resolved selection without changing replay.
@@ -2922,20 +2802,63 @@ export interface RunDeps {
     readonly testIgnore: readonly string[];
   }) => Promise<readonly string[]>;
 
-  /** The configuration subset used for discovery, target/digest resolution, and per-call AI timeout policy. */
+  /*
+   * The configuration subset used for discovery, target/digest resolution,
+   * and per-call AI timeout policy. Its ci.updateGroundingCache and
+ * grounding.localWriteBack members also supply the CI and local inputs
+   * to the grounding write-back gate, together with isCI and updateCache.
+   */
   readonly config: Pick<
     ResolvedConfig,
-    'testDir' | 'testMatch' | 'testIgnore' | 'targets' | 'defaultTarget' | 'ai'
+    'testDir' | 'testMatch' | 'testIgnore' | 'targets' | 'defaultTarget' | 'ai' | 'ci' | 'grounding'
   >;
 
+  /*
+   * Runtime supplies this environment fact once per invocation. It belongs
+   * with composed dependencies, rather than command options, because parsing
+   * must not let a caller claim a local run while actually executing in CI.
+   */
+  readonly isCI: boolean;
+
   /**
-   * Caller cancellation that stops scheduling later cases.
+   * Caller cancellation observed at the sequential case boundary.
    *
-   * Completed case outcomes are retained, matching `generate()`'s partial
-   * outcome contract rather than treating cancellation as permission to erase
-   * work that has already completed.
+   * Completed case outcomes remain execution-backed. Discovered identities
+   * that never become terminal are retained separately as evidence-free
+   * skipped rows, matching `generate()` without weakening
+   * {@link RunCaseOutcome}.
    */
   readonly signal?: AbortSignal;
+}
+
+/*
+ * Holds the two deliberately separate persistence policies plus the invocation
+ * and environment facts that choose between them. Keeping this data at the
+ * pure gate makes the write-back decision testable without replay I/O or the
+ * surrounding cleanup path.
+ */
+export interface GroundingWriteBackOptions {
+  readonly localWriteBack: 'auto' | 'explicit';
+  readonly updateCache: boolean;
+  readonly isCI: boolean;
+  readonly updateGroundingCacheConfig: boolean;
+}
+
+/*
+ * A non-CI auto posture always allows write-back regardless of the other two
+ * inputs, while a non-CI explicit posture requires updateCache. CI always
+ * requires updateCache or ci.updateGroundingCache regardless of
+ * localWriteBack.
+ *
+ * CI never consults localWriteBack, and non-CI never consults
+ * ci.updateGroundingCache. Keeping both non-interference directions explicit
+ * prevents a CI-only opt-in from changing local behavior, or a local posture
+ * from silently broadening CI persistence.
+ */
+export function groundingWriteBackAllowed(options: GroundingWriteBackOptions): boolean {
+  return options.isCI
+    ? (options.updateCache || options.updateGroundingCacheConfig)
+    : (options.localWriteBack === 'auto' || options.updateCache);
 }
 
 /**
@@ -2961,15 +2884,18 @@ export interface RunCaseOutcome {
 }
 
 /**
- * Ordered replay outcomes, discovery-only listed files, and the structural
- * zero-match fact.
+ * Ordered replay outcomes, discovery-only listed files, interruption-only
+ * skipped identities, and the structural zero-match fact.
  *
  * The separate flag distinguishes an empty discovery result from a batch that
  * ran and happened to produce no passing cases, which matters to report exit
- * selection.
+ * selection. Unprocessed identities stay outside {@link RunCaseOutcome}
+ * because a skipped batch item has no duration, plan, or step evidence. A
+ * batch-level interruption fact tells report construction to emit one
+ * run-scoped error without pretending those identities failed as cases.
  */
 export interface RunOutcome {
-  /** Completed cases in literal or deterministic discovery order. */
+  /** Terminal execution-backed cases in literal or deterministic discovery order. */
   readonly results: readonly RunCaseOutcome[];
 
   /** Whether discovery resolved no prompt files before case work began. */
@@ -2978,12 +2904,20 @@ export interface RunOutcome {
   /**
    * Files selected for discovery-only reporting.
    *
-   * This field is always present and is empty outside list mode. It remains
+   * This field is always present and is empty outside list mode. Listing is an
+   * atomic post-selection result and therefore remains non-interrupted even
+   * for an already-aborted caller signal. It remains
    * separate from {@link results} because each case outcome promises executed
    * duration and step evidence, while a listed file has intentionally not
    * entered replay.
    */
   readonly listed: readonly RunListedFile[];
+
+  /** Pending identities that have no execution evidence. */
+  readonly skipped: readonly RunListedFile[];
+
+  /** Whether cancellation intersected discovered nonterminal work. */
+  readonly interrupted: boolean;
 }
 
 /**
@@ -3000,19 +2934,23 @@ export type RunListedFile = { readonly file: string };
  * @param deps - Replay I/O, target, clock, browser, secret, event, discovery,
  * and cancellation dependencies.
  * @param options - Batch selection and replay policy.
- * @returns Completed per-case outcomes, discovery-only listed files, and the
- * zero-match fact needed by the command report.
+ * @returns Completed per-case outcomes, discovery-only listed files, ordered
+ * unprocessed identities, the interruption fact, and the zero-match fact
+ * needed by the command report.
  * @remarks
  * Literal files retain caller order and discovered files retain the injected
- * discovery order after duplicate literal paths are collapsed in first-seen
- * order. Cases run sequentially. A caller `AbortSignal` stops the scheduler
- * before another case starts, but returns the outcomes already completed; it
- * does not discard them.
+ * discovery order after grep filtering and first-seen deduplication. Cases run
+ * sequentially. A synchronous tracker marks a case terminal after its result
+ * or case-scoped error is retained; caller cancellation stops later scheduling
+ * and exposes every remaining identity in the same deterministic order. The
+ * tracker is disposed in `finally` even when case execution rejects, so a late
+ * signal cannot mutate a completed outcome.
  *
- * List mode stops after the same discovery, grep, and deduplication phase.
- * Its separate listed-file collection guarantees that this inspection path
- * cannot be treated as execution evidence by callers that consume case
- * outcomes.
+ * List mode stops atomically after the same discovery, grep, and deduplication
+ * phase. Its separate listed-file collection guarantees that this inspection
+ * path cannot be treated as execution evidence, while an already-aborted
+ * signal cannot split one deterministic selection into listed and skipped
+ * subsets.
  *
  * Each result uses a monotonic per-case duration so elapsed time remains
  * meaningful when wall-clock time changes. Replay validates the plan before
@@ -3043,13 +2981,17 @@ export type RunListedFile = { readonly file: string };
  * Dispatch-time failures with a live browser preserve best-effort screenshot
  * and redacted accessibility evidence before the session closes, while
  * pre-launch and post-close failures correctly have none. Each case isolates
- * its own failure so later cases may continue, closes its browser session, and
- * flushes accumulated grounding atomically; a flush error changes only an
- * otherwise successful case. The unified case-abort result covers suppressed
+ * its own failure so later cases may continue and closes its browser session.
+ * Changed grounding flushes atomically only when the CI/local posture gate
+ * permits it; otherwise it remains memory-only. The secret scan and flush
+ * error classification likewise run only on an allowed write path, where
+ * a flush error changes only an otherwise successful case. The unified case-abort result covers suppressed
  * fallback and unavailable capture or verification evidence without inventing
  * an error kind that misrepresents those conditions.
  */
 export async function run(deps: RunDeps, options: RunOptions): Promise<RunOutcome> {
+  const tracker = new BatchInterruptionTracker(deps.signal);
+  try {
   const discovered = options.files.length === 0
     ? (await deps.discoverTestFiles({
       testDir: deps.config.testDir,
@@ -3062,19 +3004,26 @@ export async function run(deps: RunDeps, options: RunOptions): Promise<RunOutcom
     : discovered.filter((path) => grepMatches(options.grep!, path, deps.config.testDir));
   const files = [...new Set(filteredFiles)];
 
-  if (files.length === 0) { return { results: [], noTestsFound: true, listed: [] }; }
-  if (options.list) { return { results: [], noTestsFound: false, listed: files.map((file) => ({ file })) }; }
+  if (files.length === 0) return { results: [], noTestsFound: true, listed: [], skipped: [], interrupted: false };
+  if (options.list) return { results: [], noTestsFound: false, listed: files.map((file) => ({ file })), skipped: [], interrupted: false };
 
+  for (const file of files) tracker.addDiscovered(file, file);
   const results: RunCaseOutcome[] = [];
   for (const file of files) {
-    if (deps.signal?.aborted) {
+    if (tracker.interrupted) {
       break;
     }
-
-    results.push(await runCase(deps, options, file));
+    try {
+      results.push(await runCase(deps, options, file));
+    } finally {
+      tracker.markTerminal(file);
+    }
   }
 
-  return { results, noTestsFound: false, listed: [] };
+  return { results, noTestsFound: false, listed: [], skipped: tracker.pendingIdentities.map((file) => ({ file })), interrupted: tracker.interrupted };
+  } finally {
+    tracker.dispose();
+  }
 }
 
 /**
@@ -3356,7 +3305,23 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
       }
     }
 
-    if (groundingDirty && groundingPath !== undefined && grounding !== undefined) {
+    /*
+     * Write-back requires both a changed, addressable grounding artifact
+     * and the posture gate above. Keeping the gate around the whole persistence
+     * boundary means a disallowed write also avoids its secret scan and
+     * write-error reclassification, preserving a genuinely memory-only run.
+     */
+    if (
+      groundingDirty
+      && groundingPath !== undefined
+      && grounding !== undefined
+      && groundingWriteBackAllowed({
+        localWriteBack: deps.config.grounding.localWriteBack,
+        updateCache: options.updateCache,
+        isCI: deps.isCI,
+        updateGroundingCacheConfig: deps.config.ci.updateGroundingCache,
+      })
+    ) {
       try {
         /*
          * Immediately before serialization, this persistence boundary inspects

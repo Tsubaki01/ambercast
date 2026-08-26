@@ -43,6 +43,15 @@ describe('config JSON Schema document', () => {
     ['a viewer port below the range', { $schema: CONFIG_SCHEMA_URL, viewer: { port: 0 } }, false],
     ['a viewer port above the range', { $schema: CONFIG_SCHEMA_URL, viewer: { port: 65_536 } }, false],
     ['a non-integer viewer port', { $schema: CONFIG_SCHEMA_URL, viewer: { port: 1.5 } }, false],
+    ['a committed grounding policy', { $schema: CONFIG_SCHEMA_URL, grounding: { repositoryPolicy: 'committed' } }, true],
+    ['an uncommitted grounding policy', { $schema: CONFIG_SCHEMA_URL, grounding: { repositoryPolicy: 'uncommitted' } }, true],
+    ['an automatic grounding write-back posture', { $schema: CONFIG_SCHEMA_URL, grounding: { localWriteBack: 'auto' } }, true],
+    ['an explicit grounding write-back posture', { $schema: CONFIG_SCHEMA_URL, grounding: { localWriteBack: 'explicit' } }, true],
+    ['a complete grounding group', { $schema: CONFIG_SCHEMA_URL, grounding: { repositoryPolicy: 'committed', localWriteBack: 'explicit' } }, true],
+    ['an empty grounding group', { $schema: CONFIG_SCHEMA_URL, grounding: {} }, true],
+    ['an invalid grounding policy', { $schema: CONFIG_SCHEMA_URL, grounding: { repositoryPolicy: 'local' } }, false],
+    ['an invalid grounding write-back posture', { $schema: CONFIG_SCHEMA_URL, grounding: { localWriteBack: 'manual' } }, false],
+    ['an unknown grounding key', { $schema: CONFIG_SCHEMA_URL, grounding: { unexpected: true } }, false],
   ] as const)('matches RawConfig for %s', (_name, document, expected) => {
     const validator = new Ajv2020({ strict: true }).compile(getConfigJsonSchema());
     const zodVerdict = RawConfig.safeParse(document).success;

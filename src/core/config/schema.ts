@@ -38,6 +38,22 @@ export const RawConfig = z.strictObject({
     heal: z.boolean().optional(),
     updateGroundingCache: z.boolean().optional(),
   }).optional(),
+  /*
+   * Repository policy makes grounding a required committed companion or a
+   * local, uncommitted cache. Check uses it to map a fresh plan's grounding
+   * lifecycle finding, and a future init command uses the same contract
+   * when it scaffolds .gitignore; schema validation keeps both consumers on
+   * one finite vocabulary.
+   *
+   * Local write-back chooses whether run may persist changed grounding
+   * automatically outside CI or only after its --update-cache request. It is
+   * separate from repository policy because a project may waive committed
+   * grounding while still choosing an explicit local persistence boundary.
+   */
+  grounding: z.strictObject({
+    repositoryPolicy: z.enum(['committed', 'uncommitted']).optional(),
+    localWriteBack: z.enum(['auto', 'explicit']).optional(),
+  }).optional(),
 });
 
 /**
@@ -82,6 +98,23 @@ export interface ResolvedConfig extends LayoutConfig {
   readonly ai: Readonly<{ provider: 'claude' | 'codex' | 'auto'; timeoutMs: number }>;
   readonly viewer: Readonly<{ port: number }>;
   readonly ci: Readonly<{ heal: boolean; updateGroundingCache: boolean }>;
+  /*
+   * Check reads repositoryPolicy to turn a fresh plan's grounding
+   * inspection into its lifecycle status, while a future init command
+   * reads it when choosing its .gitignore scaffold. Outside CI, localWriteBack
+   * gates the grounding persistence run performs after a case completes:
+   * auto permits local
+   * persistence by default, whereas explicit requires the invocation's
+   * --update-cache request. CI ignores localWriteBack and permits a write
+   * only through --update-cache or ci.updateGroundingCache. Keeping the pair
+   * together makes those separate
+   * repository and persistence choices available without reinterpreting raw
+   * configuration at either consumer.
+   */
+  readonly grounding: Readonly<{
+    repositoryPolicy: 'committed' | 'uncommitted';
+    localWriteBack: 'auto' | 'explicit';
+  }>;
 }
 
 /**
