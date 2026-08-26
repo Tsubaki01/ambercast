@@ -4,6 +4,7 @@ import { BrowserLaunchFailedError } from '#core/errors/browser-launch-failed-err
 import { ConfigInvalidError } from '#core/errors/config-invalid-error.js';
 import { FsIoError } from '#core/errors/fs-io-error.js';
 import { MissingPlanError } from '#core/errors/missing-plan-error.js';
+import { ReportEnvelope } from '#report/schema.js';
 import { reconcileHealCommitFailures, runHealCommand, type HealCommandInput, type HealCommandOutput } from '#runtime/heal-command.js';
 import type { HealBatchResult, HealCaseCommit, HealCaseOutcome, HealCommitOutcome, HealOutcome } from '#usecases/heal.js';
 import { createFixedClock } from '../../doubles/create-fixed-clock.js';
@@ -12,7 +13,7 @@ import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js
 const mocks = vi.hoisted(() => ({
   createFsStorage: vi.fn(), createSystemClock: vi.fn(), createProcessEnvironmentInfo: vi.fn(),
   createTtyInteractivityCheck: vi.fn(), createConfirmationAnswerReader: vi.fn(), loadConfig: vi.fn(), createAmbercast: vi.fn(),
-  heal: vi.fn(), buildHealReport: vi.fn(),
+  heal: vi.fn(), buildHealReport: vi.fn(), finalizeReportEnvelope: vi.fn(), isEmergencyFinalizedEnvelope: vi.fn(),
 }));
 
 vi.mock('#adapters/storage/fs-storage.js', () => ({ createFsStorage: mocks.createFsStorage }));
@@ -24,6 +25,10 @@ vi.mock('#config/load.js', () => ({ loadConfig: mocks.loadConfig }));
 vi.mock('#runtime/create-ambercast.js', () => ({ createAmbercast: mocks.createAmbercast }));
 vi.mock('#usecases/heal.js', async (importOriginal) => ({ ...await importOriginal<typeof import('#usecases/heal.js')>(), heal: mocks.heal }));
 vi.mock('#usecases/heal-report.js', async (importOriginal) => ({ ...await importOriginal<typeof import('#usecases/heal-report.js')>(), buildHealReport: mocks.buildHealReport }));
+vi.mock('#usecases/report-finalization.js', () => ({
+  finalizeReportEnvelope: mocks.finalizeReportEnvelope,
+  isEmergencyFinalizedEnvelope: mocks.isEmergencyFinalizedEnvelope,
+}));
 
 const CONFIG: ResolvedConfig = {
   testDir: '/workspace/tests', runsDir: '/workspace/tests/.runs', projectRoot: '/workspace',
@@ -33,11 +38,43 @@ const CONFIG: ResolvedConfig = {
   ci: { heal: true, updateGroundingCache: false }, grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
 };
 
+const rawEnvelopeForFinalizedBoundary = {} as ReportEnvelope;
+// @ts-expect-error A real command output cannot expose an unfinalized envelope.
+const rawHealCommandOutput: HealCommandOutput = { exitCode: 0, envelope: rawEnvelopeForFinalizedBoundary };
+void rawHealCommandOutput;
+
 function input(overrides: Partial<HealCommandInput> = {}): HealCommandInput {
   return { files: [], dryRun: false, yes: false, allowEmpty: false, list: false, cwd: '/workspace', ...overrides };
 }
 function report(exitCode: HealCommandOutput['exitCode']): HealCommandOutput {
   return { exitCode, envelope: { schemaVersion: '2.0', command: 'heal', startedAt: '2026-08-25T00:00:00Z', durationMs: 1, summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 }, errors: [], results: [] } } as unknown as HealCommandOutput;
+}
+function reportWithExecutionEvidence(root: string): HealCommandOutput {
+  return {
+    exitCode: 1,
+    envelope: {
+      schemaVersion: '2.0', command: 'heal', startedAt: '2026-08-25T00:00:00Z', durationMs: 1,
+      summary: { total: 1, passed: 0, failed: 1, errored: 0, skipped: 0 },
+      errors: [{
+        scope: 'case', kind: 'environment', code: 'FS_IO_ERROR',
+        caseId: `${root}/tests/login.test.md`,
+        message: 'The grounding artifact could not be read.',
+      }],
+      results: [{
+        id: `${root}/tests/login.test.md`,
+        file: `${root}/tests/login.test.md`,
+        planFile: `${root}/tests/login.ambercast.plan.json`,
+        status: 'unresolved',
+        steps: [{
+          id: 'capture', type: 'capture', status: 'passed',
+          screenshot: `${root}/tests/.runs/evidence.png`,
+        }],
+        explanation: 'The candidate did not repair the case.',
+        durationMs: 1.6,
+        dryRun: false,
+      }],
+    },
+  } as unknown as HealCommandOutput;
 }
 function caseResult(id: string, overrides: Partial<HealCaseOutcome> = {}): HealCaseOutcome {
   return { id, file: `/workspace/tests/${id}`, planFile: `/workspace/tests/${id}.ambercast.plan.json`, status: 'healed', steps: [], explanation: 'The candidate repaired the case.', durationMs: 1.6, dryRun: false, baselineReachedIndex: 0, finalReachedIndex: 1, stage3Error: undefined, finalReplayError: undefined, ...overrides };
@@ -75,7 +112,14 @@ async function useActualBuildHealReport(): Promise<void> {
   mocks.buildHealReport.mockImplementation(buildHealReport);
 }
 afterEach(() => vi.resetAllMocks());
-beforeEach(() => configure());
+beforeEach(async () => {
+  configure();
+  const actual = await vi.importActual<typeof import('#usecases/report-finalization.js')>(
+    '#usecases/report-finalization.js',
+  );
+  mocks.finalizeReportEnvelope.mockImplementation(actual.finalizeReportEnvelope);
+  mocks.isEmergencyFinalizedEnvelope.mockImplementation(actual.isEmergencyFinalizedEnvelope);
+});
 
 describe('runHealCommand', () => {
   it.each([['non-interactive', false], ['interactive but undeclined', true]] as const)('lets --list exit zero before disabled ci.heal in a %s environment', async (_name, interactive) => {
@@ -193,7 +237,7 @@ describe('runHealCommand', () => {
       built,
     });
 
-    await expect(runHealCommand(input())).resolves.toBe(built);
+    await expect(runHealCommand(input())).resolves.toEqual(built);
     expect(readConfirmationAnswer).toHaveBeenCalledOnce();
     const candidates = readConfirmationAnswer.mock.calls[0]?.[0];
     expect(candidates?.size).toBe(2);
@@ -229,7 +273,7 @@ describe('runHealCommand', () => {
     const readConfirmationAnswer = vi.fn(async (_commits: ReadonlyMap<string, HealCaseCommit>) => false);
     configure({ result: batch({ outcome: unchanged, commits: commits(pending) }), interactive: true, readConfirmationAnswer, built });
 
-    await expect(runHealCommand(input())).resolves.toBe(built);
+    await expect(runHealCommand(input())).resolves.toEqual(built);
     expect(readConfirmationAnswer).toHaveBeenCalledOnce();
     const candidates = readConfirmationAnswer.mock.calls[0]?.[0];
     expect(candidates?.size).toBe(1);
@@ -265,7 +309,6 @@ describe('runHealCommand', () => {
     ['--yes + non-interactive', { yes: true }, false, false],
     ['--dry-run', { dryRun: true }, false, false],
     ['interactive reader available', {}, true, false],
-    ['CI with ci.heal enabled', {}, false, true],
   ] as const)('skips confirmation for an empty commits map with %s', async (_name, flags, interactive, isCI) => {
     const unchanged = outcome({ results: [caseResult('unchanged.test.md', { status: 'no-changes-needed' })] });
     const readConfirmationAnswer = vi.fn(async () => true);
@@ -274,6 +317,16 @@ describe('runHealCommand', () => {
     expect(mocks.createTtyInteractivityCheck).not.toHaveBeenCalled();
     expect(readConfirmationAnswer).not.toHaveBeenCalled();
     expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({ outcome: unchanged }));
+  });
+
+  it('requires --yes for a pending commit capability in non-interactive CI', async () => {
+    const pending = capability('healable.test.md');
+    const healable = outcome({ results: [caseResult('healable.test.md')] });
+    configure({ result: batch({ outcome: healable, commits: commits(pending) }), isCI: true, interactive: false, built: report(2) });
+
+    await expect(runHealCommand(input())).resolves.toMatchObject({ exitCode: 2 });
+    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({ error: expect.any(ConfigInvalidError) }));
+    expect(pending.commit).not.toHaveBeenCalled();
   });
 
   it('commits only terminal cases after --yes when cancellation skipped a later case', async () => {
@@ -385,5 +438,94 @@ describe('runHealCommand', () => {
     configure({ result: batch({ outcome: outcome({ results: [fractional] }), commits: new Map() }), monotonic: [10, 12.6] });
     await expect(runHealCommand(input({ yes: true }))).resolves.toMatchObject({ exitCode: 0 });
     expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({ durationMs: 3, outcome: expect.objectContaining({ results: [expect.objectContaining({ durationMs: 1.6 })] }) }));
+  });
+
+  it('finalizes the completed heal report against the resolved project root', async () => {
+    const built = report(0);
+    configure({ built });
+
+    await runHealCommand(input({ yes: true }));
+
+    expect(mocks.finalizeReportEnvelope).toHaveBeenCalledExactlyOnceWith(built.envelope, '/workspace');
+  });
+
+  it('finalizes a configuration-load failure using cwd as its project-root fallback', async () => {
+    await useActualBuildHealReport();
+    mocks.loadConfig.mockRejectedValue(new ConfigInvalidError('invalid config'));
+
+    await runHealCommand(input({ cwd: '/workspace/fallback' }));
+
+    expect(mocks.finalizeReportEnvelope).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ command: 'heal' }),
+      '/workspace/fallback',
+    );
+  });
+
+  it('finalizes completed heal evidence with rounded duration and portable paths', async () => {
+    const projectRoot = '/workspace/project';
+    const built = reportWithExecutionEvidence(projectRoot);
+    configure({
+      result: batch({ commits: new Map() }),
+      config: { ...CONFIG, projectRoot },
+      built,
+    });
+
+    const output = await runHealCommand(input({ cwd: `${projectRoot}/nested`, yes: true }));
+
+    expect(output.envelope.results[0]).toMatchObject({
+      id: 'tests/login.test.md',
+      file: 'tests/login.test.md',
+      planFile: 'tests/login.ambercast.plan.json',
+      durationMs: 2,
+      steps: [expect.objectContaining({ screenshot: 'tests/.runs/evidence.png' })],
+    });
+    expect(output.envelope.errors[0]).toMatchObject({ caseId: 'tests/login.test.md' });
+  });
+
+  it('finalizes a post-config error report with the resolved project root', async () => {
+    const projectRoot = '/workspace/project';
+    const built = reportWithExecutionEvidence(projectRoot);
+    configure({ config: { ...CONFIG, projectRoot }, built });
+    mocks.heal.mockRejectedValue(new Error('heal failed'));
+
+    const output = await runHealCommand(input({ cwd: `${projectRoot}/nested`, yes: true }));
+
+    expect(output.envelope.results[0]).toMatchObject({
+      planFile: 'tests/login.ambercast.plan.json',
+      durationMs: 2,
+      steps: [expect.objectContaining({ screenshot: 'tests/.runs/evidence.png' })],
+    });
+    expect(output.envelope.errors[0]).toMatchObject({ caseId: 'tests/login.test.md' });
+  });
+
+  it('uses cwd to finalize error evidence when config loading never resolves a root', async () => {
+    const cwd = '/workspace/fallback';
+    const built = reportWithExecutionEvidence(cwd);
+    configure({ built });
+    mocks.loadConfig.mockRejectedValue(new ConfigInvalidError('invalid config'));
+
+    const output = await runHealCommand(input({ cwd }));
+
+    expect(output.envelope.results[0]).toMatchObject({
+      id: 'tests/login.test.md',
+      planFile: 'tests/login.ambercast.plan.json',
+      durationMs: 2,
+      steps: [expect.objectContaining({ screenshot: 'tests/.runs/evidence.png' })],
+    });
+  });
+
+  it.each(['completed', 'error'] as const)('forces exit 3 when %s finalization returns the emergency singleton', async (branch) => {
+    const built = report(0);
+    configure({ built });
+    if (branch === 'error') {
+      mocks.loadConfig.mockRejectedValue(new ConfigInvalidError('invalid config'));
+    }
+    mocks.finalizeReportEnvelope.mockReturnValue(built.envelope);
+    mocks.isEmergencyFinalizedEnvelope.mockReturnValue(true);
+
+    await expect(runHealCommand(input({ yes: true }))).resolves.toEqual({
+      exitCode: 3,
+      envelope: built.envelope,
+    });
   });
 });

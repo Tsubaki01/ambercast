@@ -163,7 +163,10 @@ function colorize(value: string, color: string, enabled: boolean): string {
  * an explanatory host path. A `skipped` row has no reason or artifact evidence
  * and retains the generic non-healthy styling.
  */
-function renderHumanReport(envelope: unknown, color: boolean): string {
+export function renderHumanReport(
+  envelope: Awaited<ReturnType<typeof runRunCommand>>['envelope'],
+  color: boolean,
+): string {
   if (envelope === null || typeof envelope !== 'object' || Array.isArray(envelope)) {
     return `${String(envelope)}\n`;
   }

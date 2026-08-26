@@ -19,7 +19,8 @@ import { AmbercastError } from '#core/errors/types.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
 import { isAbsolutePath, joinPath } from '#core/paths.js';
 import { check } from '#usecases/check.js';
-import { normalizeReportEnvelope } from '#usecases/report-normalization.js';
+import type { FinalizedReportEnvelope } from '#usecases/report-finalization.js';
+import { finalizeReportEnvelope, isEmergencyFinalizedEnvelope } from '#usecases/report-finalization.js';
 import { buildCheckReport, type CheckReportOutput } from '#usecases/check-report.js';
 import { createFsTestFileDiscovery } from './test-file-discovery.js';
 
@@ -67,7 +68,7 @@ export interface CheckCommandOutput {
   readonly exitCode: CheckReportOutput['exitCode'];
 
   /** Structured report for either JSON serialization or text rendering. */
-  readonly envelope: CheckReportOutput['envelope'];
+  readonly envelope: FinalizedReportEnvelope;
 }
 
 /**
@@ -87,10 +88,10 @@ export interface CheckCommandOutput {
  * an unexpected-crash report so valid invocations still resolve to the command
  * report and exit-code contract.
  *
- * Report identity normalization occurs once after report construction. The
+ * Report finalization occurs once after report construction. The
  * runtime begins with `cwd` as the root for failures before configuration is
  * available and replaces it with `ResolvedConfig.projectRoot` once loading
- * succeeds. The shared normalizer converts only `id`, `file`, `planFile`,
+ * succeeds. The shared finalizer converts only `id`, `file`, `planFile`,
  * `caseId`, `groundingFile`, and `artifactFile`, then recomputes summary from
  * their final visible values. Reasons and other free text remain untouched,
  * preserving the fixed path-free orphan-grounding contract.
@@ -129,12 +130,14 @@ export async function runCheckCommand(input: CheckCommandInput): Promise<CheckCo
     });
 
     const output = buildCheckReport({ ...reportContext(), outcome });
-    return { ...output, envelope: normalizeReportEnvelope(output.envelope, projectRoot) };
+    const finalized = finalizeReportEnvelope(output.envelope, projectRoot);
+    return { exitCode: isEmergencyFinalizedEnvelope(finalized) ? 3 : output.exitCode, envelope: finalized };
   } catch (error) {
     const classified = error instanceof AmbercastError
       ? error
       : new UnexpectedCrashError('The check command crashed unexpectedly.', undefined, { cause: error });
     const output = buildCheckReport({ ...reportContext(), error: classified });
-    return { ...output, envelope: normalizeReportEnvelope(output.envelope, projectRoot) };
+    const finalized = finalizeReportEnvelope(output.envelope, projectRoot);
+    return { exitCode: isEmergencyFinalizedEnvelope(finalized) ? 3 : output.exitCode, envelope: finalized };
   }
 }

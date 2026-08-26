@@ -61,6 +61,7 @@ async function writeSoleTargetConfigAndFreshPlan(project: string): Promise<void>
     runsDir: 'tests/.runs',
     targets: targetDefinitions,
     ai: { provider: 'codex' },
+    ci: { heal: true },
   }));
   const plan = {
     schemaVersion: 2,
@@ -158,17 +159,18 @@ describe('bin/ambercast.js (e2e)', () => {
     });
   });
 
-  it('refuses a non-interactive CI heal without authorization before attempting repair', async () => {
+  it('allows a non-interactive CI heal with zero pending commits and no --yes', async () => {
     const project = await fixtureProject();
-    const result = await runCli(['heal', '--json'], project, { ...process.env, CI: 'true' });
+    await writeSoleTargetConfigAndFreshPlan(project);
+    const result = await runCli(['heal', '--list', '--json'], project, { ...process.env, CI: 'true' });
 
-    expect(result.exitCode).toBe(2);
-    expect(result.stderr).toBe('');
     const envelope = JSON.parse(result.stdout);
     expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
+    expect(result).toMatchObject({ exitCode: 0, stderr: '' });
     expect(envelope).toMatchObject({
       command: 'heal',
-      errors: [expect.objectContaining({ scope: 'run', code: 'CONFIG_INVALID' })],
+      errors: [],
+      results: [expect.objectContaining({ status: 'listed' })],
     });
   });
 

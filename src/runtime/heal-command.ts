@@ -27,7 +27,9 @@ import { isAbsolutePath, joinPath } from '#core/paths.js';
 import { AmbercastError, type ExitCode } from '#core/errors/types.js';
 import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
 import { heal, type HealBatchResult } from '#usecases/heal.js';
-import { buildHealReport, type HealReportOutput } from '#usecases/heal-report.js';
+import { buildHealReport } from '#usecases/heal-report.js';
+import type { FinalizedReportEnvelope } from '#usecases/report-finalization.js';
+import { finalizeReportEnvelope, isEmergencyFinalizedEnvelope } from '#usecases/report-finalization.js';
 import { createAmbercast } from './create-ambercast.js';
 import { resolveAiProvider } from './resolve-ai-provider.js';
 
@@ -141,13 +143,13 @@ export interface HealCommitSettlement {
 export interface HealCommandOutput {
   /**
    * Process status selected by `buildHealReport`'s final report policy.
-   * That selection incorporates `stage3Error` and `finalReplayError`; this
-   * command computes no additional exit-code policy.
+   * That selection incorporates `stage3Error` and `finalReplayError`; an
+   * emergency finalization fallback alone replaces it with exit code 3.
    */
   readonly exitCode: ExitCode;
 
   /** Structured report for either JSON serialization or text rendering. */
-  readonly envelope: HealReportOutput['envelope'];
+  readonly envelope: FinalizedReportEnvelope;
 }
 
 /**
@@ -262,10 +264,8 @@ export function reconcileHealCommitFailures(
  * the files and repair kinds pending writes, yet it remains before the
  * first capability invocation so no real artifact write precedes consent.
  *
- * An empty `result.commits` map skips the confirmation gate entirely,
- * regardless of `--yes`/`-y`, interactivity, or CI. With no capability to
- * authorize, this command proceeds directly to report construction from the
- * unchanged outcome.
+ * An empty `result.commits` map has no artifact write to authorize, so it
+ * skips confirmation in every execution environment.
  *
  * A dry run never prompts and never invokes `commit()`, irrespective of
  * `--yes` or `-y`: the overlay has no plan or grounding change worth
@@ -293,20 +293,19 @@ export function reconcileHealCommitFailures(
  * prevent later independent commits; cancellation cannot rewrite an
  * already-started storage settlement into a different batch result.
  *
- * After the authorized capabilities have settled, this boundary first
- * reconciles failed commits and then calls `buildHealReport` exactly once.
- * Building only at that point prevents an initial report from becoming stale,
- * keeps a failed commit case-scoped, and leaves successful or uncommitted
- * measurements unchanged. Before that call, this command boundary rounds only
- * the command-level envelope duration to a non-negative integer, matching
- * `run-command.ts`'s actual precedent exactly. Each case's own
- * `HealCaseOutcome.durationMs` passes through unrounded: that shared,
- * separately tracked issue #197 characteristic is not selectively changed in
- * this command.
+ * After authorized capabilities settle, this boundary first reconciles
+ * failed commits, builds one candidate, and passes it through the shared
+ * finalizer. Building after settlement prevents an initial report from
+ * becoming stale and keeps a failed commit case-scoped; finalization then
+ * rounds executed heal-case durations, normalizes the public identities, and
+ * recomputes summary from the settled facts. The emergency singleton from
+ * that shared boundary alone selects exit code 3, so every other semantic
+ * exit code remains the report builder's decision.
  */
 export async function runHealCommand(
   input: HealCommandInput,
 ): Promise<HealCommandOutput> {
+  let projectRoot = input.cwd;
   const clock = createSystemClock();
   const startedAt = reportTimestamp(clock.now());
   const runId = runIdFor(startedAt, createCryptoRandom().uuid());
@@ -324,6 +323,7 @@ export async function runHealCommand(
       storage,
       configEnv: readConfigEnvironment(),
     });
+    projectRoot = config.projectRoot;
     const isCI = createProcessEnvironmentInfo().isCI();
     const browserDriver = createBrowserDriverResolver();
     const secrets = createEnvSecretsProvider();
@@ -393,14 +393,18 @@ export async function runHealCommand(
       }
     }
 
-    return buildHealReport({
+    const output = buildHealReport({
       ...reportContext(),
       outcome: reconcileHealCommitFailures(result.outcome, settlements),
     });
+    const finalized = finalizeReportEnvelope(output.envelope, projectRoot);
+    return { exitCode: isEmergencyFinalizedEnvelope(finalized) ? 3 : output.exitCode, envelope: finalized };
   } catch (error) {
     const classified = error instanceof AmbercastError
       ? error
       : new UnexpectedCrashError('The heal command crashed unexpectedly.', undefined, { cause: error });
-    return buildHealReport({ ...reportContext(), error: classified });
+    const output = buildHealReport({ ...reportContext(), error: classified });
+    const finalized = finalizeReportEnvelope(output.envelope, projectRoot);
+    return { exitCode: isEmergencyFinalizedEnvelope(finalized) ? 3 : output.exitCode, envelope: finalized };
   }
 }

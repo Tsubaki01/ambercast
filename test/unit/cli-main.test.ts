@@ -1,7 +1,7 @@
 import { Writable } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ReportEnvelope } from '#report/schema.js';
-import type { GenerateCommandInput } from '#runtime/generate-command.js';
+import type { GenerateCommandInput, GenerateCommandOutput } from '#runtime/generate-command.js';
 import type { CheckCommandInput } from '#runtime/check-command.js';
 import type { HealCommandInput } from '#runtime/heal-command.js';
 
@@ -14,7 +14,7 @@ vi.mock('#runtime/run-command.js', () => ({ runRunCommand }));
 vi.mock('#runtime/check-command.js', () => ({ runCheckCommand }));
 vi.mock('#runtime/heal-command.js', () => ({ runHealCommand }));
 
-import { main, REPORT_PERSISTENCE_FAILED_WARNING } from '../../src/cli/main.js';
+import { main, renderHumanReport, REPORT_PERSISTENCE_FAILED_WARNING } from '../../src/cli/main.js';
 
 class MemoryWritable extends Writable {
   chunks: string[] = [];
@@ -36,7 +36,7 @@ const ENVELOPE = {
   durationMs: 0,
   summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 },
   errors: [],
-  results: [{ id: 'login', file: 'login.test.md', status: 'listed' as const, dryRun: false }],
+  results: [{ id: 'login', file: 'login.test.md', status: 'listed' as const, dryRun: false as const }],
 };
 
 const RUN_ENVELOPE = {
@@ -84,6 +84,15 @@ const HEAL_ENVELOPE = {
   errors: [],
   results: [],
 };
+
+const rawEnvelopeForFinalizedBoundary: Extract<ReportEnvelope, { command: 'generate' }> = ENVELOPE;
+// @ts-expect-error An actual CLI command-output literal cannot cross the renderer boundary with a raw envelope.
+const rawCommandOutput: GenerateCommandOutput = { exitCode: 0, envelope: rawEnvelopeForFinalizedBoundary };
+type RendererParam = Parameters<typeof renderHumanReport>[0];
+// @ts-expect-error The renderer's actual derived parameter type excludes raw envelopes.
+const rawRendererArgument: RendererParam = rawEnvelopeForFinalizedBoundary;
+void rawCommandOutput;
+void rawRendererArgument;
 
 let cwdSpy: ReturnType<typeof vi.spyOn> | undefined;
 let initialExitCode: typeof process.exitCode;

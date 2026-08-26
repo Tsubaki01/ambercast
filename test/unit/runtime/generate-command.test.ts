@@ -20,6 +20,8 @@ const mocks = vi.hoisted(() => ({
   codexFactory: vi.fn(),
   createNoopEventSink: vi.fn(),
   createSystemClock: vi.fn(),
+  finalizeReportEnvelope: vi.fn(),
+  isEmergencyFinalizedEnvelope: vi.fn(),
 }));
 
 vi.mock('#config/load.js', () => ({ loadConfig: mocks.loadConfig }));
@@ -31,6 +33,15 @@ vi.mock('#adapters/ai/registry.js', () => ({
 }));
 vi.mock('#adapters/system/noop-event-sink.js', () => ({ createNoopEventSink: mocks.createNoopEventSink }));
 vi.mock('#adapters/system/system-clock.js', () => ({ createSystemClock: mocks.createSystemClock }));
+vi.mock('#usecases/report-finalization.js', () => ({
+  finalizeReportEnvelope: mocks.finalizeReportEnvelope,
+  isEmergencyFinalizedEnvelope: mocks.isEmergencyFinalizedEnvelope,
+}));
+
+const rawEnvelopeForFinalizedBoundary = {} as ReportEnvelope;
+// @ts-expect-error A real command output cannot expose an unfinalized envelope.
+const rawGenerateCommandOutput: GenerateCommandOutput = { exitCode: 0, envelope: rawEnvelopeForFinalizedBoundary };
+void rawGenerateCommandOutput;
 
 const CONFIG: ResolvedConfig = {
   testDir: '/workspace/tests',
@@ -108,7 +119,12 @@ afterEach(() => {
   vi.resetAllMocks();
 });
 
-beforeEach(() => {
+beforeEach(async () => {
+  const actual = await vi.importActual<typeof import('#usecases/report-finalization.js')>(
+    '#usecases/report-finalization.js',
+  );
+  mocks.finalizeReportEnvelope.mockImplementation(actual.finalizeReportEnvelope);
+  mocks.isEmergencyFinalizedEnvelope.mockImplementation(actual.isEmergencyFinalizedEnvelope);
   mocks.createSystemClock.mockReturnValue({
     now: () => new Date('2026-08-08T00:00:00Z'),
     monotonicMs: () => 10,
@@ -138,6 +154,28 @@ describe('runGenerateCommand', () => {
     }]);
     expect(returned.envelope.results[0]).not.toMatchObject({ id: `${cwd}/tests/login.test.md` });
     expect(returned.envelope.results[0]).not.toMatchObject({ id: 'tests/login.test.md' });
+  });
+
+  it('finalizes the completed report against the resolved project root', async () => {
+    const { output } = arrangeSuccessfulCommand('codex', 'codex');
+    mocks.finalizeReportEnvelope.mockImplementation((raw) => raw);
+    mocks.isEmergencyFinalizedEnvelope.mockReturnValue(false);
+
+    await runGenerateCommand(input());
+
+    expect(mocks.finalizeReportEnvelope).toHaveBeenCalledExactlyOnceWith(output.envelope, '/workspace');
+  });
+
+  it('finalizes an error report with cwd when configuration never resolves', async () => {
+    const built = reportOutput(2);
+    mocks.loadConfig.mockRejectedValue(new UnexpectedCrashError('config unavailable'));
+    mocks.buildGenerateReport.mockReturnValue(built);
+    mocks.finalizeReportEnvelope.mockImplementation((raw) => raw);
+    mocks.isEmergencyFinalizedEnvelope.mockReturnValue(false);
+
+    await runGenerateCommand(input({ cwd: '/workspace/fallback' }));
+
+    expect(mocks.finalizeReportEnvelope).toHaveBeenCalledExactlyOnceWith(built.envelope, '/workspace/fallback');
   });
 
   it('uses cwd as the resolved project root for a successful no-config invocation', async () => {
@@ -340,5 +378,21 @@ describe('runGenerateCommand', () => {
 
     await expect(runGenerateCommand(input())).resolves.toEqual(output);
     expect(mocks.buildGenerateReport).toHaveBeenCalledWith(expect.objectContaining({ error }));
+  });
+
+  it.each(['completed', 'error'] as const)('forces exit 3 when %s finalization returns the emergency singleton', async (branch) => {
+    const built = reportOutput(0);
+    arrangeSuccessfulCommand('codex', 'codex');
+    mocks.buildGenerateReport.mockReturnValue(built);
+    if (branch === 'error') {
+      mocks.loadConfig.mockRejectedValue(new UnexpectedCrashError('configuration failed'));
+    }
+    mocks.finalizeReportEnvelope.mockReturnValue(built.envelope);
+    mocks.isEmergencyFinalizedEnvelope.mockReturnValue(true);
+
+    await expect(runGenerateCommand(input())).resolves.toEqual({
+      exitCode: 3,
+      envelope: built.envelope,
+    });
   });
 });

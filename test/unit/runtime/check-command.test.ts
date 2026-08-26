@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { ConfigInvalidError } from '#core/errors/config-invalid-error.js';
@@ -8,7 +8,7 @@ import { normalizeTestMd } from '#core/ir/normalize.js';
 import type { JsonValueT, PlanDocument } from '#core/ir/schema.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
 import { ReportEnvelope } from '#report/schema.js';
-import { runCheckCommand, type CheckCommandInput } from '#runtime/check-command.js';
+import { runCheckCommand, type CheckCommandInput, type CheckCommandOutput } from '#runtime/check-command.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
 
 const mocks = vi.hoisted(() => ({
@@ -17,6 +17,8 @@ const mocks = vi.hoisted(() => ({
   createFsTestFileDiscovery: vi.fn(),
   check: vi.fn(),
   buildCheckReport: vi.fn(),
+  finalizeReportEnvelope: vi.fn(),
+  isEmergencyFinalizedEnvelope: vi.fn(),
 }));
 
 vi.mock('#config/load.js', () => ({ loadConfig: mocks.loadConfig }));
@@ -30,6 +32,15 @@ vi.mock('#usecases/check-report.js', async (importOriginal) => ({
   ...await importOriginal<typeof import('#usecases/check-report.js')>(),
   buildCheckReport: mocks.buildCheckReport,
 }));
+vi.mock('#usecases/report-finalization.js', () => ({
+  finalizeReportEnvelope: mocks.finalizeReportEnvelope,
+  isEmergencyFinalizedEnvelope: mocks.isEmergencyFinalizedEnvelope,
+}));
+
+const rawEnvelopeForFinalizedBoundary = {} as ReportEnvelope;
+// @ts-expect-error A real command output cannot expose an unfinalized envelope.
+const rawCheckCommandOutput: CheckCommandOutput = { exitCode: 0, envelope: rawEnvelopeForFinalizedBoundary };
+void rawCheckCommandOutput;
 
 const CONFIG: ResolvedConfig = {
   testDir: '/workspace/tests',
@@ -51,6 +62,14 @@ function input(overrides: Partial<CheckCommandInput> = {}): CheckCommandInput {
 
 afterEach(() => {
   vi.resetAllMocks();
+});
+
+beforeEach(async () => {
+  const actual = await vi.importActual<typeof import('#usecases/report-finalization.js')>(
+    '#usecases/report-finalization.js',
+  );
+  mocks.finalizeReportEnvelope.mockImplementation(actual.finalizeReportEnvelope);
+  mocks.isEmergencyFinalizedEnvelope.mockImplementation(actual.isEmergencyFinalizedEnvelope);
 });
 
 async function useRealCheckComposition(): Promise<void> {
@@ -250,5 +269,51 @@ describe('runCheckCommand', () => {
       kind: 'environment',
       code: 'UNEXPECTED_CRASH',
     })]);
+  });
+
+  it('finalizes both completed and error reports at the runtime boundary', async () => {
+    const completed = {
+      exitCode: 0 as const,
+      envelope: { schemaVersion: '2.0' as const, command: 'check' as const, startedAt: '2026-08-01T00:00:00Z', durationMs: 0, summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 }, errors: [], results: [] },
+    };
+    mocks.createFsReadStorage.mockReturnValue(createInMemoryStorage());
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.createFsTestFileDiscovery.mockReturnValue(async () => []);
+    mocks.check.mockResolvedValue({ results: [], errors: [], noTestsFound: false });
+    mocks.buildCheckReport.mockReturnValue(completed);
+    mocks.finalizeReportEnvelope.mockImplementation((raw) => raw);
+    mocks.isEmergencyFinalizedEnvelope.mockReturnValue(false);
+
+    await runCheckCommand(input());
+    expect(mocks.finalizeReportEnvelope).toHaveBeenCalledTimes(1);
+    expect(mocks.finalizeReportEnvelope).toHaveBeenCalledWith(completed.envelope, '/workspace');
+    mocks.finalizeReportEnvelope.mockClear();
+    mocks.check.mockRejectedValueOnce(new Error('crash'));
+    await runCheckCommand(input());
+
+    expect(mocks.finalizeReportEnvelope).toHaveBeenCalledTimes(1);
+    expect(mocks.finalizeReportEnvelope).toHaveBeenCalledWith(expect.objectContaining({ command: 'check' }), '/workspace');
+  });
+
+  it.each(['completed', 'error'] as const)('forces exit 3 when %s finalization returns the emergency singleton', async (branch) => {
+    const built = {
+      exitCode: 0 as const,
+      envelope: { schemaVersion: '2.0' as const, command: 'check' as const, startedAt: '2026-08-01T00:00:00Z', durationMs: 0, summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 }, errors: [], results: [] },
+    };
+    mocks.createFsReadStorage.mockReturnValue(createInMemoryStorage());
+    mocks.loadConfig.mockResolvedValue(CONFIG);
+    mocks.createFsTestFileDiscovery.mockReturnValue(async () => []);
+    mocks.check.mockResolvedValue({ results: [], errors: [], noTestsFound: false });
+    mocks.buildCheckReport.mockReturnValue(built);
+    if (branch === 'error') {
+      mocks.loadConfig.mockRejectedValue(new ConfigInvalidError('invalid config'));
+    }
+    mocks.finalizeReportEnvelope.mockReturnValue(built.envelope);
+    mocks.isEmergencyFinalizedEnvelope.mockReturnValue(true);
+
+    await expect(runCheckCommand(input())).resolves.toEqual({
+      exitCode: 3,
+      envelope: built.envelope,
+    });
   });
 });
