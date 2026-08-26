@@ -1,5 +1,5 @@
 /**
- * Parses CLI arguments, delegates parsed generate, run, and check commands to
+ * Parses CLI arguments, delegates parsed generate, run, check, and heal commands to
  * runtime, and selects the only process-exit boundary in the product.
  *
  * The `generate [files...]` and `run [files...]` subcommands both treat
@@ -28,7 +28,10 @@
  * output renders that same envelope with ANSI styling disabled by
  * `--no-color`. After output has been written, this
  * module sets the selected process exit code and lets Node exit naturally once
- * pending stream writes have drained.
+ * pending stream writes have drained. The `heal` subcommand follows that same
+ * parse, dispatch, and render boundary as generate, run, and check; its
+ * confirmation and persistence policy belong to runtime composition rather
+ * than requiring a second top-level CLI shape.
  *
  * The parser stays hand-written because the small fixed flag surface needs no
  * dependency or a second command grammar. This layer imports only runtime:
@@ -37,6 +40,7 @@
  */
 import { runGenerateCommand } from '#runtime/generate-command.js';
 import { runCheckCommand } from '#runtime/check-command.js';
+import { runHealCommand, type HealCommandInput } from '#runtime/heal-command.js';
 import { runRunCommand } from '#runtime/run-command.js';
 
 interface ParsedGenerateCommand {
@@ -105,7 +109,14 @@ interface ParsedCheckCommand {
   readonly color: boolean;
 }
 
-const USAGE = `Usage: ambercast <command> [options]\n\nCommands:\n  generate [files...]  Generate deterministic plans\n  run [files...]       Replay deterministic plans\n  check [files...]     Check plan freshness\n\nGenerate options:\n  --strict  --force  --dry-run  --target <name>  --ai <claude|codex>\n  --allow-empty  --list  --json  --config <path>  --no-color\n\nRun options:\n  --grep <pattern>  --target <name>  --headed  --cache-only  --update-cache  --allow-empty  --list\n  --stale <fail>  --json  --no-color\n\nCheck options:\n  --target <name>  --allow-empty  --list  --json  --config <path>  --no-color\n`;
+interface ParsedHealCommand {
+  readonly command: 'heal';
+  readonly input: HealCommandInput & { readonly signal: AbortSignal };
+  readonly json: boolean;
+  readonly color: boolean;
+}
+
+const USAGE = `Usage: ambercast <command> [options]\n\nCommands:\n  generate [files...]  Generate deterministic plans\n  run [files...]       Replay deterministic plans\n  check [files...]     Check plan freshness\n  heal [files...]      Repair deterministic plans\n\nGenerate options:\n  --strict  --force  --dry-run  --target <name>  --ai <claude|codex>\n  --allow-empty  --list  --json  --config <path>  --no-color\n\nRun options:\n  --grep <pattern>  --target <name>  --headed  --cache-only  --update-cache  --allow-empty  --list\n  --stale <fail>  --json  --no-color\n\nCheck options:\n  --target <name>  --allow-empty  --list  --json  --config <path>  --no-color\n\nHeal options:\n  --dry-run  --yes, -y  --target <name>  --ai <claude|codex>  --allow-empty  --list  --json  --no-color\n`;
 
 /*
  * Human rendering remains command-agnostic: only known healthy states are
@@ -460,6 +471,86 @@ function parseCheck(argv: readonly string[], signal: AbortSignal): ParsedCheckCo
   };
 }
 
+function parseHeal(argv: readonly string[], signal: AbortSignal): ParsedHealCommand | string {
+  const separator = argv.indexOf('--');
+  if (argv.slice(0, separator === -1 ? undefined : separator).includes('--help')) {
+    return 'help';
+  }
+
+  const files: string[] = [];
+  let dryRun = false;
+  let yes = false;
+  let target: string | undefined;
+  let aiProviderOverride: 'claude' | 'codex' | undefined;
+  let allowEmpty = false;
+  let list = false;
+  let json = false;
+  let color = true;
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index]!;
+    if (argument === '--') {
+      files.push(...argv.slice(index + 1));
+      break;
+    }
+    if (argument === '-y') {
+      yes = true;
+      continue;
+    }
+    if (!argument.startsWith('--')) {
+      files.push(argument);
+      continue;
+    }
+
+    if (argument === '--dry-run') {
+      dryRun = true;
+    } else if (argument === '--yes') {
+      yes = true;
+    } else if (argument === '--allow-empty') {
+      allowEmpty = true;
+    } else if (argument === '--list') {
+      list = true;
+    } else if (argument === '--json') {
+      json = true;
+    } else if (argument === '--no-color') {
+      color = false;
+    } else if (argument === '--target' || argument === '--ai') {
+      const value = argv[index + 1];
+      if (value === undefined || value.startsWith('--')) {
+        return `Missing value for ${argument}.`;
+      }
+
+      index += 1;
+      if (argument === '--target') {
+        target = value;
+      } else if (value === 'claude' || value === 'codex') {
+        aiProviderOverride = value;
+      } else {
+        return 'The --ai value must be claude or codex.';
+      }
+    } else {
+      return `Unknown heal option: ${argument}.`;
+    }
+  }
+
+  return {
+    command: 'heal',
+    input: {
+      files,
+      dryRun,
+      yes,
+      ...(target === undefined ? {} : { target }),
+      ...(aiProviderOverride === undefined ? {} : { aiProviderOverride }),
+      allowEmpty,
+      list,
+      cwd: process.cwd(),
+      signal,
+    },
+    json,
+    color,
+  };
+}
+
 export async function main(
   argv: readonly string[] = process.argv.slice(2),
   stdout: NodeJS.WritableStream = process.stdout,
@@ -481,7 +572,7 @@ export async function main(
     process.exitCode = 0;
     return;
   }
-  if (argv[0] !== 'generate' && argv[0] !== 'run' && argv[0] !== 'check') {
+  if (argv[0] !== 'generate' && argv[0] !== 'run' && argv[0] !== 'check' && argv[0] !== 'heal') {
     stderr.write(`Unknown command: ${argv[0]}.\n`);
     writeUsage(stderr);
     process.exitCode = 2;
@@ -493,7 +584,9 @@ export async function main(
     ? parseGenerate(argv.slice(1), controller.signal)
     : argv[0] === 'run'
       ? parseRun(argv.slice(1), controller.signal)
-      : parseCheck(argv.slice(1), controller.signal);
+      : argv[0] === 'check'
+        ? parseCheck(argv.slice(1), controller.signal)
+        : parseHeal(argv.slice(1), controller.signal);
   if (typeof parsed === 'string') {
     if (parsed === 'help') {
       writeUsage(stdout);
@@ -523,7 +616,9 @@ export async function main(
         ? await runGenerateCommand(parsed.input)
         : parsed.command === 'run'
           ? await runRunCommand(parsed.input)
-          : await runCheckCommand(parsed.input);
+          : parsed.command === 'check'
+            ? await runCheckCommand(parsed.input)
+            : await runHealCommand(parsed.input);
       if (
         parsed.command === 'run'
         && output.envelope.command === 'run'
