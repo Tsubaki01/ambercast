@@ -223,10 +223,10 @@ export function reconcileHealCommitFailures(
     return outcome;
   }
 
-  const failedCaseIds = new Set(failures.map(({ caseId }) => caseId));
+  const failedFiles = new Set(failures.map(({ commit }) => commit.file));
   return {
     ...outcome,
-    results: outcome.results.filter(({ id }) => !failedCaseIds.has(id)),
+    results: outcome.results.filter(({ file }) => !failedFiles.has(file)),
     errors: [
       ...outcome.errors,
       ...failures.map(({ commit, result }) => {
