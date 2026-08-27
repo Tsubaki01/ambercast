@@ -497,6 +497,30 @@ export function validateCommittedInstructionCoverage(
 }
 
 /**
+ * Recognizes the compatibility shape used before verification coverage was
+ * persisted with AI traces.
+ *
+ * @param trace - The raw stored trace whose optional coverage field is being
+ * inspected without granting it replay authority.
+ * @returns Whether the trace has no usable stored coverage member.
+ *
+ * @remarks
+ * The unbranded storage type lets healing inspect its raw grounding entry;
+ * requiring the ports-owned pre-scan brand here would force an unsound cast.
+ * The brand is an intersection marker, so the already pre-scanned caller
+ * remains assignable without changing its trust boundary.
+ *
+ * This shape check is intentionally narrower than full coverage validation.
+ * Healing uses it only as an inexpensive retrace pre-gate, while execution
+ * always repeats the complete safety scan before replay or provider use. A
+ * false positive can spend one safe attempt, and a false negative can defer
+ * recovery to a later stage; neither result grants an unscanned trace trust.
+ */
+export function isLegacyShapedTrace(trace: TraceRecord): boolean {
+  return !Object.hasOwn(trace, 'verificationCoverage') || trace.verificationCoverage === undefined;
+}
+
+/**
  * Classifies terminal coverage only after the run pipeline's safety pre-scan.
  *
  * @param input - Pre-scanned trace, trusted criteria, and pure materializer.
@@ -533,13 +557,13 @@ export function validateCommittedInstructionCoverage(
 export function classifyPreScannedTraceCoverage(
   input: TraceCoverageValidationInput,
 ): InstructionCoverageResult<PreScannedTraceCoverage> {
-  if (!Object.hasOwn(input.trace, 'verificationCoverage')) {
+  if (isLegacyShapedTrace(input.trace)) {
     return { success: true, data: { kind: 'legacy-cache-miss', priorTrace: input.trace as SafeLegacyTraceRecord } };
   }
-  const coverage = input.trace.verificationCoverage;
-  if (coverage === undefined) {
-    return { success: true, data: { kind: 'legacy-cache-miss', priorTrace: input.trace as SafeLegacyTraceRecord } };
-  }
+  // `isLegacyShapedTrace` returned false, so the optional storage member is
+  // present and defined even though TypeScript cannot infer that fact from a
+  // boolean helper.
+  const coverage = input.trace.verificationCoverage!;
   const issues: InstructionCoverageIssue[] = [];
   const successIds = new Set(input.criteria.filter(({ kind }) => kind === 'success').map(({ id }) => id));
   const actionIds = new Set(input.criteria.filter(({ kind }) => kind === 'action').map(({ id }) => id));

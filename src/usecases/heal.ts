@@ -9,13 +9,14 @@ import { inspectGroundingArtifact } from './check-grounding.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { normalizeTestMd, type NormalizedTestMd } from '#core/ir/normalize.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
+import { groundingRecoveryModeForStep } from '#core/ir/grounding-recovery-mode.js';
 import { PlanDocument, GeneratedPlanResponse, type GroundingDocument, type JsonValueT } from '#core/ir/schema.js';
 import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
 import { buildGeneratorTask, promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { resolveTarget } from '#core/target/resolve.js';
 import { extractSecretGrants } from '#core/ir/secret-grant-source.js';
 import { assertCommittedSecretAttributionSound, assertNoLiteralSecrets, normalizeAiStepSecretGrants } from './generator-secret-policy.js';
-import { validateCommittedInstructionCoverage } from './instruction-coverage-policy.js';
+import { isLegacyShapedTrace, validateCommittedInstructionCoverage } from './instruction-coverage-policy.js';
 import { FsIoError as FsIoErrorClass } from '#core/errors/fs-io-error.js';
 import { AmbercastError as AmbercastErrorClass } from '#core/errors/types.js';
 import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
@@ -303,7 +304,7 @@ type ReplayMeasurement =
   | { readonly interrupted: true }
   | { readonly interrupted: false; readonly replay: RunCaseOutcome; readonly reachedIndex: number };
 
-type RepairKind = 'grounding' | 'tail' | 'full-plan';
+type RepairKind = 'grounding-element' | 'grounding-ai-retrace' | 'tail' | 'full-plan';
 
 type CaseProcessingResult =
   | { readonly interrupted: true }
@@ -410,11 +411,17 @@ async function preflightCase(
 }
 
 /**
- * Attempts the element-only grounding refresh without widening AI scope.
+ * Attempts the shared Stage 1 recovery selected by the failing step kind.
  *
- * Deleting an AI trace would request a fresh agentic execution, so only an
- * element entry is eligible for this narrow retry. All other failures proceed
- * directly to tail regeneration with their existing replay evidence.
+ * Element-consuming steps qualify without a stored entry, while AI steps retry
+ * only a missing, wrong-kind, or legacy-shaped trace. Retaining an eligible AI
+ * entry preserves its trace as the hint for a focused retrace, whereas an
+ * element retry removes its stale fingerprint before replay.
+ *
+ * The attempt is scoped by an overlay snapshot. A replay that does not advance
+ * the frontier, including an interruption, restores that snapshot so
+ * speculative cache and grounding writes cannot influence the following
+ * tail-repair decision.
  */
 async function tryGroundingRepair(
   deps: HealDeps,
@@ -426,13 +433,33 @@ async function tryGroundingRepair(
   baseline: ReplayMeasurement & { readonly interrupted: false },
 ): Promise<ReplayMeasurement> {
   if (baseline.reachedIndex < 0 || baseline.reachedIndex >= plan.steps.length) return baseline;
-  const grounding = JSON.parse(await overlay.storage.readText(groundingFile)) as GroundingDocument;
   const failingStep = plan.steps[baseline.reachedIndex]!;
-  if (grounding.entries[failingStep.id]?.kind !== 'element') return baseline;
+  const mode = groundingRecoveryModeForStep(failingStep);
+  if (mode === 'none') return baseline;
 
-  delete grounding.entries[failingStep.id];
-  await overlay.storage.writeText(groundingFile, toCanonicalArtifactText(grounding as JsonValueT));
-  return measureReplay(deps, options, file, overlay, plan, false);
+  const grounding = JSON.parse(await overlay.storage.readText(groundingFile)) as GroundingDocument;
+  const entry = grounding.entries[failingStep.id];
+
+  if (mode === 'ai-retrace') {
+    // The shape check only limits Stage 1 work; executeAiStep repeats the full
+    // safety scan before it can replay or send a trace to a provider.
+    const eligible = entry === undefined || entry.kind !== 'ai' || isLegacyShapedTrace(entry.trace);
+    if (!eligible) return baseline;
+  }
+
+  const snapshot = overlay.snapshot();
+  if (mode === 'element-reground') {
+    // AI retracing retains its prior trace as a focused replay hint; only an
+    // element retry clears the stale fingerprint that prevents rebinding.
+    delete grounding.entries[failingStep.id];
+    await overlay.storage.writeText(groundingFile, toCanonicalArtifactText(grounding as JsonValueT));
+  }
+  const measurement = await measureReplay(deps, options, file, overlay, plan, false);
+  if (measurement.interrupted || measurement.reachedIndex <= baseline.reachedIndex) {
+    overlay.restore(snapshot);
+    return measurement.interrupted ? measurement : baseline;
+  }
+  return measurement;
 }
 
 /**
@@ -694,7 +721,11 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
     const beforeGrounding = measurement;
     measurement = await tryGroundingRepair(caseDeps, options, file, groundingFile, overlay, plan, measurement);
     if (measurement.interrupted) return measurement;
-    if (measurement !== beforeGrounding) repairKind = 'grounding';
+    if (measurement !== beforeGrounding) {
+      repairKind = groundingRecoveryModeForStep(plan.steps[baseline]!) === 'element-reground'
+        ? 'grounding-element'
+        : 'grounding-ai-retrace';
+    }
 
     if (measurement.reachedIndex >= 0 && measurement.reachedIndex < plan.steps.length) {
       const planBeforeTail = plan;
@@ -718,7 +749,7 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
 
   const outcome = caseOutcome(file, planFile, options, baseline, measurement, plan, stage3Error, fullPlanReplayed);
   const commit = (outcome.repairOutcome === 'healed' || outcome.repairOutcome === 'partially-healed') && overlay.hasBufferedWrites()
-    ? commitFor(file, planFile, overlay, repairKind ?? 'grounding')
+    ? commitFor(file, planFile, overlay, repairKind ?? 'grounding-element')
     : undefined;
   return { interrupted: false, outcome, commit };
 }
@@ -807,11 +838,13 @@ export async function heal(
  * but the numbered internal ladder is intentionally not a user-facing contract.
  */
 function commitFor(file: string, planFile: string, overlay: HealOverlayStorage, repairKind: RepairKind): HealCaseCommit {
-  const healingSummary = repairKind === 'grounding'
+  const healingSummary = repairKind === 'grounding-element'
     ? 're-resolved a changed page element'
-    : repairKind === 'tail'
-      ? 'regenerated the remaining steps after the first failure'
-      : 'regenerated the test from scratch';
+    : repairKind === 'grounding-ai-retrace'
+      ? 'retraced an outdated AI execution trace'
+      : repairKind === 'tail'
+        ? 'regenerated the remaining steps after the first failure'
+        : 'regenerated the test from scratch';
   return {
     file,
     planFile,

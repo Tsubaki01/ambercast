@@ -37,6 +37,22 @@ import { createFakeBrowserDriver } from '../../doubles/fake-browser-driver.js';
 import { createFakeBrowserSession, elementRefKey, type FakeBrowserSessionEntry } from '../../doubles/fake-browser-session.js';
 import { createFakeSecretsProvider } from '../../doubles/fake-secrets-provider.js';
 
+const replayRunObserver = vi.hoisted(() => ({
+  afterRun: undefined as undefined | ((storage: { readonly readText: (path: string) => Promise<string> }, options: { readonly cacheOnly?: boolean }) => void | Promise<void>),
+}));
+
+vi.mock('#usecases/run.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('#usecases/run.js')>();
+  return {
+    ...actual,
+    run: async (...args: Parameters<typeof actual.run>) => {
+      const outcome = await actual.run(...args);
+      await replayRunObserver.afterRun?.(args[0].storage, args[1]);
+      return outcome;
+    },
+  };
+});
+
 const PLAN = '/workspace/tests/login.ambercast.plan.json';
 const GROUNDING = '/workspace/tests/login.ambercast.grounding.json';
 const TEST_DIR = '/workspace/tests';
@@ -447,7 +463,7 @@ describe('heal state-machine contract', () => {
     expect(writeBinary).toHaveBeenCalledOnce();
   });
 
-  it('does not replay Stage 1 when the failing step has no grounding entry', async () => {
+  it('replays Stage 1 when an element-consuming failing step has no grounding entry', async () => {
     const scenario = await createScenario({
       grounding: {},
       aiExecutor: createFakeAiExecutor({ execute: async () => { throw new AiExecutorUnavailableError('AI is unavailable.'); } }),
@@ -455,8 +471,109 @@ describe('heal state-machine contract', () => {
     const result = await heal(scenario.deps, OPTIONS);
 
     expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'unresolved' });
-    expect(scenario.deps.browserDriver).toHaveBeenCalledOnce();
+    expect(scenario.deps.browserDriver).toHaveBeenCalledTimes(2);
     expect(scenario.deps.resolveAiExecutor).toHaveBeenCalledOnce();
+  });
+
+  it('replaces a wrong-kind AI grounding entry when Stage 1 re-resolves an element-consuming step', async () => {
+    const sessionEntries = liveEntries(SUBMIT);
+    const scenario = await createScenario({
+      sessionEntries,
+      grounding: {
+        'click-submit': {
+          kind: 'ai',
+          trace: {
+            events: [],
+            verification: [{ type: 'assert', check: 'text-visible', text: 'Dashboard' }],
+          },
+        },
+      },
+    });
+    const result = await heal(scenario.deps, OPTIONS);
+
+    expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'healed', finalReachedIndex: scenario.plan.steps.length });
+    expect(scenario.deps.browserDriver).toHaveBeenCalledTimes(2);
+    const commit = result.commits.get(result.outcome.results[0]!.id);
+    expect(commit).toBeDefined();
+    await expect(commit!.commit()).resolves.toEqual({ outcome: 'committed' });
+    const rewrittenGrounding = JSON.parse(await scenario.storage.readText(GROUNDING)) as GroundingDocument;
+    expect(rewrittenGrounding.entries['click-submit']).toMatchObject({
+      kind: 'element',
+      fingerprint: freshFingerprint(sessionEntries),
+    });
+  });
+
+  it.each([
+    ['no entry', {} as GroundingDocument['entries'], undefined],
+    ['a legacy AI trace', {
+      'recorded-ai': { kind: 'ai', trace: { events: [], verification: [{ type: 'assert', check: 'text-visible', text: 'Dashboard' }] } },
+    } as GroundingDocument['entries'], 'legacy'],
+    ['a wrong-kind element entry', {
+      'recorded-ai': { kind: 'element', fingerprint: FINGERPRINT },
+    } as GroundingDocument['entries'], 'wrong-kind'],
+  ] as const)('replays Stage 1 for an AI step with %s', async (_name, grounding, traceKind) => {
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'navigate', url: '/dashboard' });
+        await request.controller.evaluateAssert({ type: 'assert', check: 'text-visible', text: 'Dashboard' }, 'dashboard-reached');
+        return { outcome: 'success' };
+      },
+      execute: async () => ({ data: { confirmed: true }, raw: '{"confirmed":true}' }),
+    });
+    const scenario = await createScenario({
+      steps: [Step.parse({
+        id: 'recorded-ai', kind: 'ai', instruction: 'Verify the dashboard.',
+        instructionCoverage: [{ id: 'dashboard-reached', kind: 'success', sourceSpan: { startLine: 3, startColumn: 1, endLine: 3, endColumn: 56 } }],
+      })],
+      grounding,
+      aiExecutor: executor,
+    });
+
+    const result = await heal(scenario.deps, OPTIONS);
+
+    expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'healed', finalReachedIndex: 1 });
+    expect(scenario.deps.browserDriver).toHaveBeenCalledTimes(1);
+    expect(executor.agenticRequests).toHaveLength(1);
+    const recordedEntry = grounding['recorded-ai'];
+    if (traceKind === 'legacy' && recordedEntry?.kind === 'ai') {
+      expect(executor.agenticRequests[0]).toMatchObject({ priorTrace: recordedEntry.trace });
+    }
+  });
+
+  it('skips Stage 1 for an AI step with a current covered trace', async () => {
+    const scenario = await createScenario({
+      steps: [Step.parse({
+        id: 'recorded-ai', kind: 'ai', instruction: 'Verify the dashboard.',
+        instructionCoverage: [{ id: 'dashboard-reached', kind: 'success', sourceSpan: { startLine: 3, startColumn: 1, endLine: 3, endColumn: 56 } }],
+      })],
+      grounding: {
+        'recorded-ai': {
+          kind: 'ai',
+          trace: {
+            events: [],
+            verification: [{ type: 'assert', check: 'text-visible', text: 'Dashboard' }],
+            verificationCoverage: { 'dashboard-reached': 0 },
+          },
+        },
+      },
+      assertOutcome: { passed: false, message: 'Dashboard is absent.' },
+      aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: { confirmed: true }, raw: '{"confirmed":true}' }) }),
+    });
+
+    await heal(scenario.deps, OPTIONS);
+
+    expect(scenario.deps.browserDriver).toHaveBeenCalledOnce();
+  });
+
+  it('keeps none-classified navigate failures out of Stage 1 even with an element entry', async () => {
+    const scenario = await createScenario({
+      steps: [Step.parse({ id: 'navigate-dashboard', kind: 'action', action: 'navigate', url: '/dashboard' })],
+      grounding: { 'navigate-dashboard': { kind: 'element', fingerprint: FINGERPRINT } },
+    });
+
+    await heal(scenario.deps, OPTIONS);
+
+    expect(scenario.deps.browserDriver).toHaveBeenCalledOnce();
   });
 
   it('keeps the plan digest unchanged while Stage 1 re-resolves one changed element grounding entry', async () => {
@@ -477,6 +594,27 @@ describe('heal state-machine contract', () => {
     expect(refreshedEntry).toMatchObject({ kind: 'element', fingerprint: freshFingerprint(sessionEntries) });
     if (refreshedEntry?.kind === 'element') {
       expect(refreshedEntry.fingerprint).not.toEqual(FINGERPRINT);
+    }
+  });
+
+  it('discards Stage-1 grounding writes when replay does not advance the baseline frontier', async () => {
+    let stageOneOverlay: { readonly readText: (path: string) => Promise<string> } | undefined;
+    const scenario = await createScenario({
+      aiExecutor: createFakeAiExecutor({ execute: async () => { throw new AiExecutorUnavailableError('AI is unavailable.'); } }),
+    });
+    const originalGrounding = await scenario.storage.readText(GROUNDING);
+    replayRunObserver.afterRun = async (storage, options) => {
+      if (options.cacheOnly === false) stageOneOverlay = storage;
+    };
+
+    try {
+      await heal(scenario.deps, OPTIONS);
+
+      expect(scenario.deps.browserDriver).toHaveBeenCalledTimes(2);
+      expect(stageOneOverlay).toBeDefined();
+      await expect(stageOneOverlay!.readText(GROUNDING)).resolves.toBe(originalGrounding);
+    } finally {
+      replayRunObserver.afterRun = undefined;
     }
   });
 
@@ -1018,6 +1156,57 @@ describe('heal interruption contract', () => {
       },
     });
     expect(browserDriver).toHaveBeenCalledOnce();
+  });
+
+  it('restores the Stage-1 snapshot when its replay is interrupted', async () => {
+    const controller = new AbortController();
+    let stageOneOverlay: { readonly readText: (path: string) => Promise<string> } | undefined;
+    let releaseStageOne: ((session: BrowserSession) => void) | undefined;
+    let markStageOneStarted: (() => void) | undefined;
+    const stageOneStarted = new Promise<void>((resolve) => { markStageOneStarted = resolve; });
+    let launches = 0;
+    const browserDriver = vi.fn<HealDeps['browserDriver']>(() => ({
+      engine: 'chromium',
+      launch: () => {
+        launches += 1;
+        if (launches !== 2) {
+          return Promise.resolve(createFakeBrowserSession(new Map(), {
+            baseUrl: TARGETS.web.baseUrl,
+            currentUrl: TARGETS.web.baseUrl,
+            snapshot: healSnapshot(new Map()),
+          }));
+        }
+        return new Promise<BrowserSession>((resolve) => {
+          releaseStageOne = resolve;
+          markStageOneStarted?.();
+        });
+      },
+    }));
+    const scenario = await createScenario({ signal: controller.signal, browserDriver });
+    const originalGrounding = await scenario.storage.readText(GROUNDING);
+    replayRunObserver.afterRun = async (storage, options) => {
+      if (options.cacheOnly === false) stageOneOverlay = storage;
+    };
+
+    try {
+      const running = heal(scenario.deps, OPTIONS);
+      await stageOneStarted;
+      controller.abort();
+      releaseStageOne?.(createFakeBrowserSession(new Map(), {
+        baseUrl: TARGETS.web.baseUrl,
+        currentUrl: TARGETS.web.baseUrl,
+        snapshot: healSnapshot(new Map()),
+      }));
+
+      await expect(running).resolves.toMatchObject({
+        outcome: { interrupted: true, results: [], errors: [], skipped: [{ file: OPTIONS.files[0] }] },
+      });
+      expect(browserDriver).toHaveBeenCalledTimes(2);
+      expect(stageOneOverlay).toBeDefined();
+      await expect(stageOneOverlay!.readText(GROUNDING)).resolves.toBe(originalGrounding);
+    } finally {
+      replayRunObserver.afterRun = undefined;
+    }
   });
 
   it.each(['normal return', 'thrown preflight error'] as const)('disposes the interruption tracker after %s', async (mode) => {
