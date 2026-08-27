@@ -62,6 +62,27 @@ import {
 import { createFakeSecretsProvider } from '../../doubles/fake-secrets-provider.js';
 import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
 
+const groundingModeAccesses = vi.hoisted(() => ({ accesses: [] as string[] }));
+
+vi.mock('#core/ir/grounding-recovery-mode.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('#core/ir/grounding-recovery-mode.js')>();
+  const observeTable = <T extends object>(table: T, prefix: string): T => new Proxy(table, {
+    get(target, property, receiver) {
+      if (typeof property === 'string') groundingModeAccesses.accesses.push(`${prefix}.${property}`);
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  return {
+    ...actual,
+    ACTION_GROUNDING_MODE: observeTable(actual.ACTION_GROUNDING_MODE, 'action'),
+    ASSERT_GROUNDING_MODE: observeTable(actual.ASSERT_GROUNDING_MODE, 'assert'),
+    groundingRecoveryModeForStep: (step: Parameters<typeof actual.groundingRecoveryModeForStep>[0]) => {
+      groundingModeAccesses.accesses.push(`mode.${step.id}`);
+      return actual.groundingRecoveryModeForStep(step);
+    },
+  };
+});
+
 const TEST_DIR = '/workspace/tests';
 const RUNS_DIR = '/workspace/tests/.runs';
 const TARGETS = { web: { baseUrl: 'https://example.test', browser: 'chromium' } } as const;
@@ -3568,6 +3589,57 @@ describe('run element-count grounding boundary', () => {
     expect(resolveGrounded).not.toHaveBeenCalled();
     expect(session.operations()).toEqual([
       { type: 'evaluate-assert', check: { check: 'element-count', target: SUBMIT, count } },
+    ]);
+  });
+});
+
+describe('run grounding recovery-mode dispatch regression', () => {
+  it.each([
+    ['navigate', { id: 'navigate-dashboard', kind: 'action', action: 'navigate', url: '/dashboard' }],
+    ['text-visible', { id: 'dashboard-visible', kind: 'assert', check: 'text-visible', text: 'Dashboard' }],
+    ['url-matches', { id: 'dashboard-url', kind: 'assert', check: 'url-matches', pattern: '/dashboard' }],
+    ['element-count', { id: 'submit-count', kind: 'assert', check: 'element-count', target: SUBMIT, count: 0 }],
+  ] as const)('does not consult a resolvable grounding entry for none-classified %s', async (_name, rawStep) => {
+    const session = createFakeBrowserSession(liveEntries([SUBMIT]), { assertOutcome: { passed: true } });
+    const resolveGrounded = vi.spyOn(session, 'resolveGrounded').mockRejectedValue(new Error('none-classified steps must not resolve grounding'));
+    const { deps, recordingStorage } = createScenario({ browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)) });
+    const testPath = await writePrompt(recordingStorage.storage);
+    const step = rawStep as unknown as TestStep;
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [step], elementGrounding([step.id]));
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(resolveGrounded).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['click', { id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }, [SUBMIT], 'action.click'],
+    ['press', { id: 'press-submit', kind: 'action', action: 'press', target: SUBMIT, key: 'Enter' }, [SUBMIT], 'action.press'],
+    ['fill', { id: 'fill-email', kind: 'action', action: 'fill', target: EMAIL, value: 'person@example.test' }, [EMAIL], 'action.fill'],
+    ['fill-secret', { id: 'fill-password', kind: 'action', action: 'fill-secret', target: PASSWORD, secretRef: '{{secrets.password}}' }, [PASSWORD], 'action.fill-secret'],
+    ['element-visible', { id: 'submit-visible', kind: 'assert', check: 'element-visible', target: SUBMIT }, [SUBMIT], 'assert.element-visible'],
+    ['text-equals', { id: 'submit-text', kind: 'assert', check: 'text-equals', target: SUBMIT, text: 'Submit' }, [SUBMIT], 'assert.text-equals'],
+    ['capture', { id: 'capture-email', kind: 'capture', target: EMAIL, variable: 'email' }, [EMAIL], undefined],
+  ] as const)('continues to resolve grounding for element-reground %s through the shared policy', async (_name, rawStep, refs, tableAccess) => {
+    const session = createFakeBrowserSession(liveEntries(refs), { assertOutcome: { passed: true } });
+    const resolveGrounded = vi.spyOn(session, 'resolveGrounded');
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      secrets: createFakeSecretsProvider(new Map([['{{secrets.password}}', 'not-in-the-plan']])),
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    const step = rawStep as unknown as TestStep;
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [step], elementGrounding([step.id]));
+    groundingModeAccesses.accesses.length = 0;
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+
+    expect(outcome.results[0]?.result.status).toBe('passed');
+    expect(resolveGrounded).toHaveBeenCalledOnce();
+    expect(groundingModeAccesses.accesses).toEqual([
+      ...(tableAccess === undefined ? [] : [tableAccess]),
+      `mode.${step.id}`,
     ]);
   });
 });

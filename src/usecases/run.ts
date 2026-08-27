@@ -17,6 +17,11 @@ import {
   isGroundingCanonicalForClaim,
   rawGroundingHasCoverageClaim,
 } from '#core/ir/grounding-coverage-claim.js';
+import {
+  ACTION_GROUNDING_MODE,
+  ASSERT_GROUNDING_MODE,
+  groundingRecoveryModeForStep,
+} from '#core/ir/grounding-recovery-mode.js';
 import { normalizeTestMd, type NormalizedTestMd } from '#core/ir/normalize.js';
 import { isSnapshotInvalid } from '#core/ir/aria-snapshot.js';
 import {
@@ -2200,12 +2205,20 @@ async function executeAiStep(
  * Grounding changes only after a successful binding. Any miss, denial, or
  * unavailable candidate leaves the existing grounding untouched, preventing
  * failed recovery from replacing known evidence with unconfirmed data.
+ *
+ * The dispatcher calls this boundary only for variants the shared recovery
+ * table classifies as element-reground. A local invariant rejects any other
+ * caller, keeping accidental grounding of bare-target steps visible even when
+ * a switch branch is otherwise type-correct.
  */
 async function groundedTarget(
   context: DispatchContext,
   step: ActionStep | AssertStep | CaptureStep,
   target: ElementRef,
 ): Promise<BoundElement> {
+  if (groundingRecoveryModeForStep(step) !== 'element-reground') {
+    throw new Error('groundedTarget called for a step kind classified outside element-reground.');
+  }
   const entry = context.grounding.entries[step.id];
   if (entry?.kind === 'element') {
     const resolved = await context.session.resolveGrounded(target, {
@@ -2304,6 +2317,11 @@ function groundingAbort(reason: GroundingMissReason): CaseAbort {
  * reject a descriptor contaminated by the secret. This keeps plans and
  * grounding reference-only while preserving the values required to sanitize a
  * subsequent failure.
+ *
+ * The per-action lookup reads the IR recovery table at the grounding decision
+ * boundary. Individual switch cases retain their field-specific narrowing,
+ * while the table remains the single authority on which variants consume
+ * element grounding.
  */
 async function executeAction(step: Step, context: DispatchContext): Promise<DispatchOutcome> {
   if (step.kind !== 'action') {
@@ -2313,12 +2331,14 @@ async function executeAction(step: Step, context: DispatchContext): Promise<Disp
   let action: MaterializedAction;
   switch (step.action) {
     case 'click':
+      if (ACTION_GROUNDING_MODE[step.action] !== 'element-reground') throw new Error('A click action must consume element grounding.');
       action = { type: 'click', target: await groundedTarget(context, step, step.target) };
       break;
     case 'navigate':
       action = { type: 'navigate', url: step.url };
       break;
     case 'press':
+      if (ACTION_GROUNDING_MODE[step.action] !== 'element-reground') throw new Error('A press action must consume element grounding.');
       action = {
         type: 'press',
         target: await groundedTarget(context, step, step.target),
@@ -2326,6 +2346,7 @@ async function executeAction(step: Step, context: DispatchContext): Promise<Disp
       };
       break;
     case 'fill':
+      if (ACTION_GROUNDING_MODE[step.action] !== 'element-reground') throw new Error('A fill action must consume element grounding.');
       action = {
         type: 'fill',
         target: await groundedTarget(context, step, step.target),
@@ -2340,6 +2361,7 @@ async function executeAction(step: Step, context: DispatchContext): Promise<Disp
       }
 
       recordResolvedSecret(context.resolvedSecrets, step.secretRef, value);
+      if (ACTION_GROUNDING_MODE[step.action] !== 'element-reground') throw new Error('A secret fill action must consume element grounding.');
       const target = await groundedTarget(context, step, step.target);
       action = { type: 'fill-secret', target, value, policy };
       break;
@@ -2357,6 +2379,10 @@ async function executeAction(step: Step, context: DispatchContext): Promise<Disp
  * The expected description is created from the browser-facing check rather
  * than the authored plan step, so a failure explains the value the browser
  * actually evaluated after run-value materialization.
+ *
+ * The per-assertion lookup uses the same shared classification as healing.
+ * This preserves bare-target checks while making a new assertion variant
+ * choose its recovery treatment at the typed IR table.
  */
 async function executeAssert(step: Step, context: DispatchContext): Promise<DispatchOutcome> {
   if (step.kind !== 'assert') {
@@ -2369,12 +2395,14 @@ async function executeAssert(step: Step, context: DispatchContext): Promise<Disp
       check = { check: 'text-visible', text: step.text };
       break;
     case 'element-visible':
+      if (ASSERT_GROUNDING_MODE[step.check] !== 'element-reground') throw new Error('An element-visible assertion must consume element grounding.');
       check = {
         check: 'element-visible',
         target: await groundedTarget(context, step, step.target),
       };
       break;
     case 'text-equals':
+      if (ASSERT_GROUNDING_MODE[step.check] !== 'element-reground') throw new Error('A text-equals assertion must consume element grounding.');
       check = {
         check: 'text-equals',
         target: await groundedTarget(context, step, step.target),

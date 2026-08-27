@@ -11,6 +11,7 @@ import type {
 import type { PreScannedTraceRecord } from '#ports/ai.js';
 import {
   classifyPreScannedTraceCoverage,
+  isLegacyShapedTrace,
   materializeAssertionForCoverage,
   validateCommittedInstructionCoverage,
   validateGeneratedInstructionCoverage,
@@ -393,6 +394,19 @@ describe('materializeAssertionForCoverage', () => {
 
 describe('classifyPreScannedTraceCoverage', () => {
   const criteria = [trusted('ready', 'Ready')];
+
+  it.each([
+    ['no verificationCoverage key', { events: [], verification: [READY_ASSERTION] }, true],
+    ['own undefined verificationCoverage', { events: [], verification: [READY_ASSERTION], verificationCoverage: undefined }, true],
+    ['covered verificationCoverage shape', { events: [], verification: [READY_ASSERTION], verificationCoverage: { ready: 0 } }, false],
+  ] as const)('keeps isLegacyShapedTrace and pre-scanned classification aligned for %s', (_name, rawTrace, legacy) => {
+    const trace = preScanned(rawTrace as unknown as TraceRecordWithCoverageStorage);
+    const result = classifyPreScannedTraceCoverage({ trace, criteria, runValues: { values: new Map() } });
+
+    expect(isLegacyShapedTrace(trace)).toBe(legacy);
+    if (legacy) expect(expectSuccess(result)).toEqual({ kind: 'legacy-cache-miss', priorTrace: trace });
+    else expect(expectSuccess(result).kind).toBe('covered');
+  });
 
   it('classifies absent additive coverage as a safe legacy cache miss', () => {
     const trace = preScanned({ events: [], verification: [READY_ASSERTION] });
