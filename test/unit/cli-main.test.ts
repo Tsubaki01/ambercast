@@ -735,7 +735,9 @@ describe('main()', () => {
   it.each([
     ['applied', 'healed', '32'],
     ['preview-only', 'healed', '32'],
-    ['no-artifact-change', 'unresolved', '32'],
+    ['no-artifact-change', 'no-changes-needed', '32'],
+    ['no-artifact-change', 'unresolved', '31'],
+    ['applied', 'partially-healed', '31'],
     ['declined', 'healed', '31'],
     ['not-applied-interrupted', 'healed', '31'],
     ['apply-failed', 'healed', '31'],
