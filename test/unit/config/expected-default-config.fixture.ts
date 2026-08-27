@@ -9,6 +9,7 @@ export const EXPECTED_DEFAULT_CONFIG = {
     'web-user': {
       baseUrl: 'http://localhost:3000',
       browser: 'chromium',
+      healReplayIsolation: 'stateful',
     },
   },
   defaultTarget: 'web-user',
@@ -26,5 +27,8 @@ export const EXPECTED_DEFAULT_CONFIG = {
   grounding: {
     repositoryPolicy: 'committed',
     localWriteBack: 'auto',
+  },
+  heal: {
+    caseTimeoutMs: 300_000,
   },
 } as const satisfies Omit<ResolvedConfig, 'projectRoot'>;

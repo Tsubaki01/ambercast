@@ -13,6 +13,7 @@ import { AmbercastError, type AmbercastError as AmbercastErrorType } from '#core
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
+import { matchRunReferenceTokens } from '#core/ir/run-ref.js';
 import {
   isGroundingCanonicalForClaim,
   rawGroundingHasCoverageClaim,
@@ -34,7 +35,6 @@ import {
   GroundingDocument,
   PLAN_SCHEMA_VERSION,
   PlanDocument,
-  RunRef,
   TraceAction,
   TraceAssert,
   TraceRecord,
@@ -218,7 +218,6 @@ export interface CoveredTraceReplayContext {
 type StepExecutor = (step: Step, context: DispatchContext) => Promise<DispatchOutcome>;
 
 const RUN_REFERENCE_PATTERN = /\{\{run\.([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\}\}/g;
-const RUN_REFERENCE_START = '{{run.';
 
 /**
  * Smallest resolved secret length that is safe to treat as a substring
@@ -601,25 +600,11 @@ function materializeStep(
  * provider or stale trace to select an arbitrary browser value.
  */
 function assertTrustedRunReferences(value: string, context: TraceTrustContext): void {
-  let cursor = 0;
-
-  while (true) {
-    const start = value.indexOf(RUN_REFERENCE_START, cursor);
-    if (start < 0) {
-      return;
-    }
-
-    const end = value.indexOf('}}', start + RUN_REFERENCE_START.length);
-    if (end < 0) {
+  for (const reference of matchRunReferenceTokens(value)) {
+    if (reference.malformed || reference.name === undefined) {
       throw new IntegrityViolationError('An AI trace contains a malformed run reference.');
     }
-
-    const reference = value.slice(start, end + 2);
-    if (!RunRef.safeParse(reference).success) {
-      throw new IntegrityViolationError('An AI trace contains a malformed run reference.');
-    }
-
-    const name = reference.slice(RUN_REFERENCE_START.length, -2) as RunVariableName;
+    const name = reference.name as RunVariableName;
     if (!context.allowedRunRefs.has(name)) {
       throw new IntegrityViolationError('An AI trace references a run value that this step is not allowed to use.', {
         runRef: name,
@@ -631,8 +616,6 @@ function assertTrustedRunReferences(value: string, context: TraceTrustContext): 
         runRef: name,
       });
     }
-
-    cursor = end + 2;
   }
 }
 

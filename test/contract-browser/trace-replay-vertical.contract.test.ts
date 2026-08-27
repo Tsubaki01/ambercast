@@ -157,7 +157,7 @@ describe('hand-authored trace replay against real Chromium', () => {
           testDir: TEST_DIR,
           testMatch: ['**/*.test.md'],
           testIgnore: ['**/.runs/**'],
-          targets,
+          targets: { fixture: { ...targets.fixture, healReplayIsolation: 'stateful' } },
           defaultTarget: 'fixture',
           ai: { provider: 'codex', timeoutMs: 120_000 },
           ci: { heal: false, updateGroundingCache: false },

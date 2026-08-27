@@ -38,6 +38,7 @@ export const DEFAULT_RAW_CONFIG = {
     'web-user': {
       baseUrl: 'http://localhost:3000',
       browser: 'chromium',
+      healReplayIsolation: 'stateful',
     },
   },
   defaultTarget: 'web-user',
@@ -62,5 +63,8 @@ export const DEFAULT_RAW_CONFIG = {
   grounding: {
     repositoryPolicy: 'committed',
     localWriteBack: 'auto',
+  },
+  heal: {
+    caseTimeoutMs: 300_000,
   },
 } as const satisfies Omit<ResolvedConfig, 'projectRoot'>;

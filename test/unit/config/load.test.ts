@@ -16,6 +16,8 @@ const ABSOLUTE_COMMAND_CONFIG_PATH = '/workspace/explicit/command.json';
 const ABSOLUTE_ENVIRONMENT_CONFIG_PATH = '/workspace/explicit/environment.json';
 const APP_TARGET = { baseUrl: 'http://app.test', browser: 'chromium' } as const;
 const ADMIN_TARGET = { baseUrl: 'http://admin.test', browser: 'chromium' } as const;
+const RESOLVED_APP_TARGET = { ...APP_TARGET, healReplayIsolation: 'stateful' as const };
+const RESOLVED_ADMIN_TARGET = { ...ADMIN_TARGET, healReplayIsolation: 'stateful' as const };
 
 interface LoadOptions {
   readonly cwd?: string | undefined;
@@ -36,6 +38,7 @@ function expectedDefaults(configRoot: string): ResolvedConfig {
       'web-user': {
         baseUrl: 'http://localhost:3000',
         browser: 'chromium',
+        healReplayIsolation: 'stateful',
       },
     },
     defaultTarget: 'web-user',
@@ -53,6 +56,9 @@ function expectedDefaults(configRoot: string): ResolvedConfig {
     grounding: {
       repositoryPolicy: 'committed',
       localWriteBack: 'auto',
+    },
+    heal: {
+      caseTimeoutMs: 300_000,
     },
   };
 }
@@ -397,14 +403,14 @@ describe('loadConfig', () => {
     it('replaces targets atomically and clears the built-in default target when the file omits it', async () => {
       const storage = createInMemoryStorage();
       await writeConfig(storage, `${CWD}/ambercast.config.json`, {
-        targets: { app: APP_TARGET, admin: ADMIN_TARGET },
+        targets: { app: RESOLVED_APP_TARGET, admin: RESOLVED_ADMIN_TARGET },
       });
 
       const config = await load(storage);
 
       expect(config).toStrictEqual({
         ...withoutDefaultTarget(expectedDefaults(CWD)),
-        targets: { app: APP_TARGET, admin: ADMIN_TARGET },
+        targets: { app: RESOLVED_APP_TARGET, admin: RESOLVED_ADMIN_TARGET },
       });
     });
 
@@ -445,21 +451,21 @@ describe('loadConfig', () => {
     it('clears the built-in default target even when an atomic replacement still declares web-user', async () => {
       const storage = createInMemoryStorage();
       await writeConfig(storage, `${CWD}/ambercast.config.json`, {
-        targets: { 'web-user': APP_TARGET },
+        targets: { 'web-user': RESOLVED_APP_TARGET },
       });
 
       const config = await load(storage);
 
       expect(config).toStrictEqual({
         ...withoutDefaultTarget(expectedDefaults(CWD)),
-        targets: { 'web-user': APP_TARGET },
+        targets: { 'web-user': RESOLVED_APP_TARGET },
       });
     });
 
     it('uses a supplied default target only when it names a supplied replacement target', async () => {
       const storage = createInMemoryStorage();
       await writeConfig(storage, `${CWD}/ambercast.config.json`, {
-        targets: { app: APP_TARGET },
+        targets: { app: RESOLVED_APP_TARGET },
         defaultTarget: 'app',
       });
 
@@ -467,7 +473,7 @@ describe('loadConfig', () => {
 
       expect(config).toStrictEqual({
         ...expectedDefaults(CWD),
-        targets: { app: APP_TARGET },
+        targets: { app: RESOLVED_APP_TARGET },
         defaultTarget: 'app',
       });
     });
@@ -660,6 +666,7 @@ describe('loadConfig', () => {
       expect(second).toStrictEqual({
         ...withoutDefaultTarget(expectedDefaults(CWD)),
         ...fileConfig,
+        targets: { app: RESOLVED_APP_TARGET },
         ai: { provider: 'codex', timeoutMs: 120_000 },
       });
       expect(DEFAULT_RAW_CONFIG).toStrictEqual(EXPECTED_DEFAULT_CONFIG);

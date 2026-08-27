@@ -7,6 +7,26 @@
 
 import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import type { TargetDefinition } from '#core/ir/schema.js';
+import type { ResolvedTargetConfigEntry } from '#core/config/schema.js';
+
+/**
+ * Projects a resolved target to the plan and input-digest target definition.
+ *
+ * @param target - The fully resolved target, including runtime-only policy.
+ * @returns The target fields whose changes define plan freshness.
+ * @remarks
+ * The projection explicitly picks `baseUrl`, `browser`, and
+ * `secretSinkOrigins` rather than relying on a structural cast. In particular,
+ * `healReplayIsolation` governs whether healing may start against live state;
+ * it must not alter a committed plan or make an otherwise fresh plan stale.
+ */
+export function toTargetDefinition(target: ResolvedTargetConfigEntry): TargetDefinition {
+  return {
+    baseUrl: target.baseUrl,
+    browser: target.browser,
+    ...(target.secretSinkOrigins === undefined ? {} : { secretSinkOrigins: target.secretSinkOrigins }),
+  };
+}
 
 /**
  * The resolved configuration values and optional caller choice considered by
@@ -22,7 +42,7 @@ export interface ResolveTargetInput {
    * Resolved targets whose own keys support named selection and whose
    * enumerable own keys form the implicit-selection domain.
    */
-  readonly targets: Readonly<Record<string, Readonly<TargetDefinition>>>;
+  readonly targets: Readonly<Record<string, Readonly<ResolvedTargetConfigEntry>>>;
 
   /** The loader-validated default target name, when configuration defines one. */
   readonly defaultTarget: string | undefined;
@@ -40,17 +60,18 @@ export interface ResolveTargetInput {
  * only target allowed to choose browser behavior, so selection cannot silently
  * broaden AI or browser authority. The record uses own data-property semantics
  * even for special property names, preserving the ordinary object prototype.
- * Both `definition` and `definitions[name]` preserve the exact definition
- * reference held by the input record rather than cloning resolved target data.
+ * Both `definition` and `definitions[name]` are `toTargetDefinition`
+ * projections. They are never aliases of a resolved target, so configuration-
+ * only runtime policy cannot cross into plan or digest consumers.
  */
 export interface TargetSelection {
   /** The selected own target name. */
   readonly name: string;
 
-  /** The exact selected definition reference from the resolved configuration. */
+  /** The selected target's digest-bound definition projection. */
   readonly definition: Readonly<TargetDefinition>;
 
-  /** A digest-ready one-entry record preserving the same definition reference. */
+  /** A digest-ready one-entry record containing the same projected definition. */
   readonly definitions: Readonly<Record<string, Readonly<TargetDefinition>>>;
 }
 
@@ -87,7 +108,7 @@ export function resolveTarget(
   const targetNames = Object.keys(input.targets).sort();
 
   function selection(name: string): TargetSelection {
-    const definition = input.targets[name]!;
+    const definition = toTargetDefinition(input.targets[name]!);
     const definitions = Object.fromEntries([[name, definition]]);
     return { name, definition, definitions };
   }

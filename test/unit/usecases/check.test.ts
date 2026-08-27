@@ -24,6 +24,7 @@ const TEST_DIR = '/workspace/tests';
 const RUNS_DIR = '/workspace/tests/.runs';
 const PROMPT = '# Sign in\n\nWhen I submit valid credentials, I reach the dashboard.\n';
 const TARGETS = { web: { baseUrl: 'https://example.test', browser: 'chromium' } } as const;
+const RESOLVED_TARGETS = { web: { ...TARGETS.web, healReplayIsolation: 'stateful' as const } } as const;
 const OPTIONS: CheckOptions = { files: [], allowEmpty: false, list: false };
 
 type TestConfig = CheckDeps['config'];
@@ -33,7 +34,7 @@ function createConfig(overrides: Partial<TestConfig> = {}): TestConfig {
     testDir: TEST_DIR,
     testMatch: ['**/*.test.md'],
     testIgnore: ['**/.runs/**'],
-    targets: TARGETS,
+    targets: RESOLVED_TARGETS,
     defaultTarget: 'web',
     grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
     ...overrides,
@@ -575,11 +576,12 @@ describe('check', () => {
     } as const;
     const changedSelectedTargets = {
       ...planTargets,
-      web: { baseUrl: 'https://changed.example.test', browser: 'chromium' },
+      web: { baseUrl: 'https://changed.example.test', browser: 'chromium', healReplayIsolation: 'stateful' },
+      admin: { ...planTargets.admin, healReplayIsolation: 'stateful' },
     } as const;
     const changedUnrelatedTargets = {
-      ...planTargets,
-      admin: { baseUrl: 'https://changed-admin.example.test', browser: 'chromium' },
+      web: RESOLVED_TARGETS.web,
+      admin: { baseUrl: 'https://changed-admin.example.test', browser: 'chromium', healReplayIsolation: 'stateful' },
     } as const;
     const { storage, layout } = createScenario();
     await storage.writeText(testPath, PROMPT);
@@ -689,8 +691,8 @@ describe('check', () => {
       config: {
         ...ambiguousConfig,
         targets: {
-          web: TARGETS.web,
-          admin: { baseUrl: 'https://admin.example.test', browser: 'chromium' },
+          web: RESOLVED_TARGETS.web,
+          admin: { baseUrl: 'https://admin.example.test', browser: 'chromium', healReplayIsolation: 'stateful' },
         },
       },
     });
@@ -713,14 +715,16 @@ describe('check', () => {
   it('uses a sole implicit target for freshness when defaultTarget is absent', async () => {
     const testPath = `${TEST_DIR}/implicit.test.md`;
     const soleTargets = {
-      replacement: { baseUrl: 'https://replacement.example.test', browser: 'chromium' as const },
+      replacement: { baseUrl: 'https://replacement.example.test', browser: 'chromium' as const, healReplayIsolation: 'stateful' as const },
     };
     const { defaultTarget: _defaultTarget, ...configWithoutDefault } = createConfig();
     const { storage, layout, deps } = createScenario({
       config: { ...configWithoutDefault, targets: soleTargets },
     });
     await storage.writeText(testPath, PROMPT);
-    const plan = await writePlan(storage, layout, testPath, freshPlan(PROMPT, soleTargets));
+    const plan = await writePlan(storage, layout, testPath, freshPlan(PROMPT, {
+      replacement: { baseUrl: soleTargets.replacement.baseUrl, browser: soleTargets.replacement.browser },
+    }));
     await writeGrounding(storage, layout, testPath, plan);
 
     await expect(check(deps, { ...OPTIONS, files: [testPath] })).resolves.toMatchObject({
@@ -739,8 +743,8 @@ describe('check', () => {
   ) => {
     const testPath = `${TEST_DIR}/${expectedName}.test.md`;
     const targets = {
-      web: TARGETS.web,
-      admin: { baseUrl: 'https://admin.example.test', browser: 'chromium' as const },
+      web: RESOLVED_TARGETS.web,
+      admin: { baseUrl: 'https://admin.example.test', browser: 'chromium' as const, healReplayIsolation: 'stateful' as const },
     };
     const { storage, layout, deps } = createScenario({
       config: createConfig({ targets, defaultTarget: 'web' }),
@@ -750,7 +754,10 @@ describe('check', () => {
       storage,
       layout,
       testPath,
-      freshPlan(PROMPT, { [expectedName]: targets[expectedName] }),
+      freshPlan(PROMPT, { [expectedName]: {
+        baseUrl: targets[expectedName].baseUrl,
+        browser: targets[expectedName].browser,
+      } }),
     );
     await writeGrounding(storage, layout, testPath, plan);
 
@@ -771,8 +778,8 @@ describe('check', () => {
       config: {
         ...ambiguousConfig,
         targets: {
-          web: TARGETS.web,
-          admin: { baseUrl: 'https://admin.example.test', browser: 'chromium' },
+          web: RESOLVED_TARGETS.web,
+          admin: { baseUrl: 'https://admin.example.test', browser: 'chromium', healReplayIsolation: 'stateful' },
         },
       },
     });

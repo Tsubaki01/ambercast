@@ -86,12 +86,13 @@ const CONFIG: ResolvedConfig = {
   projectRoot: '/workspace',
   testMatch: ['**/*.test.md'],
   testIgnore: ['**/.runs/**'],
-  targets: { web: { baseUrl: 'https://example.test', browser: 'chromium' } },
+  targets: { web: { baseUrl: 'https://example.test', browser: 'chromium', healReplayIsolation: 'stateful' } },
   defaultTarget: 'web',
   ai: { provider: 'codex', timeoutMs: 120_000 },
   viewer: { port: 4600 },
   ci: { heal: true, updateGroundingCache: false },
   grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
+  heal: { caseTimeoutMs: 300_000 },
 };
 
 const summary = { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 };

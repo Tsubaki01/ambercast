@@ -9,14 +9,41 @@ import { z } from 'zod';
 import { TargetDefinition } from '#core/ir/schema.js';
 
 /**
+ * Schema for a target as it may appear in a partial configuration file.
+ *
+ * @remarks
+ * `healReplayIsolation` is optional only at this boundary so existing files
+ * remain valid. Loading supplies the conservative `stateful` default before
+ * any runtime consumer receives the target; keeping that defaulting out of
+ * the IR target schema prevents live replay policy from becoming a plan or
+ * input-digest dependency.
+ */
+export const TargetConfigEntry = TargetDefinition.extend({
+  healReplayIsolation: z.enum(['idempotent', 'stateful']).optional(),
+});
+
+/**
+ * Fully resolved target settings available to command and runtime selection.
+ *
+ * Unlike {@link TargetConfigEntry}, this type requires
+ * `healReplayIsolation`: callers use it to reject healing against a stateful
+ * target before browser or provider work starts. Digest-bound consumers must
+ * project it back to {@link TargetDefinition}, which intentionally has no
+ * live-only replay-isolation field.
+ */
+export type ResolvedTargetConfigEntry = Omit<z.infer<typeof TargetConfigEntry>, 'healReplayIsolation'> & {
+  readonly healReplayIsolation: 'idempotent' | 'stateful';
+};
+
+/**
  * Validates the parsed contents of a present Ambercast configuration file.
  *
  * @remarks
  * A file that exists must identify its schema through `$schema`, while every
  * setting remains optional to support partial overrides. The no-file case is
  * a separate valid input handled outside this schema. Its `targets` member
- * deliberately reuses {@link TargetDefinition}, preserving one target
- * contract across every core consumer.
+ * extends the IR target contract only at the configuration boundary by adding
+ * the configuration-only `healReplayIsolation` field.
  */
 export const RawConfig = z.strictObject({
   $schema: z.string(),
@@ -24,7 +51,7 @@ export const RawConfig = z.strictObject({
   runsDir: z.string().optional(),
   testMatch: z.array(z.string()).optional(),
   testIgnore: z.array(z.string()).optional(),
-  targets: z.record(z.string(), TargetDefinition).optional(),
+  targets: z.record(z.string(), TargetConfigEntry).optional(),
   defaultTarget: z.string().optional(),
   ai: z.strictObject({
     provider: z.enum(['claude', 'codex', 'auto']).optional(),
@@ -53,6 +80,10 @@ export const RawConfig = z.strictObject({
   grounding: z.strictObject({
     repositoryPolicy: z.enum(['committed', 'uncommitted']).optional(),
     localWriteBack: z.enum(['auto', 'explicit']).optional(),
+  }).optional(),
+  heal: z.strictObject({
+    maxStepRepairs: z.int().positive().optional().describe('Limits Stage 2 step regeneration and Stage 1 AI retrace dispatches; it does not limit element regrounding.'),
+    caseTimeoutMs: z.int().positive().optional(),
   }).optional(),
 });
 
@@ -92,7 +123,7 @@ export interface ResolvedConfig extends LayoutConfig {
   readonly projectRoot: string;
   readonly testMatch: readonly string[];
   readonly testIgnore: readonly string[];
-  readonly targets: Readonly<Record<string, Readonly<TargetDefinition>>>;
+  readonly targets: Readonly<Record<string, Readonly<ResolvedTargetConfigEntry>>>;
   readonly defaultTarget?: string;
   /** AI-provider policy with a positive, resolved per-call timeout. */
   readonly ai: Readonly<{ provider: 'claude' | 'codex' | 'auto'; timeoutMs: number }>;
@@ -115,6 +146,16 @@ export interface ResolvedConfig extends LayoutConfig {
     repositoryPolicy: 'committed' | 'uncommitted';
     localWriteBack: 'auto' | 'explicit';
   }>;
+  /**
+   * Resolved limits for one healing case.
+   *
+   * `caseTimeoutMs` is always available because healing establishes one
+   * case-wide deadline before baseline replay. An omitted `maxStepRepairs`
+   * instead leaves the structural frontier ceiling as the only repair-budget
+   * bound; its shared counter covers Stage 2 replacements and Stage 1 AI
+   * retraces, never element regrounding or replay.
+   */
+  readonly heal: Readonly<{ maxStepRepairs?: number; caseTimeoutMs: number }>;
 }
 
 /**

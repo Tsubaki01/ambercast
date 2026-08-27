@@ -33,9 +33,10 @@ vi.mock('#usecases/report-finalization.js', () => ({
 const CONFIG: ResolvedConfig = {
   testDir: '/workspace/tests', runsDir: '/workspace/tests/.runs', projectRoot: '/workspace',
   testMatch: ['**/*.test.md'], testIgnore: ['**/.runs/**'],
-  targets: { web: { baseUrl: 'https://example.test', browser: 'chromium' } }, defaultTarget: 'web',
+  targets: { web: { baseUrl: 'https://example.test', browser: 'chromium', healReplayIsolation: 'idempotent' } }, defaultTarget: 'web',
   ai: { provider: 'auto', timeoutMs: 120_000 }, viewer: { port: 4600 },
   ci: { heal: true, updateGroundingCache: false }, grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
+  heal: { caseTimeoutMs: 300_000 },
 };
 
 const rawEnvelopeForFinalizedBoundary = {} as ReportEnvelope;
@@ -77,7 +78,7 @@ function reportWithExecutionEvidence(root: string): HealCommandOutput {
 }
 function caseResult(id: string, overrides: Partial<HealCaseOutcome> = {}): HealCaseOutcome {
   const file = `/workspace/tests/${id}`;
-  return { id: file, file, planFile: `/workspace/tests/${id}.ambercast.plan.json`, repairOutcome: 'healed', steps: [], explanation: 'The candidate repaired the case.', durationMs: 1.6, baselineReachedIndex: 0, finalReachedIndex: 1, stage3Error: undefined, finalReplayError: undefined, ...overrides };
+  return { id: file, file, planFile: `/workspace/tests/${id}.ambercast.plan.json`, repairOutcome: 'healed', steps: [], explanation: 'The candidate repaired the case.', durationMs: 1.6, baselineFirstFailureIndex: 0, finalFirstFailureIndex: 1, stopReason: 'settled', stage3Error: undefined, finalReplayError: undefined, ...overrides };
 }
 function outcome(overrides: Partial<HealOutcome> = {}): HealOutcome {
   return { results: [caseResult('login.test.md')], errors: [], noTestsFound: false, listed: [], skipped: [], interrupted: false, ...overrides };
@@ -122,6 +123,81 @@ beforeEach(async () => {
 });
 
 describe('runHealCommand', () => {
+  it.each([false, true])('rejects a stateful target before work for --dry-run=%s', async (dryRun) => {
+    configure({ config: { ...CONFIG, targets: { web: { ...CONFIG.targets.web!, healReplayIsolation: 'stateful' } } }, built: report(2) });
+
+    await expect(runHealCommand(input({ dryRun }))).resolves.toMatchObject({ exitCode: 2 });
+    expect(mocks.heal).not.toHaveBeenCalled();
+    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({ error: expect.any(ConfigInvalidError) }));
+  });
+
+  it('permits an idempotent target and leaves --list outside the isolation gate', async () => {
+    await expect(runHealCommand(input())).resolves.toMatchObject({ exitCode: 0 });
+    expect(mocks.heal).toHaveBeenCalledOnce();
+
+    vi.resetAllMocks();
+    configure({ config: { ...CONFIG, targets: { web: { ...CONFIG.targets.web!, healReplayIsolation: 'stateful' } } } });
+    await expect(runHealCommand(input({ list: true }))).resolves.toMatchObject({ exitCode: 0 });
+    expect(mocks.heal).toHaveBeenCalledWith(expect.any(Object), expect.objectContaining({ list: true }));
+  });
+
+  it('checks replay isolation only on the selected target', async () => {
+    configure({
+      config: {
+        ...CONFIG,
+        targets: {
+          web: CONFIG.targets.web!,
+          admin: { baseUrl: 'https://admin.example.test', browser: 'chromium', healReplayIsolation: 'stateful' },
+        },
+      },
+    });
+
+    await expect(runHealCommand(input())).resolves.toMatchObject({ exitCode: 0 });
+    expect(mocks.heal).toHaveBeenCalledOnce();
+
+    vi.resetAllMocks();
+    configure({
+      config: {
+        ...CONFIG,
+        targets: {
+          web: CONFIG.targets.web!,
+          admin: { baseUrl: 'https://admin.example.test', browser: 'chromium', healReplayIsolation: 'stateful' },
+        },
+      },
+      built: report(2),
+    });
+    await expect(runHealCommand(input({ target: 'admin' }))).resolves.toMatchObject({ exitCode: 2 });
+    expect(mocks.heal).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['no-changes-needed', 'settled', false, 'no-artifact-change'],
+    ['healed', 'settled', true, 'preview-only'],
+    ['partially-healed', 'attempt-limit', true, 'preview-only'],
+    ['partially-healed', 'deadline', true, 'preview-only'],
+    ['unresolved', 'attempt-limit', false, 'no-artifact-change'],
+    ['unresolved', 'deadline', false, 'not-eligible'],
+  ] as const)('preserves %s/%s through settlement as %s', async (repairOutcome, stopReason, dryRun, application) => {
+    const healedOutcome = outcome({ results: [caseResult('state.test.md', { repairOutcome, stopReason })] });
+    configure({ result: batch({ outcome: healedOutcome, commits: repairOutcome === 'healed' || repairOutcome === 'partially-healed' ? commits(capability('state.test.md')) : new Map() }) });
+
+    await runHealCommand(input({ dryRun }));
+    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: expect.objectContaining({ results: [expect.objectContaining({ repairOutcome, stopReason, application })] }),
+    }));
+  });
+
+  it('rejects an absent replay-isolation setting before dry-run repair work', async () => {
+    const config = {
+      ...CONFIG,
+      targets: { web: { baseUrl: 'https://example.test', browser: 'chromium' } },
+    } as unknown as ResolvedConfig;
+    configure({ config, built: report(2) });
+
+    await expect(runHealCommand(input({ dryRun: true }))).resolves.toMatchObject({ exitCode: 2 });
+    expect(mocks.heal).not.toHaveBeenCalled();
+    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({ error: expect.any(ConfigInvalidError) }));
+  });
   it.each([['non-interactive', false], ['interactive but undeclined', true]] as const)('lets --list exit zero before disabled ci.heal in a %s environment', async (_name, interactive) => {
     const listed = batch({ outcome: outcome({ results: [], listed: [{ file: '/workspace/tests/login.test.md' }] }), commits: new Map() });
     const readConfirmationAnswer = vi.fn(async (_commits: ReadonlyMap<string, HealCaseCommit>) => 'authorized' as const);
