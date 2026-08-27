@@ -331,7 +331,7 @@ describe('buildRunReport', () => {
   });
 });
 
-describe('buildRunReport v2 interruption accounting', () => {
+describe('buildRunReport v3 interruption accounting', () => {
   it('keeps execution evidence terminal, emits only pending identity-only rows, and lets exit 2 outrank interruption', () => {
     const output = report({ outcome: {
       noTestsFound: false, interrupted: true, skipped: [{ file: 'pending.test.md' }], listed: [],
@@ -339,7 +339,7 @@ describe('buildRunReport v2 interruption accounting', () => {
     } } as unknown as Omit<RunReportInput, keyof typeof BASE>);
 
     expect(output.exitCode).toBe(2);
-    expect(output.envelope.schemaVersion).toBe('2.0');
+    expect(output.envelope.schemaVersion).toBe('3.0');
     expect(output.envelope.summary).toEqual({ total: 2, passed: 0, failed: 0, errored: 1, skipped: 1 });
     expect(output.envelope.results).toContainEqual({ id: 'pending.test.md', file: 'pending.test.md', status: 'skipped' });
     expect(output.envelope.errors).toContainEqual(expect.objectContaining({ scope: 'run', code: 'INTERRUPTED' }));

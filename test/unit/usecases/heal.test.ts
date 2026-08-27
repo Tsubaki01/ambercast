@@ -331,8 +331,8 @@ describe('heal state-machine contract', () => {
 
     expect(result.outcome.results).toHaveLength(1);
     expect(result.outcome.results[0]).toMatchObject({
-      status: 'no-changes-needed', baselineReachedIndex: scenario.plan.steps.length,
-      finalReachedIndex: scenario.plan.steps.length, dryRun: false,
+      repairOutcome: 'no-changes-needed', baselineReachedIndex: scenario.plan.steps.length,
+      finalReachedIndex: scenario.plan.steps.length,
     });
     expect(result.commits.size).toBe(0);
   });
@@ -454,7 +454,7 @@ describe('heal state-machine contract', () => {
     });
     const result = await heal(scenario.deps, OPTIONS);
 
-    expect(result.outcome.results[0]).toMatchObject({ status: 'unresolved' });
+    expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'unresolved' });
     expect(scenario.deps.browserDriver).toHaveBeenCalledOnce();
     expect(scenario.deps.resolveAiExecutor).toHaveBeenCalledOnce();
   });
@@ -465,7 +465,7 @@ describe('heal state-machine contract', () => {
     const originalPlanDigest = computePlanDigest(scenario.plan);
     const result = await heal(scenario.deps, OPTIONS);
 
-    expect(result.outcome.results[0]).toMatchObject({ status: 'healed', finalReachedIndex: scenario.plan.steps.length });
+    expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'healed', finalReachedIndex: scenario.plan.steps.length });
     const commit = result.commits.get(result.outcome.results[0]!.id);
     expect(commit).toBeDefined();
     await expect(commit!.commit()).resolves.toEqual({ outcome: 'committed' });
@@ -509,7 +509,7 @@ describe('heal state-machine contract', () => {
 
     const groundingCommit = (await heal(groundingOnly.deps, OPTIONS)).commits.get(OPTIONS.files[0]!);
     const regenerated = await heal(regeneratedTail.deps, OPTIONS);
-    expect(regenerated.outcome.results).toEqual([expect.objectContaining({ status: 'healed' })]);
+    expect(regenerated.outcome.results).toEqual([expect.objectContaining({ repairOutcome: 'healed' })]);
     const regeneratedCommit = regenerated.commits.get(OPTIONS.files[0]!);
 
     expect(groundingCommit).toBeDefined();
@@ -561,7 +561,7 @@ describe('heal state-machine contract', () => {
     const originalPlanDigest = computePlanDigest(scenario.plan);
     const result = await heal(scenario.deps, OPTIONS);
 
-    expect(result.outcome.results[0]).toMatchObject({ status: 'healed', finalReachedIndex: originalSteps.length });
+    expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'healed', finalReachedIndex: originalSteps.length });
     const commit = result.commits.get(OPTIONS.files[0]!);
     expect(commit).toBeDefined();
     await expect(commit!.commit()).resolves.toEqual({ outcome: 'committed' });
@@ -618,7 +618,7 @@ describe('heal state-machine contract', () => {
 
     const result = await heal({ ...scenario.deps, resolveAiExecutor }, OPTIONS);
 
-    expect(result.outcome.results[0]).toMatchObject({ status: 'healed' });
+    expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'healed' });
     expect(resolveAiExecutor).toHaveBeenCalledTimes(1);
   });
 
@@ -642,7 +642,7 @@ describe('heal state-machine contract', () => {
 
     const result = await heal({ ...scenario.deps, resolveAiExecutor }, OPTIONS);
 
-    expect(result.outcome.results[0]).toMatchObject({ status: 'healed' });
+    expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'healed' });
     expect(resolveAiExecutor).toHaveBeenCalledTimes(2);
   });
 
@@ -650,7 +650,7 @@ describe('heal state-machine contract', () => {
     const scenario = await createScenario({ launchFailure: true });
     const result = await heal(scenario.deps, OPTIONS);
 
-    expect(result.outcome.results[0]).toMatchObject({ status: 'unresolved', baselineReachedIndex: -1, finalReachedIndex: -1 });
+    expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'unresolved', baselineReachedIndex: -1, finalReachedIndex: -1 });
     expect(scenario.deps.resolveAiExecutor).toHaveBeenCalledTimes(1);
   });
 
@@ -681,7 +681,7 @@ describe('heal state-machine contract', () => {
     });
     const result = await heal(scenario.deps, OPTIONS);
 
-    expect(result.outcome.results[0]).toMatchObject({ status: 'healed', finalReachedIndex: 1 });
+    expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'healed', finalReachedIndex: 1 });
     const commit = result.commits.get(OPTIONS.files[0]!);
     await expect(commit?.commit()).resolves.toEqual({ outcome: 'committed' });
     const rewrittenPlan = PlanDocument.parse(JSON.parse(await scenario.storage.readText(PLAN)));
@@ -745,8 +745,8 @@ describe('heal state-machine contract', () => {
 
     expect(repairCall).toBe(2);
     expect(result.outcome.results).toEqual([
-      expect.objectContaining({ file: first, status: 'healed' }),
-      expect.objectContaining({ file: second, status: 'no-changes-needed' }),
+      expect.objectContaining({ file: first, repairOutcome: 'healed' }),
+      expect.objectContaining({ file: second, repairOutcome: 'no-changes-needed' }),
     ]);
     await expect(Promise.all([
       scenario.storage.readText(secondPlanPath),
@@ -789,7 +789,7 @@ describe('heal state-machine contract', () => {
     const result = await heal(scenario.deps, OPTIONS);
 
     expect(result.outcome.results[0]).toMatchObject({
-      status: 'unresolved', baselineReachedIndex: 0, finalReachedIndex: 1,
+      repairOutcome: 'unresolved', baselineReachedIndex: 0, finalReachedIndex: 1,
     });
     expect(result.commits.size).toBe(0);
   });
@@ -817,7 +817,7 @@ describe('heal state-machine contract', () => {
     const scenario = await createScenario({ grounding: {} });
     const result = await heal(await createDeps(scenario), OPTIONS);
 
-    expect(result.outcome.results[0]).toMatchObject({ status: 'unresolved' });
+    expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'unresolved' });
     expect(result.outcome.results[0]?.stage3Error).toBeInstanceOf(error);
   });
 
@@ -826,7 +826,7 @@ describe('heal state-machine contract', () => {
     const result = await heal(scenario.deps, OPTIONS);
 
     expect(result.outcome.results).toEqual([expect.objectContaining({
-      status: 'no-changes-needed', baselineReachedIndex: 0, finalReachedIndex: 0,
+      repairOutcome: 'no-changes-needed', baselineReachedIndex: 0, finalReachedIndex: 0,
     })]);
     expect(result.commits.size).toBe(0);
   });
@@ -859,7 +859,7 @@ describe('heal state-machine contract', () => {
     const result = await heal(scenario.deps, OPTIONS);
 
     expect(result.outcome.results[0]).toMatchObject({
-      status: 'unresolved', baselineReachedIndex: 1, finalReachedIndex: 0,
+      repairOutcome: 'unresolved', baselineReachedIndex: 1, finalReachedIndex: 0,
     });
     expect(result.commits.size).toBe(0);
     expect(scenario.textWrites).not.toHaveBeenCalled();
@@ -873,7 +873,7 @@ describe('heal state-machine contract', () => {
 
     expect(scenario.textWrites).not.toHaveBeenCalled();
     expect(result.outcome.results).toHaveLength(1);
-    expect(result.outcome.results[0]?.status).toBe('healed');
+    expect(result.outcome.results[0]?.repairOutcome).toBe('healed');
     expect([...result.commits.keys()]).toEqual([OPTIONS.files[0]]);
   });
 
@@ -974,7 +974,7 @@ describe('heal interruption contract', () => {
 
       expect(result.outcome).toMatchObject({ interrupted: true, errors: [] });
       expect(result.outcome.results).toHaveLength(1);
-      expect(result.outcome.results[0]).toMatchObject({ file: first, status: 'no-changes-needed' });
+      expect(result.outcome.results[0]).toMatchObject({ file: first, repairOutcome: 'no-changes-needed' });
       expect(result.outcome.skipped).toEqual([{ file: second }]);
       expect(scenario.deps.browserDriver).toHaveBeenCalledOnce();
       expect(scenario.textWrites).not.toHaveBeenCalled();

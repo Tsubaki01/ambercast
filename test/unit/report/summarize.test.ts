@@ -28,6 +28,14 @@ function summary(command: string, statuses: readonly string[], errors: readonly 
   } as unknown as ReportSummaryInput);
 }
 
+function healSummary(repairOutcome: 'healed' | 'partially-healed' | 'unresolved' | 'no-changes-needed', application: string, errors: readonly unknown[] = []) {
+  return summarizeReport({
+    command: 'heal',
+    results: [{ id: 'heal-case', file: 'heal-case.test.md', planFile: 'heal-case.ambercast.plan.json', status: 'completed', repairOutcome, application, stopReason: 'settled', durationMs: 1, steps: [], explanation: 'completed' }],
+    errors,
+  } as unknown as ReportSummaryInput);
+}
+
 describe('summarizeReport', () => {
   it.each([
     ['generate', 'generated', 'passed'],
@@ -53,10 +61,6 @@ describe('summarizeReport', () => {
     ['check', 'invalid-artifact-name', 'failed'],
     ['check', 'listed', 'skipped'],
     ['check', 'skipped', 'skipped'],
-    ['heal', 'healed', 'passed'],
-    ['heal', 'no-changes-needed', 'passed'],
-    ['heal', 'partially-healed', 'failed'],
-    ['heal', 'unresolved', 'failed'],
     ['heal', 'listed', 'skipped'],
     ['heal', 'skipped', 'skipped'],
     ['review', 'sufficient', 'passed'],
@@ -87,6 +91,45 @@ describe('summarizeReport', () => {
       skipped: 1,
     });
   });
+
+  it.each([
+    ['healed', 'applied', 'passed'],
+    ['healed', 'preview-only', 'passed'],
+    ['healed', 'declined', 'failed'],
+    ['healed', 'not-applied-interrupted', 'failed'],
+    ['healed', 'apply-failed', 'failed'],
+    ['healed', 'partially-applied', 'failed'],
+    ['partially-healed', 'applied', 'failed'],
+    ['partially-healed', 'preview-only', 'failed'],
+    ['partially-healed', 'declined', 'failed'],
+    ['partially-healed', 'not-applied-interrupted', 'failed'],
+    ['partially-healed', 'apply-failed', 'failed'],
+    ['partially-healed', 'partially-applied', 'failed'],
+    ['unresolved', 'no-artifact-change', 'failed'],
+    ['unresolved', 'not-eligible', 'failed'],
+    ['no-changes-needed', 'no-artifact-change', 'passed'],
+  ] as const)('classifies heal %s × %s as %s', (repairOutcome, application, classification) => {
+    expect(healSummary(repairOutcome, application)).toEqual({
+      total: 1,
+      passed: Number(classification === 'passed'),
+      failed: Number(classification === 'failed'),
+      errored: 0,
+      skipped: 0,
+    });
+  });
+
+  it.each(['apply-failed', 'partially-applied'] as const)(
+    'promotes %s from failed to errored when the case-scoped error has the same identity',
+    (application) => {
+      expect(healSummary('healed', application, [{
+        scope: 'case',
+        kind: 'environment',
+        code: 'FS_IO_ERROR',
+        message: 'write failed',
+        caseId: 'heal-case',
+      }])).toEqual({ total: 1, passed: 0, failed: 0, errored: 1, skipped: 0 });
+    },
+  );
 
   it('deduplicates every valid run classification pair and promotes it monotonically in forward order', () => {
     const classifications = ['passed', 'failed', 'skipped', 'errored'] as const;

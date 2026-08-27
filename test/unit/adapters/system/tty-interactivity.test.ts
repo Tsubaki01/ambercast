@@ -64,6 +64,36 @@ describe('createTtyInteractivityCheck()', () => {
 });
 
 describe('createConfirmationAnswerReader()', () => {
+  it.each([
+    ['y', 'y\n'],
+    ['yes', 'yes\n'],
+  ])('authorizes the candidate set for a %s answer', async (_label, input) => {
+    const { stdin, stderr } = streams();
+    const reader = createConfirmationAnswerReader(adapterStreams(stdin, stderr));
+    const answer = reader(new Map());
+
+    stdin.emit('data', Buffer.from(input));
+
+    await expect(answer).resolves.toBe('authorized');
+    expect(stdin.paused).toBe(true);
+  });
+
+  it.each([
+    ['n', 'n\n'],
+    ['no', 'no\n'],
+    ['empty input', '\n'],
+    ['unrecognized input', 'later\n'],
+  ])('declines the candidate set for %s', async (_label, input) => {
+    const { stdin, stderr } = streams();
+    const reader = createConfirmationAnswerReader(adapterStreams(stdin, stderr));
+    const answer = reader(new Map());
+
+    stdin.emit('data', Buffer.from(input));
+
+    await expect(answer).resolves.toBe('declined');
+    expect(stdin.paused).toBe(true);
+  });
+
   it('writes the escaped confirmation exchange to stderr and never renders a candidate across lines', async () => {
     const { stdin, stderr, output } = streams();
     const reader = createConfirmationAnswerReader(adapterStreams(stdin, stderr));
@@ -76,7 +106,7 @@ describe('createConfirmationAnswerReader()', () => {
 
       stdin.emit('data', Buffer.from('yes\n'));
 
-      await expect(answer).resolves.toBe(true);
+      await expect(answer).resolves.toBe('authorized');
       expect(output.join('')).toBe('crafted\\x0A\\x1B[2J-name: repair\\x0D\\x0Asummary\nApply these healing changes? [y/N] ');
       expect(output[0]).toBe('crafted\\x0A\\x1B[2J-name: repair\\x0D\\x0Asummary\n');
       expect(output[0]!.slice(0, -1)).not.toMatch(/[\u0000-\u001F\u007F-\u009F]/);
@@ -106,7 +136,7 @@ describe('createConfirmationAnswerReader()', () => {
 
     stdin.emit('data', Buffer.from('no\n'));
 
-    await expect(answer).resolves.toBe(false);
+    await expect(answer).resolves.toBe('declined');
     expect(output.join('')).toBe(`fi${escapedControls}le: su${escapedControls}mmary\nApply these healing changes? [y/N] `);
     expect(escapedControls).toContain('\\x9B');
   });
@@ -121,7 +151,7 @@ describe('createConfirmationAnswerReader()', () => {
 
     stdin.emit('data', Buffer.from('no\n'));
 
-    await expect(answer).resolves.toBe(false);
+    await expect(answer).resolves.toBe('declined');
     expect(output.join('')).toContain('check\\x01out.test.md: same repair\n');
     expect(output.join('')).toContain('check\\x02out.test.md: same repair\n');
   });
@@ -136,7 +166,7 @@ describe('createConfirmationAnswerReader()', () => {
 
     stdin.emit('data', Buffer.from('no\n'));
 
-    await expect(answer).resolves.toBe(false);
+    await expect(answer).resolves.toBe('declined');
     expect(output.join('')).toBe(
       'check\\\\x01out.test.md: literal backslash\n'
       + 'check\\x01out.test.md: control character\n'
@@ -151,11 +181,11 @@ describe('createConfirmationAnswerReader()', () => {
 
     stdin.emit('end');
 
-    await expect(answer).resolves.toBe(false);
+    await expect(answer).resolves.toBe('declined');
     expect(stdin.paused).toBe(true);
   });
 
-  it('declines and cleans up when cancellation arrives while awaiting input', async () => {
+  it('returns interrupted and cleans up when cancellation arrives while awaiting input', async () => {
     const { stdin, stderr } = streams();
     const controller = new AbortController();
     const reader = createConfirmationAnswerReader(adapterStreams(stdin, stderr));
@@ -163,7 +193,7 @@ describe('createConfirmationAnswerReader()', () => {
 
     controller.abort();
 
-    await expect(answer).resolves.toBe(false);
+    await expect(answer).resolves.toBe('interrupted');
     expect(stdin.paused).toBe(true);
     expect(stdin.listenerCount('data')).toBe(0);
     expect(stdin.listenerCount('end')).toBe(0);
@@ -186,7 +216,7 @@ describe('createConfirmationAnswerReader()', () => {
     expect(stdin.listenerCount('error')).toBe(0);
   });
 
-  it('declines an already-aborted signal before registering listeners or resuming stdin', async () => {
+  it('returns interrupted for an already-aborted signal before registering listeners or resuming stdin', async () => {
     const { stdin, stderr } = streams();
     const controller = new AbortController();
     controller.abort();
@@ -194,11 +224,60 @@ describe('createConfirmationAnswerReader()', () => {
     const once = vi.spyOn(stdin, 'once');
     const addAbortListener = vi.spyOn(controller.signal, 'addEventListener');
 
-    await expect(reader(new Map(), controller.signal)).resolves.toBe(false);
+    await expect(reader(new Map(), controller.signal)).resolves.toBe('interrupted');
     expect(once).not.toHaveBeenCalled();
     expect(addAbortListener).not.toHaveBeenCalled();
     expect(stdin.resumeCalls).toBe(0);
     expect(stdin.pauseCalls).toBe(0);
+    expect(stdin.listenerCount('data')).toBe(0);
+    expect(stdin.listenerCount('end')).toBe(0);
+    expect(stdin.listenerCount('error')).toBe(0);
+  });
+
+  it('returns interrupted when cancellation arrives while candidates are being rendered', async () => {
+    const stdin = new ConfirmationInput();
+    const controller = new AbortController();
+    let writes = 0;
+    const stderr = new Writable({
+      write(_chunk, _encoding, callback) {
+        writes += 1;
+        if (writes === 1) {
+          controller.abort();
+        }
+        callback();
+      },
+    });
+    const reader = createConfirmationAnswerReader(adapterStreams(stdin, stderr));
+    const answer = reader(new Map([
+      ['candidate', { file: 'candidate.test.md', healingSummary: 'repair selector' }],
+    ]), controller.signal);
+
+    stdin.emit('data', Buffer.from('yes\n'));
+
+    await expect(answer).resolves.toBe('interrupted');
+    expect(stdin.resumeCalls).toBe(0);
+    expect(stdin.pauseCalls).toBe(0);
+    expect(stdin.listenerCount('data')).toBe(0);
+    expect(stdin.listenerCount('end')).toBe(0);
+    expect(stdin.listenerCount('error')).toBe(0);
+  });
+
+  it('returns interrupted when rendering the prompt synchronously aborts after listener registration', async () => {
+    const stdin = new ConfirmationInput();
+    const controller = new AbortController();
+    const stderr = new Writable({
+      write(chunk, _encoding, callback) {
+        if (chunk.toString() === 'Apply these healing changes? [y/N] ') {
+          controller.abort();
+        }
+        callback();
+      },
+    });
+    const reader = createConfirmationAnswerReader(adapterStreams(stdin, stderr));
+
+    await expect(reader(new Map(), controller.signal)).resolves.toBe('interrupted');
+    expect(stdin.resumeCalls).toBe(0);
+    expect(stdin.paused).toBe(true);
     expect(stdin.listenerCount('data')).toBe(0);
     expect(stdin.listenerCount('end')).toBe(0);
     expect(stdin.listenerCount('error')).toBe(0);
@@ -213,7 +292,7 @@ describe('createConfirmationAnswerReader()', () => {
     stdin.emit('data', Buffer.from('yes\n'));
     controller.abort();
 
-    await expect(answer).resolves.toBe(true);
+    await expect(answer).resolves.toBe('authorized');
     expect(stdin.pauseCalls).toBe(1);
   });
 
@@ -239,10 +318,10 @@ describe('createConfirmationAnswerReader()', () => {
 
     if (event === 'data') {
       stdin.emit('data', Buffer.from('yes\n'));
-      await expect(answer).resolves.toBe(true);
+      await expect(answer).resolves.toBe('authorized');
     } else {
       stdin.emit('end');
-      await expect(answer).resolves.toBe(false);
+      await expect(answer).resolves.toBe('declined');
     }
 
     expect(stdin.listenerCount('data')).toBe(0);

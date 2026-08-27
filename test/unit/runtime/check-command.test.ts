@@ -88,7 +88,7 @@ describe('runCheckCommand', () => {
     const cwd = `${projectRoot}/nested-cwd`;
     const output = {
       exitCode: 5 as const,
-      envelope: { schemaVersion: '2.0' as const, command: 'check' as const, startedAt: '2026-08-01T00:00:00Z', durationMs: 1, summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 }, errors: [], results: [{ id: `${cwd}/tests/login.test.md`, file: `${cwd}/tests/login.test.md`, planFile: `${cwd}/tests/login.ambercast.plan.json`, status: 'fresh', reason: 'fresh' }] },
+      envelope: { schemaVersion: '3.0' as const, command: 'check' as const, startedAt: '2026-08-01T00:00:00Z', durationMs: 1, summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 }, errors: [], results: [{ id: `${cwd}/tests/login.test.md`, file: `${cwd}/tests/login.test.md`, planFile: `${cwd}/tests/login.ambercast.plan.json`, status: 'fresh', reason: 'fresh' }] },
     };
     mocks.createFsReadStorage.mockReturnValue(storage);
     mocks.loadConfig.mockResolvedValue({ ...CONFIG, projectRoot, testDir: `${projectRoot}/tests`, runsDir: `${projectRoot}/tests/.runs` });
@@ -111,7 +111,7 @@ describe('runCheckCommand', () => {
     const storage = createInMemoryStorage();
     const cwd = '/workspace/no-config-project';
     const config = { ...CONFIG, projectRoot: cwd, testDir: `${cwd}/tests`, runsDir: `${cwd}/tests/.runs` };
-    const output = { exitCode: 0 as const, envelope: { schemaVersion: '2.0', command: 'check', startedAt: '2026-08-01T00:00:00Z', durationMs: 1, summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 }, errors: [], results: [{ id: `${cwd}/tests/login.test.md`, file: `${cwd}/tests/login.test.md`, planFile: `${cwd}/tests/login.ambercast.plan.json`, status: 'fresh', reason: 'fresh' }] } };
+    const output = { exitCode: 0 as const, envelope: { schemaVersion: '3.0', command: 'check', startedAt: '2026-08-01T00:00:00Z', durationMs: 1, summary: { total: 1, passed: 1, failed: 0, errored: 0, skipped: 0 }, errors: [], results: [{ id: `${cwd}/tests/login.test.md`, file: `${cwd}/tests/login.test.md`, planFile: `${cwd}/tests/login.ambercast.plan.json`, status: 'fresh', reason: 'fresh' }] } };
     mocks.createFsReadStorage.mockReturnValue(storage);
     mocks.loadConfig.mockResolvedValue(config);
     mocks.createFsTestFileDiscovery.mockReturnValue(async () => []);
@@ -208,7 +208,7 @@ describe('runCheckCommand', () => {
     const report = {
       exitCode: 0 as const,
       envelope: {
-        schemaVersion: '2.0' as const,
+        schemaVersion: '3.0' as const,
         command: 'check' as const,
         startedAt: '2026-08-17T00:00:00Z',
         durationMs: 0,
@@ -274,7 +274,7 @@ describe('runCheckCommand', () => {
   it('finalizes both completed and error reports at the runtime boundary', async () => {
     const completed = {
       exitCode: 0 as const,
-      envelope: { schemaVersion: '2.0' as const, command: 'check' as const, startedAt: '2026-08-01T00:00:00Z', durationMs: 0, summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 }, errors: [], results: [] },
+      envelope: { schemaVersion: '3.0' as const, command: 'check' as const, startedAt: '2026-08-01T00:00:00Z', durationMs: 0, summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 }, errors: [], results: [] },
     };
     mocks.createFsReadStorage.mockReturnValue(createInMemoryStorage());
     mocks.loadConfig.mockResolvedValue(CONFIG);
@@ -298,7 +298,7 @@ describe('runCheckCommand', () => {
   it.each(['completed', 'error'] as const)('forces exit 3 when %s finalization returns the emergency singleton', async (branch) => {
     const built = {
       exitCode: 0 as const,
-      envelope: { schemaVersion: '2.0' as const, command: 'check' as const, startedAt: '2026-08-01T00:00:00Z', durationMs: 0, summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 }, errors: [], results: [] },
+      envelope: { schemaVersion: '3.0' as const, command: 'check' as const, startedAt: '2026-08-01T00:00:00Z', durationMs: 0, summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 }, errors: [], results: [] },
     };
     mocks.createFsReadStorage.mockReturnValue(createInMemoryStorage());
     mocks.loadConfig.mockResolvedValue(CONFIG);

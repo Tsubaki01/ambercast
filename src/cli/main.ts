@@ -155,9 +155,11 @@ function colorize(value: string, color: string, enabled: boolean): string {
  * @returns Human-readable result and error lines with a final newline when
  * any line exists.
  * @remarks
- * Status styling is data-driven rather than command-specific so a report
- * vocabulary extension must opt into healthy green styling explicitly. The
- * renderer appends a result's optional `reason`; check supplies only its fixed,
+ * Status styling is data-driven for every command except heal. Completed heal
+ * rows always have the same status, so their healthy styling must follow both
+ * the repair outcome and settled application state. Partially healed and
+ * unresolved rows remain unhealthy regardless of application; otherwise,
+ * applied, preview-only, and no-artifact-change are healthy. The renderer appends a result's optional `reason`; check supplies only its fixed,
  * path-free reason. The displayed identity comes from `file`, never
  * `groundingFile` or `artifactFile`, so artifact evidence cannot be rendered as
  * an explanatory host path. A `skipped` row has no reason or artifact evidence
@@ -177,7 +179,18 @@ export function renderHumanReport(
   const lines = results.map((result) => {
     const item = result as Record<string, unknown>;
     const status = String(item.status ?? 'unknown');
-    const statusColor = HEALTHY_REPORT_STATUSES.has(status) ? '32' : status === 'would-generate' ? '33' : '31';
+    const healApplication = report.command === 'heal' && typeof item.application === 'string'
+      ? item.application
+      : undefined;
+    const healRepairOutcome = report.command === 'heal' && typeof item.repairOutcome === 'string'
+      ? item.repairOutcome
+      : undefined;
+    const healthy = healApplication === undefined
+      ? HEALTHY_REPORT_STATUSES.has(status)
+      : healRepairOutcome !== 'partially-healed'
+        && healRepairOutcome !== 'unresolved'
+        && (healApplication === 'applied' || healApplication === 'preview-only' || healApplication === 'no-artifact-change');
+    const statusColor = healthy ? '32' : status === 'would-generate' ? '33' : '31';
     const reason = typeof item.reason === 'string' ? `: ${item.reason}` : '';
     return `${colorize(status, statusColor, color)} ${String(item.file ?? item.id ?? '')}${reason}`.trimEnd();
   });

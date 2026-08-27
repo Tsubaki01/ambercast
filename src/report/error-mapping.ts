@@ -43,6 +43,12 @@ export const REPORT_ERROR_DETAILS = {
  * @throws {Error} If the error kind has no report-code correspondence, or if
  * interruption is requested at case scope. The latter guard keeps batch
  * cancellation from inflating case-error accounting.
+ *
+ * @remarks
+ * `partiallyWritten` is extracted only for a case-scoped `FS_IO_ERROR`.
+ * Report schemas reject that field on every other branch, and this conversion
+ * otherwise omits `AmbercastError.details`, so preserving validated storage
+ * evidence here is required rather than optional metadata.
  */
 export function reportError(error: AmbercastError, location: { readonly scope: 'run' }): ReportError;
 export function reportError(error: AmbercastError, location: { readonly scope: 'case'; readonly caseId: string }): ReportError;
@@ -58,7 +64,14 @@ export function reportError(
     throw new Error('Error kind interrupted cannot be serialized at case scope.');
   }
 
+  const partiallyWritten = error.details?.partiallyWritten;
+  const fsIoDetails = error.kind === 'fs-io-error'
+    && Array.isArray(partiallyWritten)
+    && partiallyWritten.every((artifact): artifact is 'plan' | 'grounding' => artifact === 'plan' || artifact === 'grounding')
+    ? { details: { partiallyWritten: [...partiallyWritten] } }
+    : {};
+
   return (location.scope === 'run'
     ? { scope: location.scope, ...details, message: error.message }
-    : { scope: location.scope, ...details, caseId: location.caseId, message: error.message }) as ReportError;
+    : { scope: location.scope, ...details, caseId: location.caseId, message: error.message, ...fsIoDetails }) as ReportError;
 }
