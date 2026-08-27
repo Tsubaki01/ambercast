@@ -475,6 +475,34 @@ describe('heal state-machine contract', () => {
     expect(scenario.deps.resolveAiExecutor).toHaveBeenCalledOnce();
   });
 
+  it('replaces a wrong-kind AI grounding entry when Stage 1 re-resolves an element-consuming step', async () => {
+    const sessionEntries = liveEntries(SUBMIT);
+    const scenario = await createScenario({
+      sessionEntries,
+      grounding: {
+        'click-submit': {
+          kind: 'ai',
+          trace: {
+            events: [],
+            verification: [{ type: 'assert', check: 'text-visible', text: 'Dashboard' }],
+          },
+        },
+      },
+    });
+    const result = await heal(scenario.deps, OPTIONS);
+
+    expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'healed', finalReachedIndex: scenario.plan.steps.length });
+    expect(scenario.deps.browserDriver).toHaveBeenCalledTimes(2);
+    const commit = result.commits.get(result.outcome.results[0]!.id);
+    expect(commit).toBeDefined();
+    await expect(commit!.commit()).resolves.toEqual({ outcome: 'committed' });
+    const rewrittenGrounding = JSON.parse(await scenario.storage.readText(GROUNDING)) as GroundingDocument;
+    expect(rewrittenGrounding.entries['click-submit']).toMatchObject({
+      kind: 'element',
+      fingerprint: freshFingerprint(sessionEntries),
+    });
+  });
+
   it.each([
     ['no entry', {} as GroundingDocument['entries'], undefined],
     ['a legacy AI trace', {
