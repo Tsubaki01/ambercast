@@ -30,7 +30,7 @@ class MemoryWritable extends Writable {
 }
 
 const ENVELOPE = {
-  schemaVersion: '2.0' as const,
+  schemaVersion: '3.0' as const,
   command: 'generate' as const,
   startedAt: '2026-08-08T00:00:00Z',
   durationMs: 0,
@@ -40,7 +40,7 @@ const ENVELOPE = {
 };
 
 const RUN_ENVELOPE = {
-  schemaVersion: '2.0' as const,
+  schemaVersion: '3.0' as const,
   command: 'run' as const,
   startedAt: '2026-08-09T00:00:00Z',
   durationMs: 0,
@@ -51,7 +51,7 @@ const RUN_ENVELOPE = {
 };
 
 const CHECK_ENVELOPE = {
-  schemaVersion: '2.0' as const,
+  schemaVersion: '3.0' as const,
   command: 'check' as const,
   startedAt: '2026-08-17T00:00:00Z',
   durationMs: 0,
@@ -76,7 +76,7 @@ const CHECK_ENVELOPE = {
 };
 
 const HEAL_ENVELOPE = {
-  schemaVersion: '2.0' as const,
+  schemaVersion: '3.0' as const,
   command: 'heal' as const,
   startedAt: '2026-08-25T00:00:00Z',
   durationMs: 0,
@@ -126,7 +126,7 @@ describe('main()', () => {
     runCheckCommand.mockResolvedValue({
       exitCode: 3,
       envelope: {
-        schemaVersion: '2.0', command: 'check', startedAt: '2026-08-17T00:00:00Z', durationMs: 0,
+        schemaVersion: '3.0', command: 'check', startedAt: '2026-08-17T00:00:00Z', durationMs: 0,
         summary: { total: 1, passed: 0, failed: 0, errored: 0, skipped: 1 },
         errors: [{ scope: 'run', kind: 'environment', code: 'INTERRUPTED', message: 'The command was interrupted before all discovered cases reached a terminal state.' }],
         results: [{ id: 'pending.test.md', file: 'pending.test.md', status: 'skipped' }],
@@ -147,7 +147,7 @@ describe('main()', () => {
     runCheckCommand.mockResolvedValue({
       exitCode: 4,
       envelope: {
-        schemaVersion: '2.0', command: 'check', startedAt: '2026-08-17T00:00:00Z', durationMs: 0,
+        schemaVersion: '3.0', command: 'check', startedAt: '2026-08-17T00:00:00Z', durationMs: 0,
         summary: { total: 1, passed: 0, failed: 1, errored: 0, skipped: 0 }, errors: [],
         results: [{ id: 'deleted.test.md', file: 'deleted.test.md', planFile: 'deleted.ambercast.plan.json', groundingFile: artifactPath, status: 'orphaned-grounding', reason: 'No corresponding test file exists for this grounding artifact.' }],
       },
@@ -719,8 +719,8 @@ describe('main()', () => {
         summary: { total: 1, passed: 0, failed: 1, errored: 0, skipped: 0 },
         results: [{
           id: 'login.test.md', file: 'login.test.md', planFile: 'login.ambercast.plan.json',
-          status: 'unresolved', steps: [], explanation: 'The repair did not resolve the case.',
-          durationMs: 0, dryRun: false,
+          status: 'completed', repairOutcome: 'unresolved', application: 'no-artifact-change', stopReason: 'settled', steps: [], explanation: 'The repair did not resolve the case.',
+          durationMs: 0,
         }],
       },
     });
@@ -728,7 +728,30 @@ describe('main()', () => {
     const result = await run(['heal', '--no-color']);
 
     expect(runHealCommand).toHaveBeenCalledOnce();
-    expect(result.stdout).toContain('unresolved login.test.md');
+    expect(result.stdout).toContain('completed login.test.md');
     expect(result.stdout).not.toMatch(/\u001B\[/);
+  });
+
+  it.each([
+    ['applied', 'healed', '32'],
+    ['preview-only', 'healed', '32'],
+    ['no-artifact-change', 'unresolved', '32'],
+    ['declined', 'healed', '31'],
+    ['not-applied-interrupted', 'healed', '31'],
+    ['apply-failed', 'healed', '31'],
+    ['partially-applied', 'healed', '31'],
+    ['not-eligible', 'unresolved', '31'],
+  ] as const)('colors a completed heal row with application %s using ANSI %s', (application, repairOutcome, color) => {
+    const rendered = renderHumanReport({
+      ...HEAL_ENVELOPE,
+      summary: { total: 1, passed: 0, failed: 1, errored: 0, skipped: 0 },
+      results: [{
+        id: 'login.test.md', file: 'login.test.md', planFile: 'login.ambercast.plan.json',
+        status: 'completed', repairOutcome, application, stopReason: 'settled',
+        steps: [], explanation: 'The repair attempt completed.', durationMs: 0,
+      }],
+    } as never, true);
+
+    expect(rendered).toContain(`\u001B[${color}mcompleted\u001B[0m login.test.md`);
   });
 });

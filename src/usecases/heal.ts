@@ -113,8 +113,13 @@ export interface HealCaseOutcome {
   /** Companion plan path retained for execution-backed report identity. */
   readonly planFile: string;
 
-  /** Conservative progress classification for this repair attempt. */
-  readonly status: 'healed' | 'partially-healed' | 'unresolved' | 'no-changes-needed';
+  /**
+   * Conservative progress classification for this repair attempt.
+   *
+   * The name distinguishes measured repair progress from the later runtime
+   * application decision represented by report schema 3.0.
+   */
+  readonly repairOutcome: 'healed' | 'partially-healed' | 'unresolved' | 'no-changes-needed';
 
   /** Evidence returned by the last replay that was actually performed. */
   readonly steps: readonly StepResult[];
@@ -124,9 +129,6 @@ export interface HealCaseOutcome {
 
   /** Measured case duration before report-boundary integer normalization. */
   readonly durationMs: number;
-
-  /** Whether the candidate remains buffered regardless of its progress status. */
-  readonly dryRun: boolean;
 
   /** Furthest baseline passed-prefix index, with `-1` for pre-dispatch failure. */
   readonly baselineReachedIndex: number;
@@ -163,7 +165,9 @@ export interface HealOutcome {
  *
  * A two-file transaction is unavailable at the storage boundary, so a failed
  * commit reports every artifact that became visible instead of attempting an
- * unreliable compensating write.
+ * unreliable compensating write. Its `error.details.partiallyWritten` carries
+ * the same list as this outcome so report mapping can preserve the evidence
+ * after command settlement discards the capability wrapper.
  */
 export type HealCommitOutcome =
   | { readonly outcome: 'committed' }
@@ -633,7 +637,7 @@ function caseOutcome(
   stage3Error: AmbercastError | undefined,
   fullPlanReplayed: boolean,
 ): HealCaseOutcome {
-  const status = fullPlanReplayed
+  const repairOutcome = fullPlanReplayed
     ? (measurement.reachedIndex === plan.steps.length ? 'healed' : 'unresolved')
     : baseline === plan.steps.length
       ? 'no-changes-needed'
@@ -646,11 +650,10 @@ function caseOutcome(
     id: file,
     file,
     planFile,
-    status,
+    repairOutcome,
     steps: measurement.replay.result.steps,
     explanation: measurement.replay.result.explanation,
     durationMs: measurement.replay.result.durationMs,
-    dryRun: options.dryRun,
     baselineReachedIndex: baseline,
     finalReachedIndex: measurement.reachedIndex,
     stage3Error,
@@ -714,7 +717,7 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
   }
 
   const outcome = caseOutcome(file, planFile, options, baseline, measurement, plan, stage3Error, fullPlanReplayed);
-  const commit = (outcome.status === 'healed' || outcome.status === 'partially-healed') && overlay.hasBufferedWrites()
+  const commit = (outcome.repairOutcome === 'healed' || outcome.repairOutcome === 'partially-healed') && overlay.hasBufferedWrites()
     ? commitFor(file, planFile, overlay, repairKind ?? 'grounding')
     : undefined;
   return { interrupted: false, outcome, commit };
@@ -823,7 +826,11 @@ function commitFor(file: string, planFile: string, overlay: HealOverlayStorage, 
           : [];
         return {
           outcome: 'failed',
-          error: new FsIoErrorClass('Healing artifacts could not be committed.', undefined, { cause: error }),
+          error: new FsIoErrorClass(
+            'Healing artifacts could not be committed.',
+            { partiallyWritten },
+            { cause: error },
+          ),
           partiallyWritten,
         };
       }

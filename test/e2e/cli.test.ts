@@ -139,7 +139,7 @@ describe('bin/ambercast.js (e2e)', () => {
     expect(result.exitCode).toBe(0);
     const envelope = JSON.parse(result.stdout);
     expect(ReportEnvelope.safeParse(envelope).success).toBe(true);
-    expect(envelope.schemaVersion).toBe('2.0');
+    expect(envelope.schemaVersion).toBe('3.0');
     expect(envelope.results).toEqual([expect.objectContaining({ file: expect.stringContaining('test.test.md'), status: 'listed' })]);
   });
 

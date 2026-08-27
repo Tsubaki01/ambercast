@@ -57,8 +57,10 @@ const HEAL_RESULT = {
   id: 'login-succeeds',
   file: 'tests/login.test.md',
   planFile: 'tests/login.ambercast.plan.json',
-  status: 'healed',
-  dryRun: false,
+  status: 'completed',
+  repairOutcome: 'healed',
+  application: 'applied',
+  stopReason: 'settled',
   durationMs: 42,
   steps: [STEP_RESULT],
   explanation: 'The updated locator was grounded successfully.',
@@ -98,6 +100,13 @@ const CASE_USAGE_ERROR = {
   hint: 'Check ambercast.config.ts.',
   caseId: 'login-succeeds',
 };
+const CASE_FS_IO_ERROR = {
+  scope: 'case',
+  kind: 'environment',
+  code: 'FS_IO_ERROR',
+  message: 'The artifact write failed.',
+  caseId: 'login-succeeds',
+};
 
 function expectAccepted(schema: SchemaUnderTest, value: unknown): void {
   expect(schema.safeParse(value).success).toBe(true);
@@ -115,7 +124,7 @@ function without(value: Record<string, unknown>, key: string): Record<string, un
 
 function reportEnvelope(command: string, results: unknown[], overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    schemaVersion: '2.0',
+    schemaVersion: '3.0',
     command,
     startedAt: STARTED_AT,
     durationMs: 42,
@@ -150,8 +159,10 @@ const COMMAND_VARIANTS: ReadonlyArray<{
     requiredResultFields: [
       ['id', 1],
       ['file', 1],
+      ['planFile', 1],
       ['status', 1],
       ['dryRun', 'false'],
+      ['ambiguities', 'not ambiguities'],
     ],
   },
   {
@@ -189,7 +200,9 @@ const COMMAND_VARIANTS: ReadonlyArray<{
       ['file', 1],
       ['planFile', 1],
       ['status', 1],
-      ['dryRun', 'false'],
+      ['repairOutcome', 1],
+      ['application', 1],
+      ['stopReason', 1],
       ['durationMs', '42'],
       ['steps', 'not steps'],
       ['explanation', 1],
@@ -256,6 +269,97 @@ describe('run reportPersistence', () => {
 
   it('rejects reportPersistence on a non-run envelope', () => {
     expectRejected(ReportEnvelope, reportEnvelope('generate', [GENERATE_RESULT], { reportPersistence: 'persisted' }));
+  });
+});
+
+describe('heal schema 3.0 outcome and application matrix', () => {
+  const repairOutcomes = ['healed', 'partially-healed', 'unresolved', 'no-changes-needed'] as const;
+  const applications = [
+    'applied',
+    'preview-only',
+    'declined',
+    'not-applied-interrupted',
+    'apply-failed',
+    'partially-applied',
+    'no-artifact-change',
+    'not-eligible',
+  ] as const;
+  const validApplications: Readonly<Record<(typeof repairOutcomes)[number], readonly string[]>> = {
+    healed: ['applied', 'preview-only', 'declined', 'not-applied-interrupted', 'apply-failed', 'partially-applied'],
+    'partially-healed': ['applied', 'preview-only', 'declined', 'not-applied-interrupted', 'apply-failed', 'partially-applied'],
+    unresolved: ['no-artifact-change', 'not-eligible'],
+    'no-changes-needed': ['no-artifact-change'],
+  };
+  const applicationMatrix = repairOutcomes.flatMap((repairOutcome) => applications.map((application) => ({
+    repairOutcome,
+    application,
+    accepted: validApplications[repairOutcome].includes(application),
+  })));
+
+  it.each(applicationMatrix)(
+    'acceptance=$accepted for $repairOutcome × $application',
+    ({ repairOutcome, application, accepted }) => {
+      const result = { ...HEAL_RESULT, repairOutcome, application, stopReason: 'settled' };
+      expect(HealResult.safeParse(result).success).toBe(accepted);
+    },
+  );
+
+  it('accepts unresolved × not-eligible for the forward-compatible eligibility producer', () => {
+    expectAccepted(HealResult, {
+      ...HEAL_RESULT,
+      repairOutcome: 'unresolved',
+      application: 'not-eligible',
+    });
+  });
+
+  it.each(['attempt-limit', 'deadline'] as const)(
+    'accepts forward-compatible %s stop reasons where a measurement ran',
+    (stopReason) => {
+      expectAccepted(HealResult, {
+        ...HEAL_RESULT,
+        repairOutcome: 'unresolved',
+        application: 'not-eligible',
+        stopReason,
+      });
+    },
+  );
+
+  it.each(['attempt-limit', 'deadline'] as const)(
+    'rejects %s for a no-changes-needed result that was never budget-limited',
+    (stopReason) => {
+      expectRejected(HealResult, {
+        ...HEAL_RESULT,
+        repairOutcome: 'no-changes-needed',
+        application: 'no-artifact-change',
+        stopReason,
+      });
+    },
+  );
+
+  it('rejects a completed schema 3.0 row carrying the legacy dryRun field', () => {
+    expectRejected(HealResult, { ...HEAL_RESULT, dryRun: false });
+  });
+
+  it('rejects a legacy single-status heal row', () => {
+    const legacyHealResult = {
+      id: HEAL_RESULT.id,
+      file: HEAL_RESULT.file,
+      planFile: HEAL_RESULT.planFile,
+      status: 'healed',
+      dryRun: false,
+      durationMs: HEAL_RESULT.durationMs,
+      steps: HEAL_RESULT.steps,
+      explanation: HEAL_RESULT.explanation,
+    };
+
+    expectRejected(HealResult, legacyHealResult);
+  });
+
+  it('requires schema version 3.0', () => {
+    const version2Envelope = reportEnvelope('heal', [HEAL_RESULT], { schemaVersion: '2.0' });
+
+    expectRejected(ReportEnvelope, version2Envelope);
+    expectAccepted(ReportEnvelope, { ...version2Envelope, schemaVersion: '3.0' });
   });
 });
 
@@ -394,25 +498,27 @@ describe('heal result status branches', () => {
     expectRejected(ListedHealResult, { ...listedHealResult, status: 'discovered' });
   });
 
-  it('rejects dryRun outside completed heal results', () => {
-    expectRejected(RunResult, { ...RUN_RESULT, dryRun: false });
+  it('rejects the legacy dryRun field on both listed and completed heal results', () => {
     expectRejected(ListedHealResult, { ...listedHealResult, dryRun: false });
+    expectRejected(HealResult, { ...HEAL_RESULT, dryRun: false });
   });
 
-  it.each([true, false])('accepts completed heal results with dryRun %s', (dryRun) => {
-    expectAccepted(HealResult, { ...HEAL_RESULT, dryRun });
-  });
+  it.each(['repairOutcome', 'application', 'stopReason'] as const)(
+    'requires completed heal results to include %s',
+    (field) => {
+      expectRejected(HealResult, without(HEAL_RESULT, field));
+    },
+  );
 
-  it('requires completed heal results to include a boolean dryRun field', () => {
-    expectRejected(HealResult, without(HEAL_RESULT, 'dryRun'));
-    expectRejected(HealResult, { ...HEAL_RESULT, dryRun: 'false' });
-    expectRejected(HealResult, { ...HEAL_RESULT, dryRun: 0 });
-    expectRejected(HealResult, { ...HEAL_RESULT, dryRun: null });
+  it('rejects wrong-typed completed heal outcome-axis fields', () => {
+    expectRejected(HealResult, { ...HEAL_RESULT, repairOutcome: 1 });
+    expectRejected(HealResult, { ...HEAL_RESULT, application: 1 });
+    expectRejected(HealResult, { ...HEAL_RESULT, stopReason: 1 });
   });
 
   it('discriminates listed and completed heal result shapes', () => {
     expectRejected(HealResult, { ...HEAL_RESULT, status: 'listed' });
-    expectRejected(HealResult, { ...listedHealResult, status: 'healed' });
+    expectRejected(HealResult, { ...listedHealResult, status: 'completed' });
   });
 
   it('rejects an unrecognized heal status', () => {
@@ -516,7 +622,7 @@ describe('field boundaries', () => {
 
   it.each([
     ['run', RunResult, RUN_RESULT, ['passed', 'failed', 'error']],
-    ['heal', HealResult, HEAL_RESULT, ['healed', 'partially-healed', 'unresolved', 'no-changes-needed']],
+    ['heal', HealResult, HEAL_RESULT, ['completed']],
     ['check', CheckResult, CHECK_RESULT, ['fresh', 'stale', 'orphaned-plan', 'orphaned-grounding', 'missing-plan']],
     ['review', ReviewResult, REVIEW_RESULT, ['sufficient', 'insufficient']],
   ] as const)('accepts every %s result status enum value', (_command, schema, result, statuses) => {
@@ -556,6 +662,7 @@ const REPORT_ERROR_BRANCHES = [
   { scope: 'run', kind: 'environment', code: 'BROWSER_LAUNCH_FAILED', message: 'The browser could not launch.' },
   { scope: 'case', kind: 'usage', code: 'CONFIG_INVALID', message: 'The configuration is invalid.', caseId: 'login-succeeds' },
   { scope: 'case', kind: 'environment', code: 'BROWSER_LAUNCH_FAILED', message: 'The browser could not launch.', caseId: 'login-succeeds' },
+  CASE_FS_IO_ERROR,
 ] as const;
 
 describe('ReportError', () => {
@@ -609,6 +716,49 @@ describe('ReportError', () => {
 
   it('rejects an unrecognized error code', () => {
     expectRejected(ReportError, { ...CASE_USAGE_ERROR, code: 'UNKNOWN_CODE' });
+  });
+
+  it.each([
+    { partiallyWritten: [] },
+    { partiallyWritten: ['plan'] },
+    { partiallyWritten: ['grounding'] },
+    { partiallyWritten: ['plan', 'grounding'] },
+  ] as const)('accepts case-scoped FS_IO_ERROR partiallyWritten evidence $partiallyWritten', ({ partiallyWritten }) => {
+    expectAccepted(ReportError, {
+      ...CASE_FS_IO_ERROR,
+      details: { partiallyWritten },
+    });
+  });
+
+  it.each([
+    {},
+    { partiallyWritten: 'plan' },
+    { partiallyWritten: ['cache'] },
+    { partiallyWritten: [1] },
+    { partiallyWritten: ['plan'], unexpected: true },
+  ])('rejects malformed case-scoped FS_IO_ERROR details %j', (details) => {
+    expectRejected(ReportError, { ...CASE_FS_IO_ERROR, details });
+  });
+
+  it('rejects partiallyWritten details outside the case-scoped FS_IO_ERROR branch', () => {
+    const details = { partiallyWritten: ['plan'] };
+
+    expectRejected(ReportError, {
+      scope: 'run',
+      kind: 'environment',
+      code: 'FS_IO_ERROR',
+      message: 'The artifact write failed.',
+      details,
+    });
+    expectRejected(ReportError, { ...CASE_USAGE_ERROR, details });
+    expectRejected(ReportError, {
+      scope: 'case',
+      kind: 'environment',
+      code: 'BROWSER_LAUNCH_FAILED',
+      message: 'The browser could not launch.',
+      caseId: 'login-succeeds',
+      details,
+    });
   });
 
   it('rejects unknown scope and kind enum values', () => {
@@ -677,7 +827,7 @@ describe('ReportEnvelope command/result and error correlation', () => {
   });
 });
 
-describe('report schema v2 interruption contract', () => {
+describe('report schema v3 interruption contract', () => {
   const skipped = { id: 'case-a', file: 'tests/case-a.test.md', status: 'skipped' };
   const skippedForbiddenEvidence = {
     planFile: 'tests/case-a.ambercast.plan.json',
@@ -692,24 +842,26 @@ describe('report schema v2 interruption contract', () => {
     concerns: [REVIEW_CONCERN],
   } as const;
 
-  it.each(['generate', 'run', 'check', 'heal', 'review'] as const)('accepts a v2 %s envelope with the shared strict skipped shape and rejects v1', (command) => {
+  it.each(['generate', 'run', 'check', 'heal', 'review'] as const)(
+    'accepts a v3 %s envelope with the shared strict skipped shape and rejects v2',
+    (command) => {
     const value = reportEnvelope(command, [skipped], {
-      schemaVersion: '2.0',
       summary: { total: 1, passed: 0, failed: 0, errored: 0, skipped: 1 },
       ...(command === 'run' ? { reportPersistence: 'not-attempted' } : {}),
     });
 
     expectAccepted(ReportEnvelope, value);
-    expectRejected(ReportEnvelope, { ...value, schemaVersion: '1.0' });
+    expectRejected(ReportEnvelope, { ...value, schemaVersion: '2.0' });
     expect(ReportEnvelope.parse(value)).toEqual(value);
-  });
+    },
+  );
 
   it.each([
     'planFile', 'groundingFile', 'artifactFile', 'dryRun', 'reason', 'durationMs', 'steps', 'explanation', 'ambiguities', 'concerns',
   ] as const)('rejects forbidden %s evidence on every skipped branch', (field) => {
     for (const command of ['generate', 'run', 'check', 'heal', 'review'] as const) {
       expectRejected(ReportEnvelope, reportEnvelope(command, [{ ...skipped, [field]: skippedForbiddenEvidence[field] }], {
-        schemaVersion: '2.0', summary: { total: 1, passed: 0, failed: 0, errored: 0, skipped: 1 },
+        summary: { total: 1, passed: 0, failed: 0, errored: 0, skipped: 1 },
         ...(command === 'run' ? { reportPersistence: 'not-attempted' } : {}),
       }));
     }

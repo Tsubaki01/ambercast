@@ -3,29 +3,38 @@ import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable
 import { FsIoError } from '#core/errors/fs-io-error.js';
 import { MissingPlanError } from '#core/errors/missing-plan-error.js';
 import type { AmbercastError } from '#core/errors/types.js';
-import { buildHealReport, type HealReportInput } from '#usecases/heal-report.js';
-import type { HealCaseOutcome, HealOutcome } from '#usecases/heal.js';
+import {
+  buildHealReport,
+  type HealReportInput,
+  type SettledHealCaseOutcome,
+  type SettledHealOutcome,
+} from '#usecases/heal-report.js';
+import type { HealCaseOutcome } from '#usecases/heal.js';
 
 const BASE = {
   startedAt: '2026-08-25T00:00:00Z',
-  durationMs: 3.6,
+  durationMs: 4,
   options: { allowEmpty: false, list: false },
 } as const;
 
-function healed(status: HealCaseOutcome['status'] = 'healed', error?: AmbercastError): HealCaseOutcome {
+function healed(
+  repairOutcome: HealCaseOutcome['repairOutcome'] = 'healed',
+  error?: AmbercastError,
+): SettledHealCaseOutcome {
   return {
-    id: 'login.test.md', file: 'login.test.md', planFile: 'login.ambercast.plan.json', status,
-    steps: [], explanation: `The case is ${status}.`, durationMs: 1.6, dryRun: false,
-    baselineReachedIndex: 0, finalReachedIndex: status === 'healed' ? 1 : 0,
+    id: 'login.test.md', file: 'login.test.md', planFile: 'login.ambercast.plan.json', repairOutcome,
+    application: repairOutcome === 'unresolved' ? 'no-artifact-change' : repairOutcome === 'no-changes-needed' ? 'no-artifact-change' : 'applied', stopReason: 'settled',
+    steps: [], explanation: `The case is ${repairOutcome}.`, durationMs: 4,
+    baselineReachedIndex: 0, finalReachedIndex: repairOutcome === 'healed' ? 1 : 0,
     stage3Error: error, finalReplayError: undefined,
   };
 }
 
-function outcome(overrides: Partial<HealOutcome> = {}): HealOutcome {
+function outcome(overrides: Partial<SettledHealOutcome> = {}): SettledHealOutcome {
   return { results: [healed()], errors: [], noTestsFound: false, listed: [], skipped: [], interrupted: false, ...overrides };
 }
 
-function report(input: { readonly outcome?: HealOutcome; readonly error?: AmbercastError; readonly options?: HealReportInput['options'] }) {
+function report(input: { readonly outcome?: SettledHealOutcome; readonly error?: AmbercastError; readonly options?: HealReportInput['options'] }) {
   return buildHealReport({ ...BASE, ...input } as HealReportInput);
 }
 
@@ -34,13 +43,13 @@ describe('buildHealReport', () => {
     const output = report({ outcome: outcome() });
 
     expect(output.exitCode).toBe(0);
-    expect(output.envelope.results).toEqual([expect.objectContaining({ status: 'healed', dryRun: false })]);
+    expect(output.envelope.results).toEqual([expect.objectContaining({ status: 'completed', repairOutcome: 'healed', application: 'applied' })]);
     expect(JSON.stringify(output.envelope)).not.toContain('ReachedIndex');
     expect(JSON.stringify(output.envelope)).not.toContain('stage3');
   });
 
-  it.each(['partially-healed', 'unresolved'] as const)('classifies %s as an exit-1 healing failure', (status) => {
-    expect(report({ outcome: outcome({ results: [healed(status)] }) }).exitCode).toBe(1);
+  it.each(['partially-healed', 'unresolved'] as const)('classifies %s as an unconditional exit-1 healing failure', (repairOutcome) => {
+    expect(report({ outcome: outcome({ results: [healed(repairOutcome)] }) }).exitCode).toBe(1);
   });
 
   it('uses stage3Error and finalReplayError in normal exit-code priority selection', () => {
@@ -85,10 +94,24 @@ describe('buildHealReport', () => {
     expect(output.envelope.durationMs).toBe(4);
   });
 
-  it('preserves dry-run reporting while keeping report construction independent of commit capabilities', () => {
-    const output = report({ outcome: outcome({ results: [{ ...healed(), dryRun: true }] }) });
+  it('serializes a preview-only dry-run settlement without exposing raw dryRun state', () => {
+    const output = report({ outcome: outcome({ results: [{ ...healed(), application: 'preview-only' }] }) });
 
-    expect(output.envelope.results[0]).toMatchObject({ status: 'healed', dryRun: true });
+    expect(output.envelope.results[0]).toMatchObject({ status: 'completed', repairOutcome: 'healed', application: 'preview-only' });
+  });
+
+  it.each([
+    ['healed', 'declined', 1],
+    ['partially-healed', 'declined', 1],
+    ['partially-healed', 'applied', 1],
+  ] as const)('selects additive exit one for %s × %s', (repairOutcome, application, exitCode) => {
+    expect(report({ outcome: outcome({ results: [{ ...healed(repairOutcome), application }] }) }).exitCode).toBe(exitCode);
+  });
+
+  it.each(['apply-failed', 'partially-applied'] as const)('selects exit three from a matching %s FS_IO_ERROR', (application) => {
+    const row = { ...healed(), application };
+    const output = report({ outcome: outcome({ results: [row], errors: [{ file: row.file, error: new FsIoError('write failed', { partiallyWritten: application === 'partially-applied' ? ['plan'] : [] }) }] }) });
+    expect(output.exitCode).toBe(3);
   });
 
   it('turns a command-scoped classified error into an all-zero run error report', () => {

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { AmbercastError, type ErrorKind } from '#core/errors/types.js';
 import * as errorMapping from '#report/error-mapping.js';
 import { InterruptedError } from '#core/errors/interrupted-error.js';
+import { FsIoError } from '#core/errors/fs-io-error.js';
 
 const EXPECTED_REPORT_ERROR_DETAILS = {
   'config-invalid': { kind: 'usage', code: 'CONFIG_INVALID' },
@@ -30,8 +31,8 @@ const REPORTABLE_ERROR_DETAILS = Object.entries(EXPECTED_REPORT_ERROR_DETAILS) a
 class ClassifiedError extends AmbercastError {
   readonly kind: ErrorKind;
 
-  constructor(kind: ErrorKind, message: string) {
-    super(message);
+  constructor(kind: ErrorKind, message: string, details?: Record<string, unknown>) {
+    super(message, details);
     this.kind = kind;
   }
 }
@@ -79,5 +80,77 @@ describe('reportError', () => {
       scope: 'run', kind: 'environment', code: 'INTERRUPTED',
     });
     expect(() => errorMapping.reportError(error, { scope: 'case', caseId: 'case-a' })).toThrow();
+  });
+
+  it.each([
+    { partiallyWritten: [] },
+    { partiallyWritten: ['plan'] },
+    { partiallyWritten: ['grounding'] },
+    { partiallyWritten: ['plan', 'grounding'] },
+  ] as const)('preserves valid FsIoError partial-write evidence $partiallyWritten at case scope', ({ partiallyWritten }) => {
+    const error = new FsIoError('write failed', { partiallyWritten });
+
+    expect(errorMapping.reportError(error, { scope: 'case', caseId: 'login-succeeds' })).toEqual({
+      scope: 'case',
+      kind: 'environment',
+      code: 'FS_IO_ERROR',
+      caseId: 'login-succeeds',
+      message: 'write failed',
+      details: { partiallyWritten: [...partiallyWritten] },
+    });
+  });
+
+  it('omits details when an FsIoError has no partiallyWritten evidence', () => {
+    const error = new FsIoError('write failed');
+
+    expect(errorMapping.reportError(error, { scope: 'case', caseId: 'login-succeeds' })).toEqual({
+      scope: 'case',
+      kind: 'environment',
+      code: 'FS_IO_ERROR',
+      caseId: 'login-succeeds',
+      message: 'write failed',
+    });
+  });
+
+  it.each([
+    { partiallyWritten: 'plan' },
+    { partiallyWritten: ['cache'] },
+    { partiallyWritten: ['plan', 'cache'] },
+    { partiallyWritten: [1] },
+  ])('omits the entire details object for invalid FsIoError partiallyWritten evidence $partiallyWritten', ({ partiallyWritten }) => {
+    const error = new FsIoError('write failed', { partiallyWritten });
+
+    expect(errorMapping.reportError(error, { scope: 'case', caseId: 'login-succeeds' })).toEqual({
+      scope: 'case',
+      kind: 'environment',
+      code: 'FS_IO_ERROR',
+      caseId: 'login-succeeds',
+      message: 'write failed',
+    });
+  });
+
+  it('omits FsIoError details at run scope', () => {
+    const error = new FsIoError('write failed', { partiallyWritten: ['plan'] });
+
+    expect(errorMapping.reportError(error, { scope: 'run' })).toEqual({
+      scope: 'run',
+      kind: 'environment',
+      code: 'FS_IO_ERROR',
+      message: 'write failed',
+    });
+  });
+
+  it('never adds details to a non-fs-io error even if its runtime shape carries them', () => {
+    const error = new ClassifiedError('browser-launch-failed', 'browser failed', {
+      partiallyWritten: ['plan'],
+    });
+
+    expect(errorMapping.reportError(error, { scope: 'case', caseId: 'login-succeeds' })).toEqual({
+      scope: 'case',
+      kind: 'environment',
+      code: 'BROWSER_LAUNCH_FAILED',
+      caseId: 'login-succeeds',
+      message: 'browser failed',
+    });
   });
 });

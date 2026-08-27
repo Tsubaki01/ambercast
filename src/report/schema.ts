@@ -12,7 +12,7 @@ const NON_WHITESPACE_STRING_PATTERN = /\S/;
 const UTC_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 
 /** Version shared by every structured report envelope. */
-export const REPORT_SCHEMA_VERSION = '2.0' as const;
+export const REPORT_SCHEMA_VERSION = '3.0' as const;
 /**
  * Fixed disclaimer required on accessibility evidence in a structured report.
  *
@@ -64,7 +64,6 @@ export type ReportErrorCode = z.infer<typeof ReportErrorCode>;
 
 const UsageReportErrorCode = z.enum(USAGE_REPORT_ERROR_CODES);
 const EnvironmentReportErrorCode = z.enum(ENVIRONMENT_REPORT_ERROR_CODES);
-const CaseEnvironmentReportErrorCode = z.enum(ENVIRONMENT_REPORT_ERROR_CODES.filter((code) => code !== 'INTERRUPTED'));
 const ReportErrorMessageFields = {
   message: z.string(),
   hint: z.string().optional(),
@@ -92,12 +91,23 @@ const CaseUsageReportError = z.strictObject({
   caseId: NonWhitespaceString,
 });
 
-const CaseEnvironmentReportError = z.strictObject({
+const CaseOtherEnvironmentReportError = z.strictObject({
   scope: z.literal('case'),
   kind: z.literal('environment'),
-  code: CaseEnvironmentReportErrorCode,
+  code: z.enum(ENVIRONMENT_REPORT_ERROR_CODES.filter((code) => code !== 'INTERRUPTED' && code !== 'FS_IO_ERROR')),
   ...ReportErrorMessageFields,
   caseId: NonWhitespaceString,
+});
+
+const CaseFsIoReportError = z.strictObject({
+  scope: z.literal('case'),
+  kind: z.literal('environment'),
+  code: z.literal('FS_IO_ERROR'),
+  ...ReportErrorMessageFields,
+  caseId: NonWhitespaceString,
+  details: z.strictObject({
+    partiallyWritten: z.array(z.enum(['plan', 'grounding'])),
+  }).optional(),
 });
 
 /**
@@ -105,7 +115,7 @@ const CaseEnvironmentReportError = z.strictObject({
  * case.
  *
  * @remarks
- * The four branches encode scope and classification kind together, making
+ * The five branches encode scope and classification kind together, making
  * their code correlation structural. `INTERRUPTED` belongs only to the
  * run-scoped environment branch: cancellation describes an incomplete batch,
  * while skipped rows identify the affected cases without fabricating a
@@ -117,7 +127,8 @@ export const ReportError = z.union([
   RunUsageReportError,
   RunEnvironmentReportError,
   CaseUsageReportError,
-  CaseEnvironmentReportError,
+  CaseOtherEnvironmentReportError,
+  CaseFsIoReportError,
 ]);
 
 /**
@@ -312,18 +323,93 @@ export type RunResult = z.infer<typeof RunResult>;
 /**
  * Zod schema for an execution-backed result produced by the `heal` command.
  *
- * This branch shares {@link ExecutedRunResult}'s identity and evidence so
- * consumers can process completed cases consistently. `dryRun` records
- * whether that evidence came from a preview, allowing consumers to distinguish
- * a simulated heal from one that may have changed artifacts without inferring
- * it from the healing status.
+ * Completed healing rows use a nested discriminated union because the outer
+ * result union still discriminates on `status`. A flat inner `z.union` cannot
+ * participate in that outer Zod discriminated union, while `superRefine`
+ * would reject bad values only at runtime and leave invalid combinations in
+ * the TypeScript type.
+ *
+ * @remarks
+ * Each repair-outcome branch owns its permitted application values. Successful
+ * repairs always have buffered artifact writes, so they cannot report
+ * `no-artifact-change`; `not-eligible` belongs only to an unresolved attempt.
+ * A no-change measurement was never budget-limited, so its stop reason is
+ * constrained to `settled` rather than the forward-compatible budget values.
  */
-const CompletedHealResult = z.strictObject({
-  ...ResultIdentityFields,
-  status: z.enum(['healed', 'partially-healed', 'unresolved', 'no-changes-needed']),
-  dryRun: z.boolean(),
-  ...ExecutedResultFields,
-});
+const HealedOrPartiallyHealedApplication = z.enum([
+  'applied', 'preview-only', 'declined', 'not-applied-interrupted',
+  'apply-failed', 'partially-applied',
+]);
+
+const CompletedHealResult = z.discriminatedUnion('repairOutcome', [
+  z.strictObject({
+    ...ResultIdentityFields,
+    status: z.literal('completed'),
+    repairOutcome: z.literal('healed'),
+    application: HealedOrPartiallyHealedApplication,
+    stopReason: z.enum(['settled', 'attempt-limit', 'deadline']),
+    ...ExecutedResultFields,
+  }),
+  z.strictObject({
+    ...ResultIdentityFields,
+    status: z.literal('completed'),
+    repairOutcome: z.literal('partially-healed'),
+    application: HealedOrPartiallyHealedApplication,
+    stopReason: z.enum(['settled', 'attempt-limit', 'deadline']),
+    ...ExecutedResultFields,
+  }),
+  z.strictObject({
+    ...ResultIdentityFields,
+    status: z.literal('completed'),
+    repairOutcome: z.literal('unresolved'),
+    application: z.enum(['no-artifact-change', 'not-eligible']),
+    stopReason: z.enum(['settled', 'attempt-limit', 'deadline']),
+    ...ExecutedResultFields,
+  }),
+  z.strictObject({
+    ...ResultIdentityFields,
+    status: z.literal('completed'),
+    repairOutcome: z.literal('no-changes-needed'),
+    application: z.literal('no-artifact-change'),
+    stopReason: z.literal('settled'),
+    ...ExecutedResultFields,
+  }),
+]);
+
+/**
+ * Persistence application state attached to a settled completed heal row.
+ *
+ * The type is derived from the nested result branches so consumers cannot
+ * widen its vocabulary independently of the public report schema.
+ *
+ * @remarks
+ * | Value | Meaning |
+ * | --- | --- |
+ * | `applied` | An authorized commit completed. |
+ * | `preview-only` | A dry run left eligible writes unapplied. |
+ * | `declined` | Confirmation withheld authorization. |
+ * | `not-applied-interrupted` | Confirmation was interrupted before authorization. |
+ * | `apply-failed` | An authorized commit failed before any artifact became visible. |
+ * | `partially-applied` | An authorized commit failed after at least one artifact was written. |
+ * | `no-artifact-change` | No artifact commit was available for the measured result. |
+ * | `not-eligible` | Policy declines a repair attempt before it becomes commit-capable. |
+ */
+export type HealApplication = z.infer<typeof CompletedHealResult>['application'];
+
+/**
+ * Reason that a completed heal row stopped attempting repair.
+ *
+ * This remains derived from the public result branches so the type stays
+ * synchronized with every stop-reason value the schema accepts.
+ *
+ * @remarks
+ * | Value | Meaning |
+ * | --- | --- |
+ * | `settled` | The producer finished reconciliation after measurement and any applicable confirmation or commit. |
+ * | `attempt-limit` | A repair attempt reaches its permitted attempt limit. |
+ * | `deadline` | A repair attempt reaches its case time budget. |
+ */
+export type HealStopReason = z.infer<typeof CompletedHealResult>['stopReason'];
 
 /**
  * Zod schema for a prompt path reported by `heal --list`.
@@ -349,7 +435,7 @@ export type ListedHealResult = z.infer<typeof ListedHealResult>;
  * The status discriminant separates execution-backed healing results,
  * `--list` discovery rows, and interruption-only skipped rows. This gives
  * consumers one result array without implying that listed or skipped
- * identities carry dry-run, duration, plan, or step evidence.
+ * identities carry application, stop-reason, duration, plan, or step evidence.
  */
 export const HealResult = z.discriminatedUnion('status', [CompletedHealResult, ListedHealResult, SkippedResult]);
 

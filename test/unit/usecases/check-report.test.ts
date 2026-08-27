@@ -80,7 +80,7 @@ describe('buildCheckReport', () => {
     const output = report({ outcome: { noTestsFound: false, results, errors: [] } });
 
     expect(ReportEnvelope.parse(output.envelope)).toEqual({
-      schemaVersion: '2.0',
+      schemaVersion: '3.0',
       command: 'check',
       startedAt: BASE.startedAt,
       durationMs: BASE.durationMs,
@@ -190,7 +190,7 @@ describe('buildCheckReport', () => {
   });
 });
 
-describe('buildCheckReport v2 interruption accounting', () => {
+describe('buildCheckReport v3 interruption accounting', () => {
   it('retains failed evidence for exit 4 while summary promotion and interruption select exit 3', () => {
     const output = report({ outcome: {
       noTestsFound: false, interrupted: true,
@@ -198,7 +198,7 @@ describe('buildCheckReport v2 interruption accounting', () => {
     } } as unknown as Omit<CheckReportInput, keyof typeof BASE>);
 
     expect(output.exitCode).toBe(3);
-    expect(output.envelope.schemaVersion).toBe('2.0');
+    expect(output.envelope.schemaVersion).toBe('3.0');
     expect(output.envelope.summary).toEqual({ total: 1, passed: 0, failed: 0, errored: 0, skipped: 1 });
     expect(output.envelope.errors).toContainEqual(expect.objectContaining({ scope: 'run', code: 'INTERRUPTED' }));
   });

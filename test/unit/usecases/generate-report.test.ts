@@ -285,7 +285,7 @@ describe('buildGenerateReport', () => {
   });
 });
 
-describe('buildGenerateReport v2 interruption accounting', () => {
+describe('buildGenerateReport v3 interruption accounting', () => {
   it('adds one run-scoped interruption error, identity-only skipped rows, and exit 3 without inflating errored', () => {
     const output = report({ outcome: {
       noTestsFound: false,
@@ -294,7 +294,7 @@ describe('buildGenerateReport v2 interruption accounting', () => {
     } } as unknown as Omit<GenerateReportInput, keyof typeof BASE>);
 
     expect(output.exitCode).toBe(3);
-    expect(output.envelope.schemaVersion).toBe('2.0');
+    expect(output.envelope.schemaVersion).toBe('3.0');
     expect(output.envelope.summary).toEqual({ total: 2, passed: 1, failed: 0, errored: 0, skipped: 1 });
     expect(output.envelope.errors).toEqual([expect.objectContaining({ scope: 'run', code: 'INTERRUPTED' })]);
     expect(output.envelope.results[1]).toEqual({ id: 'pending.test.md', file: 'pending.test.md', status: 'skipped' });

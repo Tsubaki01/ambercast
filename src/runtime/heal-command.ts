@@ -11,7 +11,7 @@ import { AI_EXECUTOR_FACTORIES } from '#adapters/ai/registry.js';
 import { createSpawnCommandRunner } from '#adapters/ai/shared/command-runner.js';
 import { createBrowserDriverResolver } from '#adapters/browser/registry.js';
 import { createFsStorage } from '#adapters/storage/fs-storage.js';
-import { createConfirmationAnswerReader, type ConfirmationAnswerReader } from '#adapters/system/confirmation-answer-reader.js';
+import { createConfirmationAnswerReader, type ConfirmationAnswer, type ConfirmationAnswerReader } from '#adapters/system/confirmation-answer-reader.js';
 import { createCryptoRandom } from '#adapters/system/crypto-random.js';
 import { createEnvSecretsProvider } from '#adapters/system/env-secrets-provider.js';
 import { createNoopEventSink } from '#adapters/system/noop-event-sink.js';
@@ -27,7 +27,7 @@ import { isAbsolutePath, joinPath } from '#core/paths.js';
 import { AmbercastError, type ExitCode } from '#core/errors/types.js';
 import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
 import { heal, type HealBatchResult } from '#usecases/heal.js';
-import { buildHealReport } from '#usecases/heal-report.js';
+import { buildHealReport, type SettledHealOutcome } from '#usecases/heal-report.js';
 import type { FinalizedReportEnvelope } from '#usecases/report-finalization.js';
 import { finalizeReportEnvelope, isEmergencyFinalizedEnvelope } from '#usecases/report-finalization.js';
 import { createAmbercast } from './create-ambercast.js';
@@ -117,10 +117,19 @@ export interface HealCommandDeps extends HealDeps {
 }
 
 /**
+ * Confirmation state after runtime policy has decided whether asking is needed.
+ *
+ * `not-required` is added above the terminal adapter because empty commits and
+ * dry runs are runtime policy outcomes rather than user input. `--yes` is
+ * separately represented as runtime-produced `authorized`.
+ */
+export type HealConfirmationOutcome = ConfirmationAnswer | 'not-required';
+
+/**
  * Settled result of applying one authorized case commit capability.
  *
- * The case identifier associates a failed commit with the result row it must
- * replace before the final report is built.
+ * The case identifier associates a failed commit with the result row that
+ * remains in the final report alongside its matching case-scoped error.
  */
 export interface HealCommitSettlement {
   /** Stable case identity used as the key in `HealBatchResult.commits`. */
@@ -137,8 +146,8 @@ export interface HealCommitSettlement {
  * Rendering-neutral result returned by the healing runtime.
  *
  * The envelope is produced once after authorization and every authorized
- * commit has settled, so failed commits can replace only their own case result
- * with a case-scoped error before report construction.
+ * commit has settled, so a failed commit keeps its own result row and adds a
+ * matching case-scoped error before report construction.
  */
 export interface HealCommandOutput {
   /**
@@ -157,7 +166,7 @@ export interface HealCommandOutput {
  *
  * @param commits - Case-local capabilities represented only by their prompt
  * file and neutral repair summary.
- * @returns Whether the caller authorizes every supplied capability.
+ * @returns The explicit authorization state for every supplied capability.
  * @remarks
  * Confirmation describes the concrete files and repair kinds pending
  * persistence, while deliberately excluding internal stage identity. The
@@ -165,16 +174,24 @@ export interface HealCommandOutput {
  * implementation stages must not become a wording contract merely because a
  * terminal is interactive. This helper decides only whether confirmation is
  * needed; when it is, the command's constructed answer reader performs the
- * short yes/no exchange. That boundary does not introduce a general prompt
- * framework or any additional question types.
+ * short exchange. Empty commits and dry runs are not promptable, while `--yes`
+ * is pre-authorization; those policy branches return explicit values without
+ * consulting the adapter. The adapter itself has only three values so it
+ * cannot claim the policy-owned no-prompt state and accidentally authorize a
+ * write. Non-interactive callers still receive the existing configuration
+ * error rather than a fifth confirmation outcome.
  */
 export async function promptForHealConfirmation(
   commits: ReadonlyMap<string, HealCaseCommit>,
   input: Pick<HealCommandInput, 'dryRun' | 'yes' | 'signal'>,
   deps: Pick<HealCommandDeps, 'isCI' | 'isInteractive' | 'readConfirmationAnswer'>,
-): Promise<boolean> {
-  if (commits.size === 0 || input.dryRun || input.yes) {
-    return true;
+): Promise<HealConfirmationOutcome> {
+  if (commits.size === 0 || input.dryRun) {
+    return 'not-required';
+  }
+
+  if (input.yes) {
+    return 'authorized';
   }
 
   if (deps.isCI || !deps.isInteractive()) {
@@ -182,68 +199,174 @@ export async function promptForHealConfirmation(
   }
 
   if (input.signal?.aborted === true) {
-    return false;
+    return 'interrupted';
   }
 
   const candidates = new Map(
     [...commits].map(([caseId, { file, healingSummary }]) => [caseId, { file, healingSummary }]),
   );
-  const confirmed = await deps.readConfirmationAnswer(candidates, input.signal);
-  return confirmed && !input.signal?.aborted;
+  return deps.readConfirmationAnswer(candidates, input.signal);
 }
 
 /**
- * Reconciles authorized commit failures with the usecase's original outcome.
+ * Produces report-ready outcomes after confirmation and commit settlement.
  *
- * @param outcome - The unchanged outcome returned by the healing usecase.
- * @param settlements - Results of every commit attempted after authorization.
- * @returns The original outcome when all commits succeed, or an adjusted
- * outcome whose failed cases move from results to case-scoped errors.
+ * @param outcome - The measured outcome returned by the healing usecase.
+ * @param confirmation - The explicit policy or adapter confirmation outcome.
+ * @param dryRun - Whether runtime policy intentionally withheld all commits.
+ * @param settlements - Results of commit capabilities attempted after authorization.
+ * @returns A distinct settled outcome with mandatory report application facts.
  * @remarks
- * Each failed settlement removes only that case's `HealCaseOutcome` and adds
- * its `FsIoError` as a case-scoped error, retaining the commit result's
- * `partiallyWritten` evidence so the report does not claim the pair of
- * artifacts is coherent when one artifact reached storage. Successfully
- * committed cases retain their result rows exactly as healing measured them;
- * `listed`, `skipped`, `noTestsFound`, and `interrupted` likewise remain batch
- * facts rather than commit bookkeeping.
+ * The mapping is total and every settled row has `stopReason: 'settled'`. For
+ * `no-changes-needed` and `unresolved`, the
+ * per-case reconciliation never reaches confirmation; a batch-level
+ * confirmation for other rows has no effect on their result:
  *
- * This reconciliation belongs beside confirmation and persistence because it
- * translates a case-local commit capability into the outcome consumed by
- * reporting. `buildHealReport` remains a pure, commit-machinery-unaware
- * boundary, following the separation used by `run-report.ts`: report builders
- * receive settled facts instead of learning how a runtime persisted them.
+ * | Measured repair outcome | Per-case settlement | Application |
+ * | --- | --- | --- |
+ * | `no-changes-needed` or `unresolved` | absent | `no-artifact-change` |
+ *
+ * For every commit-capable `healed` or `partially-healed` row, the remaining
+ * confirmation and settlement combinations are exhaustive:
+ *
+ * | Confirmation | `dryRun` | Per-case settlement | Application |
+ * | --- | --- | --- |
+ * | `not-required` | `true` | absent | `preview-only` |
+ * | `authorized` | `false` | `committed` | `applied` |
+ * | `authorized` | `false` | `failed`, `partiallyWritten` empty | `apply-failed` |
+ * | `authorized` | `false` | `failed`, `partiallyWritten` non-empty | `partially-applied` |
+ * | `declined` | `false` | absent | `declined` |
+ * | `interrupted` | `false` | absent | `not-applied-interrupted` |
+ *
+ * The function throws `UnexpectedCrashError` for every omitted combination:
+ * a settlement for `no-changes-needed`, `unresolved`, preview-only, declined,
+ * or interrupted; `not-required` with `dryRun: false`; any non-
+ * `not-required` confirmation with `dryRun: true`; a missing, duplicate, or
+ * wrong-case settlement for an authorized commit-capable row; or an untyped
+ * settlement result. The explicit `dryRun` argument distinguishes preview-only
+ * from the invalid non-dry-run no-settlement state; confirmation and
+ * settlement count alone cannot do so. Confirmation interruption is ORed into
+ * the settled batch interruption flag because `heal()` returned before the
+ * terminal exchange began. Failed commits retain their rows and add matching
+ * case-scoped `FS_IO_ERROR`s. The error itself must carry
+ * `details.partiallyWritten` from its `HealCommitOutcome`, because report
+ * mapping reads the error details rather than the settlement wrapper. Other
+ * structured details from the underlying `FsIoError` remain available, while
+ * the outcome's partial-write evidence authoritatively replaces any stale
+ * value carried by that error.
  */
-export function reconcileHealCommitFailures(
+function settleHealOutcome(
   outcome: HealOutcome,
+  confirmation: HealConfirmationOutcome,
+  dryRun: boolean,
+  commitCaseIds: ReadonlySet<string>,
   settlements: readonly HealCommitSettlement[],
-): HealOutcome {
-  const failures = settlements.filter((settlement): settlement is HealCommitSettlement & {
-    readonly result: Extract<HealCommitOutcome, { readonly outcome: 'failed' }>;
-  } => settlement.result.outcome === 'failed');
-  if (failures.length === 0) {
-    return outcome;
+): SettledHealOutcome {
+  function unexpected(reason: string): never {
+    throw new UnexpectedCrashError(`Healing settlement invariant failed: ${reason}`);
+  }
+  const settlementsByCaseId = new Map<string, HealCommitSettlement>();
+  for (const settlement of settlements) {
+    if (settlementsByCaseId.has(settlement.caseId)) {
+      unexpected(`duplicate settlement for ${settlement.caseId}`);
+    }
+    settlementsByCaseId.set(settlement.caseId, settlement);
   }
 
-  const failedFiles = new Set(failures.map(({ commit }) => commit.file));
+  const resultIds = new Set(outcome.results.map(({ id }) => id));
+  const commitCapableIds = new Set(outcome.results
+    .filter(({ repairOutcome }) => repairOutcome === 'healed' || repairOutcome === 'partially-healed')
+    .map(({ id }) => id));
+  if (commitCaseIds.size !== commitCapableIds.size || [...commitCaseIds].some((caseId) => !commitCapableIds.has(caseId))) {
+    unexpected('commit capabilities do not match commit-capable measured cases');
+  }
+  for (const [caseId, settlement] of settlementsByCaseId) {
+    if (!resultIds.has(caseId) || settlement.commit.file !== caseId) {
+      unexpected(`settlement does not match a measured case: ${caseId}`);
+    }
+  }
+
+  if (dryRun && confirmation !== 'not-required') {
+    unexpected('a dry run received a promptable confirmation outcome');
+  }
+
+  const commitErrors: Array<HealOutcome['errors'][number]> = [];
+  const results = outcome.results.map((result) => {
+    const settlement = settlementsByCaseId.get(result.id);
+    switch (result.repairOutcome) {
+      case 'no-changes-needed':
+      case 'unresolved':
+        if (settlement !== undefined) {
+          unexpected(`${result.repairOutcome} case has a commit settlement: ${result.id}`);
+        }
+        return { ...result, application: 'no-artifact-change' as const, stopReason: 'settled' as const };
+      case 'healed':
+      case 'partially-healed':
+        switch (confirmation) {
+          case 'not-required':
+            if (!dryRun || settlement !== undefined) {
+              unexpected(`non-preview ${result.repairOutcome} case lacks an authorized settlement: ${result.id}`);
+            }
+            return { ...result, application: 'preview-only' as const, stopReason: 'settled' as const };
+          case 'declined':
+            if (settlement !== undefined) {
+              unexpected(`declined ${result.repairOutcome} case has a commit settlement: ${result.id}`);
+            }
+            return { ...result, application: 'declined' as const, stopReason: 'settled' as const };
+          case 'interrupted':
+            if (settlement !== undefined) {
+              unexpected(`interrupted ${result.repairOutcome} case has a commit settlement: ${result.id}`);
+            }
+            return { ...result, application: 'not-applied-interrupted' as const, stopReason: 'settled' as const };
+          case 'authorized':
+            if (dryRun) {
+              unexpected(`authorized ${result.repairOutcome} case occurred during a dry run: ${result.id}`);
+            }
+            if (settlement === undefined) {
+              unexpected(`authorized ${result.repairOutcome} case lacks a commit settlement: ${result.id}`);
+            }
+            if (settlement.result.outcome === 'committed') {
+              return { ...result, application: 'applied' as const, stopReason: 'settled' as const };
+            }
+            if (settlement.result.outcome === 'failed') {
+              const partiallyWritten = settlement.result.partiallyWritten;
+              if (!(settlement.result.error instanceof FsIoError)
+                || !Array.isArray(partiallyWritten)
+                || !partiallyWritten.every((artifact) => artifact === 'plan' || artifact === 'grounding')) {
+                return unexpected(`malformed failed settlement for ${result.id}`);
+              }
+              const persisted = partiallyWritten.length === 0 ? 'no artifacts' : partiallyWritten.join(' and ');
+              commitErrors.push({
+                file: result.file,
+                error: new FsIoError(
+                  `Healing artifacts could not be committed after persisting ${persisted}.`,
+                  {
+                    ...(settlement.result.error.details ?? {}),
+                    partiallyWritten: [...partiallyWritten],
+                  },
+                  { cause: settlement.result.error },
+                ),
+              });
+              return {
+                ...result,
+                application: partiallyWritten.length === 0 ? 'apply-failed' as const : 'partially-applied' as const,
+                stopReason: 'settled' as const,
+              };
+            }
+            return unexpected(`unknown settlement outcome: ${String((settlement.result as { readonly outcome: unknown }).outcome)}`);
+          default:
+            return unexpected(`unknown confirmation outcome: ${String(confirmation)}`);
+        }
+      default:
+        return unexpected(`unknown repair outcome: ${String(result.repairOutcome)}`);
+    }
+  });
+
   return {
     ...outcome,
-    results: outcome.results.filter(({ file }) => !failedFiles.has(file)),
-    errors: [
-      ...outcome.errors,
-      ...failures.map(({ commit, result }) => {
-        const { error, partiallyWritten } = result;
-        const persisted = partiallyWritten.length === 0 ? 'no artifacts' : partiallyWritten.join(' and ');
-        return {
-          file: commit.file,
-          error: new FsIoError(
-            `Healing artifacts could not be committed after persisting ${persisted}.`,
-            { ...(error.details ?? {}), partiallyWritten: [...partiallyWritten] },
-            { cause: error },
-          ),
-        };
-      }),
-    ],
+    results,
+    errors: [...outcome.errors, ...commitErrors],
+    interrupted: outcome.interrupted || confirmation === 'interrupted',
   };
 }
 
@@ -268,10 +391,9 @@ export function reconcileHealCommitFailures(
  * skips confirmation in every execution environment.
  *
  * A dry run never prompts and never invokes `commit()`, irrespective of
- * `--yes` or `-y`: the overlay has no plan or grounding change worth
- * authorizing, and the healing usecase's dry-run guarantee already preserves
- * that artifact pair without compensating command logic. The two flag forms
- * are the same pre-authorization. Without either form, a non-interactive
+ * `--yes` or `-y`: it reports pending eligible repairs as preview-only while
+ * leaving their buffered artifact changes unapplied. The two flag forms are
+ * the same pre-authorization. Without either form, a non-interactive
  * caller receives the exit-2 refusal rather than a hidden prompt or implicit
  * write. Interactivity is supplied by the `isInteractive()`/
  * `createTtyInteractivityCheck` seam, not an inline
@@ -369,24 +491,33 @@ export async function runHealCommand(
     }
 
     const result: HealBatchResult = await heal(deps, options);
-    const confirmed = await promptForHealConfirmation(result.commits, input, {
+    const confirmation = await promptForHealConfirmation(result.commits, input, {
       isCI,
       isInteractive: () => createTtyInteractivityCheck()(),
       readConfirmationAnswer: (commits, signal) => createConfirmationAnswerReader()(commits, signal),
     });
     const settlements: HealCommitSettlement[] = [];
-    if (!input.dryRun && confirmed) {
+    if (!input.dryRun && confirmation === 'authorized') {
       for (const [caseId, commit] of result.commits) {
         try {
           settlements.push({ caseId, commit, result: await commit.commit() });
         } catch (error) {
+          const partiallyWritten: ('plan' | 'grounding')[] = [];
+          const persisted = partiallyWritten.length === 0 ? 'no artifacts' : partiallyWritten.join(' and ');
           settlements.push({
             caseId,
             commit,
             result: {
               outcome: 'failed',
-              error: new FsIoError('Healing artifacts could not be committed.', undefined, { cause: error }),
-              partiallyWritten: [],
+              error: new FsIoError(
+                `Healing artifacts could not be committed after persisting ${persisted}.`,
+                {
+                  ...(error instanceof FsIoError ? error.details ?? {} : {}),
+                  partiallyWritten: [...partiallyWritten],
+                },
+                { cause: error },
+              ),
+              partiallyWritten,
             },
           });
         }
@@ -395,7 +526,7 @@ export async function runHealCommand(
 
     const output = buildHealReport({
       ...reportContext(),
-      outcome: reconcileHealCommitFailures(result.outcome, settlements),
+      outcome: settleHealOutcome(result.outcome, confirmation, input.dryRun, new Set(result.commits.keys()), settlements),
     });
     const finalized = finalizeReportEnvelope(output.envelope, projectRoot);
     return { exitCode: isEmergencyFinalizedEnvelope(finalized) ? 3 : output.exitCode, envelope: finalized };

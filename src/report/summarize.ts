@@ -89,10 +89,22 @@ export function summarizeReport(input: ReportSummaryInput): Summary {
       case 'listed': case 'skipped': return 'skipped'; default: return assertNever(result);
     }
   };
+  /**
+   * Classifies a heal row from both repair progress and persistence outcome.
+   *
+   * Partially healed and unresolved measurements remain failures regardless of
+   * application, preserving the established repair guarantee; a declined
+   * application is an additional failure condition for an otherwise healed row.
+   * Case-scoped errors are promoted separately below, so this function does
+   * not duplicate error precedence.
+   */
   const classifyHeal = (result: HealResult): Classification => {
     switch (result.status) {
-      case 'healed': case 'no-changes-needed': return 'passed';
-      case 'partially-healed': case 'unresolved': return 'failed'; case 'listed': case 'skipped': return 'skipped';
+      case 'completed':
+        if (result.repairOutcome === 'partially-healed' || result.repairOutcome === 'unresolved') return 'failed';
+        if (result.repairOutcome === 'no-changes-needed') return 'passed';
+        return result.application === 'applied' || result.application === 'preview-only' ? 'passed' : 'failed';
+      case 'listed': case 'skipped': return 'skipped';
       default: return assertNever(result);
     }
   };

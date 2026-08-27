@@ -1,10 +1,38 @@
 import type { AmbercastError, ExitCode } from '#core/errors/types.js';
 import { InterruptedError } from '#core/errors/interrupted-error.js';
 import { reportError } from '#report/error-mapping.js';
-import { REPORT_SCHEMA_VERSION, type HealResult, type ReportEnvelope } from '#report/schema.js';
+import {
+  REPORT_SCHEMA_VERSION,
+  HealResult,
+  type HealApplication,
+  type HealStopReason,
+  type ReportEnvelope,
+} from '#report/schema.js';
 import { summarizeReport } from '#report/summarize.js';
 import { selectExitCode } from './exit-code-priority.js';
-import type { HealOptions, HealOutcome } from './heal.js';
+import type { HealCaseOutcome, HealOptions, HealOutcome } from './heal.js';
+
+/**
+ * A measured heal case after runtime confirmation and persistence settlement.
+ *
+ * `application` and `stopReason` are mandatory here because report construction
+ * must never receive an unreconciled measurement with an undecided persistence
+ * outcome.
+ */
+export interface SettledHealCaseOutcome extends HealCaseOutcome {
+  readonly application: HealApplication;
+  readonly stopReason: HealStopReason;
+}
+
+/**
+ * A heal batch whose measured cases have all been settled for report output.
+ *
+ * Keeping this distinct from `HealOutcome` prevents confirmation knowledge
+ * from leaking into `heal()` while making incomplete report input a type error.
+ */
+export interface SettledHealOutcome extends Omit<HealOutcome, 'results'> {
+  readonly results: readonly SettledHealCaseOutcome[];
+}
 
 /**
  * Timing and zero-match policy that determine stable command-level report fields.
@@ -30,7 +58,7 @@ interface HealReportContext {
  * error. The union prevents a report from claiming both states at once.
  */
 export type HealReportInput = HealReportContext & (
-  | { readonly outcome: HealOutcome; readonly error?: never }
+  | { readonly outcome: SettledHealOutcome; readonly error?: never }
   | { readonly outcome?: never; readonly error: AmbercastError }
 );
 
@@ -65,8 +93,11 @@ export interface HealReportOutput {
  *
  * Exit candidates are collected rather than encoded in a heal-specific
  * precedence branch: each case error contributes its own exit code,
- * `partially-healed` and `unresolved` statuses contribute the healing failure
- * candidate, and `stage3Error` plus `finalReplayError` contribute their
+ * `partially-healed` and `unresolved` repair outcomes remain failure
+ * candidates regardless of application, while declined application adds an
+ * independent failure candidate. This preserves incomplete-repair failures
+ * instead of replacing them with a persistence-only rule. `stage3Error` plus
+ * `finalReplayError` contribute their
  * classified candidates. The shared selector then resolves their established
  * priority, as run reporting does for a result's attached error. The usual
  * disallowed empty selection and interruption candidates are added alongside
@@ -86,7 +117,7 @@ export function buildHealReport(input: HealReportInput): HealReportOutput {
   }
   const outcome = input.outcome!;
   const results: HealResult[] = [
-    ...outcome.results.map(({ baselineReachedIndex: _baseline, finalReachedIndex: _final, stage3Error: _stage3, finalReplayError: _replay, ...result }): HealResult => ({ ...result, steps: [...result.steps] })),
+    ...outcome.results.map(({ baselineReachedIndex: _baseline, finalReachedIndex: _final, stage3Error: _stage3, finalReplayError: _replay, ...result }): HealResult => ({ ...result, status: 'completed', steps: [...result.steps] }) as HealResult),
     ...outcome.listed.map(({ file }): HealResult => ({ id: file, file, status: 'listed' })),
     ...outcome.skipped.map(({ file }): HealResult => ({ id: file, file, status: 'skipped' })),
   ];
@@ -94,8 +125,8 @@ export function buildHealReport(input: HealReportInput): HealReportOutput {
   if (outcome.interrupted) errors.push(reportError(new InterruptedError(), { scope: 'run' }));
   const candidates: ExitCode[] = [
     ...outcome.errors.map(({ error }) => error.exitCode),
-    ...outcome.results.flatMap(({ status, stage3Error, finalReplayError }) => [
-      ...(status === 'partially-healed' || status === 'unresolved' ? [1 as ExitCode] : []),
+    ...outcome.results.flatMap(({ repairOutcome, application, stage3Error, finalReplayError }) => [
+      ...(repairOutcome === 'partially-healed' || repairOutcome === 'unresolved' || application === 'declined' ? [1 as ExitCode] : []),
       ...(stage3Error === undefined ? [] : [stage3Error.exitCode]),
       ...(finalReplayError === undefined ? [] : [finalReplayError.exitCode]),
     ]),

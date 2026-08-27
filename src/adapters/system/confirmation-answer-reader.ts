@@ -22,11 +22,38 @@ export interface ConfirmationCandidate {
   readonly healingSummary: string;
 }
 
-/** Reads one authorization decision for the supplied pending candidates. */
+/**
+ * Terminal answer states available from one confirmation exchange.
+ *
+ * The adapter intentionally cannot return `not-required`: deciding whether a
+ * prompt is needed belongs to runtime policy, and allowing an input adapter to
+ * claim that state could authorize a commit without a policy decision.
+ */
+export type ConfirmationAnswer = 'authorized' | 'declined' | 'interrupted';
+
+/**
+ * Reads one authorization decision for the supplied pending candidates.
+ *
+ * @remarks
+ * The returned value is determined by the terminal event, not by runtime
+ * policy:
+ *
+ * | Input event | Result |
+ * | --- | --- |
+ * | `yes` answer | resolves `authorized` |
+ * | `no` answer | resolves `declined` |
+ * | end-of-file | resolves `declined` |
+ * | signal already aborted before reading | resolves `interrupted` |
+ * | signal aborts while reading | resolves `interrupted` |
+ * | input stream error | rejects with that error |
+ *
+ * Whether a prompt is required is deliberately outside this API, so this
+ * reader never returns `not-required`.
+ */
 export type ConfirmationAnswerReader = (
   commits: ReadonlyMap<string, ConfirmationCandidate>,
   signal?: AbortSignal,
-) => Promise<boolean>;
+) => Promise<ConfirmationAnswer>;
 
 /** Process streams used exclusively for the confirmation exchange. */
 export interface ConfirmationAnswerStreams {
@@ -48,7 +75,8 @@ function displayLine(value: string): string {
  * candidates are persisted.
  *
  * @returns A function that asks about the supplied candidates and reports
- * whether the caller authorizes every pending commit capability.
+ * whether the caller authorizes every pending commit capability, declines it,
+ * or interrupts the exchange.
  *
  * @remarks
  * This adapter owns the concrete terminal exchange here,
@@ -60,19 +88,24 @@ function displayLine(value: string): string {
 export function createConfirmationAnswerReader(
   streams: ConfirmationAnswerStreams = { stdin: process.stdin, stderr: process.stderr },
 ): ConfirmationAnswerReader {
-  return async (commits, signal): Promise<boolean> => {
-    if (signal?.aborted === true) {
-      return false;
+  return async (commits, signal): Promise<ConfirmationAnswer> => {
+    const isAborted = (): boolean => signal?.aborted === true;
+    if (isAborted()) {
+      return 'interrupted';
     }
 
     for (const { file, healingSummary } of commits.values()) {
       streams.stderr.write(`${displayLine(file)}: ${displayLine(healingSummary)}\n`);
     }
 
+    if (isAborted()) {
+      return 'interrupted';
+    }
+
     streams.stderr.write('Apply these healing changes? [y/N] ');
-    return new Promise<boolean>((resolve, reject) => {
+    return new Promise<ConfirmationAnswer>((resolve, reject) => {
       let settled = false;
-      const finish = (answer: boolean): void => {
+      const finish = (answer: ConfirmationAnswer): void => {
         if (settled) {
           return;
         }
@@ -82,10 +115,10 @@ export function createConfirmationAnswerReader(
       };
       const onData = (chunk: Buffer | string): void => {
         const answer = chunk.toString().trim().toLowerCase();
-        finish(answer === 'y' || answer === 'yes');
+        finish(answer === 'y' || answer === 'yes' ? 'authorized' : 'declined');
       };
       const onEnd = (): void => {
-        finish(false);
+        finish('declined');
       };
       const onError = (error: Error): void => {
         if (settled) {
@@ -96,7 +129,7 @@ export function createConfirmationAnswerReader(
         reject(error);
       };
       const onAbort = (): void => {
-        finish(false);
+        finish('interrupted');
       };
       const cleanup = (): void => {
         streams.stdin.removeListener('data', onData);
@@ -110,6 +143,10 @@ export function createConfirmationAnswerReader(
       streams.stdin.once('end', onEnd);
       streams.stdin.once('error', onError);
       signal?.addEventListener('abort', onAbort, { once: true });
+      if (isAborted()) {
+        onAbort();
+        return;
+      }
       streams.stdin.resume();
     });
   };

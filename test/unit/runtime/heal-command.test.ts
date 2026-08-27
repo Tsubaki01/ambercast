@@ -5,7 +5,7 @@ import { ConfigInvalidError } from '#core/errors/config-invalid-error.js';
 import { FsIoError } from '#core/errors/fs-io-error.js';
 import { MissingPlanError } from '#core/errors/missing-plan-error.js';
 import { ReportEnvelope } from '#report/schema.js';
-import { reconcileHealCommitFailures, runHealCommand, type HealCommandInput, type HealCommandOutput } from '#runtime/heal-command.js';
+import { runHealCommand, type HealCommandInput, type HealCommandOutput } from '#runtime/heal-command.js';
 import type { HealBatchResult, HealCaseCommit, HealCaseOutcome, HealCommitOutcome, HealOutcome } from '#usecases/heal.js';
 import { createFixedClock } from '../../doubles/create-fixed-clock.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
@@ -47,13 +47,13 @@ function input(overrides: Partial<HealCommandInput> = {}): HealCommandInput {
   return { files: [], dryRun: false, yes: false, allowEmpty: false, list: false, cwd: '/workspace', ...overrides };
 }
 function report(exitCode: HealCommandOutput['exitCode']): HealCommandOutput {
-  return { exitCode, envelope: { schemaVersion: '2.0', command: 'heal', startedAt: '2026-08-25T00:00:00Z', durationMs: 1, summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 }, errors: [], results: [] } } as unknown as HealCommandOutput;
+  return { exitCode, envelope: { schemaVersion: '3.0', command: 'heal', startedAt: '2026-08-25T00:00:00Z', durationMs: 1, summary: { total: 0, passed: 0, failed: 0, errored: 0, skipped: 0 }, errors: [], results: [] } } as unknown as HealCommandOutput;
 }
 function reportWithExecutionEvidence(root: string): HealCommandOutput {
   return {
     exitCode: 1,
     envelope: {
-      schemaVersion: '2.0', command: 'heal', startedAt: '2026-08-25T00:00:00Z', durationMs: 1,
+      schemaVersion: '3.0', command: 'heal', startedAt: '2026-08-25T00:00:00Z', durationMs: 1,
       summary: { total: 1, passed: 0, failed: 1, errored: 0, skipped: 0 },
       errors: [{
         scope: 'case', kind: 'environment', code: 'FS_IO_ERROR',
@@ -64,20 +64,20 @@ function reportWithExecutionEvidence(root: string): HealCommandOutput {
         id: `${root}/tests/login.test.md`,
         file: `${root}/tests/login.test.md`,
         planFile: `${root}/tests/login.ambercast.plan.json`,
-        status: 'unresolved',
+        status: 'completed', repairOutcome: 'unresolved', application: 'no-artifact-change', stopReason: 'settled',
         steps: [{
           id: 'capture', type: 'capture', status: 'passed',
           screenshot: `${root}/tests/.runs/evidence.png`,
         }],
         explanation: 'The candidate did not repair the case.',
         durationMs: 1.6,
-        dryRun: false,
       }],
     },
   } as unknown as HealCommandOutput;
 }
 function caseResult(id: string, overrides: Partial<HealCaseOutcome> = {}): HealCaseOutcome {
-  return { id, file: `/workspace/tests/${id}`, planFile: `/workspace/tests/${id}.ambercast.plan.json`, status: 'healed', steps: [], explanation: 'The candidate repaired the case.', durationMs: 1.6, dryRun: false, baselineReachedIndex: 0, finalReachedIndex: 1, stage3Error: undefined, finalReplayError: undefined, ...overrides };
+  const file = `/workspace/tests/${id}`;
+  return { id: file, file, planFile: `/workspace/tests/${id}.ambercast.plan.json`, repairOutcome: 'healed', steps: [], explanation: 'The candidate repaired the case.', durationMs: 1.6, baselineReachedIndex: 0, finalReachedIndex: 1, stage3Error: undefined, finalReplayError: undefined, ...overrides };
 }
 function outcome(overrides: Partial<HealOutcome> = {}): HealOutcome {
   return { results: [caseResult('login.test.md')], errors: [], noTestsFound: false, listed: [], skipped: [], interrupted: false, ...overrides };
@@ -90,10 +90,10 @@ function commits(...candidates: readonly HealCaseCommit[]): Map<string, HealCase
 }
 function batch(overrides: Partial<HealBatchResult> = {}): HealBatchResult {
   const base = outcome();
-  return { outcome: base, commits: commits(capability(base.results[0]!.id)), ...overrides };
+  return { outcome: base, commits: commits(capability('login.test.md')), ...overrides };
 }
-function configure({ result = batch(), isCI = false, interactive = false, readConfirmationAnswer = vi.fn(async () => false), config = CONFIG, built = report(0), monotonic = [10, 12.6] }: {
-  result?: HealBatchResult; isCI?: boolean; interactive?: boolean; readConfirmationAnswer?: (commits: ReadonlyMap<string, HealCaseCommit>, signal?: AbortSignal) => Promise<boolean>; config?: ResolvedConfig; built?: HealCommandOutput; monotonic?: readonly number[];
+function configure({ result = batch(), isCI = false, interactive = false, readConfirmationAnswer = vi.fn(async () => 'declined' as const), config = CONFIG, built = report(0), monotonic = [10, 12.6] }: {
+  result?: HealBatchResult; isCI?: boolean; interactive?: boolean; readConfirmationAnswer?: (commits: ReadonlyMap<string, HealCaseCommit>, signal?: AbortSignal) => Promise<'authorized' | 'declined' | 'interrupted'>; config?: ResolvedConfig; built?: HealCommandOutput; monotonic?: readonly number[];
 } = {}): void {
   const storage = createInMemoryStorage();
   mocks.createFsStorage.mockReturnValue(storage);
@@ -124,7 +124,7 @@ beforeEach(async () => {
 describe('runHealCommand', () => {
   it.each([['non-interactive', false], ['interactive but undeclined', true]] as const)('lets --list exit zero before disabled ci.heal in a %s environment', async (_name, interactive) => {
     const listed = batch({ outcome: outcome({ results: [], listed: [{ file: '/workspace/tests/login.test.md' }] }), commits: new Map() });
-    const readConfirmationAnswer = vi.fn(async (_commits: ReadonlyMap<string, HealCaseCommit>) => true);
+    const readConfirmationAnswer = vi.fn(async (_commits: ReadonlyMap<string, HealCaseCommit>) => 'authorized' as const);
     configure({ result: listed, isCI: true, interactive, readConfirmationAnswer, config: { ...CONFIG, ci: { ...CONFIG.ci, heal: false } } });
     await expect(runHealCommand(input({ list: true }))).resolves.toMatchObject({ exitCode: 0 });
     expect(mocks.heal).toHaveBeenCalledWith(expect.any(Object), expect.objectContaining({ list: true }));
@@ -134,7 +134,7 @@ describe('runHealCommand', () => {
   });
 
   it('refuses a non-list CI invocation when ci.heal is disabled without calling heal', async () => {
-    const readConfirmationAnswer = vi.fn(async () => true);
+    const readConfirmationAnswer = vi.fn(async () => 'authorized' as const);
     configure({ isCI: true, readConfirmationAnswer, config: { ...CONFIG, ci: { ...CONFIG.ci, heal: false } }, built: report(2) });
     await expect(runHealCommand(input())).resolves.toMatchObject({ exitCode: 2 });
     expect(mocks.heal).not.toHaveBeenCalled();
@@ -144,49 +144,123 @@ describe('runHealCommand', () => {
   });
 
   it.each([
-    [0, 'healed outcome', outcome()],
-    [1, 'unresolved outcome', outcome({ results: [caseResult('unresolved.test.md', { status: 'unresolved' })] })],
-    [2, 'configuration error', outcome({ errors: [{ file: '/workspace/tests/config.test.md', error: new ConfigInvalidError('invalid') }] })],
-    [3, 'stage 3 browser error', outcome({ results: [caseResult('stage3.test.md', { status: 'unresolved', stage3Error: new BrowserLaunchFailedError('browser unavailable') })] })],
-    [4, 'final replay integrity error', outcome({ results: [caseResult('replay.test.md', { status: 'unresolved', finalReplayError: new MissingPlanError('plan missing') })] })],
-    [5, 'disallowed empty selection', outcome({ results: [], noTestsFound: true })],
-  ] as const)('forwards buildHealReport\'s preselected exit %i for %s without reimplementing selection', async (exitCode, _name, healingOutcome) => {
-    configure({ result: batch({ outcome: healingOutcome, commits: new Map() }), built: report(exitCode) });
+    [0, 'healed outcome', outcome(), commits(capability('login.test.md'))],
+    [1, 'unresolved outcome', outcome({ results: [caseResult('unresolved.test.md', { repairOutcome: 'unresolved' })] }), new Map()],
+    [2, 'configuration error', outcome({ results: [], errors: [{ file: '/workspace/tests/config.test.md', error: new ConfigInvalidError('invalid') }] }), new Map()],
+    [3, 'stage 3 browser error', outcome({ results: [caseResult('stage3.test.md', { repairOutcome: 'unresolved', stage3Error: new BrowserLaunchFailedError('browser unavailable') })] }), new Map()],
+    [4, 'final replay integrity error', outcome({ results: [caseResult('replay.test.md', { repairOutcome: 'unresolved', finalReplayError: new MissingPlanError('plan missing') })] }), new Map()],
+    [5, 'disallowed empty selection', outcome({ results: [], noTestsFound: true }), new Map()],
+  ] as const)('forwards buildHealReport\'s preselected exit %i for %s without reimplementing selection', async (exitCode, _name, healingOutcome, pendingCommits) => {
+    configure({ result: batch({ outcome: healingOutcome, commits: pendingCommits }), built: report(exitCode) });
     await expect(runHealCommand(input({ yes: true }))).resolves.toMatchObject({ exitCode });
-    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({ outcome: healingOutcome }));
+    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: expect.objectContaining({
+        errors: healingOutcome.errors,
+        noTestsFound: healingOutcome.noTestsFound,
+      }),
+    }));
   });
 
   it('forwards a stage3Error value to buildHealReport unchanged', async () => {
     const stage3Error = new BrowserLaunchFailedError('browser unavailable');
-    const healingOutcome = outcome({ results: [caseResult('stage3.test.md', { status: 'unresolved', stage3Error })] });
+    const healingOutcome = outcome({ results: [caseResult('stage3.test.md', { repairOutcome: 'unresolved', stage3Error })] });
     configure({ result: batch({ outcome: healingOutcome, commits: new Map() }), built: report(3) });
     await expect(runHealCommand(input({ yes: true }))).resolves.toMatchObject({ exitCode: 3 });
-    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({ outcome: healingOutcome }));
+    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: expect.objectContaining({
+        results: [expect.objectContaining({ stage3Error, application: 'no-artifact-change', stopReason: 'settled' })],
+      }),
+    }));
   });
 
   it.each([['ordinary dry run', false], ['--dry-run --yes no-op', true]] as const)('never prompts or commits during %s', async (_name, yes) => {
     const pending = capability('login.test.md');
-    const readConfirmationAnswer = vi.fn(async () => true);
+    const readConfirmationAnswer = vi.fn(async () => 'authorized' as const);
     configure({ result: batch({ commits: commits(pending) }), readConfirmationAnswer });
     await expect(runHealCommand(input({ dryRun: true, yes }))).resolves.toMatchObject({ exitCode: 0 });
     expect(mocks.createTtyInteractivityCheck).not.toHaveBeenCalled();
     expect(readConfirmationAnswer).not.toHaveBeenCalled();
     expect(pending.commit).not.toHaveBeenCalled();
+    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: expect.objectContaining({
+        results: [expect.objectContaining({ application: 'preview-only', stopReason: 'settled' })],
+      }),
+    }));
+  });
+
+  it('settles a partially-healed dry-run as preview-only', async () => {
+    const pending = capability('partial-preview.test.md');
+    const partial = outcome({ results: [caseResult('partial-preview.test.md', { repairOutcome: 'partially-healed', durationMs: 1 })] });
+    configure({ result: batch({ outcome: partial, commits: commits(pending) }) });
+    await useActualBuildHealReport();
+
+    await expect(runHealCommand(input({ dryRun: true }))).resolves.toMatchObject({
+      exitCode: 1,
+      envelope: expect.objectContaining({
+        results: [expect.objectContaining({ repairOutcome: 'partially-healed', application: 'preview-only' })],
+      }),
+    });
+    expect(pending.commit).not.toHaveBeenCalled();
+  });
+
+  it('settles a partially-healed authorized commit as applied', async () => {
+    const pending = capability('partial-committed.test.md');
+    const partial = outcome({ results: [caseResult('partial-committed.test.md', { repairOutcome: 'partially-healed', durationMs: 1 })] });
+    configure({ result: batch({ outcome: partial, commits: commits(pending) }) });
+    await useActualBuildHealReport();
+
+    await expect(runHealCommand(input({ yes: true }))).resolves.toMatchObject({
+      exitCode: 1,
+      envelope: expect.objectContaining({
+        results: [expect.objectContaining({ repairOutcome: 'partially-healed', application: 'applied' })],
+      }),
+    });
+    expect(pending.commit).toHaveBeenCalledOnce();
+  });
+
+  it('settles a partially-healed confirmation interruption without committing', async () => {
+    const healedPending = capability('healed-interrupted.test.md');
+    const partialPending = capability('partial-interrupted.test.md');
+    const partial = outcome({ results: [
+      caseResult('healed-interrupted.test.md', { durationMs: 1 }),
+      caseResult('partial-interrupted.test.md', { repairOutcome: 'partially-healed', durationMs: 1 }),
+    ] });
+    configure({ result: batch({ outcome: partial, commits: commits(healedPending, partialPending) }), interactive: true, readConfirmationAnswer: vi.fn(async () => 'interrupted' as const) });
+    await useActualBuildHealReport();
+
+    await expect(runHealCommand(input())).resolves.toMatchObject({
+      exitCode: 3,
+      envelope: expect.objectContaining({
+        summary: expect.objectContaining({ total: 2, failed: 2 }),
+        results: [
+          expect.objectContaining({ repairOutcome: 'healed', application: 'not-applied-interrupted' }),
+          expect.objectContaining({ repairOutcome: 'partially-healed', application: 'not-applied-interrupted' }),
+        ],
+        errors: [expect.objectContaining({ scope: 'run', code: 'INTERRUPTED' })],
+      }),
+    });
+    expect(healedPending.commit).not.toHaveBeenCalled();
+    expect(partialPending.commit).not.toHaveBeenCalled();
   });
 
   it('honors the already-parsed yes field as pre-authorization without TTY consultation', async () => {
     const pending = capability('login.test.md');
-    const readConfirmationAnswer = vi.fn(async () => true);
+    const readConfirmationAnswer = vi.fn(async () => 'authorized' as const);
     configure({ result: batch({ commits: commits(pending) }), readConfirmationAnswer });
     await expect(runHealCommand(input({ yes: true }))).resolves.toMatchObject({ exitCode: 0 });
     expect(mocks.createTtyInteractivityCheck).not.toHaveBeenCalled();
     expect(readConfirmationAnswer).not.toHaveBeenCalled();
     expect(pending.commit).toHaveBeenCalledOnce();
+    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: expect.objectContaining({
+        results: [expect.objectContaining({ application: 'applied', stopReason: 'settled' })],
+      }),
+    }));
   });
 
   it('refuses an unconfirmed non-interactive invocation without committing', async () => {
     const pending = capability('login.test.md');
-    const readConfirmationAnswer = vi.fn(async () => true);
+    const readConfirmationAnswer = vi.fn(async () => 'authorized' as const);
     configure({ result: batch({ commits: commits(pending) }), readConfirmationAnswer, built: report(2) });
     await expect(runHealCommand(input())).resolves.toMatchObject({ exitCode: 2 });
     expect(readConfirmationAnswer).not.toHaveBeenCalled();
@@ -204,7 +278,7 @@ describe('runHealCommand', () => {
     const pendingHeal = new Promise<HealBatchResult>((resolve) => {
       resolveHeal = resolve;
     });
-    const readConfirmationAnswer = vi.fn(async () => true);
+    const readConfirmationAnswer = vi.fn(async () => 'authorized' as const);
     configure({
       isCI,
       result: batch({ commits: commits(pending) }),
@@ -229,7 +303,7 @@ describe('runHealCommand', () => {
     const second = capability('second.test.md');
     const healed = outcome({ results: [caseResult('first.test.md'), caseResult('second.test.md')] });
     const built = report(0);
-    const readConfirmationAnswer = vi.fn(async (_commits: ReadonlyMap<string, HealCaseCommit>) => true);
+    const readConfirmationAnswer = vi.fn(async (_commits: ReadonlyMap<string, HealCaseCommit>) => 'authorized' as const);
     configure({
       result: batch({ outcome: healed, commits: commits(first, second) }),
       interactive: true,
@@ -247,30 +321,44 @@ describe('runHealCommand', () => {
     ]);
     expect(first.commit).toHaveBeenCalledOnce();
     expect(second.commit).toHaveBeenCalledOnce();
-    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({ outcome: healed }));
+    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: expect.objectContaining({
+        results: [
+          expect.objectContaining({ id: first.file, application: 'applied', stopReason: 'settled' }),
+          expect.objectContaining({ id: second.file, application: 'applied', stopReason: 'settled' }),
+        ],
+      }),
+    }));
   });
 
-  it('lets a post-answer abort override an affirmative reader result before any commit', async () => {
+  it('forwards the mocked report builder exit code after a mid-read interruption', async () => {
     const pending = capability('login.test.md');
     const controller = new AbortController();
     const readConfirmationAnswer = vi.fn(async (_commits: ReadonlyMap<string, HealCaseCommit>, signal?: AbortSignal) => {
       expect(signal).toBe(controller.signal);
       controller.abort();
-      return true;
+      return 'interrupted' as const;
     });
     configure({ result: batch({ commits: commits(pending) }), interactive: true, readConfirmationAnswer });
 
+    // This exercises call forwarding; the mocked exit code is not the public interruption contract.
     await expect(runHealCommand(input({ signal: controller.signal }))).resolves.toMatchObject({ exitCode: 0 });
 
     expect(readConfirmationAnswer).toHaveBeenCalledWith(expect.any(Map), controller.signal);
     expect(pending.commit).not.toHaveBeenCalled();
+    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: expect.objectContaining({
+        interrupted: true,
+        results: [expect.objectContaining({ application: 'not-applied-interrupted', stopReason: 'settled' })],
+      }),
+    }));
   });
 
-  it('leaves the healing outcome unchanged after an interactive decline without committing', async () => {
+  it('settles an interactive decline without committing', async () => {
     const pending = capability('login.test.md');
     const unchanged = outcome({ results: [caseResult('login.test.md')] });
     const built = report(0);
-    const readConfirmationAnswer = vi.fn(async (_commits: ReadonlyMap<string, HealCaseCommit>) => false);
+    const readConfirmationAnswer = vi.fn(async (_commits: ReadonlyMap<string, HealCaseCommit>) => 'declined' as const);
     configure({ result: batch({ outcome: unchanged, commits: commits(pending) }), interactive: true, readConfirmationAnswer, built });
 
     await expect(runHealCommand(input())).resolves.toEqual(built);
@@ -281,26 +369,40 @@ describe('runHealCommand', () => {
       ['/workspace/tests/login.test.md', { file: '/workspace/tests/login.test.md', healingSummary: 'Repair login.test.md' }],
     ]);
     expect(pending.commit).not.toHaveBeenCalled();
-    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({ outcome: unchanged }));
+    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: expect.objectContaining({
+        results: [expect.objectContaining({ application: 'declined', stopReason: 'settled' })],
+      }),
+    }));
   });
 
-  it('reports exit 0 for an interactive decline over a healed pending commit with the real report builder', async () => {
+  it('reports exit 1 for an interactive decline over a healed pending commit with the real report builder', async () => {
     const pending = capability('healed.test.md');
     const healed = outcome({ results: [caseResult('healed.test.md', { durationMs: 1 })] });
-    configure({ result: batch({ outcome: healed, commits: commits(pending) }), interactive: true, readConfirmationAnswer: vi.fn(async () => false) });
+    configure({ result: batch({ outcome: healed, commits: commits(pending) }), interactive: true, readConfirmationAnswer: vi.fn(async () => 'declined' as const) });
     await useActualBuildHealReport();
 
-    await expect(runHealCommand(input())).resolves.toMatchObject({ exitCode: 0 });
+    await expect(runHealCommand(input())).resolves.toMatchObject({
+      exitCode: 1,
+      envelope: expect.objectContaining({
+        results: [expect.objectContaining({ application: 'declined' })],
+      }),
+    });
     expect(pending.commit).not.toHaveBeenCalled();
   });
 
   it('reports exit 1 for an interactive decline over a partially-healed pending commit with the real report builder', async () => {
     const pending = capability('partial.test.md');
-    const partial = outcome({ results: [caseResult('partial.test.md', { status: 'partially-healed', durationMs: 1 })] });
-    configure({ result: batch({ outcome: partial, commits: commits(pending) }), interactive: true, readConfirmationAnswer: vi.fn(async () => false) });
+    const partial = outcome({ results: [caseResult('partial.test.md', { repairOutcome: 'partially-healed', durationMs: 1 })] });
+    configure({ result: batch({ outcome: partial, commits: commits(pending) }), interactive: true, readConfirmationAnswer: vi.fn(async () => 'declined' as const) });
     await useActualBuildHealReport();
 
-    await expect(runHealCommand(input())).resolves.toMatchObject({ exitCode: 1 });
+    await expect(runHealCommand(input())).resolves.toMatchObject({
+      exitCode: 1,
+      envelope: expect.objectContaining({
+        results: [expect.objectContaining({ repairOutcome: 'partially-healed', application: 'declined' })],
+      }),
+    });
     expect(pending.commit).not.toHaveBeenCalled();
   });
 
@@ -311,13 +413,102 @@ describe('runHealCommand', () => {
     ['interactive reader available', {}, true, false],
     ['CI non-interactive', {}, false, true],
   ] as const)('skips confirmation for an empty commits map with %s', async (_name, flags, interactive, isCI) => {
-    const unchanged = outcome({ results: [caseResult('unchanged.test.md', { status: 'no-changes-needed' })] });
-    const readConfirmationAnswer = vi.fn(async () => true);
+    const unchanged = outcome({ results: [caseResult('unchanged.test.md', { repairOutcome: 'no-changes-needed' })] });
+    const readConfirmationAnswer = vi.fn(async () => 'authorized' as const);
     configure({ result: batch({ outcome: unchanged, commits: new Map() }), isCI, interactive, readConfirmationAnswer });
     await expect(runHealCommand(input(flags))).resolves.toMatchObject({ exitCode: 0 });
     expect(mocks.createTtyInteractivityCheck).not.toHaveBeenCalled();
     expect(readConfirmationAnswer).not.toHaveBeenCalled();
-    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({ outcome: unchanged }));
+    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: expect.objectContaining({
+        results: [expect.objectContaining({ application: 'no-artifact-change', stopReason: 'settled' })],
+      }),
+    }));
+  });
+
+  it('reports an invariant failure when a non-dry-run healed result lacks its required commit capability', async () => {
+    configure({ result: batch({ commits: new Map() }) });
+    await useActualBuildHealReport();
+
+    await expect(runHealCommand(input({ yes: true }))).resolves.toMatchObject({
+      exitCode: 3,
+      envelope: expect.objectContaining({
+        results: [],
+        errors: [expect.objectContaining({
+          scope: 'run',
+          code: 'UNEXPECTED_CRASH',
+          message: 'Healing settlement invariant failed: commit capabilities do not match commit-capable measured cases',
+        })],
+      }),
+    });
+  });
+
+  it('reports an invariant failure when an authorized commit-capable case has no settlement', async () => {
+    const pending = capability('missing-settlement.test.md');
+    const pendingCommits = commits(pending);
+    Object.defineProperty(pendingCommits, Symbol.iterator, { value: function* (): IterableIterator<never> {} });
+    configure({ result: batch({ outcome: outcome({ results: [caseResult('missing-settlement.test.md')] }), commits: pendingCommits }) });
+    await useActualBuildHealReport();
+
+    await expect(runHealCommand(input({ yes: true }))).resolves.toMatchObject({
+      exitCode: 3,
+      envelope: expect.objectContaining({
+        results: [],
+        errors: [expect.objectContaining({
+          scope: 'run',
+          code: 'UNEXPECTED_CRASH',
+          message: 'Healing settlement invariant failed: authorized healed case lacks a commit settlement: /workspace/tests/missing-settlement.test.md',
+        })],
+      }),
+    });
+  });
+
+  it.each([
+    ['dry-run', input({ dryRun: true }), false, undefined],
+    ['declined', input(), true, 'declined'],
+    ['interrupted', input(), true, 'interrupted'],
+  ] as const)('reports an invariant failure when %s lacks a commit capability for a measured repair', async (_name, commandInput, interactive, answer) => {
+    const onlyCapability = capability('first.test.md');
+    const measured = outcome({ results: [caseResult('first.test.md'), caseResult('second.test.md', { repairOutcome: 'partially-healed' })] });
+    configure({
+      result: batch({ outcome: measured, commits: commits(onlyCapability) }),
+      interactive,
+      readConfirmationAnswer: vi.fn(async () => answer ?? 'authorized'),
+    });
+    await useActualBuildHealReport();
+
+    await expect(runHealCommand(commandInput)).resolves.toMatchObject({
+      exitCode: 3,
+      envelope: expect.objectContaining({
+        results: [],
+        errors: [expect.objectContaining({
+          scope: 'run',
+          code: 'UNEXPECTED_CRASH',
+          message: 'Healing settlement invariant failed: commit capabilities do not match commit-capable measured cases',
+        })],
+      }),
+    });
+    expect(onlyCapability.commit).not.toHaveBeenCalled();
+  });
+
+  it('reports an invariant failure for an unknown authorized settlement outcome', async () => {
+    const pending = capability('unknown-settlement.test.md', {
+      outcome: 'unknown',
+    } as unknown as HealCommitOutcome);
+    configure({ result: batch({ outcome: outcome({ results: [caseResult('unknown-settlement.test.md')] }), commits: commits(pending) }) });
+    await useActualBuildHealReport();
+
+    await expect(runHealCommand(input({ yes: true }))).resolves.toMatchObject({
+      exitCode: 3,
+      envelope: expect.objectContaining({
+        results: [],
+        errors: [expect.objectContaining({
+          scope: 'run',
+          code: 'UNEXPECTED_CRASH',
+          message: 'Healing settlement invariant failed: unknown settlement outcome: unknown',
+        })],
+      }),
+    });
   });
 
   it('requires --yes for a pending commit capability in non-interactive CI', async () => {
@@ -338,7 +529,7 @@ describe('runHealCommand', () => {
     const pendingHeal = new Promise<HealBatchResult>((resolve) => {
       resolveHeal = resolve;
     });
-    const readConfirmationAnswer = vi.fn(async () => true);
+    const readConfirmationAnswer = vi.fn(async () => 'authorized' as const);
     configure({ result: batch({ outcome: healed, commits: commits(completed) }), readConfirmationAnswer, built: report(3) });
     mocks.heal.mockImplementationOnce(async () => pendingHeal);
     const command = runHealCommand(input({ yes: true, signal: controller.signal }));
@@ -349,10 +540,15 @@ describe('runHealCommand', () => {
     await expect(command).resolves.toMatchObject({ exitCode: 3 });
     expect(readConfirmationAnswer).not.toHaveBeenCalled();
     expect(completed.commit).toHaveBeenCalledOnce();
-    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({ outcome: healed }));
+    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: expect.objectContaining({
+        interrupted: true,
+        results: [expect.objectContaining({ application: 'applied', stopReason: 'settled' })],
+      }),
+    }));
   });
 
-  it('treats interactive cancellation before confirmation as a decline with no writes', async () => {
+  it('treats interactive cancellation before confirmation as interrupted with no writes', async () => {
     const pending = capability('completed.test.md');
     const healed = outcome({ results: [caseResult('completed.test.md')], skipped: [{ file: '/workspace/tests/later.test.md' }], interrupted: true });
     const controller = new AbortController();
@@ -360,7 +556,7 @@ describe('runHealCommand', () => {
     const pendingHeal = new Promise<HealBatchResult>((resolve) => {
       resolveHeal = resolve;
     });
-    const readConfirmationAnswer = vi.fn(async () => false);
+    const readConfirmationAnswer = vi.fn(async () => 'declined' as const);
     configure({ result: batch({ outcome: healed, commits: commits(pending) }), interactive: true, readConfirmationAnswer, built: report(3) });
     mocks.heal.mockImplementationOnce(async () => pendingHeal);
     const command = runHealCommand(input({ signal: controller.signal }));
@@ -371,7 +567,12 @@ describe('runHealCommand', () => {
     await expect(command).resolves.toMatchObject({ exitCode: 3 });
     expect(readConfirmationAnswer).not.toHaveBeenCalled();
     expect(pending.commit).not.toHaveBeenCalled();
-    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({ outcome: healed }));
+    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: expect.objectContaining({
+        interrupted: true,
+        results: [expect.objectContaining({ application: 'not-applied-interrupted', stopReason: 'settled' })],
+      }),
+    }));
   });
 
   it('settles every authorized commit after cancellation begins during settlement', async () => {
@@ -385,7 +586,12 @@ describe('runHealCommand', () => {
     });
     vi.mocked(first.commit).mockImplementation(() => { controller.abort(); return firstResult; });
     vi.mocked(second.commit).mockImplementation(async () => { secondSettled = true; return { outcome: 'committed' }; });
-    configure({ result: batch({ commits: commits(first, second) }) });
+    configure({
+      result: batch({
+        outcome: outcome({ results: [caseResult('first.test.md'), caseResult('second.test.md')] }),
+        commits: commits(first, second),
+      }),
+    });
     const command = runHealCommand(input({ yes: true, signal: controller.signal }));
     void command.catch(() => undefined);
     await vi.waitFor(() => expect(first.commit).toHaveBeenCalledOnce());
@@ -400,7 +606,17 @@ describe('runHealCommand', () => {
   });
 
   it('keeps the interrupted, failed, and committed cases isolated in one authorized batch', async () => {
-    const failed = capability('failed.test.md', { outcome: 'failed', error: new FsIoError('grounding write failed'), partiallyWritten: ['plan'] });
+    const partiallyWritten: ('plan' | 'grounding')[] = ['plan', 'grounding'];
+    const originalErrorPartiallyWritten: ('plan' | 'grounding')[] = ['grounding'];
+    const commitFailure = new FsIoError('grounding write failed', {
+      operation: 'write-grounding',
+      partiallyWritten: originalErrorPartiallyWritten,
+    });
+    const failed = capability('failed.test.md', {
+      outcome: 'failed',
+      error: commitFailure,
+      partiallyWritten,
+    });
     const succeeded = capability('committed.test.md');
     const healed = outcome({
       results: [caseResult('failed.test.md'), caseResult('committed.test.md')],
@@ -409,33 +625,242 @@ describe('runHealCommand', () => {
     });
     configure({ result: batch({ outcome: healed, commits: commits(failed, succeeded) }), built: report(3) });
     await expect(runHealCommand(input({ yes: true }))).resolves.toMatchObject({ exitCode: 3 });
+    partiallyWritten.length = 0;
+    const settlementReportInput = mocks.buildHealReport.mock.calls[0]?.[0] as {
+      readonly outcome: { readonly errors: readonly { readonly error: FsIoError }[] };
+    };
+    const wrappedSettlementError = settlementReportInput.outcome.errors[0]?.error;
+    expect(commitFailure.details?.partiallyWritten).toBe(originalErrorPartiallyWritten);
+    expect(commitFailure.details?.partiallyWritten).toEqual(['grounding']);
+    expect(wrappedSettlementError?.details?.partiallyWritten).not.toBe(originalErrorPartiallyWritten);
+    expect(wrappedSettlementError?.details?.partiallyWritten).not.toBe(partiallyWritten);
     expect(failed.commit).toHaveBeenCalledOnce();
     expect(succeeded.commit).toHaveBeenCalledOnce();
     expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({
       outcome: expect.objectContaining({
-        results: [expect.objectContaining({ id: 'committed.test.md' })],
-        errors: [expect.objectContaining({ file: '/workspace/tests/failed.test.md', error: expect.any(FsIoError) })],
+        results: [
+          expect.objectContaining({
+            id: failed.file,
+            application: 'partially-applied',
+            stopReason: 'settled',
+          }),
+          expect.objectContaining({
+            id: succeeded.file,
+            application: 'applied',
+            stopReason: 'settled',
+          }),
+        ],
+        errors: [expect.objectContaining({
+          file: failed.file,
+          error: expect.objectContaining({
+            kind: 'fs-io-error',
+            message: 'Healing artifacts could not be committed after persisting plan and grounding.',
+            details: { operation: 'write-grounding', partiallyWritten: ['plan', 'grounding'] },
+            cause: commitFailure,
+          }),
+        })],
         skipped: [{ file: '/workspace/tests/interrupted-stage3.test.md' }],
         interrupted: true,
       }),
     }));
   });
 
-  it('leaves successful result rows untouched during direct reconciliation', () => {
-    const original = outcome(); const pending = capability('login.test.md');
-    expect(reconcileHealCommitFailures(original, [{ caseId: pending.file, commit: pending, result: { outcome: 'committed' } }])).toBe(original);
+  const caughtPartiallyWritten: ('plan' | 'grounding')[] = ['plan'];
+  it.each([
+    {
+      name: 'a generic error',
+      commitFailure: new Error('rename failed'),
+      expectedDetails: { partiallyWritten: [] },
+      originalPartiallyWritten: undefined,
+    },
+    {
+      name: 'an FsIoError with structured context',
+      commitFailure: new FsIoError('rename failed', {
+        operation: 'rename-plan',
+        partiallyWritten: caughtPartiallyWritten,
+      }),
+      expectedDetails: { operation: 'rename-plan', partiallyWritten: [] },
+      originalPartiallyWritten: caughtPartiallyWritten,
+    },
+  ])('wraps $name thrown by a commit attempt with authoritative empty partial-write evidence', async ({ commitFailure, expectedDetails, originalPartiallyWritten }) => {
+    const failed = capability('thrown-commit.test.md');
+    vi.mocked(failed.commit).mockRejectedValue(commitFailure);
+    configure({
+      result: batch({
+        outcome: outcome({ results: [caseResult('thrown-commit.test.md')] }),
+        commits: commits(failed),
+      }),
+      built: report(3),
+    });
+
+    await expect(runHealCommand(input({ yes: true }))).resolves.toMatchObject({ exitCode: 3 });
+    const caughtReportInput = mocks.buildHealReport.mock.calls[0]?.[0] as {
+      readonly outcome: { readonly errors: readonly { readonly error: FsIoError }[] };
+    };
+    const outerWrappedError = caughtReportInput.outcome.errors[0]?.error;
+    if (originalPartiallyWritten !== undefined) {
+      originalPartiallyWritten.push('grounding');
+      expect(commitFailure).toBeInstanceOf(FsIoError);
+      expect((commitFailure as FsIoError).details?.partiallyWritten).toBe(originalPartiallyWritten);
+      expect((commitFailure as FsIoError).details?.partiallyWritten).toEqual(['plan', 'grounding']);
+      expect(outerWrappedError?.cause).toBeInstanceOf(FsIoError);
+      const innerWrappedError = outerWrappedError?.cause as FsIoError;
+      expect(outerWrappedError?.details?.partiallyWritten).toEqual([]);
+      expect(innerWrappedError.details?.partiallyWritten).toEqual([]);
+      expect(outerWrappedError?.details?.partiallyWritten).not.toBe(innerWrappedError.details?.partiallyWritten);
+    }
+
+    expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: expect.objectContaining({
+        results: [expect.objectContaining({ application: 'apply-failed', stopReason: 'settled' })],
+        errors: [expect.objectContaining({
+          file: failed.file,
+          error: expect.objectContaining({
+            kind: 'fs-io-error',
+            message: 'Healing artifacts could not be committed after persisting no artifacts.',
+            details: expectedDetails,
+            cause: expect.objectContaining({
+              kind: 'fs-io-error',
+              message: 'Healing artifacts could not be committed after persisting no artifacts.',
+              details: expectedDetails,
+              cause: commitFailure,
+            }),
+          }),
+        })],
+      }),
+    }));
   });
 
-  it('replaces a failed commit row with a case-scoped FsIoError retaining partial-write evidence', () => {
-    const original = outcome({ results: [caseResult('broken.test.md'), caseResult('saved.test.md')] });
-    const broken = capability('broken.test.md');
-    const reconciled = reconcileHealCommitFailures(original, [{ caseId: broken.file, commit: broken, result: { outcome: 'failed', error: new FsIoError('grounding write failed'), partiallyWritten: ['plan'] } }]);
-    expect(reconciled.results).toEqual([expect.objectContaining({ id: 'saved.test.md' })]);
-    expect(reconciled.errors).toEqual([expect.objectContaining({ file: '/workspace/tests/broken.test.md', error: expect.objectContaining({ kind: 'fs-io-error', details: expect.objectContaining({ partiallyWritten: ['plan'] }) }) })]);
+  it('keeps an apply-failed case with empty partial-write evidence', async () => {
+    const failed = capability('failed-before-write.test.md', {
+      outcome: 'failed',
+      error: new FsIoError('plan write failed', { partiallyWritten: ['grounding'] }),
+      partiallyWritten: [],
+    });
+    const partial = outcome({ results: [caseResult('failed-before-write.test.md', { repairOutcome: 'partially-healed', durationMs: 1 })] });
+    configure({ result: batch({ outcome: partial, commits: commits(failed) }) });
+    await useActualBuildHealReport();
+
+    const output = await runHealCommand(input({ yes: true }));
+
+    expect(output).toMatchObject({
+      exitCode: 3,
+      envelope: expect.objectContaining({
+        summary: expect.objectContaining({ errored: 1 }),
+        results: [expect.objectContaining({
+          id: 'tests/failed-before-write.test.md',
+          repairOutcome: 'partially-healed',
+          application: 'apply-failed',
+          stopReason: 'settled',
+        })],
+        errors: [expect.objectContaining({
+          scope: 'case',
+          code: 'FS_IO_ERROR',
+          caseId: 'tests/failed-before-write.test.md',
+          details: { partiallyWritten: [] },
+          message: 'Healing artifacts could not be committed after persisting no artifacts.',
+        })],
+      }),
+    });
+    expect(failed.commit).toHaveBeenCalledOnce();
+  });
+
+  it('uses settlement partial-write evidence for a partially-applied public report', async () => {
+    const failed = capability('failed-after-plan-write.test.md', {
+      outcome: 'failed',
+      error: new FsIoError('grounding write failed', { partiallyWritten: ['grounding'] }),
+      partiallyWritten: ['plan'],
+    });
+    const partial = outcome({ results: [caseResult('failed-after-plan-write.test.md', { repairOutcome: 'partially-healed', durationMs: 1 })] });
+    configure({ result: batch({ outcome: partial, commits: commits(failed) }) });
+    await useActualBuildHealReport();
+
+    const output = await runHealCommand(input({ yes: true }));
+
+    expect(output).toMatchObject({
+      exitCode: 3,
+      envelope: expect.objectContaining({
+        summary: expect.objectContaining({ errored: 1 }),
+        results: [expect.objectContaining({
+          id: 'tests/failed-after-plan-write.test.md',
+          repairOutcome: 'partially-healed',
+          application: 'partially-applied',
+          stopReason: 'settled',
+        })],
+        errors: [expect.objectContaining({
+          scope: 'case',
+          code: 'FS_IO_ERROR',
+          caseId: 'tests/failed-after-plan-write.test.md',
+          details: { partiallyWritten: ['plan'] },
+          message: 'Healing artifacts could not be committed after persisting plan.',
+        })],
+      }),
+    });
+    expect(failed.commit).toHaveBeenCalledOnce();
+  });
+
+  it('reports an invariant failure for malformed failed settlement evidence', async () => {
+    const failed = capability('malformed-failure.test.md', {
+      outcome: 'failed',
+      error: new FsIoError('write failed'),
+      partiallyWritten: 'plan',
+    } as unknown as HealCommitOutcome);
+    configure({ result: batch({ outcome: outcome({ results: [caseResult('malformed-failure.test.md')] }), commits: commits(failed) }) });
+    await useActualBuildHealReport();
+
+    await expect(runHealCommand(input({ yes: true }))).resolves.toMatchObject({
+      exitCode: 3,
+      envelope: expect.objectContaining({
+        results: [],
+        errors: [expect.objectContaining({
+          scope: 'run',
+          code: 'UNEXPECTED_CRASH',
+          message: 'Healing settlement invariant failed: malformed failed settlement for /workspace/tests/malformed-failure.test.md',
+        })],
+      }),
+    });
+  });
+
+  it('settles a multi-case interactive decline without committing any candidate', async () => {
+    const first = capability('first.test.md');
+    const second = capability('second.test.md');
+    const healed = outcome({ results: [caseResult('first.test.md', { durationMs: 1 }), caseResult('second.test.md', { durationMs: 1 })] });
+    configure({ result: batch({ outcome: healed, commits: commits(first, second) }), interactive: true, readConfirmationAnswer: vi.fn(async () => 'declined' as const) });
+    await useActualBuildHealReport();
+
+    await expect(runHealCommand(input())).resolves.toMatchObject({
+      exitCode: 1,
+      envelope: expect.objectContaining({
+        summary: expect.objectContaining({ failed: 2 }),
+        errors: [],
+        results: [
+          expect.objectContaining({ id: 'tests/first.test.md', application: 'declined', stopReason: 'settled' }),
+          expect.objectContaining({ id: 'tests/second.test.md', application: 'declined', stopReason: 'settled' }),
+        ],
+      }),
+    });
+    expect(first.commit).not.toHaveBeenCalled();
+    expect(second.commit).not.toHaveBeenCalled();
+  });
+
+  it('treats confirmation interruption as a run interruption without committing pending candidates', async () => {
+    const pending = capability('interrupted.test.md');
+    const healed = outcome({ results: [caseResult('interrupted.test.md', { durationMs: 1 })] });
+    configure({ result: batch({ outcome: healed, commits: commits(pending) }), interactive: true, readConfirmationAnswer: vi.fn(async () => 'interrupted' as const) });
+    await useActualBuildHealReport();
+
+    await expect(runHealCommand(input())).resolves.toMatchObject({
+      exitCode: 3,
+      envelope: expect.objectContaining({
+        errors: [expect.objectContaining({ scope: 'run', code: 'INTERRUPTED' })],
+        results: [expect.objectContaining({ id: 'tests/interrupted.test.md', application: 'not-applied-interrupted', stopReason: 'settled' })],
+      }),
+    });
+    expect(pending.commit).not.toHaveBeenCalled();
   });
 
   it('rounds only command duration before reporting and preserves fractional case duration', async () => {
-    const fractional = caseResult('fractional.test.md', { durationMs: 1.6 });
+    const fractional = caseResult('fractional.test.md', { repairOutcome: 'no-changes-needed', durationMs: 1.6 });
     configure({ result: batch({ outcome: outcome({ results: [fractional] }), commits: new Map() }), monotonic: [10, 12.6] });
     await expect(runHealCommand(input({ yes: true }))).resolves.toMatchObject({ exitCode: 0 });
     expect(mocks.buildHealReport).toHaveBeenCalledWith(expect.objectContaining({ durationMs: 3, outcome: expect.objectContaining({ results: [expect.objectContaining({ durationMs: 1.6 })] }) }));
@@ -466,7 +891,10 @@ describe('runHealCommand', () => {
     const projectRoot = '/workspace/project';
     const built = reportWithExecutionEvidence(projectRoot);
     configure({
-      result: batch({ commits: new Map() }),
+      result: batch({
+        outcome: outcome({ results: [caseResult('login.test.md', { repairOutcome: 'no-changes-needed' })] }),
+        commits: new Map(),
+      }),
       config: { ...CONFIG, projectRoot },
       built,
     });
