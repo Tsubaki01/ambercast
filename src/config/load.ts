@@ -110,7 +110,7 @@ export interface LoadConfigOptions {
  * `configRoot` is also exposed as `projectRoot` for report-path relativization.
  *
  * The merge applies top-level overrides, merges only one level of `ai`,
- * `viewer`, `ci`, and `grounding`, and replaces `targets` as a whole. Atomic target
+ * `viewer`, `ci`, `grounding`, and `heal`, and replaces `targets` as a whole. Atomic target
  * replacement means that when a raw file supplies `targets`, its record
  * entirely replaces `DEFAULT_RAW_CONFIG.targets`: the built-in `web-user`
  * target is gone rather than merged alongside the replacement record. In that
@@ -225,6 +225,10 @@ export async function loadConfig(options: LoadConfigOptions): Promise<ResolvedCo
       repositoryPolicy: overrides.grounding?.repositoryPolicy ?? DEFAULT_RAW_CONFIG.grounding.repositoryPolicy,
       localWriteBack: overrides.grounding?.localWriteBack ?? DEFAULT_RAW_CONFIG.grounding.localWriteBack,
     },
+    heal: {
+      ...(overrides.heal?.maxStepRepairs === undefined ? {} : { maxStepRepairs: overrides.heal.maxStepRepairs }),
+      caseTimeoutMs: overrides.heal?.caseTimeoutMs ?? DEFAULT_RAW_CONFIG.heal.caseTimeoutMs,
+    },
   };
 
   return defaultTarget === undefined ? config : { ...config, defaultTarget };
@@ -306,9 +310,21 @@ function rejectUnsafeRawKeys(document: unknown, configPath: string): void {
   }
 }
 
-function copyTargets(source: ResolvedConfig['targets']): ResolvedConfig['targets'] {
+/**
+ * Copies resolved targets while preserving their live replay-isolation setting.
+ *
+ * Configuration loading must default `healReplayIsolation` before runtime
+ * eligibility checks inspect a target, so an omitted setting is never treated
+ * as permissive. The digest projection occurs separately and picks
+ * only plan-relevant target fields; keeping this copy whole prevents that
+ * projection boundary from accidentally erasing the live-only policy first.
+ */
+function copyTargets(source: NonNullable<RawConfigShape['targets']> | ResolvedConfig['targets']): ResolvedConfig['targets'] {
   return Object.fromEntries(
-    Object.entries(source).map(([name, target]) => [name, { ...target }]),
+    Object.entries(source).map(([name, target]) => [name, {
+      ...target,
+      healReplayIsolation: target.healReplayIsolation ?? 'stateful',
+    }]),
   );
 }
 

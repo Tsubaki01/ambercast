@@ -70,12 +70,13 @@ const CONFIG: ResolvedConfig = {
   projectRoot: '/workspace',
   testMatch: ['**/*.test.md'],
   testIgnore: ['**/.runs/**'],
-  targets: { web: { baseUrl: 'https://example.test', browser: 'chromium' } },
+  targets: { web: { baseUrl: 'https://example.test', browser: 'chromium', healReplayIsolation: 'stateful' } },
   defaultTarget: 'web',
   ai: { provider: 'auto', timeoutMs: 120_000 },
   viewer: { port: 4600 },
   ci: { heal: false, updateGroundingCache: false },
   grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
+  heal: { caseTimeoutMs: 300_000 },
 };
 
 function reportOutput(exitCode: RunCommandOutput['exitCode'], errors: ReportError[] = []): RunCommandOutput {

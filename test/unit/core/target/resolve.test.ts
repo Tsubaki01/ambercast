@@ -1,16 +1,23 @@
 import { describe, expect, it } from 'vitest';
 import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import type { TargetDefinition } from '#core/ir/schema.js';
+import { computeInputsDigest } from '#core/ir/digest.js';
+import { normalizeTestMd } from '#core/ir/normalize.js';
 import {
   resolveTarget,
+  toTargetDefinition,
   type TargetSelection,
 } from '#core/target/resolve.js';
+import type { ResolvedTargetConfigEntry } from '#core/config/schema.js';
 
-const WEB = Object.freeze({ baseUrl: 'https://web.example.test', browser: 'chromium' as const });
-const ADMIN = Object.freeze({ baseUrl: 'https://admin.example.test', browser: 'chromium' as const });
-const MOBILE = Object.freeze({ baseUrl: 'https://mobile.example.test', browser: 'chromium' as const });
+const WEB = Object.freeze({ baseUrl: 'https://web.example.test', browser: 'chromium' as const, healReplayIsolation: 'stateful' as const });
+const ADMIN = Object.freeze({ baseUrl: 'https://admin.example.test', browser: 'chromium' as const, healReplayIsolation: 'stateful' as const });
+const MOBILE = Object.freeze({ baseUrl: 'https://mobile.example.test', browser: 'chromium' as const, healReplayIsolation: 'stateful' as const });
+const WEB_DEFINITION = toTargetDefinition(WEB);
+const ADMIN_DEFINITION = toTargetDefinition(ADMIN);
+const MOBILE_DEFINITION = toTargetDefinition(MOBILE);
 
-type Targets = Readonly<Record<string, Readonly<TargetDefinition>>>;
+type Targets = Readonly<Record<string, Readonly<ResolvedTargetConfigEntry>>>;
 type Resolution = TargetSelection | TargetUnresolvedError;
 
 function expectSelection(result: Resolution): asserts result is TargetSelection {
@@ -45,15 +52,41 @@ function inheritedTarget(name: string, definition: Readonly<TargetDefinition> = 
 }
 
 describe('resolveTarget', () => {
+  it('projects live replay isolation out of plan and input-digest target definitions', () => {
+    const idempotent: ResolvedTargetConfigEntry = { baseUrl: 'https://web.example.test', browser: 'chromium', healReplayIsolation: 'idempotent' };
+    const stateful: ResolvedTargetConfigEntry = { ...idempotent, healReplayIsolation: 'stateful' };
+
+    expect(toTargetDefinition(idempotent)).toEqual({ baseUrl: 'https://web.example.test', browser: 'chromium' });
+    expect(toTargetDefinition(stateful)).toEqual(toTargetDefinition(idempotent));
+    expect(toTargetDefinition(stateful)).not.toHaveProperty('healReplayIsolation');
+  });
+
+  it('keeps the resolved target selection input digest byte-identical across isolation-only configuration changes', () => {
+    const common = { baseUrl: 'https://web.example.test', browser: 'chromium' as const };
+    const idempotent: ResolvedTargetConfigEntry = { ...common, healReplayIsolation: 'idempotent' };
+    const stateful: ResolvedTargetConfigEntry = { ...common, healReplayIsolation: 'stateful' };
+    const digest = (target: ResolvedTargetConfigEntry) => {
+      const selected = resolveTarget({ targets: { web: target }, defaultTarget: 'web', explicitTarget: undefined });
+      expectSelection(selected);
+      return computeInputsDigest({
+        normalizedTestMd: normalizeTestMd('# test\n'),
+        schemaVersion: 2,
+        generatorPromptTemplateFingerprint: 'generator-template-fixture',
+        targetDefinitions: selected.definitions,
+      });
+    };
+
+    expect(digest(idempotent)).toBe(digest(stateful));
+  });
   it('gives an explicit own target precedence over a different valid default', () => {
     const targets = { web: WEB, admin: ADMIN };
 
     const result = resolveTarget({ targets, defaultTarget: 'web', explicitTarget: 'admin' });
 
     expectSelection(result);
-    expect(result).toEqual({ name: 'admin', definition: ADMIN, definitions: { admin: ADMIN } });
-    expect(result.definition).toBe(ADMIN);
-    expect(result.definitions.admin).toBe(ADMIN);
+    expect(result).toEqual({ name: 'admin', definition: ADMIN_DEFINITION, definitions: { admin: ADMIN_DEFINITION } });
+    expect(result.definition).toEqual(ADMIN_DEFINITION);
+    expect(result.definitions.admin).toEqual(ADMIN_DEFINITION);
   });
 
   it('honors an explicit own target even when the same target is eligible as the sole implicit key', () => {
@@ -63,7 +96,7 @@ describe('resolveTarget', () => {
 
     expectSelection(result);
     expect(result.name).toBe('admin');
-    expect(result.definition).toBe(ADMIN);
+    expect(result.definition).toEqual(ADMIN_DEFINITION);
   });
 
   it.each([
@@ -81,7 +114,7 @@ describe('resolveTarget', () => {
     const result = resolveTarget({ targets, defaultTarget: 'web', explicitTarget: undefined });
 
     expectSelection(result);
-    expect(result).toEqual({ name: 'web', definition: WEB, definitions: { web: WEB } });
+    expect(result).toEqual({ name: 'web', definition: WEB_DEFINITION, definitions: { web: WEB_DEFINITION } });
   });
 
   it('selects the sole enumerable own target when named selections are absent', () => {
@@ -90,7 +123,7 @@ describe('resolveTarget', () => {
     const result = resolveTarget({ targets, defaultTarget: undefined, explicitTarget: undefined });
 
     expectSelection(result);
-    expect(result).toEqual({ name: 'mobile', definition: MOBILE, definitions: { mobile: MOBILE } });
+    expect(result).toEqual({ name: 'mobile', definition: MOBILE_DEFINITION, definitions: { mobile: MOBILE_DEFINITION } });
   });
 
   it('classifies an empty implicit target record with a stable empty target-name list', () => {
@@ -133,8 +166,8 @@ describe('resolveTarget', () => {
 
     expectSelection(result);
     expect(result.name).toBe('hidden');
-    expect(result.definition).toBe(WEB);
-    expect(result.definitions.hidden).toBe(WEB);
+    expect(result.definition).toEqual(WEB_DEFINITION);
+    expect(result.definitions.hidden).toEqual(WEB_DEFINITION);
   });
 
   it.each([
@@ -157,7 +190,7 @@ describe('resolveTarget', () => {
 
   it('ignores an enumerable prototype target when computing implicit cardinality', () => {
     const prototype = Object.fromEntries([['inheritedCustomTarget', ADMIN]]);
-    const targets = Object.assign(Object.create(prototype) as Record<string, Readonly<TargetDefinition>>, {
+    const targets = Object.assign(Object.create(prototype) as Record<string, Readonly<ResolvedTargetConfigEntry>>, {
       web: WEB,
     });
 
@@ -167,7 +200,7 @@ describe('resolveTarget', () => {
     const result = resolveTarget({ targets, defaultTarget: undefined, explicitTarget: undefined });
 
     expectSelection(result);
-    expect(result).toEqual({ name: 'web', definition: WEB, definitions: { web: WEB } });
+    expect(result).toEqual({ name: 'web', definition: WEB_DEFINITION, definitions: { web: WEB_DEFINITION } });
   });
 
   it.each([
@@ -185,8 +218,8 @@ describe('resolveTarget', () => {
 
     expectSelection(result);
     expect(result.name).toBe(name);
-    expect(result.definition).toBe(WEB);
-    expect(result.definitions[name]).toBe(WEB);
+    expect(result.definition).toEqual(WEB_DEFINITION);
+    expect(result.definitions[name]).toEqual(WEB_DEFINITION);
   });
 
   it.each([
@@ -205,8 +238,8 @@ describe('resolveTarget', () => {
 
     expectSelection(result);
     expect(result.name).toBe('');
-    expect(result.definition).toBe(WEB);
-    expect(result.definitions['']).toBe(WEB);
+    expect(result.definition).toEqual(WEB_DEFINITION);
+    expect(result.definitions['']).toEqual(WEB_DEFINITION);
   });
 
   it('does not mutate frozen inputs and exposes only the selected definition by exact identity', () => {
@@ -223,8 +256,8 @@ describe('resolveTarget', () => {
     expectSelection(result);
     expect(Object.keys(result).sort()).toEqual(['definition', 'definitions', 'name']);
     expect(Object.keys(result.definitions)).toEqual(['web']);
-    expect(result.definition).toBe(WEB);
-    expect(result.definitions.web).toBe(WEB);
+    expect(result.definition).toEqual(WEB_DEFINITION);
+    expect(result.definitions.web).toEqual(WEB_DEFINITION);
     expect(Object.hasOwn(result.definitions, 'admin')).toBe(false);
     expect(Object.entries(targets)).toEqual(beforeEntries);
     expect(Object.isFrozen(targets)).toBe(true);
@@ -243,7 +276,7 @@ describe('resolveTarget', () => {
     expectSelection(result);
     expect(Object.keys(result.definitions)).toEqual(['__proto__']);
     expect(Object.hasOwn(result.definitions, '__proto__')).toBe(true);
-    expect(result.definitions.__proto__).toBe(WEB);
+    expect(result.definitions.__proto__).toEqual(WEB_DEFINITION);
     expect(Object.getPrototypeOf(result.definitions)).toBe(Object.prototype);
   });
 });

@@ -25,7 +25,7 @@ function healed(
     id: 'login.test.md', file: 'login.test.md', planFile: 'login.ambercast.plan.json', repairOutcome,
     application: repairOutcome === 'unresolved' ? 'no-artifact-change' : repairOutcome === 'no-changes-needed' ? 'no-artifact-change' : 'applied', stopReason: 'settled',
     steps: [], explanation: `The case is ${repairOutcome}.`, durationMs: 4,
-    baselineReachedIndex: 0, finalReachedIndex: repairOutcome === 'healed' ? 1 : 0,
+    baselineFirstFailureIndex: 0, finalFirstFailureIndex: repairOutcome === 'healed' ? 1 : 0,
     stage3Error: error, finalReplayError: undefined,
   };
 }

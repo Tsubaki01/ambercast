@@ -86,9 +86,14 @@ vi.mock('#core/ir/grounding-recovery-mode.js', async (importOriginal) => {
 const TEST_DIR = '/workspace/tests';
 const RUNS_DIR = '/workspace/tests/.runs';
 const TARGETS = { web: { baseUrl: 'https://example.test', browser: 'chromium' } } as const;
+const RESOLVED_TARGETS = { web: { ...TARGETS.web, healReplayIsolation: 'stateful' as const } } as const;
 const MULTI_TARGETS = {
   web: { baseUrl: 'https://example.test', browser: 'chromium' },
   staging: { baseUrl: 'https://staging.example.test', browser: 'chromium' },
+} as const;
+const RESOLVED_MULTI_TARGETS = {
+  web: { ...MULTI_TARGETS.web, healReplayIsolation: 'stateful' as const },
+  staging: { ...MULTI_TARGETS.staging, healReplayIsolation: 'stateful' as const },
 } as const;
 const PROMPT = '# Sign in\n\nWhen I submit valid credentials, I reach the dashboard.\n';
 const DEFAULT_INSTRUCTION_COVERAGE = [{
@@ -217,7 +222,7 @@ function createScenario(overrides: Partial<RunDeps> = {}): Scenario {
       testDir: TEST_DIR,
       testMatch: ['**/*.test.md'],
       testIgnore: ['**/.runs/**'],
-      targets: TARGETS,
+      targets: RESOLVED_TARGETS,
       defaultTarget: 'web',
       ai: { provider: 'codex', timeoutMs: 120_000 },
       ci: { heal: false, updateGroundingCache: false },
@@ -422,7 +427,7 @@ function configWithAiTimeout(timeoutMs: number): RunDeps['config'] {
     testDir: TEST_DIR,
     testMatch: ['**/*.test.md'],
     testIgnore: ['**/.runs/**'],
-    targets: TARGETS,
+    targets: RESOLVED_TARGETS,
     defaultTarget: 'web',
     ai: { provider: 'codex', timeoutMs },
     ci: { heal: false, updateGroundingCache: false },
@@ -710,7 +715,7 @@ describe('run', () => {
         testDir: TEST_DIR,
         testMatch: ['**/*.test.md'],
         testIgnore: ['**/.runs/**'],
-        targets: MULTI_TARGETS,
+        targets: RESOLVED_MULTI_TARGETS,
         defaultTarget: 'web',
         ai: { provider: 'codex', timeoutMs: 120_000 },
         ci: { heal: false, updateGroundingCache: false },
@@ -737,7 +742,7 @@ describe('run', () => {
         testDir: TEST_DIR,
         testMatch: ['**/*.test.md'],
         testIgnore: [],
-        targets: TARGETS,
+        targets: RESOLVED_TARGETS,
         defaultTarget: 'web',
         ai: { provider: 'codex' as const, timeoutMs: 120_000 },
         ci: { heal: false, updateGroundingCache: false },
@@ -753,7 +758,7 @@ describe('run', () => {
         testDir: TEST_DIR,
         testMatch: ['**/*.test.md'],
         testIgnore: [],
-        targets: MULTI_TARGETS,
+        targets: RESOLVED_MULTI_TARGETS,
         ai: { provider: 'codex' as const, timeoutMs: 120_000 },
         ci: { heal: false, updateGroundingCache: false },
         grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
@@ -807,11 +812,12 @@ describe('run', () => {
     const inheritedDefinition = {
       baseUrl: 'https://inherited.example.test',
       browser: 'chromium' as const,
+      healReplayIsolation: 'stateful' as const,
     };
     const prototype = Object.fromEntries([[inheritedName, inheritedDefinition]]);
     const targets = Object.assign(
       Object.create(prototype) as Record<string, Readonly<typeof inheritedDefinition>>,
-      { web: TARGETS.web },
+      { web: RESOLVED_TARGETS.web },
     ) as RunDeps['config']['targets'];
     expect(Object.hasOwn(targets, 'web')).toBe(true);
     expect(Object.hasOwn(targets, inheritedName)).toBe(false);
@@ -864,7 +870,9 @@ describe('run', () => {
       baseUrl: 'https://replacement.example.test',
       browser: 'chromium' as const,
     };
-    const soleTargets = { replacement: soleDefinition };
+    const soleTargets = {
+      replacement: { ...soleDefinition, healReplayIsolation: 'stateful' as const },
+    };
     const session = createFakeBrowserSession(new Map());
     const launch = vi.fn<BrowserDriver['launch']>(async () => session);
     const driver: BrowserDriver = { engine: 'chromium', launch };
@@ -882,14 +890,15 @@ describe('run', () => {
       },
     });
     const testPath = await writePrompt(recordingStorage.storage);
-    await seedFreshArtifacts(recordingStorage.storage, testPath, [], {}, soleTargets);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [], {}, { replacement: soleDefinition });
 
     const outcome = await run(deps, DEFAULT_OPTIONS);
 
     expect(outcome.results[0]?.result.status).toBe('passed');
     expect(outcome.results[0]?.error).toBeUndefined();
     expect(launch).toHaveBeenCalledOnce();
-    expect(launch.mock.calls[0]?.[0]).toBe(soleDefinition);
+    expect(launch.mock.calls[0]?.[0]).toStrictEqual(soleDefinition);
+    expect(launch.mock.calls[0]?.[0]).not.toBe(soleDefinition);
   });
 
   it.each([
@@ -910,7 +919,7 @@ describe('run', () => {
         testDir: TEST_DIR,
         testMatch: ['**/*.test.md'],
         testIgnore: [],
-        targets: MULTI_TARGETS,
+        targets: RESOLVED_MULTI_TARGETS,
         defaultTarget: 'web',
         ai: { provider: 'codex', timeoutMs: 120_000 },
         ci: { heal: false, updateGroundingCache: false },
@@ -934,13 +943,14 @@ describe('run', () => {
 
     expect(outcome.results[0]?.result.status).toBe('passed');
     expect(outcome.results[0]?.error).toBeUndefined();
-    expect(launch.mock.calls[0]?.[0]).toBe(expectedDefinition);
+    expect(launch.mock.calls[0]?.[0]).toStrictEqual(expectedDefinition);
+    expect(launch.mock.calls[0]?.[0]).not.toBe(expectedDefinition);
   });
 
   it('treats a selected target change as stale while ignoring an unrelated target change', async () => {
     const selectedChanged = {
-      web: { baseUrl: 'https://changed.example.test', browser: 'chromium' as const },
-      staging: MULTI_TARGETS.staging,
+      web: { baseUrl: 'https://changed.example.test', browser: 'chromium' as const, healReplayIsolation: 'stateful' as const },
+      staging: { ...MULTI_TARGETS.staging, healReplayIsolation: 'stateful' as const },
     };
     const changedScenario = createScenario({
       config: {
@@ -963,8 +973,8 @@ describe('run', () => {
     expect(changedScenario.browserDriver).not.toHaveBeenCalled();
 
     const unrelatedChanged = {
-      web: TARGETS.web,
-      staging: { baseUrl: 'https://changed-staging.example.test', browser: 'chromium' as const },
+      web: RESOLVED_TARGETS.web,
+      staging: { baseUrl: 'https://changed-staging.example.test', browser: 'chromium' as const, healReplayIsolation: 'stateful' as const },
     };
     const unrelatedScenario = createScenario({
       config: {
@@ -1013,7 +1023,7 @@ describe('run', () => {
         testDir: TEST_DIR,
         testMatch: ['**/*.test.md'],
         testIgnore: [],
-        targets: TARGETS,
+        targets: RESOLVED_TARGETS,
         ai: { provider: 'codex', timeoutMs: 120_000 },
         ci: { heal: false, updateGroundingCache: false },
         grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
@@ -1323,11 +1333,23 @@ describe('run', () => {
     };
     const DENY_EVERYWHERE_TARGETS: RunDeps['config']['targets'] = {
       web: {
+        ...RESOLVED_TARGETS.web,
+        secretSinkOrigins: { [SECRET_REF]: [] },
+      },
+    };
+    const DENY_EVERYWHERE_TARGET_DEFINITIONS: PlanDocument['targets'] = {
+      web: {
         ...TARGETS.web,
         secretSinkOrigins: { [SECRET_REF]: [] },
       },
     };
     const IDP_ONLY_TARGETS: RunDeps['config']['targets'] = {
+      web: {
+        ...RESOLVED_TARGETS.web,
+        secretSinkOrigins: { [SECRET_REF]: ['https://idp.example.test'] },
+      },
+    };
+    const IDP_ONLY_TARGET_DEFINITIONS: PlanDocument['targets'] = {
       web: {
         ...TARGETS.web,
         secretSinkOrigins: { [SECRET_REF]: ['https://idp.example.test'] },
@@ -1344,7 +1366,7 @@ describe('run', () => {
         secrets,
       });
       const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${SECRET_REF}\n`);
-      await seedFreshArtifacts(recordingStorage.storage, testPath, [FILL_STEP], elementGrounding([FILL_STEP.id]), DENY_EVERYWHERE_TARGETS);
+      await seedFreshArtifacts(recordingStorage.storage, testPath, [FILL_STEP], elementGrounding([FILL_STEP.id]), DENY_EVERYWHERE_TARGET_DEFINITIONS);
 
       const outcome = await run(deps, DEFAULT_OPTIONS);
 
@@ -1374,7 +1396,7 @@ describe('run', () => {
         secrets,
       });
       const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${SECRET_REF}\n`);
-      await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep('recorded-ai', [SECRET_REF])], {}, DENY_EVERYWHERE_TARGETS);
+      await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep('recorded-ai', [SECRET_REF])], {}, DENY_EVERYWHERE_TARGET_DEFINITIONS);
 
       const outcome = await run(deps, DEFAULT_OPTIONS);
 
@@ -1388,9 +1410,9 @@ describe('run', () => {
     });
 
     it.each([
-      ['allows the default policy at the base URL origin', TARGETS, TARGETS.web.baseUrl, true],
-      ['denies the default policy at a different origin', TARGETS, 'https://idp.example.test/login', false],
-    ] as const)('%s', async (_description, targets, currentUrl, allowed) => {
+      ['allows the default policy at the base URL origin', RESOLVED_TARGETS, TARGETS, TARGETS.web.baseUrl, true],
+      ['denies the default policy at a different origin', RESOLVED_TARGETS, TARGETS, 'https://idp.example.test/login', false],
+    ] as const)('%s', async (_description, targets, targetDefinitions, currentUrl, allowed) => {
       const session = createFakeBrowserSession(liveEntries([PASSWORD]), { currentUrl });
       const { deps, recordingStorage } = createScenario({
         browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
@@ -1398,7 +1420,7 @@ describe('run', () => {
         secrets: createFakeSecretsProvider(new Map([[SECRET_REF, SECRET_VALUE]])),
       });
       const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `${PROMPT}\n${SECRET_REF}\n`);
-      await seedFreshArtifacts(recordingStorage.storage, testPath, [FILL_STEP], elementGrounding([FILL_STEP.id]), targets);
+      await seedFreshArtifacts(recordingStorage.storage, testPath, [FILL_STEP], elementGrounding([FILL_STEP.id]), targetDefinitions);
 
       const outcome = await run(deps, DEFAULT_OPTIONS);
 
@@ -1426,7 +1448,7 @@ describe('run', () => {
         secrets: createFakeSecretsProvider(new Map([[SECRET_REF, SECRET_VALUE]])),
       });
       const allowedPath = await writePrompt(allowedScenario.recordingStorage.storage, 'allowed.test.md', `${PROMPT}\n${SECRET_REF}\n`);
-      await seedFreshArtifacts(allowedScenario.recordingStorage.storage, allowedPath, [FILL_STEP], elementGrounding([FILL_STEP.id]), IDP_ONLY_TARGETS);
+      await seedFreshArtifacts(allowedScenario.recordingStorage.storage, allowedPath, [FILL_STEP], elementGrounding([FILL_STEP.id]), IDP_ONLY_TARGET_DEFINITIONS);
 
       const allowedOutcome = await run(allowedScenario.deps, DEFAULT_OPTIONS);
 
@@ -1450,7 +1472,7 @@ describe('run', () => {
         secrets: createFakeSecretsProvider(new Map([[SECRET_REF, SECRET_VALUE]])),
       });
       const deniedPath = await writePrompt(deniedScenario.recordingStorage.storage, 'denied.test.md', `${PROMPT}\n${SECRET_REF}\n`);
-      await seedFreshArtifacts(deniedScenario.recordingStorage.storage, deniedPath, [FILL_STEP], elementGrounding([FILL_STEP.id]), IDP_ONLY_TARGETS);
+      await seedFreshArtifacts(deniedScenario.recordingStorage.storage, deniedPath, [FILL_STEP], elementGrounding([FILL_STEP.id]), IDP_ONLY_TARGET_DEFINITIONS);
 
       const deniedOutcome = await run(deniedScenario.deps, DEFAULT_OPTIONS);
 
@@ -1547,6 +1569,9 @@ describe('run', () => {
         snapshot: wideSnapshot,
       });
       const wideTargets: RunDeps['config']['targets'] = {
+        web: { ...RESOLVED_TARGETS.web, secretSinkOrigins: { [SECRET_REF]: ['https://idp.example.test'] } },
+      };
+      const wideTargetDefinitions: PlanDocument['targets'] = {
         web: { ...TARGETS.web, secretSinkOrigins: { [SECRET_REF]: ['https://idp.example.test'] } },
       };
       const wideScenario = createScenario({
@@ -1559,7 +1584,7 @@ describe('run', () => {
         secrets: createFakeSecretsProvider(new Map([[SECRET_REF, SECRET_VALUE]])),
       });
       const widePath = await writePrompt(wideScenario.recordingStorage.storage, 'wide.test.md', `${PROMPT}\n${SECRET_REF}\n`);
-      const widePlan = await createFreshPlan(wideScenario.recordingStorage.storage, widePath, [FILL_STEP], wideTargets);
+      const widePlan = await createFreshPlan(wideScenario.recordingStorage.storage, widePath, [FILL_STEP], wideTargetDefinitions);
       const wideLayout = createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR });
       await wideScenario.recordingStorage.storage.writeText(
         wideLayout.planPathFor(widePath),
@@ -1596,7 +1621,7 @@ describe('run', () => {
         testPath,
         [{ id: 'leave-target', kind: 'action', action: 'navigate', url: 'https://idp.example.test/login' }],
         {},
-        IDP_ONLY_TARGETS,
+        IDP_ONLY_TARGET_DEFINITIONS,
       );
 
       const outcome = await run(deps, DEFAULT_OPTIONS);
@@ -5654,7 +5679,7 @@ describe('run failure evidence', () => {
         browserDriver: () => createFakeBrowserDriver(() => session), secrets: createFakeSecretsProvider(new Map()),
         resolveAiExecutor: async () => createFakeAiExecutor(), events: createRecordingEventSink().sink,
         discoverTestFiles: async () => [],
-        config: { testDir, testMatch: ['**/*.test.md'], testIgnore: ['**/.runs/**'], targets: TARGETS, defaultTarget: 'web', ai: { provider: 'codex', timeoutMs: 120_000 }, ci: { heal: false, updateGroundingCache: false }, grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' } },
+        config: { testDir, testMatch: ['**/*.test.md'], testIgnore: ['**/.runs/**'], targets: RESOLVED_TARGETS, defaultTarget: 'web', ai: { provider: 'codex', timeoutMs: 120_000 }, ci: { heal: false, updateGroundingCache: false }, grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' } },
         isCI: false,
       }, { files: [testPath], cacheOnly: false, updateCache: false, allowEmpty: false, list: false, stale: 'fail' });
       const result = outcome.results[0]?.result;

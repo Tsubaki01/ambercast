@@ -29,6 +29,7 @@ const RUNS_DIR = `${TEST_DIR}/.runs`;
 const TEST_PATH = `${TEST_DIR}/covered.test.md`;
 const PROMPT = '# Covered replay\n\nReach the dashboard.\n';
 const TARGETS = { web: { baseUrl: 'https://example.test', browser: 'chromium' as const } };
+const RESOLVED_TARGETS = { web: { ...TARGETS.web, healReplayIsolation: 'stateful' as const } };
 const OPTIONS: RunOptions = {
   files: [TEST_PATH],
   cacheOnly: false,
@@ -213,7 +214,7 @@ function scenario(
       testDir: TEST_DIR,
       testMatch: ['**/*.test.md'],
       testIgnore: ['**/.runs/**'],
-      targets: TARGETS,
+      targets: RESOLVED_TARGETS,
       defaultTarget: 'web',
       ai: { provider: 'codex', timeoutMs: 1000 },
       ci: { heal: false, updateGroundingCache: false },

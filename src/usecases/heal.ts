@@ -1,4 +1,5 @@
 import type { AmbercastError } from '#core/errors/types.js';
+import type { ResolvedConfig } from '#core/config/schema.js';
 import type { FsIoError } from '#core/errors/fs-io-error.js';
 import type { StepResult } from '#report/schema.js';
 import type { StorageAdapter } from '#ports/storage.js';
@@ -10,7 +11,8 @@ import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { normalizeTestMd, type NormalizedTestMd } from '#core/ir/normalize.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { groundingRecoveryModeForStep } from '#core/ir/grounding-recovery-mode.js';
-import { PlanDocument, GeneratedPlanResponse, type GroundingDocument, type JsonValueT } from '#core/ir/schema.js';
+import { PlanDocument, GeneratedPlanResponse, type GroundingDocument, type JsonValueT, type Step } from '#core/ir/schema.js';
+import type { LayoutResolver } from '#core/layout/resolve.js';
 import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
 import { buildGeneratorTask, promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { resolveTarget } from '#core/target/resolve.js';
@@ -21,6 +23,8 @@ import { FsIoError as FsIoErrorClass } from '#core/errors/fs-io-error.js';
 import { AmbercastError as AmbercastErrorClass } from '#core/errors/types.js';
 import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
 import { BatchInterruptionTracker } from './batch-interruption.js';
+import { obligationFingerprintMatches } from '#core/ir/obligation-fingerprint.js';
+import { joinPath } from '#core/paths.js';
 
 /**
  * Selection and write-intent choices for one healing batch.
@@ -57,19 +61,18 @@ export interface HealOptions {
 }
 
 /**
- * Capabilities available to the healing state machine.
+ * Dependencies available to healing, including its resolved case-wide limits.
  *
  * @remarks
- * This extends `RunDeps` instead of copying its fields so replay keeps the
- * established dependency contract as it evolves. The state machine projects a
- * `GenerateDeps` value only when full regeneration is needed: it reuses the
- * common capabilities and resolves the lazy replay executor at that boundary,
- * where generation requires an already-resolved executor. Keeping the wider
- * surface here avoids making cache-hit-only healing resolve AI eagerly.
+ * Healing deliberately replaces, rather than widens, `RunDeps.config`: ordinary
+ * replay must not acquire a heal-specific configuration requirement merely
+ * because healing reuses it. The intersection retains the established replay
+ * configuration surface while making the resolved `heal` limits available to
+ * the state machine before it schedules any repair work.
  */
-// The named extension preserves heal's projection boundary without copying RunDeps.
-// eslint-disable-next-line @typescript-eslint/no-empty-object-type
-export interface HealDeps extends RunDeps {}
+export type HealDeps = Omit<RunDeps, 'config'> & {
+  readonly config: RunDeps['config'] & Pick<ResolvedConfig, 'heal'>;
+};
 
 /** A selected file retained for discovery-only or interruption reporting. */
 export type HealListedFile = { readonly file: string };
@@ -94,10 +97,10 @@ export interface HealCaseError {
  * The execution-backed result for one healed case.
  *
  * @remarks
- * The two reached indices measure the furthest confirmed passed prefix before
- * and after repair, rather than counting failures in a fail-fast replay.
- * `-1` means dispatch never began for a nonempty plan, preserving the
- * distinction between a pre-launch failure and a failure at the first step.
+ * The two first-failure indices identify the first failed or errored step
+ * before and after repair. They equal `plan.steps.length` when every step
+ * passed, that step's index when a failed or errored step produces evidence,
+ * and `-1` when failure occurs before any step produces evidence.
  * `stage3Error` records failure while producing a full regenerated candidate;
  * `finalReplayError` records the classified failure attached to the last
  * replay actually performed. They remain separate because successful
@@ -131,11 +134,21 @@ export interface HealCaseOutcome {
   /** Measured case duration before report-boundary integer normalization. */
   readonly durationMs: number;
 
-  /** Furthest baseline passed-prefix index, with `-1` for pre-dispatch failure. */
-  readonly baselineReachedIndex: number;
+  /** Baseline first-failure index: all passed → N (`plan.steps.length`); first failed/error step → its index; pre-evidence failure → -1 (below every real index). */
+  readonly baselineFirstFailureIndex: number;
 
-  /** Furthest final replay passed-prefix index, with the same sentinel meaning. */
-  readonly finalReachedIndex: number;
+  /** Final first-failure index: all passed → N (`plan.steps.length`); first failed/error step → its index; pre-evidence failure → -1 (below every real index). */
+  readonly finalFirstFailureIndex: number;
+
+  /**
+   * Completed-loop exit cause, kept separate from the measured repair result.
+   *
+   * A deadline and an attempt ceiling constrain whether another dispatch may
+   * start; neither changes whether the retained measurement advanced beyond
+   * the baseline. Consumers can therefore distinguish a settled repair from
+   * an otherwise identical partial result stopped by a resource boundary.
+   */
+  readonly stopReason: 'settled' | 'attempt-limit' | 'deadline';
 
   /** Classified failure encountered while constructing a full-plan candidate. */
   readonly stage3Error: AmbercastError | undefined;
@@ -192,7 +205,7 @@ export interface HealCaseCommit {
   /** Prompt file whose buffered artifacts this capability may persist. */
   readonly file: string;
 
-  /** Plan companion that will be updated if the commit succeeds. */
+  /** Plan companion updated by a successful commit. */
   readonly planFile: string;
 
   /** Neutral repair description for a confirmation prompt. */
@@ -302,7 +315,55 @@ type ResolveCaseAiExecutor = () => Promise<ResolvedAiExecutor>;
 
 type ReplayMeasurement =
   | { readonly interrupted: true }
-  | { readonly interrupted: false; readonly replay: RunCaseOutcome; readonly reachedIndex: number };
+  | {
+    readonly interrupted: false;
+    readonly replay: RunCaseOutcome;
+    readonly firstFailureIndex: number;
+    readonly attemptOrdinal: number;
+    readonly evidenceDir: string;
+  };
+
+/**
+ * One adopted frontier replacement retained as provider context for later repairs.
+ *
+ * Only improvements enter this closed record: rejected or discarded candidates
+ * must not influence a later request. The paired indices prove strict frontier
+ * progress, and the nullable category preserves the meaningful absence of a
+ * step classification when replay produced no step evidence.
+ */
+interface RepairHistoryEntry {
+  readonly stepId: string;
+  readonly before: Step;
+  readonly after: Step;
+  readonly fromFirstFailureIndex: number;
+  readonly toFirstFailureIndex: number;
+  readonly failureCategory: StepResult['type'] | null;
+}
+
+/**
+ * Projects replay results into the minimal evidence allowed in provider context.
+ *
+ * The projection retains only step identity and pass/fail status. It excludes
+ * screenshots and every page-evidence field, because provider context must not
+ * acquire filesystem locations or browser evidence merely as repair history
+ * grows across iterations.
+ */
+function toProviderReplayEvidence(steps: readonly StepResult[]): readonly StepResult[] {
+  return steps.map(({ id, type, status }) => ({ id, type, status }));
+}
+
+/**
+ * Creates the layout view for one monotonically numbered replay attempt.
+ *
+ * The decorator preserves every injected layout capability except
+ * `runsDirFor`, whose result gains an attempt-specific child directory. A
+ * single case-wide ordinal prevents baseline, Stage 1, Stage 2, and Stage 3
+ * screenshots from overwriting one another while keeping discarded evidence
+ * available for diagnosis.
+ */
+function attemptScopedLayout(layout: LayoutResolver, attemptOrdinal: number): LayoutResolver {
+  return { ...layout, runsDirFor: (file, runId) => joinPath(layout.runsDirFor(file, runId), `attempt-${attemptOrdinal}`) };
+}
 
 type RepairKind = 'grounding-element' | 'grounding-ai-retrace' | 'tail' | 'full-plan';
 
@@ -343,26 +404,33 @@ async function measureReplay(
   overlay: HealOverlayStorage,
   plan: TrustedPlan,
   cacheOnly: boolean,
+  attemptOrdinal: number,
 ): Promise<ReplayMeasurement> {
-  const batch = await run({ ...deps, storage: overlay.storage }, replayOptions(file, options, cacheOnly));
+  const evidenceDir = attemptScopedLayout(deps.layout, attemptOrdinal).runsDirFor(file, deps.runId);
+  const batch = await run({ ...deps, storage: overlay.storage, layout: attemptScopedLayout(deps.layout, attemptOrdinal) }, replayOptions(file, options, cacheOnly));
   const replay = batch.results[0];
   if (batch.interrupted || replay === undefined) return { interrupted: true };
 
   return {
     interrupted: false,
     replay,
-    reachedIndex: reachedIndex(replay, plan),
+    firstFailureIndex: firstFailureIndex(replay, plan),
+    attemptOrdinal,
+    evidenceDir,
   };
 }
 
 /**
- * Computes the furthest passed prefix while retaining pre-launch failures.
+ * Computes the first-failure index: all passed steps yield N
+ * (`plan.steps.length`); the first failed or errored step yields its index;
+ * and failure before any step produces evidence yields -1, ordered below every
+ * real index.
  *
  * `run()` has no step evidence when it fails before dispatch, and treating
  * that state as a failure of the first step would make repair scope falsely
- * specific. The negative sentinel remains ordered below every real index.
+ * specific.
  */
-function reachedIndex(replay: RunCaseOutcome, plan: TrustedPlan): number {
+function firstFailureIndex(replay: RunCaseOutcome, plan: TrustedPlan): number {
   const steps = replay.result.steps;
   if (steps.filter((step) => step.status === 'passed').length === plan.steps.length) return plan.steps.length;
   return steps.findIndex((step) => step.status === 'failed' || step.status === 'error');
@@ -431,9 +499,10 @@ async function tryGroundingRepair(
   overlay: HealOverlayStorage,
   plan: TrustedPlan,
   baseline: ReplayMeasurement & { readonly interrupted: false },
+  nextAttemptOrdinal: () => number,
 ): Promise<ReplayMeasurement> {
-  if (baseline.reachedIndex < 0 || baseline.reachedIndex >= plan.steps.length) return baseline;
-  const failingStep = plan.steps[baseline.reachedIndex]!;
+  if (baseline.firstFailureIndex < 0 || baseline.firstFailureIndex >= plan.steps.length) return baseline;
+  const failingStep = plan.steps[baseline.firstFailureIndex]!;
   const mode = groundingRecoveryModeForStep(failingStep);
   if (mode === 'none') return baseline;
 
@@ -454,8 +523,8 @@ async function tryGroundingRepair(
     delete grounding.entries[failingStep.id];
     await overlay.storage.writeText(groundingFile, toCanonicalArtifactText(grounding as JsonValueT));
   }
-  const measurement = await measureReplay(deps, options, file, overlay, plan, false);
-  if (measurement.interrupted || measurement.reachedIndex <= baseline.reachedIndex) {
+  const measurement = await measureReplay(deps, options, file, overlay, plan, false, nextAttemptOrdinal());
+  if (measurement.interrupted || measurement.firstFailureIndex <= baseline.firstFailureIndex) {
     overlay.restore(snapshot);
     return measurement.interrupted ? measurement : baseline;
   }
@@ -487,13 +556,13 @@ function claimedPrefixGrantOffsets(plan: TrustedPlan, start: number, normalized:
 }
 
 /**
- * Replaces the failing tail and verifies its full committed form before replay.
+ * Replaces one failing step and verifies its full committed form before replay.
  *
  * The overlay snapshot keeps an invalid provider response or partial pair from
  * contaminating the later full-regeneration attempt; only a fully validated
  * candidate may become the next measurement input.
  */
-async function tryTailRepair(
+async function trySingleStepRepair(
   deps: HealDeps,
   resolveAiExecutor: ResolveCaseAiExecutor,
   options: HealOptions,
@@ -505,51 +574,52 @@ async function tryTailRepair(
   plan: TrustedPlan,
   baseline: ReplayMeasurement & { readonly interrupted: false },
   measurement: ReplayMeasurement & { readonly interrupted: false },
+  repairHistory: readonly RepairHistoryEntry[],
+  nextAttemptOrdinal: () => number,
 ): Promise<{ readonly plan: TrustedPlan; readonly measurement: ReplayMeasurement }> {
-  if (measurement.reachedIndex >= plan.steps.length) return { plan, measurement };
+  if (measurement.firstFailureIndex >= plan.steps.length) return { plan, measurement };
 
   const snapshot = overlay.snapshot();
-  const start = Math.max(0, measurement.reachedIndex);
-  const ids = plan.steps.slice(start).map((step) => step.id);
+  const start = measurement.firstFailureIndex;
+  const step = plan.steps[start]!;
   try {
     const executor = await resolveAiExecutor();
     const response = await executor.execute({
-      prompt: buildGeneratorTask('Repair the requested failing plan tail. Return replacement steps only for the requested step IDs, preserving each ID and their original order. Use the supplied test prompt, target definitions, plan continuity, and replay evidence to repair the failure.'),
+      prompt: buildGeneratorTask('Repair the requested failing plan step. Return exactly one replacement step with the requested ID, preserving its kind and obligations. Use the supplied test prompt, target definitions, plan continuity, and replay evidence to repair the failure.'),
       responseSchema: typedJsonSchema(GeneratedPlanResponse),
       context: {
         testMd: normalized,
         targets: plan.targets,
         replacement: {
-          stepIds: ids,
-          startIndex: start,
-          prefix: plan.steps.slice(0, start),
-          tail: plan.steps.slice(start),
+          stepId: step.id,
+          index: start,
         },
         baselineFailure: {
           explanation: baseline.replay.result.explanation,
-          failingStep: baseline.reachedIndex < 0 ? undefined : plan.steps[baseline.reachedIndex],
-          steps: baseline.replay.result.steps,
+          failingStep: baseline.firstFailureIndex < 0 ? undefined : plan.steps[baseline.firstFailureIndex],
+          steps: toProviderReplayEvidence(baseline.replay.result.steps),
         },
         currentFailure: {
           explanation: measurement.replay.result.explanation,
-          failingStep: measurement.reachedIndex < 0 ? undefined : plan.steps[measurement.reachedIndex],
-          steps: measurement.replay.result.steps,
+          failingStep: measurement.firstFailureIndex < 0 ? undefined : plan.steps[measurement.firstFailureIndex],
+          steps: toProviderReplayEvidence(measurement.replay.result.steps),
         },
+        repairHistory,
       } as unknown as JsonValueT,
       ...(deps.signal === undefined ? {} : { signal: deps.signal }),
     });
     const generated = GeneratedPlanResponse.parse(response.data);
-    const generatedIds = generated.steps.map((step) => step.id);
-    if (generatedIds.length !== ids.length || new Set(generatedIds).size !== ids.length || ids.some((id) => !generatedIds.includes(id))) {
+    if (generated.steps.length !== 1 || generated.steps[0]?.id !== step.id) {
       throw new Error('Replacement IDs mismatch.');
     }
 
     const prepared = prepareInstructionCoveredSteps(generated, normalized, claimedPrefixGrantOffsets(plan, start, normalized));
     if (!prepared.success) throw new Error('Instruction coverage is invalid.');
-    const replacementById = new Map(normalizeAiStepSecretGrants(prepared.data).map((step) => [step.id, step]));
+    const replacement = normalizeAiStepSecretGrants(prepared.data)[0]!;
+    if (!obligationFingerprintMatches(step, replacement)) throw new Error('Replacement obligations mismatch.');
     const candidate = PlanDocument.parse({
       ...plan,
-      steps: [...plan.steps.slice(0, start), ...ids.map((id) => replacementById.get(id)!)],
+      steps: [...plan.steps.slice(0, start), replacement, ...plan.steps.slice(start + 1)],
     });
     assertCommittedSecretAttributionSound(candidate, normalized);
     for (const step of candidate.steps) {
@@ -560,7 +630,7 @@ async function tryTailRepair(
     assertNoLiteralSecrets(candidate);
 
     const previousGrounding = JSON.parse(await overlay.storage.readText(groundingFile)) as GroundingDocument;
-    const entries = Object.fromEntries(Object.entries(previousGrounding.entries).filter(([id]) => !ids.includes(id)));
+    const entries = Object.fromEntries(Object.entries(previousGrounding.entries).filter(([id]) => id !== step.id));
     await overlay.storage.writeText(planFile, toCanonicalArtifactText(candidate as JsonValueT));
     await overlay.storage.writeText(groundingFile, toCanonicalArtifactText({
       schemaVersion: 1,
@@ -568,9 +638,16 @@ async function tryTailRepair(
       entries,
     } as JsonValueT));
 
-    const replay = await measureReplay(deps, options, file, overlay, candidate, false);
-    if (replay.interrupted) overlay.restore(snapshot);
-    return { plan: replay.interrupted ? plan : candidate, measurement: replay.interrupted ? { interrupted: true } : replay };
+    const replay = await measureReplay(deps, options, file, overlay, candidate, false, nextAttemptOrdinal());
+    if (replay.interrupted) {
+      overlay.restore(snapshot);
+      return { plan, measurement: { interrupted: true } };
+    }
+    if (replay.firstFailureIndex <= measurement.firstFailureIndex) {
+      overlay.restore(snapshot);
+      return { plan, measurement };
+    }
+    return { plan: candidate, measurement: replay };
   } catch {
     overlay.restore(snapshot);
     if (deps.signal?.aborted) return { plan, measurement: { interrupted: true } };
@@ -596,6 +673,7 @@ async function tryFullPlanRepair(
   digest: string,
   plan: TrustedPlan,
   measurement: ReplayMeasurement & { readonly interrupted: false },
+  nextAttemptOrdinal: () => number,
 ): Promise<{ readonly plan: TrustedPlan; readonly measurement: ReplayMeasurement; readonly stage3Error: AmbercastError | undefined; readonly replayed: boolean }> {
   const snapshot = overlay.snapshot();
   try {
@@ -628,7 +706,7 @@ async function tryFullPlanRepair(
     }
 
     const regeneratedPlan = (await readTrustedInstructionCoveredPlan(overlay.storage, planFile, digest, normalized)).plan;
-    const replay = await measureReplay(deps, options, file, overlay, regeneratedPlan, false);
+    const replay = await measureReplay(deps, options, file, overlay, regeneratedPlan, false, nextAttemptOrdinal());
     if (replay.interrupted) {
       overlay.restore(snapshot);
       return { plan, measurement: replay, stage3Error: undefined, replayed: false };
@@ -657,20 +735,20 @@ async function tryFullPlanRepair(
 function caseOutcome(
   file: string,
   planFile: string,
-  options: HealOptions,
   baseline: number,
   measurement: ReplayMeasurement & { readonly interrupted: false },
   plan: TrustedPlan,
   stage3Error: AmbercastError | undefined,
   fullPlanReplayed: boolean,
+  stopReason: HealCaseOutcome['stopReason'],
 ): HealCaseOutcome {
   const repairOutcome = fullPlanReplayed
-    ? (measurement.reachedIndex === plan.steps.length ? 'healed' : 'unresolved')
+    ? (measurement.firstFailureIndex === plan.steps.length ? 'healed' : 'unresolved')
     : baseline === plan.steps.length
       ? 'no-changes-needed'
-      : measurement.reachedIndex === plan.steps.length
+      : measurement.firstFailureIndex === plan.steps.length
         ? 'healed'
-        : measurement.reachedIndex > baseline
+        : measurement.firstFailureIndex > baseline
           ? 'partially-healed'
           : 'unresolved';
   return {
@@ -681,8 +759,9 @@ function caseOutcome(
     steps: measurement.replay.result.steps,
     explanation: measurement.replay.result.explanation,
     durationMs: measurement.replay.result.durationMs,
-    baselineReachedIndex: baseline,
-    finalReachedIndex: measurement.reachedIndex,
+    baselineFirstFailureIndex: baseline,
+    finalFirstFailureIndex: measurement.firstFailureIndex,
+    stopReason,
     stage3Error,
     finalReplayError: measurement.replay.error,
   };
@@ -694,6 +773,20 @@ function caseOutcome(
  * Returning interruption separately prevents a partially attempted case from
  * being mistaken for a normal error or result. The outer batch owns skipped
  * identity reporting because only it knows the remaining selected suffix.
+ *
+ * @remarks
+ * The repair phase iterates one frontier at a time. A visited-frontier set
+ * records every non-sentinel frontier before Stage 1 so a replay that regresses
+ * to an earlier index cannot dispatch work there again. Each iteration
+ * measures first, then runs Stage 1, and runs Stage 2 only when Stage 1 does not
+ * advance the frontier. Immediately before every provider dispatch, the
+ * deadline takes precedence over the attempt ceiling; neither limit applies to
+ * a non-dispatching recovery. A failed, discarded, exhausted, or revisited
+ * incremental path enters Stage 3, whose unsuccessful full-plan replay
+ * restores the best pre-Stage-3 incremental candidate. The resulting full
+ * pass, resource-bound, and Stage-3 states are classified from the retained
+ * measurement and stop reason, keeping measured progress separate from why
+ * iteration stopped.
  */
 async function healCase(deps: HealDeps, options: HealOptions, file: string): Promise<CaseProcessingResult> {
   const planFile = deps.layout.planPathFor(file);
@@ -709,45 +802,112 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
   };
   const caseDeps: HealDeps = { ...deps, resolveAiExecutor: resolveCaseAiExecutor };
   let plan = preflight.plan;
-  let measurement = await measureReplay(caseDeps, options, file, overlay, plan, true);
+  let attemptOrdinal = 0;
+  const nextAttemptOrdinal = () => ++attemptOrdinal;
+  const deadline = caseDeps.clock.monotonicMs() + caseDeps.config.heal.caseTimeoutMs;
+  let measurement = await measureReplay(caseDeps, options, file, overlay, plan, true, nextAttemptOrdinal());
   if (measurement.interrupted) return measurement;
 
-  const baseline = measurement.reachedIndex;
+  const baseline = measurement.firstFailureIndex;
   let repairKind: RepairKind | undefined;
   let stage3Error: AmbercastError | undefined;
   let fullPlanReplayed = false;
+  let stopReason: HealCaseOutcome['stopReason'] = 'settled';
+  let stage3Required = baseline !== plan.steps.length;
+  const structuralCeiling = plan.steps.length - baseline;
+  const maxDispatches = Math.min(structuralCeiling, caseDeps.config.heal.maxStepRepairs ?? Infinity);
+  let chargedDispatches = 0;
+  const visitedFrontiers = new Set<number>();
+  const repairHistory: RepairHistoryEntry[] = [];
+  let remeasureOnEntry = true;
 
-  if (baseline !== plan.steps.length) {
+  const dispatchAllowed = (): boolean => {
+    if (caseDeps.clock.monotonicMs() >= deadline) {
+      stopReason = 'deadline';
+      return false;
+    }
+    if (chargedDispatches >= maxDispatches) {
+      stopReason = 'attempt-limit';
+      return false;
+    }
+    chargedDispatches += 1;
+    return true;
+  };
+  const groundingRepairDispatches = async (frontier: number, mode: ReturnType<typeof groundingRecoveryModeForStep>): Promise<boolean> => {
+    if (mode !== 'ai-retrace') return false;
+    const grounding = JSON.parse(await overlay.storage.readText(groundingFile)) as GroundingDocument;
+    const entry = grounding.entries[plan.steps[frontier]!.id];
+    return entry === undefined || entry.kind !== 'ai' || isLegacyShapedTrace(entry.trace);
+  };
+
+  while (stage3Required) {
+    if (remeasureOnEntry) {
+      measurement = await measureReplay(caseDeps, options, file, overlay, plan, false, nextAttemptOrdinal());
+      if (measurement.interrupted) return measurement;
+    }
+    remeasureOnEntry = true;
+    if (measurement.firstFailureIndex === plan.steps.length) {
+      stage3Required = false;
+      stopReason = 'settled';
+      break;
+    }
+    if (measurement.firstFailureIndex === -1 || visitedFrontiers.has(measurement.firstFailureIndex)) break;
+    const frontier = measurement.firstFailureIndex;
+    visitedFrontiers.add(frontier);
+    const mode = groundingRecoveryModeForStep(plan.steps[frontier]!);
+    if (await groundingRepairDispatches(frontier, mode) && !dispatchAllowed()) break;
     const beforeGrounding = measurement;
-    measurement = await tryGroundingRepair(caseDeps, options, file, groundingFile, overlay, plan, measurement);
+    measurement = await tryGroundingRepair(caseDeps, options, file, groundingFile, overlay, plan, measurement, nextAttemptOrdinal);
     if (measurement.interrupted) return measurement;
-    if (measurement !== beforeGrounding) {
-      repairKind = groundingRecoveryModeForStep(plan.steps[baseline]!) === 'element-reground'
-        ? 'grounding-element'
-        : 'grounding-ai-retrace';
+    if (measurement.firstFailureIndex > frontier) {
+      repairKind = mode === 'element-reground' ? 'grounding-element' : 'grounding-ai-retrace';
+      continue;
     }
+    if (mode === 'element-reground' || !dispatchAllowed()) break;
+    const beforePlan = plan;
+    const beforeMeasurement = measurement;
+    const repaired = await trySingleStepRepair(caseDeps, resolveCaseAiExecutor, options, file, planFile, groundingFile, overlay, preflight.normalized, plan, beforeGrounding, measurement, repairHistory, nextAttemptOrdinal);
+    plan = repaired.plan;
+    measurement = repaired.measurement;
+    if (measurement.interrupted) return measurement;
+    if (plan === beforePlan || measurement.firstFailureIndex <= frontier) break;
+    repairKind = 'tail';
+    repairHistory.push({
+      stepId: beforePlan.steps[frontier]!.id,
+      before: beforePlan.steps[frontier]!,
+      after: plan.steps[frontier]!,
+      fromFirstFailureIndex: frontier,
+      toFirstFailureIndex: measurement.firstFailureIndex,
+      failureCategory: beforePlan.steps[frontier]!.kind,
+    });
+    if (beforeMeasurement === measurement) break;
+  }
 
-    if (measurement.reachedIndex >= 0 && measurement.reachedIndex < plan.steps.length) {
-      const planBeforeTail = plan;
-      const tail = await tryTailRepair(caseDeps, resolveCaseAiExecutor, options, file, planFile, groundingFile, overlay, preflight.normalized, plan, beforeGrounding, measurement);
-      plan = tail.plan;
-      measurement = tail.measurement;
-      if (measurement.interrupted) return measurement;
-      if (plan !== planBeforeTail) repairKind = 'tail';
-    }
-
-    if (measurement.reachedIndex < plan.steps.length) {
-      const full = await tryFullPlanRepair(caseDeps, resolveCaseAiExecutor, options, file, planFile, overlay, preflight.normalized, preflight.digest, plan, measurement);
-      plan = full.plan;
-      measurement = full.measurement;
-      if (measurement.interrupted) return measurement;
+  if (stage3Required && measurement.firstFailureIndex < plan.steps.length) {
+    if (caseDeps.clock.monotonicMs() >= deadline) {
+      stopReason = 'deadline';
+    } else {
+      const bestPlan = plan;
+      const bestMeasurement = measurement;
+      const bestSnapshot = overlay.snapshot();
+      const full = await tryFullPlanRepair(caseDeps, resolveCaseAiExecutor, options, file, planFile, overlay, preflight.normalized, preflight.digest, plan, measurement, nextAttemptOrdinal);
+      if (full.measurement.interrupted) return full.measurement;
       stage3Error = full.stage3Error;
-      fullPlanReplayed = full.replayed;
-      if (full.replayed) repairKind = 'full-plan';
+      if (full.replayed && full.measurement.firstFailureIndex === full.plan.steps.length) {
+        plan = full.plan;
+        measurement = full.measurement;
+        repairKind = 'full-plan';
+        fullPlanReplayed = true;
+        stopReason = 'settled';
+      } else {
+        overlay.restore(bestSnapshot);
+        plan = bestPlan;
+        measurement = bestMeasurement;
+      }
     }
   }
 
-  const outcome = caseOutcome(file, planFile, options, baseline, measurement, plan, stage3Error, fullPlanReplayed);
+  const outcome = caseOutcome(file, planFile, baseline, measurement, plan, stage3Error, fullPlanReplayed, stopReason);
   const commit = (outcome.repairOutcome === 'healed' || outcome.repairOutcome === 'partially-healed') && overlay.hasBufferedWrites()
     ? commitFor(file, planFile, overlay, repairKind ?? 'grounding-element')
     : undefined;

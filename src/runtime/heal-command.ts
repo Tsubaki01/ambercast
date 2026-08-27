@@ -26,6 +26,7 @@ import { FsIoError } from '#core/errors/fs-io-error.js';
 import { isAbsolutePath, joinPath } from '#core/paths.js';
 import { AmbercastError, type ExitCode } from '#core/errors/types.js';
 import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
+import { resolveTarget } from '#core/target/resolve.js';
 import { heal, type HealBatchResult } from '#usecases/heal.js';
 import { buildHealReport, type SettledHealOutcome } from '#usecases/heal-report.js';
 import type { FinalizedReportEnvelope } from '#usecases/report-finalization.js';
@@ -217,14 +218,16 @@ export async function promptForHealConfirmation(
  * @param settlements - Results of commit capabilities attempted after authorization.
  * @returns A distinct settled outcome with mandatory report application facts.
  * @remarks
- * The mapping is total and every settled row has `stopReason: 'settled'`. For
- * `no-changes-needed` and `unresolved`, the
- * per-case reconciliation never reaches confirmation; a batch-level
- * confirmation for other rows has no effect on their result:
+ * The mapping is total and preserves the measurement-owned `stopReason`.
+ * `no-changes-needed` is always `'settled'` because its loop never starts.
+ * A row without a commit capability retains `no-artifact-change`; in
+ * particular, an unresolved row that reached Stage 3 can retain either
+ * `'settled'` or `'attempt-limit'` without being reclassified by settlement.
+ * A batch-level confirmation for other rows has no effect on these rows:
  *
  * | Measured repair outcome | Per-case settlement | Application |
  * | --- | --- | --- |
- * | `no-changes-needed` or `unresolved` | absent | `no-artifact-change` |
+ * | no commit capability | absent | `no-artifact-change` |
  *
  * For every commit-capable `healed` or `partially-healed` row, the remaining
  * confirmation and settlement combinations are exhaustive:
@@ -295,11 +298,17 @@ function settleHealOutcome(
     const settlement = settlementsByCaseId.get(result.id);
     switch (result.repairOutcome) {
       case 'no-changes-needed':
-      case 'unresolved':
         if (settlement !== undefined) {
           unexpected(`${result.repairOutcome} case has a commit settlement: ${result.id}`);
         }
         return { ...result, application: 'no-artifact-change' as const, stopReason: 'settled' as const };
+      case 'unresolved':
+        if (settlement !== undefined) {
+          unexpected(`${result.repairOutcome} case has a commit settlement: ${result.id}`);
+        }
+        return result.stopReason === 'deadline'
+          ? { ...result, application: 'not-eligible' as const }
+          : { ...result, application: 'no-artifact-change' as const };
       case 'healed':
       case 'partially-healed':
         switch (confirmation) {
@@ -307,17 +316,17 @@ function settleHealOutcome(
             if (!dryRun || settlement !== undefined) {
               unexpected(`non-preview ${result.repairOutcome} case lacks an authorized settlement: ${result.id}`);
             }
-            return { ...result, application: 'preview-only' as const, stopReason: 'settled' as const };
+            return { ...result, application: 'preview-only' as const };
           case 'declined':
             if (settlement !== undefined) {
               unexpected(`declined ${result.repairOutcome} case has a commit settlement: ${result.id}`);
             }
-            return { ...result, application: 'declined' as const, stopReason: 'settled' as const };
+            return { ...result, application: 'declined' as const };
           case 'interrupted':
             if (settlement !== undefined) {
               unexpected(`interrupted ${result.repairOutcome} case has a commit settlement: ${result.id}`);
             }
-            return { ...result, application: 'not-applied-interrupted' as const, stopReason: 'settled' as const };
+            return { ...result, application: 'not-applied-interrupted' as const };
           case 'authorized':
             if (dryRun) {
               unexpected(`authorized ${result.repairOutcome} case occurred during a dry run: ${result.id}`);
@@ -326,7 +335,7 @@ function settleHealOutcome(
               unexpected(`authorized ${result.repairOutcome} case lacks a commit settlement: ${result.id}`);
             }
             if (settlement.result.outcome === 'committed') {
-              return { ...result, application: 'applied' as const, stopReason: 'settled' as const };
+              return { ...result, application: 'applied' as const };
             }
             if (settlement.result.outcome === 'failed') {
               const partiallyWritten = settlement.result.partiallyWritten;
@@ -350,7 +359,6 @@ function settleHealOutcome(
               return {
                 ...result,
                 application: partiallyWritten.length === 0 ? 'apply-failed' as const : 'partially-applied' as const,
-                stopReason: 'settled' as const,
               };
             }
             return unexpected(`unknown settlement outcome: ${String((settlement.result as { readonly outcome: unknown }).outcome)}`);
@@ -488,6 +496,17 @@ export async function runHealCommand(
 
     if (!input.list && isCI && !config.ci.heal) {
       throw new ConfigInvalidError('Healing is disabled in CI; set ci.heal to true to enable it.');
+    }
+    if (!input.list) {
+      const target = resolveTarget({
+        targets: config.targets,
+        defaultTarget: config.defaultTarget,
+        explicitTarget: input.target,
+      });
+      if (target instanceof AmbercastError) throw target;
+      if (config.targets[target.name]!.healReplayIsolation !== 'idempotent') {
+        throw new ConfigInvalidError('Healing requires the selected target to set healReplayIsolation to idempotent.');
+      }
     }
 
     const result: HealBatchResult = await heal(deps, options);

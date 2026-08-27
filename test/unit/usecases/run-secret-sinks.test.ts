@@ -53,6 +53,7 @@ import { createFakeCommandRunner } from '../../doubles/create-fake-command-runne
 const TEST_DIR = '/workspace/tests';
 const RUNS_DIR = '/workspace/tests/.runs';
 const TARGETS = { web: { baseUrl: 'https://example.test', browser: 'chromium' } } as const;
+const RESOLVED_TARGETS = { web: { ...TARGETS.web, healReplayIsolation: 'stateful' as const } } as const;
 const PROMPT = '# Sign in\n\nWhen I submit valid credentials, I reach the dashboard.\n';
 const SECRET_REF = '{{secrets.AMBERCAST_SECRET_DUMMY}}';
 const SECRET_VALUE = 'sk-AMBERCAST_SECRET_DUMMY';
@@ -234,7 +235,7 @@ function createRunScenario(
         testDir: TEST_DIR,
         testMatch: ['**/*.test.md'],
         testIgnore: ['**/.runs/**'],
-        targets: TARGETS,
+        targets: RESOLVED_TARGETS,
         defaultTarget: 'web',
         ai: { provider: 'codex', timeoutMs: 120_000 },
         ci: { heal: false, updateGroundingCache: false },
@@ -304,7 +305,7 @@ function createGenerateScenario(
         testDir: TEST_DIR,
         testMatch: ['**/*.test.md'],
         testIgnore: ['**/.runs/**'],
-        targets: TARGETS,
+        targets: RESOLVED_TARGETS,
         defaultTarget: 'web',
         ai: { provider: 'codex', timeoutMs: aiTimeoutMs },
       },

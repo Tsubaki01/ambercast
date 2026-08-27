@@ -48,12 +48,13 @@ const CONFIG: ResolvedConfig = {
   projectRoot: '/workspace',
   testMatch: ['**/*.test.md'],
   testIgnore: ['**/.runs/**'],
-  targets: { web: { baseUrl: 'https://example.test', browser: 'chromium' } },
+  targets: { web: { baseUrl: 'https://example.test', browser: 'chromium', healReplayIsolation: 'stateful' } },
   defaultTarget: 'web',
   ai: { provider: 'auto', timeoutMs: 120_000 },
   viewer: { port: 4600 },
   ci: { heal: false, updateGroundingCache: false },
   grounding: { repositoryPolicy: 'committed', localWriteBack: 'auto' },
+  heal: { caseTimeoutMs: 300_000 },
 };
 
 function input(overrides: Partial<CheckCommandInput> = {}): CheckCommandInput {
@@ -158,10 +159,10 @@ describe('runCheckCommand', () => {
           normalizedTestMd: normalizeTestMd(prompt),
           schemaVersion: 2,
           generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
-          targetDefinitions: { web: CONFIG.targets.web! },
+          targetDefinitions: { web: { baseUrl: CONFIG.targets.web!.baseUrl, browser: CONFIG.targets.web!.browser } },
         }),
       },
-      targets: { web: CONFIG.targets.web! },
+      targets: { web: { baseUrl: CONFIG.targets.web!.baseUrl, browser: CONFIG.targets.web!.browser } },
       steps: [],
     } as unknown as PlanDocument;
     await storage.writeText(testPath, prompt);
@@ -201,7 +202,7 @@ describe('runCheckCommand', () => {
       ...CONFIG,
       testDir: '/workspace/overridden-tests',
       runsDir: '/workspace/overridden-tests/.runs',
-      targets: { admin: { baseUrl: 'https://admin.example.test', browser: 'chromium' } },
+      targets: { admin: { baseUrl: 'https://admin.example.test', browser: 'chromium', healReplayIsolation: 'stateful' } },
       defaultTarget: 'admin',
     } as const satisfies ResolvedConfig;
     const outcome = { noTestsFound: true, results: [], errors: [] } as const;

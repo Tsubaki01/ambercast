@@ -30,6 +30,7 @@ import { createRecordingEventSink } from '../../doubles/create-recording-event-s
 const TEST_DIR = '/workspace/tests';
 const RUNS_DIR = '/workspace/tests/.runs';
 const TARGETS = { web: { baseUrl: 'https://example.test', browser: 'chromium' } } as const;
+const RESOLVED_TARGETS = { web: { ...TARGETS.web, healReplayIsolation: 'stateful' as const } } as const;
 const PROMPT = '# Sign in\n\nWhen I submit valid credentials, I reach the dashboard.\n';
 const RESPONSE: GeneratedPlanResponse = { steps: [], ambiguities: [] };
 const FIRST_SECRET_REF = '{{secrets.FOO}}';
@@ -219,7 +220,7 @@ function createScenario(overrides: Partial<GenerateDeps> = {}) {
       testDir: TEST_DIR,
       testMatch: ['**/*.test.md'],
       testIgnore: ['**/.runs/**'],
-      targets: TARGETS,
+      targets: RESOLVED_TARGETS,
       defaultTarget: 'web',
       ai: { provider: 'codex', timeoutMs: 100 },
     },
@@ -651,6 +652,7 @@ describe('generate', () => {
         baseUrl: 'https://example.test',
         browser: 'chromium' as const,
         secretSinkOrigins: { '{{secrets.app.password}}': ['https://idp.example.test'] },
+        healReplayIsolation: 'stateful' as const,
       },
     };
     const { deps, recordingStorage } = createScenario({
@@ -670,7 +672,13 @@ describe('generate', () => {
     });
 
     const plan = PlanDocument.parse(JSON.parse(await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.plan.json`)));
-    expect(plan.targets).toEqual(targets);
+    expect(plan.targets).toEqual({
+      web: {
+        baseUrl: targets.web.baseUrl,
+        browser: targets.web.browser,
+        secretSinkOrigins: targets.web.secretSinkOrigins,
+      },
+    });
   });
 
   it.each([
@@ -952,7 +960,7 @@ describe('generate', () => {
 
   it('selects the sole own target when configuration omits defaultTarget', async () => {
     const soleTargets = {
-      replacement: { baseUrl: 'https://replacement.example.test', browser: 'chromium' as const },
+      replacement: { baseUrl: 'https://replacement.example.test', browser: 'chromium' as const, healReplayIsolation: 'stateful' as const },
     };
     const { deps, execute, recordingStorage } = createScenario({
       config: {
@@ -973,12 +981,21 @@ describe('generate', () => {
       readonly targets: GenerateDeps['config']['targets'];
     };
     expect(Object.keys(context.targets)).toEqual(['replacement']);
-    expect(context.targets.replacement).toBe(soleTargets.replacement);
+    expect(context.targets.replacement).toEqual({
+      baseUrl: soleTargets.replacement.baseUrl,
+      browser: soleTargets.replacement.browser,
+    });
+    expect(context.targets.replacement).not.toHaveProperty('healReplayIsolation');
     const plan = PlanDocument.parse(JSON.parse(
       await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.plan.json`),
     ));
     expect(Object.keys(plan.targets)).toEqual(['replacement']);
-    expect(plan.targets).toEqual(soleTargets);
+    expect(plan.targets).toEqual({
+      replacement: {
+        baseUrl: soleTargets.replacement.baseUrl,
+        browser: soleTargets.replacement.browser,
+      },
+    });
   });
 
   it.each([
@@ -988,7 +1005,7 @@ describe('generate', () => {
         testDir: TEST_DIR,
         testMatch: ['**/*.test.md'],
         testIgnore: [],
-        targets: TARGETS,
+        targets: RESOLVED_TARGETS,
         defaultTarget: 'web',
         ai: { provider: 'codex' as const, timeoutMs: 100 },
       },
@@ -1003,8 +1020,8 @@ describe('generate', () => {
         testMatch: ['**/*.test.md'],
         testIgnore: [],
         targets: {
-          web: TARGETS.web,
-          admin: { baseUrl: 'https://admin.example.test', browser: 'chromium' as const },
+          web: RESOLVED_TARGETS.web,
+          admin: { baseUrl: 'https://admin.example.test', browser: 'chromium' as const, healReplayIsolation: 'stateful' as const },
         },
         ai: { provider: 'codex' as const, timeoutMs: 100 },
       },
@@ -1055,11 +1072,12 @@ describe('generate', () => {
     const inheritedDefinition = {
       baseUrl: 'https://inherited.example.test',
       browser: 'chromium' as const,
+      healReplayIsolation: 'stateful' as const,
     };
     const prototype = Object.fromEntries([[inheritedName, inheritedDefinition]]);
     const targets = Object.assign(
       Object.create(prototype) as Record<string, Readonly<typeof inheritedDefinition>>,
-      { web: TARGETS.web },
+      { web: RESOLVED_TARGETS.web },
     ) as GenerateDeps['config']['targets'];
     expect(Object.hasOwn(targets, 'web')).toBe(true);
     expect(Object.hasOwn(targets, inheritedName)).toBe(false);
@@ -1111,8 +1129,8 @@ describe('generate', () => {
     expectedName,
   ) => {
     const targets = {
-      web: TARGETS.web,
-      admin: { baseUrl: 'https://admin.example.test', browser: 'chromium' as const },
+      web: RESOLVED_TARGETS.web,
+      admin: { baseUrl: 'https://admin.example.test', browser: 'chromium' as const, healReplayIsolation: 'stateful' as const },
     };
     const { deps, execute, recordingStorage } = createScenario({
       config: {
@@ -1129,13 +1147,17 @@ describe('generate', () => {
     await generate(deps, { ...DEFAULT_OPTIONS, ...(target === undefined ? {} : { target }) });
 
     expect(execute).toHaveBeenCalledOnce();
-    const expectedDefinition = targets[expectedName];
+    const expectedDefinition = {
+      baseUrl: targets[expectedName].baseUrl,
+      browser: targets[expectedName].browser,
+    };
     const otherName = expectedName === 'web' ? 'admin' : 'web';
     const context = execute.mock.calls[0]?.[0].context as {
       readonly targets: GenerateDeps['config']['targets'];
     };
     expect(Object.keys(context.targets)).toEqual([expectedName]);
-    expect(context.targets[expectedName]).toBe(expectedDefinition);
+    expect(context.targets[expectedName]).toEqual(expectedDefinition);
+    expect(context.targets[expectedName]).not.toHaveProperty('healReplayIsolation');
     expect(Object.hasOwn(context.targets, otherName)).toBe(false);
     const plan = PlanDocument.parse(JSON.parse(
       await recordingStorage.storage.readText(`${TEST_DIR}/login.ambercast.plan.json`),
@@ -1147,12 +1169,12 @@ describe('generate', () => {
 
   it('regenerates for a changed selected target but ignores an unrelated target change', async () => {
     const selectedChanged = {
-      web: { baseUrl: 'https://changed.example.test', browser: 'chromium' as const },
-      admin: { baseUrl: 'https://admin.example.test', browser: 'chromium' as const },
+      web: { baseUrl: 'https://changed.example.test', browser: 'chromium' as const, healReplayIsolation: 'stateful' as const },
+      admin: { baseUrl: 'https://admin.example.test', browser: 'chromium' as const, healReplayIsolation: 'stateful' as const },
     };
     const unrelatedChanged = {
-      web: TARGETS.web,
-      admin: { baseUrl: 'https://changed-admin.example.test', browser: 'chromium' as const },
+      web: RESOLVED_TARGETS.web,
+      admin: { baseUrl: 'https://changed-admin.example.test', browser: 'chromium' as const, healReplayIsolation: 'stateful' as const },
     };
 
     const changedScenario = createScenario({
@@ -1241,7 +1263,7 @@ describe('generate', () => {
     let observedSignal: AbortSignal | undefined;
     const { deps, recordingStorage } = createScenario({
       signal: caller.signal,
-      config: { testDir: TEST_DIR, testMatch: ['**/*.test.md'], testIgnore: [], targets: TARGETS, defaultTarget: 'web', ai: sequentialTimeoutConfig([101, 102]) },
+      config: { testDir: TEST_DIR, testMatch: ['**/*.test.md'], testIgnore: [], targets: RESOLVED_TARGETS, defaultTarget: 'web', ai: sequentialTimeoutConfig([101, 102]) },
       aiExecutor: createFakeAiExecutor({
         execute: (request) => {
           if (request.context !== null && typeof request.context === 'object' && 'testMd' in request.context && request.context.testMd === 'first') {
