@@ -1,6 +1,7 @@
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
+import { planProducerBundleFingerprint } from '#core/ai/plan-producer-bundle.js';
 import {
   PlanDocument,
   type GeneratedPlanResponse,
@@ -75,6 +76,7 @@ registerUsecaseEmitsEventsContract([
         normalizedTestMd: normalizeTestMd(PROMPT),
         schemaVersion: 2,
         generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
+        planProducerBundleFingerprint: planProducerBundleFingerprint(),
         targetDefinitions: TARGETS,
       });
       const plan = PlanDocument.parse({

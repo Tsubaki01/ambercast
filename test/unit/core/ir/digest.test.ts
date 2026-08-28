@@ -25,6 +25,7 @@ function createInputs(overrides: Partial<DigestInputs> = {}): DigestInputs {
     normalizedTestMd: asNormalizedTestMd('# Smoke\n'),
     schemaVersion: 2,
     generatorPromptTemplateFingerprint: 'generator-template-v2',
+    planProducerBundleFingerprint: 'producer-bundle-v1',
     targetDefinitions: { app: targetDefinition() },
     ...overrides,
   };
@@ -85,10 +86,10 @@ describe('computeInputsDigest', () => {
   });
 
   // The expected SHA-256 was calculated without calling the implementation.
-  // Its exact JCS preimage is {"generatorPromptTemplateFingerprint":"generator-template-v2","normalizedTestMd":"# Smoke\n","schemaVersion":2,"targetDefinitions":{"app":{"baseUrl":"https://example.test","browser":"chromium"}}}.
-  // Command: printf '%s' '{"generatorPromptTemplateFingerprint":"generator-template-v2","normalizedTestMd":"# Smoke\n","schemaVersion":2,"targetDefinitions":{"app":{"baseUrl":"https://example.test","browser":"chromium"}}}' | shasum -a 256
+  // Its exact JCS preimage is {"generatorPromptTemplateFingerprint":"generator-template-v2","normalizedTestMd":"# Smoke\n","planProducerBundleFingerprint":"producer-bundle-v1","schemaVersion":2,"targetDefinitions":{"app":{"baseUrl":"https://example.test","browser":"chromium"}}}.
+  // Command: printf '%s' '{"generatorPromptTemplateFingerprint":"generator-template-v2","normalizedTestMd":"# Smoke\n","planProducerBundleFingerprint":"producer-bundle-v1","schemaVersion":2,"targetDefinitions":{"app":{"baseUrl":"https://example.test","browser":"chromium"}}}' | shasum -a 256
   it('matches the independently derived SHA-256 oracle for the fixed preimage', () => {
-    expect(computeInputsDigest(createInputs())).toBe('8bc85d6ea7d1d835870ef68982bd8b3831e203c197e9aff3d60ea75768e5911b');
+    expect(computeInputsDigest(createInputs())).toBe('7500082d9b70d1e2186bb1043b80538395d38de0a37a112ca70f2125de647385');
   });
 
   // The `-?` modifier prevents a future optional DigestInputs field from silently evading this completeness check.
@@ -110,6 +111,10 @@ describe('computeInputsDigest', () => {
     generatorPromptTemplateFingerprint: {
       displayName: 'generator prompt-template fingerprint',
       mutate: (inputs) => ({ ...inputs, generatorPromptTemplateFingerprint: 'generator-template-v2-mutated' }),
+    },
+    planProducerBundleFingerprint: {
+      displayName: 'plan producer-bundle fingerprint',
+      mutate: (inputs) => ({ ...inputs, planProducerBundleFingerprint: 'producer-bundle-v1-mutated' }),
     },
     targetDefinitions: {
       displayName: 'target definitions',
@@ -168,7 +173,7 @@ describe('computeInputsDigest', () => {
     expect(computeInputsDigest(reordered)).toBe(computeInputsDigest(first));
   });
 
-  it('hashes only its four declared fields when passed a structurally wider runtime object', () => {
+  it('hashes only its five declared fields when passed a structurally wider runtime object', () => {
     const declaredInputs = createInputs();
     const widerRuntimeInputs = {
       ...declaredInputs,

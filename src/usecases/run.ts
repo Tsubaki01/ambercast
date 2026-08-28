@@ -57,6 +57,7 @@ import {
 import type { LayoutResolver } from '#core/layout/resolve.js';
 import { joinPath, relativeWithin } from '#core/paths.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
+import { planProducerBundleFingerprint } from '#core/ai/plan-producer-bundle.js';
 import { resolveTarget } from '#core/target/resolve.js';
 import type {
   InstructionCoverageAiActionController,
@@ -3086,6 +3087,7 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
       normalizedTestMd,
       schemaVersion: PLAN_SCHEMA_VERSION,
       generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
+      planProducerBundleFingerprint: planProducerBundleFingerprint(),
       targetDefinitions: resolvedTargets,
     });
     const trustedPlan = await readTrustedInstructionCoveredPlan(

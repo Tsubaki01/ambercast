@@ -15,6 +15,7 @@ import { PlanDocument, GeneratedPlanResponse, type GroundingDocument, type JsonV
 import type { LayoutResolver } from '#core/layout/resolve.js';
 import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
 import { buildGeneratorTask, promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
+import { planProducerBundleFingerprint } from '#core/ai/plan-producer-bundle.js';
 import { resolveTarget } from '#core/target/resolve.js';
 import { extractSecretGrants } from '#core/ir/secret-grant-source.js';
 import { assertCommittedSecretAttributionSound, assertNoLiteralSecrets, normalizeAiStepSecretGrants } from './generator-secret-policy.js';
@@ -558,6 +559,7 @@ async function preflightCase(
     normalizedTestMd: normalized,
     schemaVersion: 2,
     generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
+    planProducerBundleFingerprint: planProducerBundleFingerprint(),
     targetDefinitions: target.definitions,
   });
   const plan = (await readTrustedInstructionCoveredPlan(overlay.storage, planFile, digest, normalized)).plan;

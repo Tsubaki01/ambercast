@@ -9,6 +9,7 @@ import { StaleIrError } from '#core/errors/stale-ir-error.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
+import { planProducerBundleFingerprint } from '#core/ai/plan-producer-bundle.js';
 import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import {
@@ -229,6 +230,7 @@ async function createScenario(options: {
         normalizedTestMd: normalizeTestMd(options.prompt ?? PROMPT),
         schemaVersion: 2,
         generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
+        planProducerBundleFingerprint: planProducerBundleFingerprint(),
         targetDefinitions: TARGETS,
       }),
     },

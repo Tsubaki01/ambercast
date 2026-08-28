@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
+import { planProducerBundleFingerprint } from '#core/ai/plan-producer-bundle.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import type { JsonValueT, PlanDocument } from '#core/ir/schema.js';
 import { ReportEnvelope } from '#report/schema.js';
@@ -70,6 +71,7 @@ async function writeSoleTargetConfigAndFreshPlan(project: string, ciHeal = true)
         normalizedTestMd: normalizeTestMd(FIXTURE_PROMPT),
         schemaVersion: 2,
         generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
+        planProducerBundleFingerprint: planProducerBundleFingerprint(),
         targetDefinitions,
       }),
     },
