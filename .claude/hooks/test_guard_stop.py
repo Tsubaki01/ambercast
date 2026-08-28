@@ -754,3 +754,208 @@ class EndToEndTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProgressArtifactDigestTest(unittest.TestCase):
+    """The progress digest must ignore a delegation's own transcript.
+
+    Regression for issue #210: `codex exec --json` and `-o <file>` stream into
+    `.claude/impl/issue-<N>-reviews/`, so every blocked turn grew a file inside
+    the digested set, the digest moved, and the stall counter reset forever.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.proj = Path(self._tmp.name)
+        self.reviews = self.proj / ".claude" / "impl" / "issue-13-reviews"
+        self.reviews.mkdir(parents=True)
+        self.logs = self.proj / ".claude" / "logs"
+        self.logs.mkdir(parents=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def digest(self):
+        return guard_stop.progress_hash(str(self.proj), "13")
+
+    def test_review_verdict_counts_as_progress(self):
+        before = self.digest()
+        (self.reviews / "step10-review.md").write_text("approve", encoding="utf-8")
+        self.assertNotEqual(self.digest(), before)
+
+    def test_implementation_log_counts_as_progress(self):
+        before = self.digest()
+        (self.logs / "2026-08-28_issue-13.md").write_text("log", encoding="utf-8")
+        self.assertNotEqual(self.digest(), before)
+
+    def test_growing_a_delegation_jsonl_is_not_progress(self):
+        transcript = self.reviews / "step10.jsonl"
+        transcript.write_text('{"turn":1}\n', encoding="utf-8")
+        before = self.digest()
+        transcript.write_text('{"turn":1}\n{"turn":2}\n', encoding="utf-8")
+        self.assertEqual(self.digest(), before)
+
+    def test_creating_a_delegation_jsonl_is_not_progress(self):
+        before = self.digest()
+        (self.reviews / "step10.jsonl").write_text('{"turn":1}\n', encoding="utf-8")
+        self.assertEqual(self.digest(), before)
+
+    def test_growing_the_last_message_file_is_not_progress(self):
+        last = self.reviews / "step10b.msg.txt"
+        last.write_text("partial", encoding="utf-8")
+        before = self.digest()
+        last.write_text("partial, then more", encoding="utf-8")
+        self.assertEqual(self.digest(), before)
+
+    def test_transcript_in_the_logs_directory_is_not_progress(self):
+        before = self.digest()
+        (self.logs / "delegation.jsonl").write_text("{}\n", encoding="utf-8")
+        self.assertEqual(self.digest(), before)
+
+    def test_unrecognised_artifact_is_not_progress(self):
+        """Allowlist, not denylist: an unknown file may only make the guard
+        give up earlier, never loop longer."""
+        before = self.digest()
+        (self.reviews / "scratch.bin").write_bytes(b"\x00\x01")
+        self.assertEqual(self.digest(), before)
+
+    def test_incident_replay_reaches_the_stall_ceiling(self):
+        """The exact #210 shape: a transcript grows on every blocked turn."""
+        write_state(self.proj, "13", ISSUE13_PARTIAL)
+        transcript = self.reviews / "step10.jsonl"
+        blocked = 0
+        for turn in range(1, 12):
+            transcript.write_text("x" * turn * 100, encoding="utf-8")
+            os.utime(transcript, (turn, turn))
+            if guard_stop.evaluate(str(self.proj), "issues/13") is None:
+                break
+            blocked += 1
+        self.assertEqual(blocked, guard_stop.MAX_STALLED_BLOCKS)
+
+
+class AbsoluteBlockCeilingTest(unittest.TestCase):
+    """A ceiling that a moving progress digest cannot clear.
+
+    MAX_STALLED_BLOCKS only bounds a *stationary* flow, so any defect in
+    progress detection removes the bound entirely. Codex CLI has no outer
+    backstop of its own (openai/codex#37937 open, #12336 closed as not
+    planned), so on that path this is the only ceiling.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.proj = Path(self._tmp.name)
+        write_state(self.proj, "13", ISSUE13_PARTIAL)
+        self.plan = self.proj / ".claude" / "impl" / "issue-13-plan.md"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def side(self) -> Path:
+        return Path(guard_stop.sidecar_path(str(self.proj), "13"))
+
+    def block_with_fresh_progress(self, session_id=""):
+        """One blocked turn whose progress digest always looks different."""
+        self.plan.write_text(str(os.urandom(8)), encoding="utf-8")
+        return guard_stop.evaluate(str(self.proj), "issues/13", session_id)
+
+    def test_total_blocks_is_recorded(self):
+        self.block_with_fresh_progress()
+        self.block_with_fresh_progress()
+        self.assertEqual(json.loads(self.side().read_text())["total_blocks"], 2)
+
+    def test_moving_digest_never_clears_the_absolute_ceiling(self):
+        for _ in range(guard_stop.MAX_TOTAL_BLOCKS):
+            self.assertIsNotNone(self.block_with_fresh_progress())
+        self.assertIsNone(
+            self.block_with_fresh_progress(),
+            "a digest that moves every turn must not defeat the absolute ceiling",
+        )
+
+    def test_ceiling_stays_closed_once_reached(self):
+        for _ in range(guard_stop.MAX_TOTAL_BLOCKS + 1):
+            self.block_with_fresh_progress()
+        for _ in range(3):
+            self.assertIsNone(self.block_with_fresh_progress())
+
+    def test_consecutive_ceiling_still_applies_first(self):
+        """A stationary flow must still stop at the much lower stall ceiling."""
+        for _ in range(guard_stop.MAX_STALLED_BLOCKS):
+            self.assertIsNotNone(guard_stop.evaluate(str(self.proj), "issues/13"))
+        self.assertIsNone(guard_stop.evaluate(str(self.proj), "issues/13"))
+
+    def test_pause_resets_the_absolute_ceiling(self):
+        for _ in range(guard_stop.MAX_TOTAL_BLOCKS + 1):
+            self.block_with_fresh_progress()
+        write_state(self.proj, "13", ISSUE13_PARTIAL + "paused=true\n")
+        self.assertIsNone(guard_stop.evaluate(str(self.proj), "issues/13"))
+        self.assertFalse(self.side().exists())
+        write_state(self.proj, "13", ISSUE13_PARTIAL)
+        self.assertIsNotNone(self.block_with_fresh_progress())
+
+    def test_completed_flow_resets_the_absolute_ceiling(self):
+        for _ in range(guard_stop.MAX_TOTAL_BLOCKS + 1):
+            self.block_with_fresh_progress()
+        write_state(self.proj, "13", ALL_DONE)
+        self.assertIsNone(guard_stop.evaluate(str(self.proj), "issues/13"))
+        self.assertFalse(self.side().exists())
+
+    def test_a_different_session_starts_a_fresh_budget(self):
+        for _ in range(guard_stop.MAX_TOTAL_BLOCKS + 1):
+            self.block_with_fresh_progress("session-a")
+        self.assertIsNone(self.block_with_fresh_progress("session-a"))
+        self.assertIsNotNone(self.block_with_fresh_progress("session-b"))
+
+    def corrupt_counter(self, key, value):
+        side = self.side()
+        data = json.loads(side.read_text())
+        data[key] = value
+        side.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_a_negative_total_cannot_buy_extra_blocks(self):
+        """The sidecar lives in a directory agents write to: -100 must not
+        become 200 more blocks before the ceiling."""
+        self.block_with_fresh_progress()
+        self.corrupt_counter("total_blocks", -100)
+        self.block_with_fresh_progress()
+        self.assertEqual(json.loads(self.side().read_text())["total_blocks"], 1)
+
+    def test_a_negative_consecutive_count_cannot_buy_extra_blocks(self):
+        guard_stop.evaluate(str(self.proj), "issues/13")
+        self.corrupt_counter("consecutive_blocks", -100)
+        for _ in range(guard_stop.MAX_STALLED_BLOCKS):
+            guard_stop.evaluate(str(self.proj), "issues/13")
+        self.assertIsNone(guard_stop.evaluate(str(self.proj), "issues/13"))
+
+    def test_fractional_counters_are_rejected(self):
+        self.block_with_fresh_progress()
+        self.corrupt_counter("total_blocks", 3.9)
+        self.block_with_fresh_progress()
+        self.assertEqual(json.loads(self.side().read_text())["total_blocks"], 1)
+
+    def test_boolean_counters_are_rejected(self):
+        """True is an int in Python; it must not be read as a count of 1."""
+        self.block_with_fresh_progress()
+        self.corrupt_counter("total_blocks", True)
+        self.block_with_fresh_progress()
+        self.assertEqual(json.loads(self.side().read_text())["total_blocks"], 1)
+
+    def test_counter_helper_rejects_non_counts(self):
+        for value in (-1, -100, 3.9, True, False, "5", None, [], {}):
+            with self.subTest(value=value):
+                self.assertEqual(guard_stop._counter(value), 0)
+        for value in (0, 1, 100):
+            with self.subTest(value=value):
+                self.assertEqual(guard_stop._counter(value), value)
+
+    def test_malformed_total_is_treated_as_zero(self):
+        self.block_with_fresh_progress()
+        side = self.side()
+        data = json.loads(side.read_text())
+        data["total_blocks"] = "not-a-number"
+        side.write_text(json.dumps(data), encoding="utf-8")
+        self.assertIsNotNone(self.block_with_fresh_progress())
+        self.assertEqual(json.loads(side.read_text())["total_blocks"], 1)
+
+    def test_absolute_ceiling_is_far_above_the_stall_ceiling(self):
+        self.assertGreater(guard_stop.MAX_TOTAL_BLOCKS, guard_stop.MAX_STALLED_BLOCKS * 10)

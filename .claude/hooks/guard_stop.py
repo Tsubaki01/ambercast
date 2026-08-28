@@ -25,10 +25,17 @@ Scope and escape hatches:
   progress the stop is allowed until progress resumes. The digest covers
   everything a working flow touches — state, todos, plan, review verdicts,
   implementation logs, and the git working tree — so only a genuinely stuck
-  agent exhausts the budget. The counter is scoped to the session id and
-  persisted atomically, failing open (allow the stop) when it cannot be
-  recorded. Claude Code's own consecutive-block cap
-  (CLAUDE_CODE_STOP_HOOK_BLOCK_CAP) remains the outer backstop.
+  agent exhausts the budget. It counts only PROGRESS_ARTIFACT_SUFFIXES in the
+  review and log directories, because a delegated agent's transcript is
+  streamed into the review directory by the caller and would otherwise make
+  every blocked turn look like progress (#210). The counter is scoped to the
+  session id and persisted atomically, failing open (allow the stop) when it
+  cannot be recorded.
+- absolute ceiling: the same sidecar records MAX_TOTAL_BLOCKS worth of blocks
+  that no amount of progress resets, so a defect in progress detection can no
+  longer remove the bound. Claude Code's own consecutive-block cap
+  (CLAUDE_CODE_STOP_HOOK_BLOCK_CAP, default 8) is an additional outer backstop
+  there; Codex CLI has none, which is why this ceiling lives in the guard.
 - kill switch: AMBERCAST_GUARD_STOP=0 disables the hook entirely
 
 Branch evidence deliberately distinguishes detached state from unavailable policy
@@ -46,6 +53,27 @@ import sys
 import tempfile
 
 MAX_STALLED_BLOCKS = 3
+
+# Absolute ceiling that a moving progress digest cannot clear. MAX_STALLED_BLOCKS
+# only bounds a *stationary* flow, so any defect in progress detection removes
+# the bound entirely — which is what happened in issue #210: the delegation's own
+# transcript sat inside the digested set, the digest moved every turn, and the
+# stall counter reset 2,019 times (5h21m, 442,176,708 input tokens). This counter
+# is never reset by progress; only pausing, finishing, or a different session
+# starts a fresh budget. Codex CLI has no outer backstop of its own
+# (openai/codex#37937 open; --max-turns, #12336, closed as not planned), so on
+# that path this is the only ceiling. Kept far above MAX_STALLED_BLOCKS because a
+# long healthy flow legitimately ends many turns while steps remain.
+MAX_TOTAL_BLOCKS = 100
+
+# Artifacts that represent real flow progress in the digested directories.
+# An allowlist on purpose: a delegated agent's transcript is streamed into
+# .claude/impl/issue-<N>-reviews/ by the *caller* (`codex exec --json` redirected
+# there, `-o <file>` written there), so it grows on every blocked turn no matter
+# how the model is sandboxed. Under an allowlist an unrecognised file can only
+# make the guard give up earlier, never loop longer; a denylist would let the
+# next transcript naming convention reintroduce issue #210.
+PROGRESS_ARTIFACT_SUFFIXES = (".md",)
 
 # Ordered step keys of the /implement flow with the one-line description used
 # in the block reason. Must stay in sync with .claude/skills/implement/SKILL.md.
@@ -203,11 +231,15 @@ def _hash_dir_listing(h, directory):
     """Add directory metadata without reading append-mostly artifact content."""
     # Name + size + mtime is enough of a signal for append-mostly artifacts
     # (review verdicts, implementation logs) without hashing their content.
+    # Only PROGRESS_ARTIFACT_SUFFIXES are digested: a delegation transcript
+    # shares these directories and would otherwise count as progress (#210).
     try:
         names = sorted(os.listdir(directory))
     except OSError:
         names = []
     for name in names:
+        if not name.endswith(PROGRESS_ARTIFACT_SUFFIXES):
+            continue
         try:
             st = os.stat(os.path.join(directory, name))
         except OSError:
@@ -269,6 +301,18 @@ def progress_hash(proj, issue):
     _hash_dir_listing(h, os.path.join(proj, ".claude", "logs"))
     _hash_git(h, proj)
     return h.hexdigest()
+
+
+def _counter(value):
+    """Read a persisted counter, treating anything but a non-negative int as 0.
+
+    The sidecar is an ordinary file in a directory agents write to, so a bad
+    value must never buy extra blocks: `int(-100)` would allow 200 more blocks
+    before MAX_TOTAL_BLOCKS is reached, and a large enough negative would
+    remove the ceiling outright. `type(...) is int` rather than isinstance() so
+    that booleans, which are ints in Python, do not count either.
+    """
+    return value if type(value) is int and value >= 0 else 0
 
 
 def _load_sidecar(side):
@@ -350,18 +394,22 @@ def evaluate(proj, branch, session_id=""):
     digest = progress_hash(proj, issue)
     prev = _load_sidecar(side)
     blocks = 0
-    if (
-        prev.get("progress_sha256") == digest
-        and prev.get("session_id", "") == session_id
-    ):
-        try:
-            blocks = int(prev.get("consecutive_blocks", 0))
-        except (ValueError, TypeError):
-            blocks = 0
+    total = 0
+    if prev.get("session_id", "") == session_id:
+        total = _counter(prev.get("total_blocks", 0))
+        if prev.get("progress_sha256") == digest:
+            blocks = _counter(prev.get("consecutive_blocks", 0))
 
     if blocks >= MAX_STALLED_BLOCKS:
         # Stalled: the agent was pushed back repeatedly without the flow
         # advancing, so something needs a human. Let the stop through.
+        return None
+
+    if total >= MAX_TOTAL_BLOCKS:
+        # The session has been pushed back this many times in total, however
+        # much the progress digest moved in between. Progress detection itself
+        # is no longer trustworthy here, so stop blocking rather than risk the
+        # unbounded loop of #210.
         return None
 
     persisted = _persist_sidecar(
@@ -369,6 +417,7 @@ def evaluate(proj, branch, session_id=""):
         {
             "progress_sha256": digest,
             "consecutive_blocks": blocks + 1,
+            "total_blocks": total + 1,
             "session_id": session_id,
         },
     )
