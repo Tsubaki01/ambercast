@@ -41,7 +41,16 @@ describe('createRunsDirContainedStorage', () => {
     ['ensureDir', async (storage: Pick<StorageAdapter, 'writeText' | 'writeBinary' | 'ensureDir'>, path: string) => storage.ensureDir(path)],
   ])('permits $0 inside the resolved root', async (_name, write) => {
     const { root, base } = await fixture();
-    await expect(createRunsDirContainedStorage(base)(root) && write(createRunsDirContainedStorage(base)(root), join(root, 'nested', 'target'))).resolves.toBeUndefined();
+    const contained = createRunsDirContainedStorage(base)(root);
+
+    await expect(write(contained, join(root, 'nested', 'target'))).resolves.toBeUndefined();
+  });
+
+  it('permits the resolved root itself', async () => {
+    const { root, base } = await fixture();
+    const contained = createRunsDirContainedStorage(base)(root);
+
+    await expect(contained.ensureDir(root)).resolves.toBeUndefined();
   });
 
   it('permits a child whose name starts with two dots', async () => {
