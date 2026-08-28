@@ -303,6 +303,18 @@ def progress_hash(proj, issue):
     return h.hexdigest()
 
 
+def _counter(value):
+    """Read a persisted counter, treating anything but a non-negative int as 0.
+
+    The sidecar is an ordinary file in a directory agents write to, so a bad
+    value must never buy extra blocks: `int(-100)` would allow 200 more blocks
+    before MAX_TOTAL_BLOCKS is reached, and a large enough negative would
+    remove the ceiling outright. `type(...) is int` rather than isinstance() so
+    that booleans, which are ints in Python, do not count either.
+    """
+    return value if type(value) is int and value >= 0 else 0
+
+
 def _load_sidecar(side):
     """Load a valid stall-counter sidecar, treating malformed data as absent."""
     try:
@@ -384,15 +396,9 @@ def evaluate(proj, branch, session_id=""):
     blocks = 0
     total = 0
     if prev.get("session_id", "") == session_id:
-        try:
-            total = int(prev.get("total_blocks", 0))
-        except (ValueError, TypeError):
-            total = 0
+        total = _counter(prev.get("total_blocks", 0))
         if prev.get("progress_sha256") == digest:
-            try:
-                blocks = int(prev.get("consecutive_blocks", 0))
-            except (ValueError, TypeError):
-                blocks = 0
+            blocks = _counter(prev.get("consecutive_blocks", 0))
 
     if blocks >= MAX_STALLED_BLOCKS:
         # Stalled: the agent was pushed back repeatedly without the flow

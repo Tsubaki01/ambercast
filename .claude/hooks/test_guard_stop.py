@@ -906,6 +906,48 @@ class AbsoluteBlockCeilingTest(unittest.TestCase):
         self.assertIsNone(self.block_with_fresh_progress("session-a"))
         self.assertIsNotNone(self.block_with_fresh_progress("session-b"))
 
+    def corrupt_counter(self, key, value):
+        side = self.side()
+        data = json.loads(side.read_text())
+        data[key] = value
+        side.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_a_negative_total_cannot_buy_extra_blocks(self):
+        """The sidecar lives in a directory agents write to: -100 must not
+        become 200 more blocks before the ceiling."""
+        self.block_with_fresh_progress()
+        self.corrupt_counter("total_blocks", -100)
+        self.block_with_fresh_progress()
+        self.assertEqual(json.loads(self.side().read_text())["total_blocks"], 1)
+
+    def test_a_negative_consecutive_count_cannot_buy_extra_blocks(self):
+        guard_stop.evaluate(str(self.proj), "issues/13")
+        self.corrupt_counter("consecutive_blocks", -100)
+        for _ in range(guard_stop.MAX_STALLED_BLOCKS):
+            guard_stop.evaluate(str(self.proj), "issues/13")
+        self.assertIsNone(guard_stop.evaluate(str(self.proj), "issues/13"))
+
+    def test_fractional_counters_are_rejected(self):
+        self.block_with_fresh_progress()
+        self.corrupt_counter("total_blocks", 3.9)
+        self.block_with_fresh_progress()
+        self.assertEqual(json.loads(self.side().read_text())["total_blocks"], 1)
+
+    def test_boolean_counters_are_rejected(self):
+        """True is an int in Python; it must not be read as a count of 1."""
+        self.block_with_fresh_progress()
+        self.corrupt_counter("total_blocks", True)
+        self.block_with_fresh_progress()
+        self.assertEqual(json.loads(self.side().read_text())["total_blocks"], 1)
+
+    def test_counter_helper_rejects_non_counts(self):
+        for value in (-1, -100, 3.9, True, False, "5", None, [], {}):
+            with self.subTest(value=value):
+                self.assertEqual(guard_stop._counter(value), 0)
+        for value in (0, 1, 100):
+            with self.subTest(value=value):
+                self.assertEqual(guard_stop._counter(value), value)
+
     def test_malformed_total_is_treated_as_zero(self):
         self.block_with_fresh_progress()
         side = self.side()
