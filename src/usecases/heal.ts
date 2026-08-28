@@ -25,6 +25,7 @@ import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
 import { BatchInterruptionTracker } from './batch-interruption.js';
 import { obligationFingerprintMatches } from '#core/ir/obligation-fingerprint.js';
 import { joinPath } from '#core/paths.js';
+import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
 
 /**
  * Selection and write-intent choices for one healing batch.
@@ -68,10 +69,22 @@ export interface HealOptions {
  * replay must not acquire a heal-specific configuration requirement merely
  * because healing reuses it. The intersection retains the established replay
  * configuration surface while making the resolved `heal` limits available to
- * the state machine before it schedules any repair work.
+ * the state machine before it schedules any repair work. Containment remains
+ * an injected capability because filesystem-aware adapter composition belongs
+ * to runtime; each case supplies its own evidence-directory root when it
+ * needs the capability.
  */
 export type HealDeps = Omit<RunDeps, 'config'> & {
   readonly config: RunDeps['config'] & Pick<ResolvedConfig, 'heal'>;
+
+  /**
+   * Produces the write-only containment boundary for one case's evidence root.
+   *
+   * @remarks
+   * This remains injected because adapter composition belongs to runtime; it is
+   * a function rather than a pre-bound view because every case has a distinct root.
+   */
+  readonly containWrites: (root: string) => Pick<StorageAdapter, 'writeText' | 'writeBinary' | 'ensureDir'>;
 };
 
 /** A selected file retained for discovery-only or interruption reporting. */
@@ -181,7 +194,9 @@ export interface HealOutcome {
  * commit reports every artifact that became visible instead of attempting an
  * unreliable compensating write. Its `error.details.partiallyWritten` carries
  * the same list as this outcome so report mapping can preserve the evidence
- * after command settlement discards the capability wrapper.
+ * after command settlement discards the capability wrapper. Integrity failures
+ * form a separate arm so their zero-write guarantee remains checked by the
+ * type system rather than depending on callers to interpret an error class.
  */
 export type HealCommitOutcome =
   | { readonly outcome: 'committed' }
@@ -189,6 +204,11 @@ export type HealCommitOutcome =
       readonly outcome: 'failed';
       readonly error: FsIoError;
       readonly partiallyWritten: readonly ('plan' | 'grounding')[];
+    }
+  | {
+      readonly outcome: 'failed';
+      readonly error: IntegrityViolationError;
+      readonly partiallyWritten: readonly [];
     };
 
 /**
@@ -247,8 +267,34 @@ export interface HealOverlayStorage {
   /** Whether either tracked artifact has buffered content awaiting a decision. */
   hasBufferedWrites(): boolean;
 
-  /** Writes only buffered tracked artifacts to the underlying storage. */
+  /**
+   * Writes buffered tracked artifacts only while their captured preimage is intact.
+   *
+   * @remarks
+   * Before writing anything, the overlay re-reads both tracked artifacts' real
+   * bytes and compares them with the preimage retained by `capturePreimage()`.
+   * Any mismatch, including either artifact having been deleted, throws
+   * `IntegrityViolationError` before either write begins, so an integrity
+   * failure can never produce a partial commit. A filesystem read error other
+   * than a missing artifact, such as a permission error, is not reclassified
+   * as a mismatch and propagates as an ordinary I/O failure, like a write-loop
+   * error. The pre-pass detects changes completed before it starts, but the
+   * accepted TOCTOU boundary means it cannot detect a change landing strictly
+   * between the pre-pass finishing and the write loop's write call completing.
+   */
   flush(): Promise<void>;
+
+  /**
+   * Captures the current real bytes for the tracked artifact pair before repair.
+   *
+   * @remarks
+   * The overlay retains this preimage instead of accepting one from `flush`, so
+   * a caller cannot pair a commit with bytes captured for another case. `healCase`
+   * must call this only after preflight succeeds: preflight owns the established
+   * classification of missing or invalid artifacts, while this capture observes
+   * only changes that occur after those checks.
+   */
+  capturePreimage(): Promise<void>;
 
   /** Captures immutable buffered contents before an all-or-nothing stage attempt. */
   snapshot(): OverlaySnapshot;
@@ -262,17 +308,25 @@ export interface HealOverlayStorage {
  *
  * @param base - Real storage used for reads, untracked operations, and commits.
  * @param trackedPaths - The sole artifact pair whose text writes are deferred.
+ * @param containedWrites - Write-only storage constrained to this case's evidence directory.
  * @returns A storage view with snapshot, restore, and explicit flush controls.
  * @remarks
  * Buffering makes dry runs and non-improving candidates safe without changing
  * the storage port. A flush is intentionally an explicit capability: callers
- * decide whether it is authorized after observing the completed batch.
+ * decide whether it is authorized after observing the completed batch. The
+ * containment view is deliberately narrower than `StorageAdapter` because it
+ * only guards binary writes, directory creation, and untracked text writes.
+ * It remains separate from `base`: tracked plan and grounding writes are
+ * committed through the unwrapped base storage because they legitimately lie
+ * outside the evidence directory.
  */
 export function createHealOverlayStorage(
   base: StorageAdapter,
   trackedPaths: { readonly planPath: string; readonly groundingPath: string },
+  containedWrites: Pick<StorageAdapter, 'writeText' | 'writeBinary' | 'ensureDir'>,
 ): HealOverlayStorage {
   let buffered = new Map<string, string>();
+  let preimage: { readonly plan: Uint8Array; readonly grounding: Uint8Array } | undefined;
   const tracked = (path: string) => path === trackedPaths.planPath || path === trackedPaths.groundingPath;
   const storage: StorageAdapter = {
     readText: async (path) => buffered.has(path) ? buffered.get(path)! : base.readText(path),
@@ -282,31 +336,72 @@ export function createHealOverlayStorage(
         buffered.set(path, text);
         return;
       }
-      await base.writeText(path, text);
+      await containedWrites.writeText(path, text);
     },
     readBinary: (path) => base.readBinary(path),
-    writeBinary: (path, text) => base.writeBinary(path, text),
+    writeBinary: (path, text) => containedWrites.writeBinary(path, text),
     listFiles: (path) => base.listFiles(path),
-    ensureDir: (path) => base.ensureDir(path),
+    ensureDir: (path) => containedWrites.ensureDir(path),
   };
   return {
     storage,
     hasBufferedWrites: () => buffered.size > 0,
+    capturePreimage: async () => {
+      preimage = {
+        plan: await base.readBinary(trackedPaths.planPath),
+        grounding: await base.readBinary(trackedPaths.groundingPath),
+      };
+    },
     flush: async () => {
+      if (buffered.size === 0) return;
+
       const written: ('plan' | 'grounding')[] = [];
       try {
+        if (preimage === undefined) {
+          throw new Error('Healing artifact preimage was not captured.');
+        }
+
+        const mismatched: ('plan' | 'grounding')[] = [];
+        for (const [kind, path, expected] of [
+          ['plan', trackedPaths.planPath, preimage.plan],
+          ['grounding', trackedPaths.groundingPath, preimage.grounding],
+        ] as const) {
+          try {
+            const actual = await base.readBinary(path);
+            if (actual.length !== expected.length || actual.some((byte, index) => byte !== expected[index])) {
+              mismatched.push(kind);
+            }
+          } catch (error) {
+            if (isMissingArtifactError(error)) {
+              mismatched.push(kind);
+              continue;
+            }
+            throw error;
+          }
+        }
+        if (mismatched.length > 0) {
+          throw new IntegrityViolationError('Healing artifacts changed after preflight.', { mismatched });
+        }
+
         for (const [kind, path] of [['plan', trackedPaths.planPath], ['grounding', trackedPaths.groundingPath]] as const) {
           if (!buffered.has(path)) continue;
           await base.writeText(path, buffered.get(path)!);
           written.push(kind);
         }
       } catch (error) {
+        if (error instanceof IntegrityViolationError) {
+          throw error;
+        }
         throw Object.assign(error instanceof Error ? error : new Error('Healing artifact write failed.'), { written });
       }
     },
     snapshot: () => new Map(buffered),
     restore: (snapshot) => { buffered = new Map(snapshot); },
   };
+}
+
+function isMissingArtifactError(error: unknown): error is NodeJS.ErrnoException {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT';
 }
 
 type TrustedPlan = Awaited<ReturnType<typeof readTrustedInstructionCoveredPlan>>['plan'];
@@ -791,8 +886,13 @@ function caseOutcome(
 async function healCase(deps: HealDeps, options: HealOptions, file: string): Promise<CaseProcessingResult> {
   const planFile = deps.layout.planPathFor(file);
   const groundingFile = deps.layout.groundingPathFor(file);
-  const overlay = createHealOverlayStorage(deps.storage, { planPath: planFile, groundingPath: groundingFile });
+  const overlay = createHealOverlayStorage(
+    deps.storage,
+    { planPath: planFile, groundingPath: groundingFile },
+    deps.containWrites(deps.layout.runsDirFor(file, deps.runId)),
+  );
   const preflight = await preflightCase(deps, options, file, planFile, groundingFile, overlay);
+  await overlay.capturePreimage();
   let resolvedAiExecutor: ResolvedAiExecutor | undefined;
   const resolveCaseAiExecutor: ResolveCaseAiExecutor = async () => {
     if (resolvedAiExecutor !== undefined) return resolvedAiExecutor;
@@ -1014,6 +1114,10 @@ function commitFor(file: string, planFile: string, overlay: HealOverlayStorage, 
         await overlay.flush();
         return { outcome: 'committed' };
       } catch (error) {
+        if (error instanceof IntegrityViolationError) {
+          // Preserve the integrity classification; wrapping would misstate it as an environment failure.
+          return { outcome: 'failed', error, partiallyWritten: [] };
+        }
         const partiallyWritten = error instanceof Error && Array.isArray((error as Error & { written?: unknown }).written)
           ? (error as Error & { written: ('plan' | 'grounding')[] }).written
           : [];

@@ -3,6 +3,7 @@ import type { ResolvedConfig } from '#core/config/schema.js';
 import { BrowserLaunchFailedError } from '#core/errors/browser-launch-failed-error.js';
 import { ConfigInvalidError } from '#core/errors/config-invalid-error.js';
 import { FsIoError } from '#core/errors/fs-io-error.js';
+import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
 import { MissingPlanError } from '#core/errors/missing-plan-error.js';
 import { ReportEnvelope } from '#report/schema.js';
 import { runHealCommand, type HealCommandInput, type HealCommandOutput } from '#runtime/heal-command.js';
@@ -14,9 +15,11 @@ const mocks = vi.hoisted(() => ({
   createFsStorage: vi.fn(), createSystemClock: vi.fn(), createProcessEnvironmentInfo: vi.fn(),
   createTtyInteractivityCheck: vi.fn(), createConfirmationAnswerReader: vi.fn(), loadConfig: vi.fn(), createAmbercast: vi.fn(),
   heal: vi.fn(), buildHealReport: vi.fn(), finalizeReportEnvelope: vi.fn(), isEmergencyFinalizedEnvelope: vi.fn(),
+  createRunsDirContainedStorage: vi.fn(),
 }));
 
 vi.mock('#adapters/storage/fs-storage.js', () => ({ createFsStorage: mocks.createFsStorage }));
+vi.mock('#adapters/storage/runs-dir-contained-storage.js', () => ({ createRunsDirContainedStorage: mocks.createRunsDirContainedStorage }));
 vi.mock('#adapters/system/process-environment-info.js', () => ({ createProcessEnvironmentInfo: mocks.createProcessEnvironmentInfo }));
 vi.mock('#adapters/system/system-clock.js', () => ({ createSystemClock: mocks.createSystemClock }));
 vi.mock('#adapters/system/tty-interactivity.js', () => ({ createTtyInteractivityCheck: mocks.createTtyInteractivityCheck }));
@@ -95,9 +98,14 @@ function batch(overrides: Partial<HealBatchResult> = {}): HealBatchResult {
 }
 function configure({ result = batch(), isCI = false, interactive = false, readConfirmationAnswer = vi.fn(async () => 'declined' as const), config = CONFIG, built = report(0), monotonic = [10, 12.6] }: {
   result?: HealBatchResult; isCI?: boolean; interactive?: boolean; readConfirmationAnswer?: (commits: ReadonlyMap<string, HealCaseCommit>, signal?: AbortSignal) => Promise<'authorized' | 'declined' | 'interrupted'>; config?: ResolvedConfig; built?: HealCommandOutput; monotonic?: readonly number[];
-} = {}): void {
+} = {}): ReturnType<typeof createInMemoryStorage> {
   const storage = createInMemoryStorage();
   mocks.createFsStorage.mockReturnValue(storage);
+  mocks.createRunsDirContainedStorage.mockReturnValue(() => ({
+    writeText: storage.writeText,
+    writeBinary: storage.writeBinary,
+    ensureDir: storage.ensureDir,
+  }));
   mocks.createSystemClock.mockReturnValue({ now: () => new Date('2026-08-25T00:00:00.000Z'), monotonicMs: vi.fn().mockReturnValueOnce(monotonic[0] ?? 10).mockReturnValue(monotonic[1] ?? 12.6) });
   mocks.createProcessEnvironmentInfo.mockReturnValue({ isCI: vi.fn(() => isCI) });
   mocks.createTtyInteractivityCheck.mockReturnValue(vi.fn(() => interactive));
@@ -106,6 +114,7 @@ function configure({ result = batch(), isCI = false, interactive = false, readCo
   mocks.createAmbercast.mockReturnValue({ storage, layout: {}, clock: createFixedClock(new Date('2026-08-25T00:00:00.000Z'), 1), discoverTestFiles: vi.fn(async () => []) });
   mocks.heal.mockResolvedValue(result);
   mocks.buildHealReport.mockReturnValue(built);
+  return storage;
 }
 
 async function useActualBuildHealReport(): Promise<void> {
@@ -139,6 +148,17 @@ describe('runHealCommand', () => {
     configure({ config: { ...CONFIG, targets: { web: { ...CONFIG.targets.web!, healReplayIsolation: 'stateful' } } } });
     await expect(runHealCommand(input({ list: true }))).resolves.toMatchObject({ exitCode: 0 });
     expect(mocks.heal).toHaveBeenCalledWith(expect.any(Object), expect.objectContaining({ list: true }));
+  });
+
+  it('wires contained writes to heal using the command storage', async () => {
+    const storage = configure();
+
+    await runHealCommand(input());
+
+    expect(mocks.createRunsDirContainedStorage).toHaveBeenCalledWith(storage);
+    expect(mocks.heal).toHaveBeenCalledWith(expect.objectContaining({
+      containWrites: mocks.createRunsDirContainedStorage.mock.results[0]?.value,
+    }), expect.any(Object));
   });
 
   it('checks replay isolation only on the selected target', async () => {
@@ -839,6 +859,27 @@ describe('runHealCommand', () => {
       }),
     });
     expect(failed.commit).toHaveBeenCalledOnce();
+  });
+
+  it('preserves an integrity commit refusal as apply-failed without reclassifying it as FsIoError', async () => {
+    const cause = new IntegrityViolationError('plan changed after preflight', { mismatched: ['plan'] });
+    const failed = capability('integrity-refusal.test.md', {
+      outcome: 'failed',
+      error: cause,
+      partiallyWritten: [],
+    });
+    configure({ result: batch({ outcome: outcome({ results: [caseResult('integrity-refusal.test.md')] }), commits: commits(failed) }) });
+    await useActualBuildHealReport();
+
+    await expect(runHealCommand(input({ yes: true }))).resolves.toMatchObject({
+      exitCode: 4,
+      envelope: expect.objectContaining({
+        results: [expect.objectContaining({ application: 'apply-failed' })],
+      }),
+    });
+    const settled = (mocks.buildHealReport.mock.calls[0]?.[0] as { readonly outcome: HealOutcome }).outcome.errors[0]?.error;
+    expect(settled).toBeInstanceOf(IntegrityViolationError);
+    expect(settled).toMatchObject({ cause, details: { mismatched: ['plan'], partiallyWritten: [] } });
   });
 
   it('uses settlement partial-write evidence for a partially-applied public report', async () => {

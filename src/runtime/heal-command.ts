@@ -11,6 +11,7 @@ import { AI_EXECUTOR_FACTORIES } from '#adapters/ai/registry.js';
 import { createSpawnCommandRunner } from '#adapters/ai/shared/command-runner.js';
 import { createBrowserDriverResolver } from '#adapters/browser/registry.js';
 import { createFsStorage } from '#adapters/storage/fs-storage.js';
+import { createRunsDirContainedStorage } from '#adapters/storage/runs-dir-contained-storage.js';
 import { createConfirmationAnswerReader, type ConfirmationAnswer, type ConfirmationAnswerReader } from '#adapters/system/confirmation-answer-reader.js';
 import { createCryptoRandom } from '#adapters/system/crypto-random.js';
 import { createEnvSecretsProvider } from '#adapters/system/env-secrets-provider.js';
@@ -23,6 +24,7 @@ import { createTtyInteractivityCheck } from '#adapters/system/tty-interactivity.
 import { loadConfig } from '#config/load.js';
 import { ConfigInvalidError } from '#core/errors/config-invalid-error.js';
 import { FsIoError } from '#core/errors/fs-io-error.js';
+import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
 import { isAbsolutePath, joinPath } from '#core/paths.js';
 import { AmbercastError, type ExitCode } from '#core/errors/types.js';
 import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
@@ -251,12 +253,15 @@ export async function promptForHealConfirmation(
  * settlement count alone cannot do so. Confirmation interruption is ORed into
  * the settled batch interruption flag because `heal()` returned before the
  * terminal exchange began. Failed commits retain their rows and add matching
- * case-scoped `FS_IO_ERROR`s. The error itself must carry
- * `details.partiallyWritten` from its `HealCommitOutcome`, because report
- * mapping reads the error details rather than the settlement wrapper. Other
- * structured details from the underlying `FsIoError` remain available, while
- * the outcome's partial-write evidence authoritatively replaces any stale
- * value carried by that error.
+ * case-scoped errors without collapsing an integrity refusal into an
+ * execution-environment failure: integrity failures remain
+ * `INTEGRITY_VIOLATION`, while genuine persistence failures remain
+ * `FS_IO_ERROR`. The error itself must carry `details.partiallyWritten` from
+ * its `HealCommitOutcome`, because report mapping reads the error details
+ * rather than the settlement wrapper. Other structured details from the
+ * underlying classified error remain available, while the outcome's
+ * partial-write evidence authoritatively replaces any stale value carried by
+ * that error.
  */
 function settleHealOutcome(
   outcome: HealOutcome,
@@ -339,22 +344,30 @@ function settleHealOutcome(
             }
             if (settlement.result.outcome === 'failed') {
               const partiallyWritten = settlement.result.partiallyWritten;
-              if (!(settlement.result.error instanceof FsIoError)
+              if (!(settlement.result.error instanceof FsIoError
+                || settlement.result.error instanceof IntegrityViolationError)
                 || !Array.isArray(partiallyWritten)
                 || !partiallyWritten.every((artifact) => artifact === 'plan' || artifact === 'grounding')) {
                 return unexpected(`malformed failed settlement for ${result.id}`);
               }
               const persisted = partiallyWritten.length === 0 ? 'no artifacts' : partiallyWritten.join(' and ');
+              const errorDetails = {
+                ...(settlement.result.error.details ?? {}),
+                partiallyWritten: [...partiallyWritten],
+              };
               commitErrors.push({
                 file: result.file,
-                error: new FsIoError(
-                  `Healing artifacts could not be committed after persisting ${persisted}.`,
-                  {
-                    ...(settlement.result.error.details ?? {}),
-                    partiallyWritten: [...partiallyWritten],
-                  },
-                  { cause: settlement.result.error },
-                ),
+                error: settlement.result.error instanceof IntegrityViolationError
+                  ? new IntegrityViolationError(
+                    `Healing artifacts could not be committed after persisting ${persisted}.`,
+                    errorDetails,
+                    { cause: settlement.result.error },
+                  )
+                  : new FsIoError(
+                    `Healing artifacts could not be committed after persisting ${persisted}.`,
+                    errorDetails,
+                    { cause: settlement.result.error },
+                  ),
               });
               return {
                 ...result,
@@ -467,6 +480,7 @@ export async function runHealCommand(
     });
     const deps: HealDeps = {
       storage: ambercast.storage,
+      containWrites: createRunsDirContainedStorage(ambercast.storage),
       layout: ambercast.layout,
       clock: ambercast.clock,
       runId,
