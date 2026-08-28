@@ -1238,6 +1238,28 @@ export const GeneratedPlanResponse = z.strictObject({
 });
 
 /**
+ * Validates the provider response at the local generation-policy boundary.
+ *
+ * The policy accepts an empty transient intent for an action-only AI step so
+ * it can report the actionable missing-success-criterion diagnostic,
+ * while retaining the strict generated-response contract for every other
+ * provider field. Keeping this acceptance contract beside the requested
+ * response shape lets producer provenance diagnose changes to either side of
+ * the provider boundary independently (Issue #204).
+ */
+export const GeneratedPlanResponseForPolicy = GeneratedPlanResponse.extend({
+  steps: z.array(z.union([
+    GeneratedStep,
+    GeneratedAiStep.extend({
+      verificationIntent: z.array(z.strictObject({
+        criterionId: InstructionCriterionId,
+        assertion: JsonValue,
+      })),
+    }),
+  ])),
+});
+
+/**
  * The validated, provider-authored portion from which a complete plan is
  * assembled locally.
  */

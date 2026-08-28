@@ -5,6 +5,7 @@ import { createChromiumBrowserDriver } from '#adapters/browser/chromium.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
+import { planProducerBundleFingerprint } from '#core/ai/plan-producer-bundle.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import {
   GroundingDocument,
@@ -91,6 +92,7 @@ describe('hand-authored trace replay against real Chromium', () => {
             normalizedTestMd: normalizeTestMd(PROMPT),
             schemaVersion: 2,
             generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
+            planProducerBundleFingerprint: planProducerBundleFingerprint(),
             targetDefinitions: targets,
           }),
         },

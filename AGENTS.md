@@ -24,7 +24,7 @@ Pre-implementation. The current package is a 0.0.1 placeholder that reserves the
 - The prompt (`<name>.test.md`) is the source of truth. The IR is a generated artifact, never hand-edited.
 - IR files: `<name>.ambercast.plan.json` (reviewed, committed) and `<name>.ambercast.grounding.json` (grounding cache, committed by default). Run results go to `.runs/` (gitignored).
 - IR format: plain JSON (RFC 8259). Canonical serialization: JCS-style key ordering with 2-space pretty-printing; parse → re-serialize must be byte-identical.
-- Freshness: the plan embeds an `inputsDigest` (normalized prompt digest + schemaVersion + generator prompt-template fingerprint + target definitions). Stale plans fail with a message; no silent auto-regenerate in CI.
+- Freshness: the plan embeds an `inputsDigest` (normalized prompt digest + schemaVersion + generator prompt-template fingerprint + plan producer bundle fingerprint + target definitions). Stale plans fail with a message; no silent auto-regenerate in CI.
 - Repairs regenerate a step subtree via structured output and re-serialize the whole document — never patch raw text.
 - Secrets are referenced (`{{secrets.*}}`), never baked into the IR; the schema rejects literal secrets.
 

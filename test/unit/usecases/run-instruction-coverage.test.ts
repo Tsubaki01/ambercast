@@ -3,6 +3,7 @@ import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
+import { planProducerBundleFingerprint } from '#core/ai/plan-producer-bundle.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import type { Fingerprint, JsonValueT, PlanDocument, TraceRecord } from '#core/ir/schema.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
@@ -107,6 +108,7 @@ function coveredPlan(criteria: readonly Criterion[] = DEFAULT_CRITERIA): PlanDoc
         normalizedTestMd: normalizeTestMd(PROMPT),
         schemaVersion: 2,
         generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
+        planProducerBundleFingerprint: planProducerBundleFingerprint(),
         targetDefinitions: TARGETS,
       }),
     },

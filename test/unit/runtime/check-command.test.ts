@@ -4,6 +4,7 @@ import type { ResolvedConfig } from '#core/config/schema.js';
 import { ConfigInvalidError } from '#core/errors/config-invalid-error.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
+import { planProducerBundleFingerprint } from '#core/ai/plan-producer-bundle.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import type { JsonValueT, PlanDocument } from '#core/ir/schema.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
@@ -159,6 +160,7 @@ describe('runCheckCommand', () => {
           normalizedTestMd: normalizeTestMd(prompt),
           schemaVersion: 2,
           generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
+          planProducerBundleFingerprint: planProducerBundleFingerprint(),
           targetDefinitions: { web: { baseUrl: CONFIG.targets.web!.baseUrl, browser: CONFIG.targets.web!.browser } },
         }),
       },

@@ -7,8 +7,14 @@ import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
 import { composeAiDeadline, isAiDeadlineTimeout } from '#core/ai/ai-deadline.js';
 import {
   buildGeneratorTask,
+  GENERATE_PLAN_TASK_INSTRUCTION,
   promptTemplateFingerprint,
 } from '#core/ai/prompt-envelope.js';
+import {
+  liveProducerBundleInputs,
+  planProducerBundleComponentDiagnostics,
+  computePlanProducerBundleFingerprint,
+} from '#core/ai/plan-producer-bundle.js';
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
@@ -19,13 +25,10 @@ import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { normalizeTestMd, type NormalizedTestMd } from '#core/ir/normalize.js';
 import {
-  GeneratedAiStep,
   GeneratedPlanResponse,
-  GeneratedStep,
+  GeneratedPlanResponseForPolicy,
   GROUNDING_SCHEMA_VERSION,
   GroundingDocument,
-  InstructionCriterionId,
-  JsonValue,
   PLAN_SCHEMA_VERSION,
   PlanDocument,
   type GroundingDocument as GroundingDocumentType,
@@ -40,7 +43,6 @@ import { resolveTarget } from '#core/target/resolve.js';
 import type { AiExecutor } from '#ports/ai.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { EventSink } from '#ports/system.js';
-import { z } from 'zod';
 import {
   assertCommittedSecretAttributionSound,
   assertNoLiteralSecrets,
@@ -57,28 +59,7 @@ import { BatchInterruptionTracker } from './batch-interruption.js';
 
 const GENERATED_PLAN_RESPONSE_SCHEMA = typedJsonSchema(GeneratedPlanResponse);
 
-/*
- * Empty transient intent remains policy input only for an action-only AI step,
- * whose actionable failure is the missing success criterion. An arbitrary
- * JSON assertion likewise reaches the policy's supported-vocabulary check.
- * Relaxing only this transient provider field after transport validation
- * avoids coupling either diagnostic to Zod's issue-code and union-path
- * representation while every other provider field still passes the strict
- * generated response authority.
- */
-const GENERATED_PLAN_RESPONSE_FOR_POLICY = GeneratedPlanResponse.extend({
-  steps: z.array(z.union([
-    GeneratedStep,
-    GeneratedAiStep.extend({
-      verificationIntent: z.array(z.strictObject({
-        criterionId: InstructionCriterionId,
-        assertion: JsonValue,
-      })),
-    }),
-  ])),
-});
-
-type GeneratedPlanResponseForPolicy = Omit<
+type GeneratedPlanResponseForPolicyType = Omit<
   GeneratedInstructionCoveredPlanResponse,
   'steps'
 > & {
@@ -105,7 +86,7 @@ type GeneratedPlanResponseForPolicy = Omit<
  * secret policy does not mistake them for uncovered.
  */
 export function prepareInstructionCoveredSteps(
-  response: GeneratedPlanResponseForPolicy,
+  response: GeneratedPlanResponseForPolicyType,
   normalizedTestMd: NormalizedTestMd,
   alreadyClaimedOffsets: ReadonlySet<number> = new Set(),
 ): InstructionCoverageResult<InstructionCoveredStep[]> {
@@ -457,10 +438,13 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
     const resolvedTargets = targetSelection.definitions;
 
     const normalizedTestMd = normalizeTestMd(testMd);
+    const producerBundleInputs = liveProducerBundleInputs();
+    const producerBundleFingerprint = computePlanProducerBundleFingerprint(producerBundleInputs);
     const inputsDigest = computeInputsDigest({
       normalizedTestMd,
       schemaVersion: PLAN_SCHEMA_VERSION,
       generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
+      planProducerBundleFingerprint: producerBundleFingerprint,
       targetDefinitions: resolvedTargets,
     });
     const planPath = deps.layout.planPathFor(file);
@@ -491,7 +475,7 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
     try {
       deps.events.emit({ type: 'ai-call' });
       response = await deps.aiExecutor.execute({
-        prompt: buildGeneratorTask('Generate a deterministic ambercast execution plan.'),
+        prompt: buildGeneratorTask(GENERATE_PLAN_TASK_INSTRUCTION),
         responseSchema: GENERATED_PLAN_RESPONSE_SCHEMA,
         context: { testMd: normalizedTestMd, targets: resolvedTargets } as unknown as JsonValueT,
         signal: deadline.signal,
@@ -513,7 +497,7 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
       break;
     }
 
-    const parsedResponse = GENERATED_PLAN_RESPONSE_FOR_POLICY.safeParse(response.data);
+    const parsedResponse = GeneratedPlanResponseForPolicy.safeParse(response.data);
     if (!parsedResponse.success) {
       results.push({
         file,
@@ -552,7 +536,13 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
     const candidate = {
       schemaVersion: PLAN_SCHEMA_VERSION,
       source: { inputsDigest },
-      ...(response.data.generatorMeta === undefined ? {} : { generatorMeta: response.data.generatorMeta }),
+      generatorMeta: {
+        ...(response.data.generatorMeta ?? {}),
+        planProducerBundle: {
+          fingerprint: producerBundleFingerprint,
+          components: planProducerBundleComponentDiagnostics(producerBundleInputs),
+        },
+      },
       targets: resolvedTargets,
       steps: normalizedSteps,
     };

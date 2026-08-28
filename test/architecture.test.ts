@@ -8,6 +8,7 @@ import { computeInputsDigest as relativeComputeInputsDigest } from '../src/core/
 import { scanAccessibilityCaptureFieldAccess } from '../tools/accessibility-capture-scanner.js';
 import { scanComputeInputsDigestCalls } from '../tools/digest-scanner.js';
 import { scanFillSecretCallSites } from '../tools/fill-secret-call-scanner.js';
+import { liveProducerBundleInputs, planProducerBundleManifest } from '#core/ai/plan-producer-bundle.js';
 
 const SOURCE_ROOT = fileURLToPath(new URL('../src/', import.meta.url));
 const DIGEST_MODULE_FILE = fileURLToPath(new URL('../src/core/ir/digest.ts', import.meta.url));
@@ -110,6 +111,40 @@ function scanGeneratorExecutePrompts(sourceFile: ts.SourceFile): readonly Genera
 
   visit(sourceFile);
   return sites;
+}
+
+function scanGeneratorTaskInstructions(program: ts.Program, sourceFile: ts.SourceFile): readonly string[] {
+  const checker = program.getTypeChecker();
+  const composerBindings = valueImportBindings(sourceFile, PROMPT_ENVELOPE_SPECIFIER, new Set(['buildGeneratorTask']));
+  const instructions: string[] = [];
+
+  function resolveInstruction(expression: ts.Expression): string | undefined {
+    if (ts.isStringLiteral(expression)) return expression.text;
+    if (!ts.isIdentifier(expression)) return undefined;
+    const symbol = checker.getSymbolAtLocation(expression);
+    const resolved = symbol !== undefined && symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol;
+    const declaration = resolved?.declarations?.find(ts.isVariableDeclaration);
+    return declaration?.initializer !== undefined && ts.isStringLiteral(declaration.initializer)
+      ? declaration.initializer.text
+      : undefined;
+  }
+
+  function visit(node: ts.Node): void {
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'execute') {
+      const request = node.arguments[0];
+      const prompt = request !== undefined && ts.isObjectLiteralExpression(request)
+        ? request.properties.find((property): property is ts.PropertyAssignment => ts.isPropertyAssignment(property) && propertyNameText(property.name) === 'prompt')?.initializer
+        : undefined;
+      if (prompt !== undefined && ts.isCallExpression(prompt) && ts.isIdentifier(prompt.expression) && composerBindings.get(prompt.expression.text) === 'buildGeneratorTask') {
+        const instruction = prompt.arguments[0] === undefined ? undefined : resolveInstruction(prompt.arguments[0]);
+        if (instruction === undefined) throw new Error(`Unresolvable buildGeneratorTask instruction at line ${sourceFile.getLineAndCharacterOfPosition(prompt.getStart(sourceFile)).line + 1}.`);
+        instructions.push(instruction);
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(sourceFile);
+  return instructions;
 }
 
 function generatorTemplateUsesSharedTaskComposer(sourceFile: ts.SourceFile): boolean {
@@ -369,6 +404,20 @@ describe('architecture guardrails', () => {
     const actualSites = scanGeneratorExecutePrompts(generateModule);
     expect(actualSites.length).toBeGreaterThan(0);
     expect(actualSites.every(({ usesSharedComposer }) => usesSharedComposer)).toBe(true);
+  });
+
+  test('covers every generate.ts task instruction in the producer-bundle manifest', () => {
+    // This is intentionally limited to generate.ts: heal.ts Stage 2 has no inputsDigest freshness contract.
+    const tsconfigFileName = ts.sys.resolvePath('tsconfig.json');
+    const config = ts.readConfigFile(tsconfigFileName, ts.sys.readFile);
+    if (config.error !== undefined) throw new Error(`Could not read ${tsconfigFileName}.`);
+    const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, dirname(tsconfigFileName));
+    const program = ts.createProgram({ rootNames: [GENERATE_MODULE_FILE, PROMPT_ENVELOPE_MODULE_FILE], options: { ...parsed.options, noEmit: true } });
+    const generateModule = program.getSourceFile(GENERATE_MODULE_FILE);
+    if (generateModule === undefined) throw new Error('Architecture program must include generate.ts.');
+    const instructions = scanGeneratorTaskInstructions(program, generateModule);
+    expect(instructions.length).toBeGreaterThan(0);
+    for (const instruction of instructions) expect(Object.values(planProducerBundleManifest(liveProducerBundleInputs()))).toContain(instruction);
   });
 
   test('builds the fingerprint template directly through the shared generator task composer', async () => {

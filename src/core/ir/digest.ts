@@ -19,7 +19,18 @@ import type {
   TargetDefinition,
 } from './schema.js';
 
-function sha256Hex(value: JsonValueT): string {
+/**
+ * Hashes canonical JSON bytes as lowercase SHA-256 hexadecimal text.
+ *
+ * The explicit name preserves the serialization precondition for callers in
+ * other core modules: equal JavaScript values are provenance-equivalent only
+ * after the repository's canonical JSON representation has removed insertion
+ * order as a source of change.
+ *
+ * @param value - A JSON value to serialize through the canonical artifact form.
+ * @returns The SHA-256 digest of the canonical JSON bytes.
+ */
+export function sha256HexOfCanonicalJson(value: JsonValueT): string {
   return createHash('sha256').update(toCanonicalDigestBytes(value)).digest('hex');
 }
 
@@ -57,6 +68,15 @@ export interface DigestInputs {
   readonly generatorPromptTemplateFingerprint: string;
 
   /**
+   * Identifies the plan-semantic producer bundle used to derive the plan.
+   *
+   * A producer-contract change can alter generation even when prompt text,
+   * schema version, and template bytes stay unchanged, so this provenance
+   * member remains independent of the template fingerprint.
+   */
+  readonly planProducerBundleFingerprint: string;
+
+  /**
    * Preserves target names as well as their definitions in the digest input.
    *
    * Matching `PlanDocument.targets` as a named record makes a target rename
@@ -72,8 +92,9 @@ export interface DigestInputs {
  *
  * @remarks Before canonical serialization, the implementation constructs a
  * fresh, fixed-shape preimage containing exactly `normalizedTestMd`,
- * `schemaVersion`, `generatorPromptTemplateFingerprint`, and
- * `targetDefinitions`. It deliberately does not hash the received `inputs`
+ * `schemaVersion`, `generatorPromptTemplateFingerprint`,
+ * `planProducerBundleFingerprint`, and `targetDefinitions`. It deliberately
+ * does not hash the received `inputs`
  * object directly: a structurally wider runtime object can carry extra
  * properties, and letting those silently influence the digest would defeat
  * `DigestInputs` as a closed, declared contract.
@@ -86,10 +107,11 @@ export function computeInputsDigest(inputs: DigestInputs): string {
     normalizedTestMd: inputs.normalizedTestMd,
     schemaVersion: inputs.schemaVersion,
     generatorPromptTemplateFingerprint: inputs.generatorPromptTemplateFingerprint,
+    planProducerBundleFingerprint: inputs.planProducerBundleFingerprint,
     targetDefinitions: inputs.targetDefinitions,
   };
 
-  return sha256Hex(preimage as JsonValueT);
+  return sha256HexOfCanonicalJson(preimage as JsonValueT);
 }
 
 /**
@@ -106,7 +128,7 @@ export function computeInputsDigest(inputs: DigestInputs): string {
 export function computePlanDigest(plan: PlanDocument): string {
   const { generatorMeta: _generatorMeta, ...canonicalPlan } = plan;
 
-  return sha256Hex(canonicalPlan as JsonValueT);
+  return sha256HexOfCanonicalJson(canonicalPlan as JsonValueT);
 }
 
 /**

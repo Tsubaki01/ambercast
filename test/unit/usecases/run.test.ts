@@ -16,6 +16,7 @@ import { StaleIrError } from '#core/errors/stale-ir-error.js';
 import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
+import { planProducerBundleFingerprint } from '#core/ai/plan-producer-bundle.js';
 import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
 import {
   extractDiscardedScalarValues,
@@ -301,6 +302,7 @@ async function createFreshPlan(
     normalizedTestMd,
     schemaVersion: 2,
     generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
+    planProducerBundleFingerprint: planProducerBundleFingerprint(),
     targetDefinitions,
   });
   const plan = {
@@ -5657,7 +5659,7 @@ describe('run failure evidence', () => {
         source: {
           inputsDigest: computeInputsDigest({
             normalizedTestMd: normalizeTestMd(PROMPT), schemaVersion: 2,
-            generatorPromptTemplateFingerprint: promptTemplateFingerprint(), targetDefinitions: TARGETS,
+            generatorPromptTemplateFingerprint: promptTemplateFingerprint(), planProducerBundleFingerprint: planProducerBundleFingerprint(), targetDefinitions: TARGETS,
           }),
         },
         targets: TARGETS,

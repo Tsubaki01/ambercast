@@ -46,6 +46,16 @@ export const COMMON_PROMPT_POLICY_TEMPLATE = staticGrammar();
 export const GENERATOR_INSTRUCTION_COVERAGE_POLICY_TEMPLATE = `For every AI step, copy a unique verbatim citation for each success or action criterion into instructionCoverage. Provide verificationIntent with one complete terminal assertion for every success criterion. Citations and verificationIntent are attribution inputs and are not committed to the plan.`;
 
 /**
+ * Supplies the literal task instruction for ordinary plan generation.
+ *
+ * Keeping these bytes in core makes the live provider request and the
+ * producer-bundle provenance manifest depend on one value. That shared
+ * ownership prevents a task-instruction edit from changing generated plan
+ * semantics without making committed plans stale (Issue #204).
+ */
+export const GENERATE_PLAN_TASK_INSTRUCTION = 'Generate a deterministic ambercast execution plan.';
+
+/**
  * Agentic-only criterion-tagging policy bytes.
  *
  * @remarks

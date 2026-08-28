@@ -10,6 +10,7 @@ import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
 import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
 import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
+import { planProducerBundleFingerprint } from '#core/ai/plan-producer-bundle.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import {
   GroundingDocument,
@@ -163,6 +164,7 @@ async function createFreshPlan(
     normalizedTestMd,
     schemaVersion: 2,
     generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
+    planProducerBundleFingerprint: planProducerBundleFingerprint(),
     targetDefinitions: TARGETS,
   });
   const plan = {

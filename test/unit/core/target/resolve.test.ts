@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import type { TargetDefinition } from '#core/ir/schema.js';
 import { computeInputsDigest } from '#core/ir/digest.js';
+import { planProducerBundleFingerprint } from '#core/ai/plan-producer-bundle.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import {
   resolveTarget,
@@ -72,6 +73,7 @@ describe('resolveTarget', () => {
         normalizedTestMd: normalizeTestMd('# test\n'),
         schemaVersion: 2,
         generatorPromptTemplateFingerprint: 'generator-template-fixture',
+        planProducerBundleFingerprint: planProducerBundleFingerprint(),
         targetDefinitions: selected.definitions,
       });
     };
