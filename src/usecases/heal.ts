@@ -12,7 +12,7 @@ import { deriveCurrentPlanInputProvenance } from '#core/ai/plan-input-provenance
 import { normalizeTestMd, type NormalizedTestMd } from '#core/ir/normalize.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { groundingRecoveryModeForStep } from '#core/ir/grounding-recovery-mode.js';
-import { GROUNDING_SCHEMA_VERSION, PlanDocument, GeneratedPlanResponse, type GroundingDocument, type JsonValueT, type Step } from '#core/ir/schema.js';
+import { GROUNDING_SCHEMA_VERSION, PlanDocument, GeneratedPlanResponse, type GroundingDocument, type JsonValueT } from '#core/ir/schema.js';
 import type { LayoutResolver } from '#core/layout/resolve.js';
 import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
 import { buildGeneratorTask } from '#core/ai/prompt-envelope.js';
@@ -33,6 +33,12 @@ import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
 import { SecretGrantUnattributableError } from '#core/errors/secret-grant-unattributable-error.js';
 import { SecretLiteralRejectedError } from '#core/errors/secret-literal-rejected-error.js';
+import {
+  buildStage2RepairContext,
+  type RepairHistoryEntry,
+  type ReplayMeasurement,
+  type TrustedPlan,
+} from './heal-provider-context.js';
 
 /**
  * Selection and write-intent choices for one healing batch.
@@ -429,36 +435,8 @@ function isMissingArtifactError(error: unknown): error is NodeJS.ErrnoException 
   return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT';
 }
 
-type TrustedPlan = Awaited<ReturnType<typeof readTrustedInstructionCoveredPlan>>['plan'];
 type ResolvedAiExecutor = Awaited<ReturnType<HealDeps['resolveAiExecutor']>>;
 type ResolveCaseAiExecutor = () => Promise<ResolvedAiExecutor>;
-
-type ReplayMeasurement =
-  | { readonly interrupted: true }
-  | {
-    readonly interrupted: false;
-    readonly replay: RunCaseOutcome;
-    readonly firstFailureIndex: number;
-    readonly attemptOrdinal: number;
-    readonly evidenceDir: string;
-  };
-
-/**
- * One adopted frontier replacement retained as provider context for later repairs.
- *
- * Only improvements enter this closed record: rejected or discarded candidates
- * must not influence a later request. The paired indices prove strict frontier
- * progress, and the nullable category preserves the meaningful absence of a
- * step classification when replay produced no step evidence.
- */
-interface RepairHistoryEntry {
-  readonly stepId: string;
-  readonly before: Step;
-  readonly after: Step;
-  readonly fromFirstFailureIndex: number;
-  readonly toFirstFailureIndex: number;
-  readonly failureCategory: StepResult['type'] | null;
-}
 
 /**
  * Separates an adopted Stage 2 candidate from an intentional rejection or an
@@ -480,18 +458,6 @@ type SingleStepRepairResult =
   }
   | { readonly kind: 'rejected'; readonly reason: StageTwoRejectionReason }
   | { readonly kind: 'interrupted' };
-
-/**
- * Projects replay results into the minimal evidence allowed in provider context.
- *
- * The projection retains only step identity and pass/fail status. It excludes
- * screenshots and every page-evidence field, because provider context must not
- * acquire filesystem locations or browser evidence merely as repair history
- * grows across iterations.
- */
-function toProviderReplayEvidence(steps: readonly StepResult[]): readonly StepResult[] {
-  return steps.map(({ id, type, status }) => ({ id, type, status }));
-}
 
 /**
  * Creates the layout view for one monotonically numbered replay attempt.
@@ -767,7 +733,10 @@ async function trySingleStepRepair(
   overlay: HealOverlayStorage,
   normalized: NormalizedTestMd,
   plan: TrustedPlan,
-  baseline: ReplayMeasurement & { readonly interrupted: false },
+  caseBaseline: {
+    readonly plan: TrustedPlan;
+    readonly measurement: ReplayMeasurement & { readonly interrupted: false };
+  },
   measurement: ReplayMeasurement & { readonly interrupted: false },
   repairHistory: readonly RepairHistoryEntry[],
   nextAttemptOrdinal: () => number,
@@ -804,25 +773,12 @@ async function trySingleStepRepair(
     response = await executor.execute({
       prompt: buildGeneratorTask('Repair the requested failing plan step. Return exactly one replacement step with the requested ID, preserving its kind and obligations. Use the supplied test prompt, target definitions, plan continuity, and replay evidence to repair the failure.'),
       responseSchema: typedJsonSchema(GeneratedPlanResponse),
-      context: {
-        testMd: normalized,
-        targets: plan.targets,
-        replacement: {
-          stepId: step.id,
-          index: start,
-        },
-        baselineFailure: {
-          explanation: baseline.replay.result.explanation,
-          failingStep: baseline.firstFailureIndex < 0 ? undefined : plan.steps[baseline.firstFailureIndex],
-          steps: toProviderReplayEvidence(baseline.replay.result.steps),
-        },
-        currentFailure: {
-          explanation: measurement.replay.result.explanation,
-          failingStep: measurement.firstFailureIndex < 0 ? undefined : plan.steps[measurement.firstFailureIndex],
-          steps: toProviderReplayEvidence(measurement.replay.result.steps),
-        },
+      context: buildStage2RepairContext({
+        normalizedTestMd: normalized,
+        baseline: caseBaseline,
+        current: { plan, measurement },
         repairHistory,
-      } as unknown as JsonValueT,
+      }),
       ...(deps.signal === undefined ? {} : { signal: deps.signal }),
     });
   } catch (error) {
@@ -1044,13 +1000,14 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
   let measurement = await measureReplay(caseDeps, options, file, overlay, plan, true, nextAttemptOrdinal());
   if (measurement.interrupted) return measurement;
 
-  const baseline = measurement.firstFailureIndex;
+  const caseBaseline = { plan: preflight.plan, measurement };
+  const baselineFirstFailureIndex = measurement.firstFailureIndex;
   let repairKind: RepairKind | undefined;
   let stage3Error: AmbercastError | undefined;
   let fullPlanReplayed = false;
   let stopReason: HealCaseOutcome['stopReason'] = 'settled';
-  let stage3Required = baseline !== plan.steps.length;
-  const structuralCeiling = plan.steps.length - baseline;
+  let stage3Required = baselineFirstFailureIndex !== plan.steps.length;
+  const structuralCeiling = plan.steps.length - baselineFirstFailureIndex;
   const maxDispatches = Math.min(structuralCeiling, caseDeps.config.heal.maxStepRepairs ?? Infinity);
   let chargedDispatches = 0;
   const visitedFrontiers = new Set<number>();
@@ -1092,7 +1049,6 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
     visitedFrontiers.add(frontier);
     const mode = groundingRecoveryModeForStep(plan.steps[frontier]!);
     if (await groundingRepairDispatches(frontier, mode) && !dispatchAllowed()) break;
-    const beforeGrounding = measurement;
     measurement = await tryGroundingRepair(caseDeps, options, file, groundingFile, overlay, plan, measurement, nextAttemptOrdinal);
     if (measurement.interrupted) return measurement;
     if (measurement.firstFailureIndex > frontier) {
@@ -1102,7 +1058,7 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
     if (mode === 'element-reground' || !dispatchAllowed()) break;
     const beforePlan = plan;
     const beforeMeasurement = measurement;
-    const repaired = await trySingleStepRepair(caseDeps, resolveCaseAiExecutor, options, file, planFile, groundingFile, overlay, preflight.normalized, plan, beforeGrounding, measurement, repairHistory, nextAttemptOrdinal);
+    const repaired = await trySingleStepRepair(caseDeps, resolveCaseAiExecutor, options, file, planFile, groundingFile, overlay, preflight.normalized, plan, caseBaseline, measurement, repairHistory, nextAttemptOrdinal);
     if (repaired.kind === 'interrupted') return { interrupted: true };
     if (repaired.kind === 'rejected') break;
     plan = repaired.plan;
@@ -1145,7 +1101,7 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
     }
   }
 
-  const outcome = caseOutcome(file, planFile, baseline, measurement, plan, stage3Error, fullPlanReplayed, stopReason);
+  const outcome = caseOutcome(file, planFile, baselineFirstFailureIndex, measurement, plan, stage3Error, fullPlanReplayed, stopReason);
   const commit = (outcome.repairOutcome === 'healed' || outcome.repairOutcome === 'partially-healed') && overlay.hasBufferedWrites()
     ? commitFor(file, planFile, overlay, repairKind ?? 'grounding-element')
     : undefined;

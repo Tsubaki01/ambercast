@@ -91,6 +91,17 @@ const OPTIONS: HealOptions = {
   list: false,
 };
 
+type Stage2RequestContext = {
+  readonly trustedInputs?: {
+    readonly frontier?: { readonly index: number; readonly stepId: string };
+    readonly repairHistory?: unknown;
+  };
+};
+
+function stage2Frontier(request: { readonly context?: unknown }): { readonly index: number; readonly stepId: string } | undefined {
+  return (request.context as Stage2RequestContext | undefined)?.trustedInputs?.frontier;
+}
+
 /**
  * Mirrors the live accessibility evidence independently from grounded-entry
  * verification. Route-B resolution reads this tree, whereas session entries
@@ -959,7 +970,7 @@ describe('heal state-machine contract', () => {
         if (request.prompt.startsWith('Confirm whether')) {
           return { data: { confirmed: true }, raw: '{"confirmed":true}' };
         }
-        if ((request.context as { replacement?: unknown }).replacement !== undefined) repairRequest = request;
+        if (stage2Frontier(request) !== undefined) repairRequest = request;
         return { data: repair, raw: JSON.stringify(repair) };
       } }),
     });
@@ -983,15 +994,16 @@ describe('heal state-machine contract', () => {
     expect(rewrittenPlan.steps.map((step) => step.id)).toEqual(['fill-password', 'click-submit', 'click-after']);
     expect(repairRequest?.prompt).toContain('Repair the requested failing plan step.');
     expect(repairRequest?.context).toMatchObject({
-      testMd: normalizeTestMd(SECRET_PROMPT),
-      targets: TARGETS,
-      replacement: {
-        stepId: 'click-submit',
-        index: 1,
+      trustedInputs: {
+        testMd: normalizeTestMd(SECRET_PROMPT),
+        targets: TARGETS,
+        frontier: { stepId: 'click-submit', index: 1 },
       },
-      baselineFailure: {
-        failingStep: expect.objectContaining({ id: 'click-submit' }),
-        explanation: expect.any(String),
+      untrustedReplayEvidence: {
+        baselineFailure: {
+          failingStep: expect.objectContaining({ id: 'click-submit' }),
+          explanation: expect.any(String),
+        },
       },
     });
   });
@@ -1004,8 +1016,7 @@ describe('heal state-machine contract', () => {
     ];
     const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: unknown }) => {
       if (request.prompt.startsWith('Confirm whether')) return { data: { confirmed: true }, raw: '{}' };
-      const replacement = (request.context as { readonly replacement?: unknown }).replacement;
-      if (replacement !== undefined) {
+      if (stage2Frontier(request) !== undefined) {
         return {
           data: { steps: [{ id: 'repair-me', kind: 'action', action: 'navigate', url: '/healed' }], ambiguities: [] },
           raw: '{}',
@@ -1027,7 +1038,7 @@ describe('heal state-machine contract', () => {
 
     expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'healed', finalFirstFailureIndex: 3 });
     expect(result.outcome.errors).toEqual([]);
-    expect(execute.mock.calls.filter(([request]) => (request.context as { readonly replacement?: unknown }).replacement === undefined && !request.prompt.startsWith('Confirm whether'))).toHaveLength(0);
+    expect(execute.mock.calls.filter(([request]) => stage2Frontier(request) === undefined && !request.prompt.startsWith('Confirm whether'))).toHaveLength(0);
     expect(events.emitted()).not.toContainEqual(expect.objectContaining({ type: 'heal-stage2-rejected', reason: 'secret-attribution' }));
     const commit = result.commits.get(OPTIONS.files[0]!);
     expect(commit).toBeDefined();
@@ -1039,7 +1050,7 @@ describe('heal state-machine contract', () => {
   it('lets a Stage-2 replacement reclaim its replaced secret grant through its own citation', async () => {
     const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: unknown }) => {
       if (request.prompt.startsWith('Confirm whether')) return { data: { confirmed: true }, raw: '{}' };
-      if ((request.context as { readonly replacement?: unknown }).replacement === undefined) {
+      if (stage2Frontier(request) === undefined) {
         throw new Error('Full regeneration must not be requested when the replacement claims its old grant.');
       }
       return {
@@ -1106,8 +1117,8 @@ describe('heal state-machine contract', () => {
 
     expect(result.outcome.errors).toEqual([]);
     expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'healed', finalFirstFailureIndex: 1 });
-    expect(execute.mock.calls.filter(([request]) => (request.context as { readonly replacement?: unknown }).replacement !== undefined)).toHaveLength(1);
-    expect(execute.mock.calls.find(([request]) => (request.context as { readonly replacement?: unknown }).replacement !== undefined)?.[0].context).toMatchObject({ replacement: { stepId: 'repair-ai', index: 0 } });
+    expect(execute.mock.calls.filter(([request]) => stage2Frontier(request) !== undefined)).toHaveLength(1);
+    expect(execute.mock.calls.find(([request]) => stage2Frontier(request) !== undefined)?.[0].context).toMatchObject({ trustedInputs: { frontier: { stepId: 'repair-ai', index: 0 } } });
     expect(events.emitted()).not.toContainEqual(expect.objectContaining({
       type: 'heal-stage2-rejected',
       reason: 'secret-attribution',
@@ -1122,8 +1133,7 @@ describe('heal state-machine contract', () => {
       if (request.prompt.startsWith('Confirm whether')) {
         return { data: { confirmed: true }, raw: '{"confirmed":true}' };
       }
-      const context = request.context as { readonly replacement?: unknown };
-      return context.replacement === undefined
+      return stage2Frontier(request) === undefined
         ? {
           data: { steps: [{ id: 'regenerated-submit', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [] },
           raw: '{}',
@@ -1554,10 +1564,10 @@ describe('heal state-machine contract', () => {
     const replacementRequests: { readonly context?: JsonValueT }[] = [];
     const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: JsonValueT }) => {
       if (request.prompt.startsWith('Confirm whether')) return { data: { confirmed: true }, raw: '{}' };
-      const replacement = (request.context as { readonly replacement?: { readonly index: number } }).replacement;
-      if (replacement !== undefined) {
+      const frontier = stage2Frontier(request);
+      if (frontier !== undefined) {
         replacementRequests.push({ context: structuredClone(request.context!) });
-        const response = replacement.index === 0
+        const response = frontier.index === 0
           ? { steps: [{ id: 'first', kind: 'action', action: 'navigate', url: '/first-healed' }], ambiguities: [] }
           : { steps: [{ id: 'second', kind: 'action', action: 'navigate', url: 'http://[' }], ambiguities: [] };
         return { data: response, raw: JSON.stringify(response) };
@@ -1579,16 +1589,16 @@ describe('heal state-machine contract', () => {
     await heal(scenario.deps, OPTIONS);
 
     expect(replacementRequests).toHaveLength(2);
-    expect(replacementRequests[0]?.context).toMatchObject({ repairHistory: [] });
+    expect(replacementRequests[0]?.context).toMatchObject({ trustedInputs: { repairHistory: [] } });
     expect(replacementRequests[1]?.context).toMatchObject({
-      repairHistory: [{
+      trustedInputs: { repairHistory: [{
         stepId: 'first',
         before: { id: 'first', kind: 'action', action: 'navigate', url: 'http://[' },
         after: { id: 'first', kind: 'action', action: 'navigate', url: '/first-healed' },
         fromFirstFailureIndex: 0,
         toFirstFailureIndex: 1,
         failureCategory: 'action',
-      }],
+      }] },
     });
   });
 
@@ -2089,10 +2099,10 @@ describe('heal state-machine contract', () => {
   it('adopts two advancing frontier replacements and settles healed without a Stage 3 request', async () => {
     const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: unknown }) => {
       if (request.prompt.startsWith('Confirm whether')) return { data: { confirmed: true }, raw: '{}' };
-      const replacement = (request.context as { readonly replacement?: { readonly index: number } }).replacement;
+      const frontier = stage2Frontier(request);
       return {
         data: {
-          steps: replacement?.index === 0
+          steps: frontier?.index === 0
             ? [{ id: 'click-submit', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }]
             : [{ id: 'click-after', kind: 'action', action: 'click', target: REPAIRED_AFTER_SUBMIT }],
           ambiguities: [],
@@ -2114,18 +2124,18 @@ describe('heal state-machine contract', () => {
     });
     const result = await heal(scenario.deps, OPTIONS);
     expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'healed', stopReason: 'settled', finalFirstFailureIndex: 1 });
-    expect(execute.mock.calls.filter(([request]) => (request.context as { replacement?: unknown }).replacement !== undefined)).toHaveLength(0);
-    expect(execute.mock.calls.filter(([request]) => !request.prompt.startsWith('Confirm whether') && (request.context as { replacement?: unknown }).replacement === undefined)).toHaveLength(1);
+    expect(execute.mock.calls.filter(([request]) => stage2Frontier(request) !== undefined)).toHaveLength(0);
+    expect(execute.mock.calls.filter(([request]) => !request.prompt.startsWith('Confirm whether') && stage2Frontier(request) === undefined)).toHaveLength(1);
   });
 
   it('discards a non-advancing candidate then makes exactly one Stage 3 request and no further Stage 2 request', async () => {
     const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: unknown }) => request.prompt.startsWith('Confirm whether')
       ? { data: { confirmed: true }, raw: '{}' }
-      : { data: (request.context as { replacement?: unknown }).replacement === undefined ? { steps: [{ id: 'full', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [] } : { steps: [{ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }], ambiguities: [] }, raw: '{}' });
+      : { data: stage2Frontier(request) === undefined ? { steps: [{ id: 'full', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [] } : { steps: [{ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }], ambiguities: [] }, raw: '{}' });
     const scenario = await createScenario({ sessionEntries: new Map([[elementRefKey(SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }], ...liveEntries(REPAIRED_SUBMIT)]), aiExecutor: createFakeAiExecutor({ execute }) });
     await heal(scenario.deps, OPTIONS);
-    expect(execute.mock.calls.filter(([request]) => (request.context as { replacement?: unknown }).replacement !== undefined)).toHaveLength(0);
-    expect(execute.mock.calls.filter(([request]) => !request.prompt.startsWith('Confirm whether') && (request.context as { replacement?: unknown }).replacement === undefined)).toHaveLength(1);
+    expect(execute.mock.calls.filter(([request]) => stage2Frontier(request) !== undefined)).toHaveLength(0);
+    expect(execute.mock.calls.filter(([request]) => !request.prompt.startsWith('Confirm whether') && stage2Frontier(request) === undefined)).toHaveLength(1);
   });
 
   it('routes a replay revisit of a visited frontier to Stage 3 without a second dispatch at that index', async () => {
@@ -2140,10 +2150,10 @@ describe('heal state-machine contract', () => {
     };
     const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: unknown }) => {
       if (request.prompt.startsWith('Confirm whether')) return { data: { confirmed: true }, raw: '{}' };
-      const replacement = (request.context as { readonly replacement?: { readonly index: number } }).replacement;
+      const frontier = stage2Frontier(request);
       return {
         data: {
-          steps: replacement === undefined
+          steps: frontier === undefined
             ? [
               { id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT },
               { id: 'click-after', kind: 'action', action: 'click', target: AFTER_SUBMIT },
@@ -2167,8 +2177,8 @@ describe('heal state-machine contract', () => {
       aiExecutor: createFakeAiExecutor({ execute }),
     });
     await heal(scenario.deps, OPTIONS);
-    expect(execute.mock.calls.filter(([request]) => (request.context as { replacement?: unknown }).replacement !== undefined)).toHaveLength(0);
-    expect(execute.mock.calls.filter(([request]) => !request.prompt.startsWith('Confirm whether') && (request.context as { replacement?: unknown }).replacement === undefined)).toHaveLength(1);
+    expect(execute.mock.calls.filter(([request]) => stage2Frontier(request) !== undefined)).toHaveLength(0);
+    expect(execute.mock.calls.filter(([request]) => !request.prompt.startsWith('Confirm whether') && stage2Frontier(request) === undefined)).toHaveLength(1);
   });
 
   it('sends a -1 loop entry to Stage 3 with zero Stage 1 or Stage 2 dispatches', async () => {
@@ -2181,8 +2191,7 @@ describe('heal state-machine contract', () => {
   it('reports attempt-limit after a prior advance and enters Stage 3', async () => {
     const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: unknown }) => {
       if (request.prompt.startsWith('Confirm whether')) return { data: { confirmed: true }, raw: '{}' };
-      const replacement = (request.context as { replacement?: { index: number } }).replacement;
-      if (replacement?.index === 0) return { data: { steps: [{ id: 'click-submit', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [] }, raw: '{}' };
+      if (stage2Frontier(request)?.index === 0) return { data: { steps: [{ id: 'click-submit', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [] }, raw: '{}' };
       throw new Error('Stage 3 remains unresolved.');
     });
     const scenario = await createScenario({
@@ -2204,10 +2213,10 @@ describe('heal state-machine contract', () => {
   it('reports settled when an attempt-limit Stage 3 replay fully heals the plan', async () => {
     const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: unknown }) => {
       if (request.prompt.startsWith('Confirm whether')) return { data: { confirmed: true }, raw: '{}' };
-      const replacement = (request.context as { readonly replacement?: { readonly index: number } }).replacement;
+      const frontier = stage2Frontier(request);
       return {
         data: {
-          steps: replacement === undefined
+          steps: frontier === undefined
             ? [
               { id: 'click-submit', kind: 'action', action: 'click', target: REPAIRED_SUBMIT },
               { id: 'click-after', kind: 'action', action: 'click', target: REPAIRED_AFTER_SUBMIT },
@@ -2289,13 +2298,13 @@ describe('heal state-machine contract', () => {
     const scenario = await createScenario({ steps: [AI_STEP], grounding: {}, aiExecutor: createFakeAiExecutor({ execute, executeAgentic: async () => ({ outcome: 'failure' }) }) });
     const result = await heal({ ...scenario.deps, config: { ...scenario.deps.config, heal: { caseTimeoutMs: 300_000, maxStepRepairs: 1 } } }, OPTIONS);
     expect(result.outcome.results[0]).toMatchObject({ stopReason: 'attempt-limit' });
-    expect(execute.mock.calls.filter(([request]) => (request.context as { replacement?: unknown }).replacement !== undefined)).toHaveLength(0);
+    expect(execute.mock.calls.filter(([request]) => stage2Frontier(request) !== undefined)).toHaveLength(0);
   });
 
   it('restores the best incremental candidate when Stage 3 replay does not fully pass', async () => {
     const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: unknown }) => {
       if (request.prompt.startsWith('Confirm whether')) return { data: { confirmed: true }, raw: '{}' };
-      if ((request.context as { replacement?: unknown }).replacement !== undefined) {
+      if (stage2Frontier(request) !== undefined) {
         return { data: { steps: [{ id: 'click-submit', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [] }, raw: '{}' };
       }
       return { data: { steps: [{ id: 'regenerated-submit', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }, { id: 'regenerated-after', kind: 'action', action: 'click', target: AFTER_SUBMIT }], ambiguities: [] }, raw: '{}' };
@@ -2329,8 +2338,7 @@ describe('heal state-machine contract', () => {
   it('classifies a no-Stage-3 measurement that advances but still fails as partially-healed under R11', async () => {
     const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: unknown }) => {
       if (request.prompt.startsWith('Confirm whether')) return { data: { confirmed: true }, raw: '{}' };
-      const replacement = (request.context as { readonly replacement?: { readonly index: number } }).replacement;
-      if (replacement?.index === 0) {
+      if (stage2Frontier(request)?.index === 0) {
         return { data: { steps: [{ id: 'click-submit', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [] }, raw: '{}' };
       }
       throw new Error('No further candidate is available.');
@@ -2364,8 +2372,8 @@ describe('heal state-machine contract', () => {
         : Step.parse({ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT });
     const scenario = await createScenario({ steps: [step], grounding: {}, aiExecutor: createFakeAiExecutor({ execute, executeAgentic }) });
     await heal({ ...scenario.deps, config: { ...scenario.deps.config, heal: { caseTimeoutMs: 300_000, maxStepRepairs: 1 } } }, OPTIONS);
-    const replacementDispatches = execute.mock.calls.filter(([request]) => (request.context as { readonly replacement?: unknown }).replacement !== undefined);
-    const nonReplacementDispatches = execute.mock.calls.filter(([request]) => (request.context as { readonly replacement?: unknown }).replacement === undefined);
+    const replacementDispatches = execute.mock.calls.filter(([request]) => stage2Frontier(request) !== undefined);
+    const nonReplacementDispatches = execute.mock.calls.filter(([request]) => stage2Frontier(request) === undefined);
     const expected = mode === 'none'
       ? { replacement: 1, nonReplacement: 1, aiRetrace: 0 }
       : mode === 'ai-retrace'
@@ -2519,9 +2527,9 @@ describe('heal interruption contract', () => {
   it('lets cancellation win over a simultaneous classifiable Stage-2 delegate failure without rejection, Stage 3, or retained writes', async () => {
     const controller = new AbortController();
     const events = createRecordingEventSink();
-    const replacementRequests: { readonly replacement?: unknown; readonly repairHistory?: unknown }[] = [];
+    const replacementRequests: Stage2RequestContext[] = [];
     const execute = vi.fn(async (request: { readonly context?: unknown }) => {
-      replacementRequests.push(structuredClone(request.context as { readonly replacement?: unknown; readonly repairHistory?: unknown }));
+      replacementRequests.push(structuredClone(request.context as Stage2RequestContext));
       controller.abort();
       throw new AiResponseInvalidError('Provider response became invalid at cancellation.');
     });
@@ -2543,7 +2551,7 @@ describe('heal interruption contract', () => {
       skipped: [{ file: OPTIONS.files[0] }],
     });
     expect(replacementRequests).toHaveLength(1);
-    expect(replacementRequests[0]).toMatchObject({ replacement: { stepId: 'repair-me', index: 0 }, repairHistory: [] });
+    expect(replacementRequests[0]).toMatchObject({ trustedInputs: { frontier: { stepId: 'repair-me', index: 0 }, repairHistory: [] } });
     expect(events.emitted().filter((event) => event.type === 'ai-call' && event.stepId === 'repair-me')).toEqual([
       { type: 'ai-call', stepId: 'repair-me' },
     ]);
@@ -2555,7 +2563,7 @@ describe('heal interruption contract', () => {
   it('restores the Stage-2 snapshot when cancellation arrives during candidate replay', async () => {
     const controller = new AbortController();
     const events = createRecordingEventSink();
-    const replacementRequests: { readonly replacement?: unknown; readonly repairHistory?: unknown }[] = [];
+    const replacementRequests: Stage2RequestContext[] = [];
     let stageTwoOverlay: StorageAdapter | undefined;
     replayRunObserver.afterRun = (_deps, storage, options) => {
       if (options.cacheOnly === false && stageTwoOverlay === undefined) stageTwoOverlay = storage;
@@ -2583,7 +2591,7 @@ describe('heal interruption contract', () => {
     }));
     const response = { steps: [{ id: 'repair-me', kind: 'action', action: 'navigate', url: '/healed' }], ambiguities: [] };
     const execute = vi.fn(async (request: { readonly context?: unknown }) => {
-      replacementRequests.push(structuredClone(request.context as { readonly replacement?: unknown; readonly repairHistory?: unknown }));
+      replacementRequests.push(structuredClone(request.context as Stage2RequestContext));
       return { data: response, raw: JSON.stringify(response) };
     });
     const scenario = await createScenario({
@@ -2613,7 +2621,7 @@ describe('heal interruption contract', () => {
       skipped: [{ file: OPTIONS.files[0] }],
     });
     expect(replacementRequests).toHaveLength(1);
-    expect(replacementRequests[0]).toMatchObject({ replacement: { stepId: 'repair-me', index: 0 }, repairHistory: [] });
+    expect(replacementRequests[0]).toMatchObject({ trustedInputs: { frontier: { stepId: 'repair-me', index: 0 }, repairHistory: [] } });
     expect(events.emitted().filter((event) => event.type === 'ai-call' && event.stepId === 'repair-me')).toEqual([
       { type: 'ai-call', stepId: 'repair-me' },
     ]);
