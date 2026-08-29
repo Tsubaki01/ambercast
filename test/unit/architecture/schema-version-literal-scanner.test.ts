@@ -81,8 +81,9 @@ describe('scanSchemaVersionLiteralViolations()', () => {
       { line: 2, column: 11 },
     ],
   ] as const)('reports %s at the schemaVersion use coordinate', async (_name, source, coordinate) => {
-    const [violation] = await scan(source);
-    expect(violation).toMatchObject(coordinate);
+    expect(await scan(source)).toEqual(expect.arrayContaining([
+      expect.objectContaining(coordinate),
+    ]));
   });
 
   it('allows direct named imports of either canonical authority', async () => {
@@ -92,6 +93,18 @@ describe('scanSchemaVersionLiteralViolations()', () => {
       'const grounding = { schemaVersion: GROUNDING_SCHEMA_VERSION };',
       'if (plan.schemaVersion !== PLAN_SCHEMA_VERSION) throw new Error();',
     ].join('\n'))).toEqual([]);
+  });
+
+  it('allows a direct named authority import in shorthand form but reports a local numeric shorthand', async () => {
+    expect(await scan([
+      "import { PLAN_SCHEMA_VERSION as schemaVersion } from '../core/ir/schema.js';",
+      'const plan = { schemaVersion };',
+    ].join('\n'))).toEqual([]);
+
+    expect(await scan([
+      'const schemaVersion = 2;',
+      'const plan = { schemaVersion };',
+    ].join('\n'))).toHaveLength(1);
   });
 
   it('documents that namespace imports are outside the supported direct-binding contract', async () => {

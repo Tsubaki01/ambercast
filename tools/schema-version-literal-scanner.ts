@@ -119,10 +119,8 @@ export function scanSchemaVersionLiteralViolations(
     return isNumericSymbol(checker.getSymbolAtLocation(current), seen);
   }
 
-  function isDirectNamedSchemaAuthority(expression: ts.Expression): boolean {
-    const current = unwrap(expression);
-    if (!ts.isIdentifier(current)) return false;
-    const declaration = checker.getSymbolAtLocation(current)?.declarations?.find(ts.isImportSpecifier);
+  function isDirectNamedSchemaAuthoritySymbol(symbol: ts.Symbol | undefined): boolean {
+    const declaration = symbol?.declarations?.find(ts.isImportSpecifier);
     if (declaration === undefined) return false;
     const authorityName = declaration.propertyName?.text ?? declaration.name.text;
     const importDeclaration = declaration.parent.parent.parent;
@@ -138,6 +136,12 @@ export function scanSchemaVersionLiteralViolations(
     return canonicalAuthorities.has(authorityName)
       && resolution !== undefined
       && ts.sys.resolvePath(resolution.resolvedFileName) === canonicalSchemaFileName;
+  }
+
+  function isDirectNamedSchemaAuthority(expression: ts.Expression): boolean {
+    const current = unwrap(expression);
+    return ts.isIdentifier(current)
+      && isDirectNamedSchemaAuthoritySymbol(checker.getSymbolAtLocation(current));
   }
 
   function isSchemaVersionAccess(expression: ts.Expression): boolean {
@@ -173,11 +177,10 @@ export function scanSchemaVersionLiteralViolations(
     return ts.isStringLiteral(expression) && expression.text === 'schemaVersion';
   }
 
-  function report(sourceFile: ts.SourceFile, node: ts.Node, prioritize = false): void {
+  function report(sourceFile: ts.SourceFile, node: ts.Node): void {
     const position = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
     const violation = { fileName: sourceFile.fileName, line: position.line + 1, column: position.character + 1 };
-    if (prioritize) violations.unshift(violation);
-    else violations.push(violation);
+    violations.push(violation);
   }
 
   function isBypass(expression: ts.Expression): boolean {
@@ -191,12 +194,15 @@ export function scanSchemaVersionLiteralViolations(
       if (ts.isPropertyAssignment(node) && isSchemaVersionPropertyName(node.name)) {
         if (isBypass(node.initializer)) report(sourceFile, node);
       } else if (ts.isShorthandPropertyAssignment(node) && node.name.text === 'schemaVersion') {
-        if (isNumericSymbol(checker.getShorthandAssignmentValueSymbol(node), new Set())) report(sourceFile, node);
+        if (
+          !isDirectNamedSchemaAuthoritySymbol(checker.getShorthandAssignmentValueSymbol(node))
+          && isNumericSymbol(checker.getShorthandAssignmentValueSymbol(node), new Set())
+        ) report(sourceFile, node);
       } else if (ts.isPropertyDeclaration(node) && isSchemaVersionPropertyName(node.name) && node.initializer !== undefined) {
         if (isBypass(node.initializer)) report(sourceFile, node);
       } else if (ts.isBinaryExpression(node)) {
-        if (isSchemaVersionAccess(node.left) && isBypass(node.right)) report(sourceFile, schemaVersionCoordinate(node.left), true);
-        if (isSchemaVersionAccess(node.right) && isBypass(node.left)) report(sourceFile, schemaVersionCoordinate(node.right), true);
+        if (isSchemaVersionAccess(node.left) && isBypass(node.right)) report(sourceFile, schemaVersionCoordinate(node.left));
+        if (isSchemaVersionAccess(node.right) && isBypass(node.left)) report(sourceFile, schemaVersionCoordinate(node.right));
       }
       ts.forEachChild(node, visit);
     }
@@ -204,5 +210,9 @@ export function scanSchemaVersionLiteralViolations(
     visit(sourceFile);
   }
 
-  return violations;
+  return violations.sort((left, right) => {
+    if (left.fileName !== right.fileName) return left.fileName < right.fileName ? -1 : 1;
+    if (left.line !== right.line) return left.line - right.line;
+    return left.column - right.column;
+  });
 }
