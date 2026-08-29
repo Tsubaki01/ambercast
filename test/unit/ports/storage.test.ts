@@ -4,6 +4,7 @@ import type { ReadStorageAdapter, StorageAdapter } from '../../../src/ports/stor
 describe('storage port shape', () => {
   it('defines the complete text, binary, existence, listing, and directory surface', () => {
     expectTypeOf<StorageAdapter['readText']>().toEqualTypeOf<(path: string) => Promise<string>>();
+    expectTypeOf<StorageAdapter['readTextSnapshot']>().toEqualTypeOf<(path: string) => Promise<{ readonly text: string; readonly bytes: Uint8Array }>>();
     expectTypeOf<StorageAdapter['writeText']>().toEqualTypeOf<(path: string, content: string) => Promise<void>>();
     expectTypeOf<StorageAdapter['readBinary']>().toEqualTypeOf<(path: string) => Promise<Uint8Array>>();
     expectTypeOf<StorageAdapter['writeBinary']>().toEqualTypeOf<(path: string, content: Uint8Array) => Promise<void>>();

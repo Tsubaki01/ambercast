@@ -122,6 +122,10 @@ export function createFsStorage(): StorageAdapter {
     async readText(path: string): Promise<string> {
       return readFile(path, 'utf8');
     },
+    async readTextSnapshot(path: string): Promise<{ readonly text: string; readonly bytes: Uint8Array }> {
+      const bytes = new Uint8Array(await readFile(path));
+      return { text: new TextDecoder().decode(bytes), bytes: new Uint8Array(bytes) };
+    },
     async writeText(path: string, content: string): Promise<void> {
       await ensureParentDirectory(path);
       await writeAtomic(path, async (temporaryPath) => {

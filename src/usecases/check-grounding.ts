@@ -34,6 +34,37 @@ export type GroundingInspection =
   | { readonly kind: 'valid' };
 
 /**
+ * Inspects grounding text that a caller has already observed.
+ *
+ * @remarks
+ * Parsing, provenance, and conditional canonicality classification need no
+ * storage capability. Healing can therefore validate one retained snapshot,
+ * while the exported inspector retains its existing read-only storage contract
+ * and behavior.
+ */
+export function inspectGroundingArtifactText(text: string, plan: PlanDocument): GroundingInspection {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { kind: 'invalid' };
+  }
+
+  const grounding = GroundingDocument.safeParse(parsed);
+  if (!grounding.success) return { kind: 'invalid' };
+  if (!isPlanDigestCurrent(grounding.data, computePlanDigest(plan))) return { kind: 'stale' };
+
+  let hasClaim: boolean;
+  try {
+    hasClaim = rawGroundingHasCoverageClaim(text);
+  } catch {
+    return { kind: 'invalid' };
+  }
+  if (hasClaim && !isGroundingCanonicalForClaim(text, grounding.data)) return { kind: 'invalid' };
+  return { kind: 'valid' };
+}
+
+/**
  * Classifies the grounding companion associated with one plan.
  *
  * @param storage - Read-only storage whose no-write contract is an invariant
@@ -69,33 +100,5 @@ export async function inspectGroundingArtifact(
     return { kind: 'missing' };
   }
 
-  const text = await storage.readText(groundingPath);
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return { kind: 'invalid' };
-  }
-
-  const grounding = GroundingDocument.safeParse(parsed);
-  if (!grounding.success) {
-    return { kind: 'invalid' };
-  }
-
-  if (!isPlanDigestCurrent(grounding.data, computePlanDigest(plan))) {
-    return { kind: 'stale' };
-  }
-
-  let hasClaim: boolean;
-  try {
-    hasClaim = rawGroundingHasCoverageClaim(text);
-  } catch {
-    return { kind: 'invalid' };
-  }
-  if (hasClaim && !isGroundingCanonicalForClaim(text, grounding.data)) {
-    return { kind: 'invalid' };
-  }
-
-  return { kind: 'valid' };
+  return inspectGroundingArtifactText(await storage.readText(groundingPath), plan);
 }

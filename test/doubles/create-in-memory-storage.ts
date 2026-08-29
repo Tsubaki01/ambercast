@@ -88,6 +88,14 @@ export function createInMemoryStorage(): StorageAdapter {
 
       return utf8Decoder.decode(content);
     },
+    async readTextSnapshot(path: string): Promise<{ readonly text: string; readonly bytes: Uint8Array }> {
+      const content = files.get(path);
+      if (content === undefined) {
+        throw new Error(`Cannot read non-file path: ${path}`);
+      }
+
+      return { text: utf8Decoder.decode(content), bytes: new Uint8Array(content) };
+    },
     async writeText(path: string, content: string): Promise<void> {
       ensureParentDirectories(path, directories, files);
       if (directories.has(path)) {
