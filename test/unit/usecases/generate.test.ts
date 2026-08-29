@@ -12,6 +12,7 @@ import {
 } from '#core/ir/schema.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import * as planProducerBundle from '#core/ai/plan-producer-bundle.js';
+import * as planInputProvenance from '#core/ai/plan-input-provenance.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import { createLayoutResolver } from '#core/layout/resolve.js';
@@ -710,10 +711,12 @@ describe('generate', () => {
     const testPath = await writePrompt(recordingStorage.storage);
     await seedFreshArtifacts(recordingStorage.storage, testPath);
     recordingStorage.reset();
+    const derive = vi.spyOn(planInputProvenance, 'deriveCurrentPlanInputProvenance');
 
     await expect(generate(deps, DEFAULT_OPTIONS)).resolves.toMatchObject({
       results: [{ file: testPath, status: 'skipped-fresh', planFile: `${TEST_DIR}/login.ambercast.plan.json` }],
     });
+    expect(derive).toHaveBeenCalled();
     expect(execute).not.toHaveBeenCalled();
     expect(events.emitted()).toEqual([]);
     expect(recordingStorage.writes).toEqual([]);
@@ -1800,22 +1803,18 @@ describe('generate', () => {
     expect(toCanonicalArtifactText(parsed as unknown as JsonValueT)).toBe(text);
   });
 
-  const producerBundleMeta = {
-    fingerprint: expect.any(String),
-    components: {
-      generatorPromptTemplate: expect.any(String),
-      generatorTaskInstruction: expect.any(String),
-      generatedPlanResponseSchema: expect.any(String),
-      generatedPlanResponseLocalContract: expect.any(String),
-      instructionCoveragePolicyRevision: expect.any(Number),
-      generatorSecretPolicyRevision: expect.any(Number),
-    },
+  const producerBundleMeta = () => {
+    const inputs = planProducerBundle.liveProducerBundleInputs();
+    return {
+      fingerprint: planProducerBundle.computePlanProducerBundleFingerprint(inputs),
+      components: planProducerBundle.planProducerBundleComponentDiagnostics(inputs),
+    };
   };
 
   it.each([
-    ['creates the producer bundle when the provider omits generatorMeta', undefined, { planProducerBundle: producerBundleMeta }],
-    ['preserves unrelated provider generatorMeta keys', { provider: 'fixture' }, { provider: 'fixture', planProducerBundle: producerBundleMeta }],
-    ['overrides a provider-supplied producer bundle', { planProducerBundle: { fingerprint: 'provider-value', providerOwnedField: 'must-not-survive' } }, { planProducerBundle: producerBundleMeta }],
+    ['creates the producer bundle when the provider omits generatorMeta', undefined, () => ({ planProducerBundle: producerBundleMeta() })],
+    ['preserves unrelated provider generatorMeta keys', { provider: 'fixture' }, () => ({ provider: 'fixture', planProducerBundle: producerBundleMeta() })],
+    ['overrides a provider-supplied producer bundle', { planProducerBundle: { fingerprint: 'provider-value', providerOwnedField: 'must-not-survive' } }, () => ({ planProducerBundle: producerBundleMeta() })],
   ] as const)('%s', async (_name, generatorMeta, expectedGeneratorMeta) => {
     const response = { ...RESPONSE, ...(generatorMeta === undefined ? {} : { generatorMeta }) } as GeneratedPlanResponse;
     const { deps, recordingStorage } = createScenario({ aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: response, raw: JSON.stringify(response) }) }) });
@@ -1823,23 +1822,55 @@ describe('generate', () => {
 
     await expect(generate(deps, DEFAULT_OPTIONS)).resolves.toMatchObject({ results: [{ status: 'generated' }] });
     const artifact = JSON.parse(await recordingStorage.storage.readText(deps.layout.planPathFor(testPath))) as { generatorMeta: unknown };
-    expect(artifact.generatorMeta).toEqual(expectedGeneratorMeta);
+    expect(artifact.generatorMeta).toEqual(expectedGeneratorMeta());
   });
 
-  it('records the same producer fingerprint in generatorMeta and the written inputs digest contract', async () => {
+  it('derives the written digest and producer-bundle diagnostics from one live snapshot', async () => {
+    const firstSnapshot = {
+      generatorPromptTemplate: 'first template',
+      generatorTaskInstruction: 'first task',
+      generatedPlanResponseSchema: { type: 'object', title: 'first' },
+      generatedPlanResponseLocalContract: { type: 'object', title: 'first local contract' },
+      instructionCoveragePolicyRevision: 101,
+      generatorSecretPolicyRevision: 102,
+    };
+    const secondSnapshot = {
+      generatorPromptTemplate: 'second template',
+      generatorTaskInstruction: 'second task',
+      generatedPlanResponseSchema: { type: 'object', title: 'second' },
+      generatedPlanResponseLocalContract: { type: 'object', title: 'second local contract' },
+      instructionCoveragePolicyRevision: 201,
+      generatorSecretPolicyRevision: 202,
+    };
+    const liveInputs = vi.spyOn(planProducerBundle, 'liveProducerBundleInputs')
+      .mockReturnValueOnce(firstSnapshot)
+      .mockReturnValueOnce(secondSnapshot);
     const { deps, recordingStorage } = createScenario();
     const testPath = await writePrompt(recordingStorage.storage);
 
-    await generate(deps, DEFAULT_OPTIONS);
-    const artifact = JSON.parse(await recordingStorage.storage.readText(deps.layout.planPathFor(testPath))) as { source: { inputsDigest: string }; generatorMeta: { planProducerBundle: { fingerprint: string } } };
-    expect(artifact.generatorMeta.planProducerBundle.fingerprint).toBe(planProducerBundle.planProducerBundleFingerprint());
-    expect(artifact.source.inputsDigest).toBe(computeInputsDigest({
-      normalizedTestMd: normalizeTestMd(PROMPT),
-      schemaVersion: 2,
-      generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
-      planProducerBundleFingerprint: artifact.generatorMeta.planProducerBundle.fingerprint,
-      targetDefinitions: TARGETS,
-    }));
+    try {
+      await generate(deps, DEFAULT_OPTIONS);
+      const artifact = JSON.parse(await recordingStorage.storage.readText(deps.layout.planPathFor(testPath))) as {
+        source: { inputsDigest: string };
+        generatorMeta: { planProducerBundle: { fingerprint: string; components: unknown } };
+      };
+      const firstFingerprint = planProducerBundle.computePlanProducerBundleFingerprint(firstSnapshot);
+
+      expect(liveInputs).toHaveBeenCalledTimes(1);
+      expect(artifact.generatorMeta.planProducerBundle).toEqual({
+        fingerprint: firstFingerprint,
+        components: planProducerBundle.planProducerBundleComponentDiagnostics(firstSnapshot),
+      });
+      expect(artifact.source.inputsDigest).toBe(computeInputsDigest({
+        normalizedTestMd: normalizeTestMd(PROMPT),
+        schemaVersion: 2,
+        generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
+        planProducerBundleFingerprint: firstFingerprint,
+        targetDefinitions: TARGETS,
+      }));
+    } finally {
+      liveInputs.mockRestore();
+    }
   });
 
   it('changes the written inputs digest when the producer bundle fingerprint changes', async () => {

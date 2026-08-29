@@ -1,16 +1,36 @@
 import * as ts from 'typescript';
 
-/** Describes the two input-shape failures the digest call-site scan reports. */
-export type DigestCallViolation =
+/**
+ * Describes every independently reportable digest call-site failure.
+ *
+ * The scanner reports failures as a collection because an
+ * authority-external call can also violate the inline-preimage shape. Keeping
+ * both findings prevents a location restriction from masking a structural
+ * escape hatch and lets architecture tests require exactly one call in
+ * `plan-input-provenance.ts` and none elsewhere. Direct resolved calls are
+ * the deliberate boundary: rebinding the imported function to a local
+ * variable, such as `const digest = computeInputsDigest`, remains outside the
+ * scanner's symbol-at-callee guarantee.
+ */
+export type DigestCallSiteViolation =
   | 'argument-must-be-inline-object-literal'
-  | 'argument-must-not-contain-spread';
+  | 'argument-must-not-contain-spread'
+  | 'call-site-outside-authority';
 
-/** Records one checker-resolved call to the exported digest function. */
+/**
+ * Records one checker-resolved call to the exported digest function.
+ *
+ * A call can accumulate multiple findings, rather than selecting an arbitrary
+ * primary failure. The scan considers only
+ * `plan-input-provenance.ts` an allowed production location, reflecting the
+ * one-authority invariant instead of treating the primitive's declaration
+ * module as a second permitted caller.
+ */
 export interface DigestCallSite {
   readonly fileName: string;
   readonly line: number;
   readonly column: number;
-  readonly violation: DigestCallViolation | undefined;
+  readonly violations: DigestCallSiteViolation[];
 }
 
 /**
@@ -19,15 +39,38 @@ export interface DigestCallSite {
  *
  * This deliberate test-support seam complements the syntax-only ESLint rule:
  * it compares declaration identity so renamed imports and namespace calls
- * cannot bypass the digest-input containment contract. The
- * scanner returns every resolved call, with a violation only when its argument
- * is not one spread-free inline object literal after removing transparent
- * TypeScript wrappers. Derived nondeterminism inside a scalar remains outside
- * the scope of this structural check.
+ * cannot bypass the digest-input containment contract. The scanner
+ * returns every resolved call with all applicable
+ * structural and authority-location findings. It flags every call outside
+ * `plan-input-provenance.ts` with `call-site-outside-authority`, while
+ * retaining the existing spread-free inline-object rule after transparent
+ * TypeScript wrappers are removed. Derived nondeterminism inside
+ * a scalar remains outside this structural check.
+ *
+ * @param program - The TypeScript program whose non-declaration sources are
+ * inspected.
+ * @param digestModuleFileName - The source-file name of the module exporting
+ * `computeInputsDigest`.
+ * @param authorityFileName - The canonical source-file name allowed to invoke
+ * `computeInputsDigest` in production.
+ * @returns Every checker-resolved digest call, with zero or more findings for
+ * each call site.
+ * @throws {Error} If the program omits the digest module or that module does
+ * not export `computeInputsDigest` as a function.
+ * @example
+ * ```ts
+ * const calls = scanComputeInputsDigestCalls(
+ *   program,
+ *   digestModuleFileName,
+ *   authorityFileName,
+ * );
+ * expect(calls.flatMap((call) => call.violations)).toEqual([]);
+ * ```
  */
 export function scanComputeInputsDigestCalls(
   program: ts.Program,
   digestModuleFileName: string,
+  authorityFileName: string,
 ): DigestCallSite[] {
   const digestModule = program.getSourceFile(digestModuleFileName);
 
@@ -49,6 +92,7 @@ export function scanComputeInputsDigestCalls(
   const targetDeclaration = digestDeclaration;
 
   const callSites: DigestCallSite[] = [];
+  const canonicalAuthorityFileName = ts.sys.resolvePath(authorityFileName);
 
   function resolvesToDigestDeclaration(callee: ts.Expression): boolean {
     const symbol = checker.getSymbolAtLocation(callee);
@@ -90,18 +134,22 @@ export function scanComputeInputsDigestCalls(
     if (ts.isCallExpression(node) && resolvesToDigestDeclaration(node.expression)) {
       const argument = node.arguments.length === 1 ? node.arguments[0] : undefined;
       const unwrappedArgument = argument === undefined ? undefined : unwrapDigestArgument(argument);
-      const violation = unwrappedArgument === undefined || !ts.isObjectLiteralExpression(unwrappedArgument)
-        ? 'argument-must-be-inline-object-literal'
-        : unwrappedArgument.properties.some(ts.isSpreadAssignment)
-          ? 'argument-must-not-contain-spread'
-          : undefined;
+      const violations: DigestCallSiteViolation[] = [];
+      if (ts.sys.resolvePath(sourceFile.fileName) !== canonicalAuthorityFileName) {
+        violations.push('call-site-outside-authority');
+      }
+      if (unwrappedArgument === undefined || !ts.isObjectLiteralExpression(unwrappedArgument)) {
+        violations.push('argument-must-be-inline-object-literal');
+      } else if (unwrappedArgument.properties.some(ts.isSpreadAssignment)) {
+        violations.push('argument-must-not-contain-spread');
+      }
       const position = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
 
       callSites.push({
         fileName: sourceFile.fileName,
         line: position.line + 1,
         column: position.character + 1,
-        violation,
+        violations,
       });
     }
 

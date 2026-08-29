@@ -7,15 +7,15 @@ import type { RunCaseOutcome, RunDeps } from './run.js';
 import { run, readTrustedInstructionCoveredPlan } from './run.js';
 import { generate, prepareInstructionCoveredSteps } from './generate.js';
 import { inspectGroundingArtifact } from './check-grounding.js';
-import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
+import { computePlanDigest } from '#core/ir/digest.js';
+import { deriveCurrentPlanInputProvenance } from '#core/ai/plan-input-provenance.js';
 import { normalizeTestMd, type NormalizedTestMd } from '#core/ir/normalize.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { groundingRecoveryModeForStep } from '#core/ir/grounding-recovery-mode.js';
-import { PlanDocument, GeneratedPlanResponse, type GroundingDocument, type JsonValueT, type Step } from '#core/ir/schema.js';
+import { GROUNDING_SCHEMA_VERSION, PlanDocument, GeneratedPlanResponse, type GroundingDocument, type JsonValueT, type Step } from '#core/ir/schema.js';
 import type { LayoutResolver } from '#core/layout/resolve.js';
 import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
-import { buildGeneratorTask, promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
-import { planProducerBundleFingerprint } from '#core/ai/plan-producer-bundle.js';
+import { buildGeneratorTask } from '#core/ai/prompt-envelope.js';
 import { resolveTarget } from '#core/target/resolve.js';
 import { extractSecretGrants } from '#core/ir/secret-grant-source.js';
 import { assertCommittedSecretAttributionSound, assertNoLiteralSecrets, normalizeAiStepSecretGrants } from './generator-secret-policy.js';
@@ -555,13 +555,10 @@ async function preflightCase(
   });
   if (target instanceof AmbercastErrorClass) throw target;
 
-  const digest = computeInputsDigest({
+  const digest = deriveCurrentPlanInputProvenance({
     normalizedTestMd: normalized,
-    schemaVersion: 2,
-    generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
-    planProducerBundleFingerprint: planProducerBundleFingerprint(),
     targetDefinitions: target.definitions,
-  });
+  }).inputsDigest;
   const plan = (await readTrustedInstructionCoveredPlan(overlay.storage, planFile, digest, normalized)).plan;
   assertCommittedSecretAttributionSound(plan, normalized);
 
@@ -730,7 +727,7 @@ async function trySingleStepRepair(
     const entries = Object.fromEntries(Object.entries(previousGrounding.entries).filter(([id]) => id !== step.id));
     await overlay.storage.writeText(planFile, toCanonicalArtifactText(candidate as JsonValueT));
     await overlay.storage.writeText(groundingFile, toCanonicalArtifactText({
-      schemaVersion: 1,
+      schemaVersion: GROUNDING_SCHEMA_VERSION,
       planDigest: computePlanDigest(candidate),
       entries,
     } as JsonValueT));

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { createFsStorage } from '#adapters/storage/fs-storage.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
+import * as planInputProvenance from '#core/ai/plan-input-provenance.js';
 import { BrowserLaunchFailedError } from '#core/errors/browser-launch-failed-error.js';
 import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
@@ -1054,10 +1055,12 @@ describe('run', () => {
       { id: 'fill-email', kind: 'action', action: 'fill', target: EMAIL, value: 'person@example.test' },
     ];
     await seedFreshArtifacts(recordingStorage.storage, testPath, steps, elementGrounding(['click-submit', 'fill-email']));
+    const derive = vi.spyOn(planInputProvenance, 'deriveCurrentPlanInputProvenance');
 
     const outcome = await run(deps, DEFAULT_OPTIONS);
 
     expect(outcome.results[0]?.result).toMatchObject({ status: 'passed' });
+    expect(derive).toHaveBeenCalled();
     expect(events.emitted()).toEqual([
       { type: 'step-start', stepId: 'click-submit' },
       { type: 'step-result', stepId: 'click-submit', via: 'grounding' },
