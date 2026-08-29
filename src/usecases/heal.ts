@@ -39,6 +39,7 @@ import {
   type ReplayMeasurement,
   type TrustedPlan,
 } from './heal-provider-context.js';
+import { createHealAiDispatchBudget } from './heal-ai-dispatch-budget.js';
 
 /**
  * Selection and write-intent choices for one healing batch.
@@ -436,7 +437,7 @@ function isMissingArtifactError(error: unknown): error is NodeJS.ErrnoException 
 }
 
 type ResolvedAiExecutor = Awaited<ReturnType<HealDeps['resolveAiExecutor']>>;
-type ResolveCaseAiExecutor = () => Promise<ResolvedAiExecutor>;
+type ResolveCaseAiExecutor = (signal?: AbortSignal) => Promise<ResolvedAiExecutor>;
 
 /**
  * Separates an adopted Stage 2 candidate from an intentional rejection or an
@@ -718,10 +719,9 @@ export function claimedRetainedGrantOffsets(
  * contaminating the later full-regeneration attempt; only a fully validated
  * candidate may become the next measurement input. Its rejection
  * finalizer restores the snapshot, emits one rejection event, and then returns
- * the typed result. Stage 2 is called only after admission succeeds, so a
- * rejected admission emits neither its dispatch `ai-call` nor a rejection.
- * When dispatched, its `ai-call` is emitted immediately before the executor
- * invocation so reports distinguish this provider request from replay events.
+ * the typed result. A phase rejected before work starts emits neither event.
+ * Once Stage 2 starts, its `ai-call` remains an attempted-dispatch diagnostic
+ * even if dispatch-time admission later rejects the phase.
  */
 async function trySingleStepRepair(
   deps: HealDeps,
@@ -969,11 +969,13 @@ function caseOutcome(
  * @remarks
  * The repair phase iterates one frontier at a time. A visited-frontier set
  * records every non-sentinel frontier before Stage 1 so a replay that regresses
- * to an earlier index cannot dispatch work there again. Each iteration
- * measures first, then runs Stage 1, and runs Stage 2 only when Stage 1 does not
- * advance the frontier. Immediately before every provider dispatch, the
- * deadline takes precedence over the attempt ceiling; neither limit applies to
- * a non-dispatching recovery. A failed, discarded, exhausted, or revisited
+ * to an earlier index cannot dispatch work there again. Each iteration uses
+ * its retained measurement, runs Stage 1, and runs Stage 2 only when Stage 1
+ * does not advance the frontier. The deadline is checked both at phase entry,
+ * where it can deny even a non-dispatching recovery, and immediately before
+ * every real dispatch inside an admitted phase; the attempt ceiling applies
+ * only to chargeable dispatches within an admitted incremental phase. A failed,
+ * discarded, exhausted, or revisited
  * incremental path enters Stage 3, whose unsuccessful full-plan replay
  * restores the best pre-Stage-3 incremental candidate. The resulting full
  * pass, resource-bound, and Stage-3 states are classified from the retained
@@ -985,60 +987,55 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
   const groundingFile = deps.layout.groundingPathFor(file);
   const preflight = await preflightCase(deps, options, file, planFile, groundingFile);
   const overlay = preflight.createOverlay(deps.containWrites(deps.layout.runsDirFor(file, deps.runId)));
-  let resolvedAiExecutor: ResolvedAiExecutor | undefined;
-  const resolveCaseAiExecutor: ResolveCaseAiExecutor = async () => {
-    if (resolvedAiExecutor !== undefined) return resolvedAiExecutor;
-    const executor = await deps.resolveAiExecutor(deps.signal);
-    resolvedAiExecutor = executor;
-    return executor;
-  };
-  const caseDeps: HealDeps = { ...deps, resolveAiExecutor: resolveCaseAiExecutor };
+  const caseDeps = deps;
   let plan = preflight.plan;
   let attemptOrdinal = 0;
   const nextAttemptOrdinal = () => ++attemptOrdinal;
   const deadline = caseDeps.clock.monotonicMs() + caseDeps.config.heal.caseTimeoutMs;
-  let measurement = await measureReplay(caseDeps, options, file, overlay, plan, true, nextAttemptOrdinal());
-  if (measurement.interrupted) return measurement;
+  const budget = createHealAiDispatchBudget({
+    resolveAiExecutor: deps.resolveAiExecutor,
+    signal: deps.signal,
+    clock: deps.clock,
+    deadlineMs: deadline,
+    maxDispatches: caseDeps.config.heal.maxStepRepairs ?? Infinity,
+  });
+  const cacheBaseline = await measureReplay(caseDeps, options, file, overlay, plan, true, nextAttemptOrdinal());
+  if (cacheBaseline.interrupted) return cacheBaseline;
+  let measurement = cacheBaseline;
 
-  const caseBaseline = { plan: preflight.plan, measurement };
-  const baselineFirstFailureIndex = measurement.firstFailureIndex;
+  let stopReason: HealCaseOutcome['stopReason'] = 'settled';
+  if (measurement.firstFailureIndex !== plan.steps.length) {
+    const snapshot = overlay.snapshot();
+    const initial = await budget.runPhase('incremental', (phaseDeps) => measureReplay(
+      { ...caseDeps, resolveAiExecutor: phaseDeps.resolveAiExecutor },
+      options,
+      file,
+      overlay,
+      plan,
+      false,
+      nextAttemptOrdinal(),
+    ));
+    if (!initial.admitted) {
+      overlay.restore(snapshot);
+      stopReason = initial.deniedReason;
+    } else if (!initial.result.ok) {
+      throw initial.result.error;
+    } else {
+      const initialMeasurement = initial.result.value;
+      if (initialMeasurement.interrupted) return initialMeasurement;
+      measurement = initialMeasurement;
+    }
+  }
+  const caseBaseline = { plan: preflight.plan, measurement: cacheBaseline };
+  const baselineFirstFailureIndex = cacheBaseline.firstFailureIndex;
   let repairKind: RepairKind | undefined;
   let stage3Error: AmbercastError | undefined;
   let fullPlanReplayed = false;
-  let stopReason: HealCaseOutcome['stopReason'] = 'settled';
   let stage3Required = baselineFirstFailureIndex !== plan.steps.length;
-  const structuralCeiling = plan.steps.length - baselineFirstFailureIndex;
-  const maxDispatches = Math.min(structuralCeiling, caseDeps.config.heal.maxStepRepairs ?? Infinity);
-  let chargedDispatches = 0;
   const visitedFrontiers = new Set<number>();
   const repairHistory: RepairHistoryEntry[] = [];
-  let remeasureOnEntry = true;
 
-  const dispatchAllowed = (): boolean => {
-    if (caseDeps.clock.monotonicMs() >= deadline) {
-      stopReason = 'deadline';
-      return false;
-    }
-    if (chargedDispatches >= maxDispatches) {
-      stopReason = 'attempt-limit';
-      return false;
-    }
-    chargedDispatches += 1;
-    return true;
-  };
-  const groundingRepairDispatches = async (frontier: number, mode: ReturnType<typeof groundingRecoveryModeForStep>): Promise<boolean> => {
-    if (mode !== 'ai-retrace') return false;
-    const grounding = JSON.parse(await readStorageText(overlay.storage, groundingFile, 'The grounding artifact could not be read.')) as GroundingDocument;
-    const entry = grounding.entries[plan.steps[frontier]!.id];
-    return entry === undefined || entry.kind !== 'ai' || isLegacyShapedTrace(entry.trace);
-  };
-
-  while (stage3Required) {
-    if (remeasureOnEntry) {
-      measurement = await measureReplay(caseDeps, options, file, overlay, plan, false, nextAttemptOrdinal());
-      if (measurement.interrupted) return measurement;
-    }
-    remeasureOnEntry = true;
+  while (stage3Required && stopReason === 'settled') {
     if (measurement.firstFailureIndex === plan.steps.length) {
       stage3Required = false;
       stopReason = 'settled';
@@ -1048,22 +1045,41 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
     const frontier = measurement.firstFailureIndex;
     visitedFrontiers.add(frontier);
     const mode = groundingRecoveryModeForStep(plan.steps[frontier]!);
-    if (await groundingRepairDispatches(frontier, mode) && !dispatchAllowed()) break;
-    measurement = await tryGroundingRepair(caseDeps, options, file, groundingFile, overlay, plan, measurement, nextAttemptOrdinal);
-    if (measurement.interrupted) return measurement;
+    const stage1Snapshot = overlay.snapshot();
+    const stage1 = await budget.runPhase('incremental', (phaseDeps) => tryGroundingRepair(
+      { ...caseDeps, resolveAiExecutor: phaseDeps.resolveAiExecutor }, options, file, groundingFile, overlay, plan, measurement, nextAttemptOrdinal,
+    ));
+    if (!stage1.admitted) {
+      overlay.restore(stage1Snapshot);
+      stopReason = stage1.deniedReason;
+      break;
+    }
+    if (!stage1.result.ok) throw stage1.result.error;
+    const stage1Measurement = stage1.result.value;
+    if (stage1Measurement.interrupted) return stage1Measurement;
+    measurement = stage1Measurement;
     if (measurement.firstFailureIndex > frontier) {
       repairKind = mode === 'element-reground' ? 'grounding-element' : 'grounding-ai-retrace';
       continue;
     }
-    if (mode === 'element-reground' || !dispatchAllowed()) break;
+    const stage2Snapshot = overlay.snapshot();
     const beforePlan = plan;
     const beforeMeasurement = measurement;
-    const repaired = await trySingleStepRepair(caseDeps, resolveCaseAiExecutor, options, file, planFile, groundingFile, overlay, preflight.normalized, plan, caseBaseline, measurement, repairHistory, nextAttemptOrdinal);
+    const stage2 = await budget.runPhase('incremental', (phaseDeps) => trySingleStepRepair(
+      { ...caseDeps, resolveAiExecutor: phaseDeps.resolveAiExecutor }, phaseDeps.resolveAiExecutor, options, file, planFile, groundingFile, overlay, preflight.normalized, plan, caseBaseline, measurement, repairHistory, nextAttemptOrdinal,
+    ));
+    if (!stage2.admitted) {
+      overlay.restore(stage2Snapshot);
+      stopReason = stage2.deniedReason;
+      break;
+    }
+    if (!stage2.result.ok) throw stage2.result.error;
+    const repaired = stage2.result.value;
     if (repaired.kind === 'interrupted') return { interrupted: true };
     if (repaired.kind === 'rejected') break;
     plan = repaired.plan;
+    if (repaired.measurement.interrupted) return { interrupted: true };
     measurement = repaired.measurement;
-    if (measurement.interrupted) return measurement;
     if (measurement.firstFailureIndex <= frontier) break;
     repairKind = 'tail';
     repairHistory.push({
@@ -1077,14 +1093,20 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
     if (beforeMeasurement === measurement) break;
   }
 
-  if (stage3Required && measurement.firstFailureIndex < plan.steps.length) {
-    if (caseDeps.clock.monotonicMs() >= deadline) {
-      stopReason = 'deadline';
-    } else {
+  if (stage3Required && measurement.firstFailureIndex < plan.steps.length && stopReason !== 'deadline') {
       const bestPlan = plan;
       const bestMeasurement = measurement;
       const bestSnapshot = overlay.snapshot();
-      const full = await tryFullPlanRepair(caseDeps, resolveCaseAiExecutor, options, file, planFile, overlay, preflight.normalized, preflight.digest, plan, measurement, nextAttemptOrdinal);
+      const fullPhase = await budget.runPhase('stage3', (phaseDeps) => tryFullPlanRepair(
+        { ...caseDeps, resolveAiExecutor: phaseDeps.resolveAiExecutor }, phaseDeps.resolveAiExecutor, options, file, planFile, overlay, preflight.normalized, preflight.digest, plan, measurement, nextAttemptOrdinal,
+      ));
+      if (!fullPhase.admitted) {
+        overlay.restore(bestSnapshot);
+        stopReason = fullPhase.deniedReason;
+      } else if (!fullPhase.result.ok) {
+        throw fullPhase.result.error;
+      } else {
+      const full = fullPhase.result.value;
       if (full.measurement.interrupted) return full.measurement;
       stage3Error = full.stage3Error;
       if (full.replayed && full.measurement.firstFailureIndex === full.plan.steps.length) {
@@ -1098,7 +1120,7 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
         plan = bestPlan;
         measurement = bestMeasurement;
       }
-    }
+      }
   }
 
   const outcome = caseOutcome(file, planFile, baselineFirstFailureIndex, measurement, plan, stage3Error, fullPlanReplayed, stopReason);
@@ -1126,13 +1148,15 @@ export async function heal(
 ): Promise<HealBatchResult> {
   const tracker = new BatchInterruptionTracker(deps.signal);
   try {
-    const files = options.files.length
+    const selectedFiles = options.files.length
       ? [...options.files]
       : (await deps.discoverTestFiles({
         testDir: deps.config.testDir,
         testMatch: deps.config.testMatch,
         testIgnore: deps.config.testIgnore,
       })).map((file) => `${deps.config.testDir}/${file}`);
+    // F5i keeps each case's independent budget and commit capability unique.
+    const files = Array.from(new Set(selectedFiles));
     if (options.list) {
       return {
         outcome: { results: [], errors: [], noTestsFound: files.length === 0, listed: files.map((file) => ({ file })), skipped: [], interrupted: false },

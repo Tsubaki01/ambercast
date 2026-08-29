@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FsIoError } from '#core/errors/fs-io-error.js';
 import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
@@ -433,6 +434,7 @@ describe('heal state-machine contract', () => {
       expect.stringMatching(/\/attempt-2$/),
       expect.stringMatching(/\/attempt-3$/),
       expect.stringMatching(/\/attempt-4$/),
+      expect.stringMatching(/\/attempt-5$/),
     ]);
     expect(new Set(replayDirectories).size).toBe(replayDirectories.length);
     expect(new Set(screenshotPaths).size).toBe(screenshotPaths.length);
@@ -1188,7 +1190,7 @@ describe('heal state-machine contract', () => {
     expect(result.commits.size).toBe(0);
   });
 
-  it('reports an unclassified Stage-3 resolver failure as an unresolved result instead of a case-scoped error', async () => {
+  it('propagates an initial Stage-2 resolver failure as a case-scoped unexpected crash without Stage 3', async () => {
     const scenario = await createScenario({
       sessionEntries: new Map([
         [elementRefKey(SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }],
@@ -1198,13 +1200,10 @@ describe('heal state-machine contract', () => {
 
     const result = await heal({ ...scenario.deps, resolveAiExecutor }, OPTIONS);
 
-    expect(result.outcome.results).toEqual([
-      expect.objectContaining({
-        repairOutcome: 'unresolved',
-        stage3Error: expect.any(UnexpectedCrashError),
-      }),
+    expect(result.outcome.results).toEqual([]);
+    expect(result.outcome.errors).toEqual([
+      expect.objectContaining({ file: OPTIONS.files[0], error: expect.any(UnexpectedCrashError) }),
     ]);
-    expect(result.outcome.errors).toEqual([]);
     expect(resolveAiExecutor).toHaveBeenCalledOnce();
     expect(result.commits.size).toBe(0);
   });
@@ -2123,9 +2122,9 @@ describe('heal state-machine contract', () => {
       aiExecutor: createFakeAiExecutor({ execute }),
     });
     const result = await heal(scenario.deps, OPTIONS);
-    expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'healed', stopReason: 'settled', finalFirstFailureIndex: 1 });
-    expect(execute.mock.calls.filter(([request]) => stage2Frontier(request) !== undefined)).toHaveLength(0);
-    expect(execute.mock.calls.filter(([request]) => !request.prompt.startsWith('Confirm whether') && stage2Frontier(request) === undefined)).toHaveLength(1);
+    expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'healed', stopReason: 'settled', finalFirstFailureIndex: 2 });
+    expect(execute.mock.calls.filter(([request]) => stage2Frontier(request) !== undefined)).toHaveLength(2);
+    expect(execute.mock.calls.filter(([request]) => !request.prompt.startsWith('Confirm whether') && stage2Frontier(request) === undefined)).toHaveLength(0);
   });
 
   it('discards a non-advancing candidate then makes exactly one Stage 3 request and no further Stage 2 request', async () => {
@@ -2134,7 +2133,7 @@ describe('heal state-machine contract', () => {
       : { data: stage2Frontier(request) === undefined ? { steps: [{ id: 'full', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [] } : { steps: [{ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }], ambiguities: [] }, raw: '{}' });
     const scenario = await createScenario({ sessionEntries: new Map([[elementRefKey(SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }], ...liveEntries(REPAIRED_SUBMIT)]), aiExecutor: createFakeAiExecutor({ execute }) });
     await heal(scenario.deps, OPTIONS);
-    expect(execute.mock.calls.filter(([request]) => stage2Frontier(request) !== undefined)).toHaveLength(0);
+    expect(execute.mock.calls.filter(([request]) => stage2Frontier(request) !== undefined)).toHaveLength(1);
     expect(execute.mock.calls.filter(([request]) => !request.prompt.startsWith('Confirm whether') && stage2Frontier(request) === undefined)).toHaveLength(1);
   });
 
@@ -2177,7 +2176,7 @@ describe('heal state-machine contract', () => {
       aiExecutor: createFakeAiExecutor({ execute }),
     });
     await heal(scenario.deps, OPTIONS);
-    expect(execute.mock.calls.filter(([request]) => stage2Frontier(request) !== undefined)).toHaveLength(0);
+    expect(execute.mock.calls.filter(([request]) => stage2Frontier(request) !== undefined)).toHaveLength(1);
     expect(execute.mock.calls.filter(([request]) => !request.prompt.startsWith('Confirm whether') && stage2Frontier(request) === undefined)).toHaveLength(1);
   });
 
@@ -2188,7 +2187,7 @@ describe('heal state-machine contract', () => {
     expect(execute).toHaveBeenCalledOnce();
   });
 
-  it('reports attempt-limit after a prior advance and enters Stage 3', async () => {
+  it('reports attempt-limit before progress when the initial live measurement consumes the allowance', async () => {
     const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: unknown }) => {
       if (request.prompt.startsWith('Confirm whether')) return { data: { confirmed: true }, raw: '{}' };
       if (stage2Frontier(request)?.index === 0) return { data: { steps: [{ id: 'click-submit', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [] }, raw: '{}' };
@@ -2207,7 +2206,32 @@ describe('heal state-machine contract', () => {
       aiExecutor: createFakeAiExecutor({ execute }),
     });
     const result = await heal({ ...scenario.deps, config: { ...scenario.deps.config, heal: { caseTimeoutMs: 300_000, maxStepRepairs: 1 } } }, OPTIONS);
-    expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'unresolved', stopReason: 'settled' });
+    expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'unresolved', stopReason: 'attempt-limit' });
+  });
+
+  it('reports partially-healed when a first Stage 2 advance exhausts the next frontier allowance', async () => {
+    const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: unknown }) => {
+      if (request.prompt.startsWith('Confirm whether')) return { data: { confirmed: true }, raw: '{}' };
+      const frontier = stage2Frontier(request);
+      if (frontier?.index === 0) return { data: { steps: [{ id: 'click-submit', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [] }, raw: '{}' };
+      return { data: { steps: [{ id: 'click-after', kind: 'action', action: 'click', target: REPAIRED_AFTER_SUBMIT }], ambiguities: [] }, raw: '{}' };
+    });
+    const scenario = await createScenario({
+      steps: [
+        Step.parse({ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }),
+        Step.parse({ id: 'click-after', kind: 'action', action: 'click', target: AFTER_SUBMIT }),
+      ],
+      sessionEntries: new Map([
+        [elementRefKey(SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }],
+        [elementRefKey(AFTER_SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }],
+        ...liveEntries(REPAIRED_SUBMIT),
+      ]),
+      aiExecutor: createFakeAiExecutor({ execute }),
+    });
+
+    const result = await heal({ ...scenario.deps, config: { ...scenario.deps.config, heal: { caseTimeoutMs: 300_000, maxStepRepairs: 2 } } }, OPTIONS);
+
+    expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'partially-healed', stopReason: 'attempt-limit' });
   });
 
   it('reports settled when an attempt-limit Stage 3 replay fully heals the plan', async () => {
@@ -2260,7 +2284,7 @@ describe('heal state-machine contract', () => {
     expect(result.outcome.results[0]).toMatchObject({ stopReason: 'attempt-limit' });
   });
 
-  it('returns partially-healed at a deadline after an advance and remains confirmation eligible', async () => {
+  it('returns unresolved at a deadline before progress without entering Stage 3', async () => {
     let expired = false;
     const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: unknown }) => {
       if (request.prompt.startsWith('Confirm whether')) return { data: { confirmed: true }, raw: '{}' };
@@ -2281,8 +2305,46 @@ describe('heal state-machine contract', () => {
     });
     const result = await heal({ ...scenario.deps, clock: { now: () => new Date(), monotonicMs: () => expired ? 2 : 0 }, config: { ...scenario.deps.config, heal: { caseTimeoutMs: 1 } } }, OPTIONS);
     const outcome = result.outcome.results[0]!;
-    expect({ repairOutcome: outcome.repairOutcome, stopReason: outcome.stopReason, finalFirstFailureIndex: outcome.finalFirstFailureIndex }).toEqual({ repairOutcome: 'healed', stopReason: 'settled', finalFirstFailureIndex: 1 });
-    expect(result.commits.has(OPTIONS.files[0]!)).toBe(true);
+    expect({ repairOutcome: outcome.repairOutcome, stopReason: outcome.stopReason, finalFirstFailureIndex: outcome.finalFirstFailureIndex }).toEqual({ repairOutcome: 'unresolved', stopReason: 'deadline', finalFirstFailureIndex: 0 });
+    expect(result.commits.has(OPTIONS.files[0]!)).toBe(false);
+  });
+
+  it('keeps a progressed candidate committable after the next phase is deadline-denied', async () => {
+    let stageTwoGenerationCompleted = false;
+    let stageTwoCandidateReplayed = false;
+    const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: unknown }) => {
+      if (request.prompt.startsWith('Confirm whether')) {
+        expect(stageTwoGenerationCompleted).toBe(true);
+        return { data: { confirmed: true }, raw: '{}' };
+      }
+      if (stage2Frontier(request) !== undefined) stageTwoGenerationCompleted = true;
+      return { data: { steps: [{ id: 'click-submit', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [] }, raw: '{}' };
+    });
+    const scenario = await createScenario({
+      steps: [
+        Step.parse({ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }),
+        Step.parse({ id: 'click-after', kind: 'action', action: 'click', target: AFTER_SUBMIT }),
+      ],
+      sessionEntries: new Map([
+        [elementRefKey(SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }],
+        [elementRefKey(AFTER_SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }],
+        ...liveEntries(REPAIRED_SUBMIT),
+      ]),
+      aiExecutor: createFakeAiExecutor({ execute }),
+    });
+    replayRunObserver.afterRun = (_deps, _storage, options) => {
+      if (options.cacheOnly === false && stageTwoGenerationCompleted) stageTwoCandidateReplayed = true;
+    };
+    const clock = { now: () => new Date(), monotonicMs: () => stageTwoCandidateReplayed ? 2 : 0 };
+
+    const result = await heal({ ...scenario.deps, clock, config: { ...scenario.deps.config, heal: { caseTimeoutMs: 1 } } }, OPTIONS);
+    const outcome = result.outcome.results[0]!;
+    expect(outcome).toMatchObject({ repairOutcome: 'partially-healed', stopReason: 'deadline' });
+    expect(stageTwoGenerationCompleted).toBe(true);
+    expect(stageTwoCandidateReplayed).toBe(true);
+    expect(execute.mock.calls.some(([request]) => request.prompt.startsWith('Confirm whether'))).toBe(true);
+    const commit = result.commits.get(OPTIONS.files[0]!);
+    await expect(commit?.commit()).resolves.toEqual({ outcome: 'committed' });
   });
 
   it('returns unresolved at a deadline before progress without entering Stage 3', async () => {
@@ -2312,8 +2374,8 @@ describe('heal state-machine contract', () => {
     const scenario = await createScenario({ steps: [Step.parse({ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }), Step.parse({ id: 'click-after', kind: 'action', action: 'click', target: AFTER_SUBMIT })], sessionEntries: new Map([[elementRefKey(SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }], [elementRefKey(AFTER_SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }], ...liveEntries(REPAIRED_SUBMIT)]), aiExecutor: createFakeAiExecutor({ execute }) });
     const result = await heal(scenario.deps, OPTIONS);
     const outcome = result.outcome.results[0]!;
-    expect({ repairOutcome: outcome.repairOutcome, stopReason: outcome.stopReason, finalFirstFailureIndex: outcome.finalFirstFailureIndex }).toEqual({ repairOutcome: 'unresolved', stopReason: 'settled', finalFirstFailureIndex: 0 });
-    expect(result.commits.has(OPTIONS.files[0]!)).toBe(false);
+    expect({ repairOutcome: outcome.repairOutcome, stopReason: outcome.stopReason, finalFirstFailureIndex: outcome.finalFirstFailureIndex }).toEqual({ repairOutcome: 'partially-healed', stopReason: 'settled', finalFirstFailureIndex: 1 });
+    expect(result.commits.has(OPTIONS.files[0]!)).toBe(true);
   });
 
   it('classifies an unchanged no-Stage-3 measurement as no-changes-needed under R11', async () => {
@@ -2341,7 +2403,7 @@ describe('heal state-machine contract', () => {
       if (stage2Frontier(request)?.index === 0) {
         return { data: { steps: [{ id: 'click-submit', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [] }, raw: '{}' };
       }
-      throw new Error('No further candidate is available.');
+      throw new AiResponseInvalidError('No further candidate is available.');
     });
     const scenario = await createScenario({
       steps: [Step.parse({ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }), Step.parse({ id: 'click-after', kind: 'action', action: 'click', target: AFTER_SUBMIT })],
@@ -2350,8 +2412,13 @@ describe('heal state-machine contract', () => {
     });
     const result = await heal(scenario.deps, OPTIONS);
     const outcome = result.outcome.results[0]!;
-    expect({ repairOutcome: outcome.repairOutcome, stopReason: outcome.stopReason, baselineFirstFailureIndex: outcome.baselineFirstFailureIndex, finalFirstFailureIndex: outcome.finalFirstFailureIndex, stage3Error: outcome.stage3Error }).toEqual({ repairOutcome: 'unresolved', stopReason: 'settled', baselineFirstFailureIndex: 0, finalFirstFailureIndex: 0, stage3Error: expect.any(Error) });
-    expect(result.commits.has(OPTIONS.files[0]!)).toBe(false);
+    // This fixture's frontier-0 Stage 2 candidate is admissible and succeeds,
+    // strictly advancing the frontier to 1 before Stage 3 fails. Per F5h/G2, a
+    // verified candidate that strictly advanced past baseline is retained rather
+    // than discarded when a later phase fails, so the case settles as
+    // partially-healed at the advanced index, matching this test's own title.
+    expect({ repairOutcome: outcome.repairOutcome, stopReason: outcome.stopReason, baselineFirstFailureIndex: outcome.baselineFirstFailureIndex, finalFirstFailureIndex: outcome.finalFirstFailureIndex, stage3Error: outcome.stage3Error }).toEqual({ repairOutcome: 'partially-healed', stopReason: 'settled', baselineFirstFailureIndex: 0, finalFirstFailureIndex: 1, stage3Error: expect.any(Error) });
+    expect(result.commits.has(OPTIONS.files[0]!)).toBe(true);
   });
 
   it('classifies a no-Stage-3 measurement without advance as unresolved under R11', async () => {
@@ -2377,9 +2444,238 @@ describe('heal state-machine contract', () => {
     const expected = mode === 'none'
       ? { replacement: 1, nonReplacement: 1, aiRetrace: 0 }
       : mode === 'ai-retrace'
-        ? { replacement: 0, nonReplacement: 1, aiRetrace: 2 }
-        : { replacement: 0, nonReplacement: 1, aiRetrace: 0 };
+        ? { replacement: 0, nonReplacement: 1, aiRetrace: 1 }
+        : { replacement: 1, nonReplacement: 1, aiRetrace: 0 };
     expect({ replacement: replacementDispatches.length, nonReplacement: nonReplacementDispatches.length, aiRetrace: executeAgentic.mock.calls.length }).toEqual(expected);
+  });
+
+  it('deduplicates explicitly selected files before creating cases', async () => {
+    const scenario = await createScenario({
+      sessionEntries: new Map([[elementRefKey(SUBMIT), { exists: true, currentFingerprint: FINGERPRINT }]]),
+    });
+
+    const result = await heal(scenario.deps, { ...OPTIONS, files: [OPTIONS.files[0]!, OPTIONS.files[0]!] });
+
+    expect(result.outcome.results).toHaveLength(1);
+    expect(result.outcome.results.map((outcome) => outcome.file)).toEqual([OPTIONS.files[0]]);
+  });
+
+  it('does not perform a live replay or resolve AI when the cache-only baseline fully passes', async () => {
+    const resolveAiExecutor = vi.fn(async () => createFakeAiExecutor());
+    const replayModes: boolean[] = [];
+    const scenario = await createScenario({
+      sessionEntries: new Map([[elementRefKey(SUBMIT), { exists: true, currentFingerprint: FINGERPRINT }]]),
+    });
+
+    replayRunObserver.afterRun = (_deps, _storage, options) => { replayModes.push(options.cacheOnly === true); };
+
+    const result = await heal({ ...scenario.deps, resolveAiExecutor }, OPTIONS);
+
+    expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'no-changes-needed', stopReason: 'settled' });
+    expect(replayModes).toEqual([true]);
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+  });
+
+  it('heals an element-reground frontier through Stage 2 and retains the proposed replacement', async () => {
+    const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: unknown }) => {
+      if (request.prompt.startsWith('Confirm whether')) return { data: { confirmed: true }, raw: '{}' };
+      return { data: { steps: [{ id: 'click-submit', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [] }, raw: '{}' };
+    });
+    const scenario = await createScenario({
+      sessionEntries: new Map([
+        [elementRefKey(SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }],
+        ...liveEntries(REPAIRED_SUBMIT),
+      ]),
+      aiExecutor: createFakeAiExecutor({ execute }),
+    });
+
+    const result = await heal(scenario.deps, OPTIONS);
+    const commit = result.commits.get(OPTIONS.files[0]!);
+
+    expect(execute.mock.calls.some(([request]) => stage2Frontier(request) !== undefined)).toBe(true);
+    await expect(commit?.commit()).resolves.toEqual({ outcome: 'committed' });
+    const plan = PlanDocument.parse(JSON.parse(await scenario.storage.readText(PLAN)));
+    expect(plan.steps[0]).toMatchObject({ id: 'click-submit', action: 'click', target: REPAIRED_SUBMIT });
+  });
+
+  it.each([
+    ['accepts a locator-only replacement', 'click', true],
+    ['rejects an obligation-changing replacement', 'navigate', false],
+  ] as const)('%s for an element-reground Stage 2 candidate', async (_name, action, shouldCommit) => {
+    const events = createRecordingEventSink();
+    const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: unknown }) => {
+      if (request.prompt.startsWith('Confirm whether')) return { data: { confirmed: true }, raw: '{}' };
+      if (stage2Frontier(request) === undefined) throw new AiResponseInvalidError('No full-plan candidate is available.');
+      return { data: { steps: [{ id: 'click-submit', kind: 'action', action, ...(action === 'click' ? { target: REPAIRED_SUBMIT } : { url: '/different-obligation' }) }], ambiguities: [] }, raw: '{}' };
+    });
+    const scenario = await createScenario({
+      sessionEntries: new Map([
+        [elementRefKey(SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }],
+        ...liveEntries(REPAIRED_SUBMIT),
+      ]),
+      aiExecutor: createFakeAiExecutor({ execute }),
+    });
+
+    const result = await heal({ ...scenario.deps, events: events.sink }, OPTIONS);
+
+    expect(execute.mock.calls.some(([request]) => stage2Frontier(request) !== undefined)).toBe(true);
+    expect(result.commits.has(OPTIONS.files[0]!)).toBe(shouldCommit);
+    if (!shouldCommit) {
+      expect(events.emitted()).toContainEqual({
+        type: 'heal-stage2-rejected',
+        stepId: 'click-submit',
+        reason: 'obligation-mismatch',
+      });
+    }
+  });
+
+  it('restores the pre-phase snapshot when the deadline expires between Stage 2 dispatches', async () => {
+    let expired = false;
+    let deniedPhaseStorage: StorageAdapter | undefined;
+    const events = createRecordingEventSink();
+    const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: unknown }) => {
+      if (stage2Frontier(request) !== undefined) {
+        expired = true;
+        return { data: { steps: [{ id: 'click-submit', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [] }, raw: '{}' };
+      }
+      return { data: { confirmed: true }, raw: '{}' };
+    });
+    const scenario = await createScenario({
+      sessionEntries: new Map([
+        [elementRefKey(SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }],
+        ...liveEntries(REPAIRED_SUBMIT),
+      ]),
+      aiExecutor: createFakeAiExecutor({ execute }),
+    });
+    const originalPlan = await scenario.storage.readText(PLAN);
+    const originalGrounding = await scenario.storage.readText(GROUNDING);
+    replayRunObserver.afterRun = (_deps, storage, options) => {
+      if (options.cacheOnly === false && expired) deniedPhaseStorage = storage;
+    };
+
+    const result = await heal({
+      ...scenario.deps,
+      events: events.sink,
+      clock: { now: () => new Date(), monotonicMs: () => expired ? 2 : 0 },
+      config: { ...scenario.deps.config, heal: { caseTimeoutMs: 1 } },
+    }, OPTIONS);
+
+    expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'unresolved', stopReason: 'deadline', finalFirstFailureIndex: 0 });
+    expect(result.commits.size).toBe(0);
+    expect(deniedPhaseStorage).toBeDefined();
+    await expect(Promise.all([
+      deniedPhaseStorage!.readText(PLAN),
+      deniedPhaseStorage!.readText(GROUNDING),
+    ])).resolves.toEqual([originalPlan, originalGrounding]);
+    expect(events.emitted().filter((event) => event.type === 'ai-call' && event.stepId === 'click-submit')).toEqual([
+      { type: 'ai-call', stepId: 'click-submit' },
+      { type: 'ai-call', stepId: 'click-submit' },
+    ]);
+    expect(events.emitted().filter((event) => event.type === 'heal-stage2-rejected')).toEqual([
+      { type: 'heal-stage2-rejected', stepId: 'click-submit', reason: 'no-advance' },
+    ]);
+  });
+
+  it('starts the case deadline after preflight and does not charge preflight elapsed time', async () => {
+    let preflightFinished = false;
+    const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: unknown }) => {
+      if (request.prompt.startsWith('Confirm whether')) return { data: { confirmed: true }, raw: '{}' };
+      return { data: { steps: [{ id: 'click-submit', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [] }, raw: '{}' };
+    });
+    const resolveAiExecutor = vi.fn(async () => createFakeAiExecutor({ execute }));
+    const scenario = await createScenario({
+      sessionEntries: new Map([
+        [elementRefKey(SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }],
+        ...liveEntries(REPAIRED_SUBMIT),
+      ]),
+    });
+    const storage: StorageAdapter = {
+      ...scenario.storage,
+      async readTextSnapshot(path) {
+        const snapshot = await scenario.storage.readTextSnapshot(path);
+        if (path === GROUNDING) preflightFinished = true;
+        return snapshot;
+      },
+    };
+    const monotonicMs = vi.fn(() => preflightFinished ? 50_000 : 0);
+
+    const result = await heal({
+      ...scenario.deps,
+      storage,
+      resolveAiExecutor,
+      clock: { now: () => new Date(), monotonicMs },
+      config: { ...scenario.deps.config, heal: { caseTimeoutMs: 1 } },
+    }, OPTIONS);
+
+    expect(preflightFinished).toBe(true);
+    expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'healed', stopReason: 'settled' });
+    expect(execute.mock.calls.some(([request]) => stage2Frontier(request) !== undefined)).toBe(true);
+    expect(resolveAiExecutor).toHaveBeenCalled();
+    expect(monotonicMs.mock.calls.length).toBeGreaterThan(0);
+  });
+
+  it('gives the second file an independent deadline and commit capability after the first expires', async () => {
+    const first = OPTIONS.files[0]!;
+    const second = '/workspace/tests/second.test.md';
+    const firstPlan = PLAN;
+    const firstGrounding = GROUNDING;
+    let activeFile = first;
+    const clockCalls = new Map<string, number>();
+    const scenario = await createScenario({
+      sessionEntries: new Map([
+        [elementRefKey(SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }],
+        ...liveEntries(REPAIRED_SUBMIT),
+      ]),
+      aiExecutor: createFakeAiExecutor({ execute: async (request) => request.prompt.startsWith('Confirm whether')
+        ? { data: { confirmed: true }, raw: '{}' }
+        : { data: { steps: [{ id: 'click-submit', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [] }, raw: '{}' } }),
+    });
+    const secondPlan = scenario.deps.layout.planPathFor(second);
+    const secondGrounding = scenario.deps.layout.groundingPathFor(second);
+    await scenario.storage.writeText(second, await scenario.storage.readText(first));
+    await scenario.storage.writeText(secondPlan, await scenario.storage.readText(PLAN));
+    await scenario.storage.writeText(secondGrounding, await scenario.storage.readText(GROUNDING));
+    const storage: StorageAdapter = {
+      ...scenario.storage,
+      async readTextSnapshot(path) {
+        if (path === first || path === firstPlan || path === firstGrounding) activeFile = first;
+        if (path === second || path === secondPlan || path === secondGrounding) activeFile = second;
+        return scenario.storage.readTextSnapshot(path);
+      },
+    };
+    const monotonicMs = vi.fn(() => {
+      const calls = (clockCalls.get(activeFile) ?? 0) + 1;
+      clockCalls.set(activeFile, calls);
+      if (activeFile === first) return calls === 1 ? 0 : 2;
+      return 100;
+    });
+
+    const result = await heal({
+      ...scenario.deps,
+      storage,
+      clock: { now: () => new Date(), monotonicMs },
+      config: { ...scenario.deps.config, heal: { caseTimeoutMs: 1, maxStepRepairs: 2 } },
+    }, { ...OPTIONS, files: [first, second] });
+
+    expect(result.outcome.results).toHaveLength(2);
+    expect(result.outcome.results[0]).toMatchObject({ file: first, repairOutcome: 'unresolved', stopReason: 'deadline' });
+    expect(result.outcome.results[1]).toMatchObject({ file: second, repairOutcome: 'healed', stopReason: 'settled' });
+    expect(result.commits.has(first)).toBe(false);
+    expect(result.commits.has(second)).toBe(true);
+    expect(clockCalls.get(second)).toBeGreaterThan(0);
+  });
+
+  it('keeps the F5j dispatch-budget wording byte-identical across public surfaces', async () => {
+    const sentence = 'Hard limit on real provider dispatches started during incremental repair. Charged at dispatch time regardless of outcome. Includes element confirmation dispatches. Excludes the cache-only baseline and Stage 3.';
+    const [schema, cli, docs] = await Promise.all([
+      readFile(new URL('../../../src/core/config/schema.ts', import.meta.url), 'utf8'),
+      readFile(new URL('../../../src/cli/main.ts', import.meta.url), 'utf8'),
+      readFile(new URL('../../../docs/configuration.md', import.meta.url), 'utf8'),
+    ]);
+
+    expect(schema).toContain(sentence);
+    expect(cli).toContain(sentence);
+    expect(docs).toContain(sentence);
   });
 });
 
