@@ -7,8 +7,12 @@ import { computeInputsDigest as aliasComputeInputsDigest } from '#core/ir/digest
 import { computeInputsDigest as relativeComputeInputsDigest } from '../src/core/ir/digest.js';
 import { scanAccessibilityCaptureFieldAccess } from '../tools/accessibility-capture-scanner.js';
 import { scanComputeInputsDigestCalls } from '../tools/digest-scanner.js';
+import { scanSchemaVersionLiteralViolations } from '../tools/schema-version-literal-scanner.js';
 import { scanFillSecretCallSites } from '../tools/fill-secret-call-scanner.js';
-import { liveProducerBundleInputs, planProducerBundleManifest } from '#core/ai/plan-producer-bundle.js';
+import {
+  liveProducerBundleInputs,
+  planProducerBundleManifest,
+} from '#core/ai/plan-producer-bundle.js';
 
 const SOURCE_ROOT = fileURLToPath(new URL('../src/', import.meta.url));
 const DIGEST_MODULE_FILE = fileURLToPath(new URL('../src/core/ir/digest.ts', import.meta.url));
@@ -20,6 +24,9 @@ const GENERATE_MODULE_FILE = fileURLToPath(new URL('../src/usecases/generate.ts'
 const CHECK_TEST_FILE = fileURLToPath(new URL('./unit/usecases/check.test.ts', import.meta.url));
 const CHECK_MODULE_FILE = fileURLToPath(new URL('../src/usecases/check.ts', import.meta.url));
 const CHECK_COMMAND_MODULE_FILE = fileURLToPath(new URL('../src/runtime/check-command.ts', import.meta.url));
+const HEAL_MODULE_FILE = fileURLToPath(new URL('../src/usecases/heal.ts', import.meta.url));
+const PLAN_INPUT_PROVENANCE_MODULE_FILE = fileURLToPath(new URL('../src/core/ai/plan-input-provenance.ts', import.meta.url));
+const IR_SCHEMA_MODULE_FILE = fileURLToPath(new URL('../src/core/ir/schema.ts', import.meta.url));
 
 const PROMPT_ENVELOPE_SPECIFIER = '#core/ai/prompt-envelope.js';
 const IR_SCHEMA_SPECIFIER = '#core/ir/schema.js';
@@ -528,13 +535,12 @@ describe('architecture guardrails', () => {
         expectedSites: [
           { authority: 'GROUNDING_SCHEMA_VERSION', kind: 'property' },
           { authority: 'PLAN_SCHEMA_VERSION', kind: 'property' },
-          { authority: 'PLAN_SCHEMA_VERSION', kind: 'property' },
         ],
         fileName: GENERATE_MODULE_FILE,
         usecase: 'generate',
       },
       {
-        expectedSites: [{ authority: 'PLAN_SCHEMA_VERSION', kind: 'property' }],
+        expectedSites: [],
         fileName: CHECK_MODULE_FILE,
         usecase: 'check',
       },
@@ -542,10 +548,19 @@ describe('architecture guardrails', () => {
         expectedSites: [
           { authority: 'GROUNDING_SCHEMA_VERSION', kind: 'property' },
           { authority: 'GROUNDING_SCHEMA_VERSION', kind: 'comparison' },
-          { authority: 'PLAN_SCHEMA_VERSION', kind: 'property' },
         ],
         fileName: RUN_MODULE_FILE,
         usecase: 'run',
+      },
+      {
+        expectedSites: [{ authority: 'GROUNDING_SCHEMA_VERSION', kind: 'property' }],
+        fileName: HEAL_MODULE_FILE,
+        usecase: 'heal',
+      },
+      {
+        expectedSites: [{ authority: 'PLAN_SCHEMA_VERSION', kind: 'property' }],
+        fileName: PLAN_INPUT_PROVENANCE_MODULE_FILE,
+        usecase: 'plan-input-provenance',
       },
     ];
     const scans = await Promise.all(usecases.map(async ({ expectedSites, fileName, usecase }) => {
@@ -570,7 +585,7 @@ describe('architecture guardrails', () => {
         sites: expectedSites,
         usecase,
       })));
-    expect(scans.every(({ lines }) => lines.length > 0 && lines.every((line) => line > 0))).toBe(true);
+    expect(scans.every(({ lines }) => lines.every((line) => line > 0))).toBe(true);
   });
 
   test('keeps check tests, usecase, and runtime composition free of AI/browser, event, and secrets imports', async () => {
@@ -664,9 +679,77 @@ describe('architecture guardrails', () => {
     expect(sourceFiles.length).toBeGreaterThan(0);
     expect(program.getSyntacticDiagnostics()).toEqual([]);
     expect(program.getSemanticDiagnostics()).toEqual([]);
-    const callSites = scanComputeInputsDigestCalls(program, DIGEST_MODULE_FILE);
+    const callSites = scanComputeInputsDigestCalls(
+      program,
+      DIGEST_MODULE_FILE,
+      PLAN_INPUT_PROVENANCE_MODULE_FILE,
+    );
 
-    expect(callSites.filter((site) => site.violation !== undefined)).toEqual([]);
+    expect(callSites.flatMap((site) => site.violations)).toEqual([]);
+    expect(callSites).toEqual([
+      expect.objectContaining({
+        fileName: PLAN_INPUT_PROVENANCE_MODULE_FILE,
+        violations: [],
+      }),
+    ]);
+  });
+
+  test('detects a planted digest call outside the exact authority identity through the architecture scan path', () => {
+    const authority = ts.createSourceFile(
+      '/virtual/src/core/ai/plan-input-provenance.ts',
+      "import { computeInputsDigest } from '../ir/digest.js'; computeInputsDigest({ schemaVersion: 2 });",
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    const impostor = ts.createSourceFile(
+      '/virtual/vendor/src/core/ai/plan-input-provenance.ts',
+      "import { computeInputsDigest } from '../../../../src/core/ir/digest.js'; computeInputsDigest({ schemaVersion: 2 });",
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    const digest = ts.createSourceFile(
+      '/virtual/src/core/ir/digest.ts',
+      'export function computeInputsDigest(_input: object): string { return \'digest\'; }',
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    const sources = new Map([[authority.fileName, authority], [impostor.fileName, impostor], [digest.fileName, digest]]);
+    const host = ts.createCompilerHost({ noEmit: true, target: ts.ScriptTarget.ES2023 });
+    const originalGetSourceFile = host.getSourceFile.bind(host);
+    const originalFileExists = host.fileExists.bind(host);
+    const originalReadFile = host.readFile.bind(host);
+    host.getSourceFile = (fileName, languageVersion) => sources.get(fileName) ?? originalGetSourceFile(fileName, languageVersion);
+    host.fileExists = (fileName) => sources.has(fileName) || originalFileExists(fileName);
+    host.readFile = (fileName) => sources.get(fileName)?.text ?? originalReadFile(fileName);
+    host.resolveModuleNames = (moduleNames) => moduleNames.map((moduleName) => (
+      moduleName.endsWith('/digest.js')
+        ? { resolvedFileName: digest.fileName, extension: ts.Extension.Ts }
+        : undefined
+    ));
+    const program = ts.createProgram({ rootNames: [...sources.keys()], options: { noEmit: true, target: ts.ScriptTarget.ES2023 }, host });
+
+    expect(scanComputeInputsDigestCalls(program, digest.fileName, authority.fileName)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ fileName: impostor.fileName, violations: ['call-site-outside-authority'] }),
+    ]));
+  });
+
+  test('scans every production source file without schemaVersion literal violations', async () => {
+    const sourceFiles = await findTypeScriptFiles(SOURCE_ROOT);
+    const program = ts.createProgram({ rootNames: sourceFiles, options: { module: ts.ModuleKind.NodeNext, moduleResolution: ts.ModuleResolutionKind.NodeNext, noEmit: true, strict: true, target: ts.ScriptTarget.ES2023, types: ['node'] } });
+    expect(scanSchemaVersionLiteralViolations(program, IR_SCHEMA_MODULE_FILE)).toEqual([]);
+  });
+
+  test('detects a planted schemaVersion authority bypass through the architecture scan path', async () => {
+    const source = ts.createSourceFile('/virtual/src/usecases/planted.ts', 'const plan = { schemaVersion: 2 };', ts.ScriptTarget.ES2023, true);
+    const schema = ts.createSourceFile(IR_SCHEMA_MODULE_FILE, 'export const PLAN_SCHEMA_VERSION = 2 as const; export const GROUNDING_SCHEMA_VERSION = 1 as const;', ts.ScriptTarget.ES2023, true);
+    const host = ts.createCompilerHost({ noEmit: true, target: ts.ScriptTarget.ES2023 });
+    const originals = new Map([[source.fileName, source], [schema.fileName, schema]]);
+    const originalGetSourceFile = host.getSourceFile.bind(host);
+    host.getSourceFile = (fileName, languageVersion) => originals.get(fileName) ?? originalGetSourceFile(fileName, languageVersion);
+    const program = ts.createProgram({ rootNames: [...originals.keys()], options: { noEmit: true, target: ts.ScriptTarget.ES2023 }, host });
+    expect(scanSchemaVersionLiteralViolations(program, IR_SCHEMA_MODULE_FILE)).toEqual([
+      expect.objectContaining({ fileName: source.fileName, line: 1, column: expect.any(Number) }),
+    ]);
   });
 
   test('resolves the core subpath alias to the relative digest module', () => {

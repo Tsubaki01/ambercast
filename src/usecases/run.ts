@@ -11,7 +11,7 @@ import { StaleIrError } from '#core/errors/stale-ir-error.js';
 import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { AmbercastError, type AmbercastError as AmbercastErrorType } from '#core/errors/types.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
-import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
+import { computePlanDigest } from '#core/ir/digest.js';
 import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
 import { matchRunReferenceTokens } from '#core/ir/run-ref.js';
 import {
@@ -33,7 +33,6 @@ import {
 import {
   GROUNDING_SCHEMA_VERSION,
   GroundingDocument,
-  PLAN_SCHEMA_VERSION,
   PlanDocument,
   TraceAction,
   TraceAssert,
@@ -56,8 +55,7 @@ import {
 } from '#core/ir/schema.js';
 import type { LayoutResolver } from '#core/layout/resolve.js';
 import { joinPath, relativeWithin } from '#core/paths.js';
-import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
-import { planProducerBundleFingerprint } from '#core/ai/plan-producer-bundle.js';
+import { deriveCurrentPlanInputProvenance } from '#core/ai/plan-input-provenance.js';
 import { resolveTarget } from '#core/target/resolve.js';
 import type {
   InstructionCoverageAiActionController,
@@ -3083,13 +3081,10 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
     const resolvedTargets = targetSelection.definitions;
 
     const normalizedTestMd = normalizeTestMd(testMd);
-    const inputsDigest = computeInputsDigest({
+    const inputsDigest = deriveCurrentPlanInputProvenance({
       normalizedTestMd,
-      schemaVersion: PLAN_SCHEMA_VERSION,
-      generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
-      planProducerBundleFingerprint: planProducerBundleFingerprint(),
       targetDefinitions: resolvedTargets,
-    });
+    }).inputsDigest;
     const trustedPlan = await readTrustedInstructionCoveredPlan(
       deps.storage,
       planPath,

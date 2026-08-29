@@ -2,6 +2,7 @@ import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { DEFAULT_RAW_CONFIG } from '#config/defaults.js';
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
+import * as planInputProvenance from '#core/ai/plan-input-provenance.js';
 import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
@@ -189,11 +190,13 @@ describe('check', () => {
         },
       },
     } as GroundingDocument['entries']);
+    const derive = vi.spyOn(planInputProvenance, 'deriveCurrentPlanInputProvenance');
 
     await expect(check(deps, { ...OPTIONS, files: [testPath] })).resolves.toMatchObject({
       results: [{ id: testPath, status: 'fresh' }],
       errors: [],
     });
+    expect(derive).toHaveBeenCalled();
   });
 
   it('discovers nested relative test paths and anchors their findings to the configured test directory', async () => {

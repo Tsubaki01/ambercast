@@ -7,6 +7,7 @@ import { MissingPlanError } from '#core/errors/missing-plan-error.js';
 import { SecretGrantUnattributableError } from '#core/errors/secret-grant-unattributable-error.js';
 import { StaleIrError } from '#core/errors/stale-ir-error.js';
 import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
+import * as planInputProvenance from '#core/ai/plan-input-provenance.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
 import { planProducerBundleFingerprint } from '#core/ai/plan-producer-bundle.js';
@@ -17,6 +18,7 @@ import {
   type GroundingDocument,
   type GeneratedPlanResponse,
   type JsonValueT,
+  GROUNDING_SCHEMA_VERSION,
   PlanDocument,
   Step,
   type Fingerprint,
@@ -635,6 +637,7 @@ describe('heal state-machine contract', () => {
       storage: { ...base, readBinary },
       sessionEntries: new Map([[elementRefKey(SUBMIT), { exists: true, currentFingerprint: FINGERPRINT }]]),
     });
+    const derive = vi.spyOn(planInputProvenance, 'deriveCurrentPlanInputProvenance');
     const result = await heal(scenario.deps, OPTIONS);
 
     expect(result.outcome.results).toHaveLength(1);
@@ -643,6 +646,7 @@ describe('heal state-machine contract', () => {
       finalFirstFailureIndex: scenario.plan.steps.length,
     });
     expect(result.commits.size).toBe(0);
+    expect(derive).toHaveBeenCalled();
     expect(readBinary).toHaveBeenCalledTimes(2);
     expect(readBinary).toHaveBeenNthCalledWith(1, PLAN);
     expect(readBinary).toHaveBeenNthCalledWith(2, GROUNDING);
@@ -1001,6 +1005,7 @@ describe('heal state-machine contract', () => {
     const rewrittenGrounding = JSON.parse(await scenario.storage.readText(GROUNDING)) as GroundingDocument;
     expect(rewrittenPlan.source.inputsDigest).toBe(scenario.plan.source.inputsDigest);
     expect(computePlanDigest(rewrittenPlan)).not.toBe(originalPlanDigest);
+    expect(rewrittenGrounding.schemaVersion).toBe(GROUNDING_SCHEMA_VERSION);
     expect(rewrittenGrounding.planDigest).toBe(computePlanDigest(rewrittenPlan));
     expect(rewrittenGrounding.entries).toEqual({
       'fill-password': { kind: 'element', fingerprint: FINGERPRINT },

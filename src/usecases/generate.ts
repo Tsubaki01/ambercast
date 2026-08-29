@@ -8,13 +8,11 @@ import { composeAiDeadline, isAiDeadlineTimeout } from '#core/ai/ai-deadline.js'
 import {
   buildGeneratorTask,
   GENERATE_PLAN_TASK_INSTRUCTION,
-  promptTemplateFingerprint,
 } from '#core/ai/prompt-envelope.js';
 import {
-  liveProducerBundleInputs,
   planProducerBundleComponentDiagnostics,
-  computePlanProducerBundleFingerprint,
 } from '#core/ai/plan-producer-bundle.js';
+import { deriveCurrentPlanInputProvenance } from '#core/ai/plan-input-provenance.js';
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
@@ -22,7 +20,7 @@ import { FsIoError } from '#core/errors/fs-io-error.js';
 import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
 import { AmbercastError, type AmbercastError as AmbercastErrorType } from '#core/errors/types.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
-import { computeInputsDigest, computePlanDigest } from '#core/ir/digest.js';
+import { computePlanDigest } from '#core/ir/digest.js';
 import { normalizeTestMd, type NormalizedTestMd } from '#core/ir/normalize.js';
 import {
   GeneratedPlanResponse,
@@ -438,15 +436,11 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
     const resolvedTargets = targetSelection.definitions;
 
     const normalizedTestMd = normalizeTestMd(testMd);
-    const producerBundleInputs = liveProducerBundleInputs();
-    const producerBundleFingerprint = computePlanProducerBundleFingerprint(producerBundleInputs);
-    const inputsDigest = computeInputsDigest({
+    const provenance = deriveCurrentPlanInputProvenance({
       normalizedTestMd,
-      schemaVersion: PLAN_SCHEMA_VERSION,
-      generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
-      planProducerBundleFingerprint: producerBundleFingerprint,
       targetDefinitions: resolvedTargets,
     });
+    const { inputsDigest, producerBundleFingerprint, producerBundleInputs } = provenance;
     const planPath = deps.layout.planPathFor(file);
     const groundingPath = deps.layout.groundingPathFor(file);
 

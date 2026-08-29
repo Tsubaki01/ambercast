@@ -11,13 +11,10 @@
 import type { ResolvedConfig } from '#core/config/schema.js';
 import { FsIoError } from '#core/errors/fs-io-error.js';
 import { TargetUnresolvedError } from '#core/errors/target-unresolved-error.js';
-import { promptTemplateFingerprint } from '#core/ai/prompt-envelope.js';
-import { planProducerBundleFingerprint } from '#core/ai/plan-producer-bundle.js';
+import { deriveCurrentPlanInputProvenance } from '#core/ai/plan-input-provenance.js';
 import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
-import { computeInputsDigest } from '#core/ir/digest.js';
 import { normalizeTestMd, type NormalizedTestMd } from '#core/ir/normalize.js';
 import {
-  PLAN_SCHEMA_VERSION,
   PlanDocument,
   type InstructionCoveredPlanDocument,
   type JsonValueT,
@@ -426,13 +423,10 @@ export async function check(deps: CheckDeps, options: CheckOptions): Promise<Che
         });
         continue;
       }
-      const inputsDigest = computeInputsDigest({
+      const inputsDigest = deriveCurrentPlanInputProvenance({
         normalizedTestMd,
-        schemaVersion: PLAN_SCHEMA_VERSION,
-        generatorPromptTemplateFingerprint: promptTemplateFingerprint(),
-        planProducerBundleFingerprint: planProducerBundleFingerprint(),
         targetDefinitions: targetSelection.definitions,
-      });
+      }).inputsDigest;
       if (parsedPlan.data.source.inputsDigest === inputsDigest) {
         /*
          * Grounding is inspected only after the plan has passed its own
