@@ -8,6 +8,9 @@
 import { z } from 'zod';
 import { TargetDefinition } from '#core/ir/schema.js';
 
+/** Shared explanation for the incremental repair dispatch budget. */
+export const HEAL_MAX_STEP_REPAIRS_DESCRIPTION = 'Hard limit on real provider dispatches started during incremental repair. Charged at dispatch time regardless of outcome. Includes element confirmation dispatches. Excludes the cache-only baseline and Stage 3.';
+
 /**
  * Schema for a target as it may appear in a partial configuration file.
  *
@@ -82,7 +85,7 @@ export const RawConfig = z.strictObject({
     localWriteBack: z.enum(['auto', 'explicit']).optional(),
   }).optional(),
   heal: z.strictObject({
-    maxStepRepairs: z.int().positive().optional().describe('Limits Stage 2 step regeneration and Stage 1 AI retrace dispatches; it does not limit element regrounding.'),
+    maxStepRepairs: z.int().positive().optional().describe(HEAL_MAX_STEP_REPAIRS_DESCRIPTION),
     caseTimeoutMs: z.int().positive().optional(),
   }).optional(),
 });
@@ -150,10 +153,11 @@ export interface ResolvedConfig extends LayoutConfig {
    * Resolved limits for one healing case.
    *
    * `caseTimeoutMs` is always available because healing establishes one
-   * case-wide deadline before baseline replay. An omitted `maxStepRepairs`
-   * instead leaves the structural frontier ceiling as the only repair-budget
-   * bound; its shared counter covers Stage 2 replacements and Stage 1 AI
-   * retraces, never element regrounding or replay.
+   * case-wide deadline before baseline replay. It establishes an admission
+   * boundary for starting a new repair phase or dispatch, without interrupting
+   * work already in flight or invalidating a commit already produced. See
+   * {@link HEAL_MAX_STEP_REPAIRS_DESCRIPTION} for the dispatches controlled
+   * when `maxStepRepairs` is present.
    */
   readonly heal: Readonly<{ maxStepRepairs?: number; caseTimeoutMs: number }>;
 }
