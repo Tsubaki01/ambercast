@@ -18,7 +18,8 @@ import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
 import { buildGeneratorTask } from '#core/ai/prompt-envelope.js';
 import { resolveTarget } from '#core/target/resolve.js';
 import { extractSecretGrants } from '#core/ir/secret-grant-source.js';
-import { assertCommittedSecretAttributionSound, assertNoLiteralSecrets, normalizeAiStepSecretGrants } from './generator-secret-policy.js';
+import { assertCommittedSecretAttributionSound, assertNoLiteralSecrets, enumerateSecretGrantClaims, normalizeAiStepSecretGrants } from './generator-secret-policy.js';
+import type { StageTwoRejectionReason } from '#ports/system.js';
 import { isLegacyShapedTrace, validateCommittedInstructionCoverage } from './instruction-coverage-policy.js';
 import { FsIoError as FsIoErrorClass } from '#core/errors/fs-io-error.js';
 import { MissingPlanError } from '#core/errors/missing-plan-error.js';
@@ -28,6 +29,10 @@ import { BatchInterruptionTracker } from './batch-interruption.js';
 import { obligationFingerprintMatches } from '#core/ir/obligation-fingerprint.js';
 import { joinPath } from '#core/paths.js';
 import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
+import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
+import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
+import { SecretGrantUnattributableError } from '#core/errors/secret-grant-unattributable-error.js';
+import { SecretLiteralRejectedError } from '#core/errors/secret-literal-rejected-error.js';
 
 /**
  * Selection and write-intent choices for one healing batch.
@@ -456,6 +461,27 @@ interface RepairHistoryEntry {
 }
 
 /**
+ * Separates an adopted Stage 2 candidate from an intentional rejection or an
+ * interrupted attempt.
+ *
+ * The result makes the caller's control flow explicit instead of inferring a
+ * rejection from object identity. The implementation checks for
+ * cancellation before every rejection classification, maps executor-thrown
+ * `AiResponseInvalidError` to `provider-error`, reserves `response-shape` for
+ * local safe-parse and count checks after a valid executor response, and then
+ * evaluates the fixed `id-mismatch`, `secret-attribution`, `coverage-invalid`,
+ * `obligation-mismatch`, `literal-secret`, and `no-advance` sequence.
+ */
+type SingleStepRepairResult =
+  | {
+    readonly kind: 'accepted';
+    readonly plan: TrustedPlan;
+    readonly measurement: ReplayMeasurement & { readonly interrupted: false };
+  }
+  | { readonly kind: 'rejected'; readonly reason: StageTwoRejectionReason }
+  | { readonly kind: 'interrupted' };
+
+/**
  * Projects replay results into the minimal evidence allowed in provider context.
  *
  * The projection retains only step identity and pass/fail status. It excludes
@@ -551,6 +577,22 @@ function firstFailureIndex(replay: RunCaseOutcome, plan: TrustedPlan): number {
   return steps.findIndex((step) => step.status === 'failed' || step.status === 'error');
 }
 
+async function readStorageText(storage: StorageAdapter, path: string, message: string): Promise<string> {
+  try {
+    return await storage.readText(path);
+  } catch (error) {
+    throw new FsIoErrorClass(message, undefined, { cause: error });
+  }
+}
+
+async function writeStorageText(storage: StorageAdapter, path: string, text: string, message: string): Promise<void> {
+  try {
+    await storage.writeText(path, text);
+  } catch (error) {
+    throw new FsIoErrorClass(message, undefined, { cause: error });
+  }
+}
+
 /**
  * Loads only artifacts trustworthy enough to be repaired.
  *
@@ -565,7 +607,7 @@ async function preflightCase(
   planFile: string,
   groundingFile: string,
 ): Promise<ValidatedHealPreflight> {
-  const normalized = normalizeTestMd(await deps.storage.readText(file));
+  const normalized = normalizeTestMd(await readStorageText(deps.storage, file, 'The test prompt could not be read.'));
   const target = resolveTarget({
     targets: deps.config.targets,
     defaultTarget: deps.config.defaultTarget,
@@ -648,7 +690,7 @@ async function tryGroundingRepair(
   const mode = groundingRecoveryModeForStep(failingStep);
   if (mode === 'none') return baseline;
 
-  const grounding = JSON.parse(await overlay.storage.readText(groundingFile)) as GroundingDocument;
+  const grounding = JSON.parse(await readStorageText(overlay.storage, groundingFile, 'The grounding artifact could not be read.')) as GroundingDocument;
   const entry = grounding.entries[failingStep.id];
 
   if (mode === 'ai-retrace') {
@@ -663,7 +705,7 @@ async function tryGroundingRepair(
     // AI retracing retains its prior trace as a focused replay hint; only an
     // element retry clears the stale fingerprint that prevents rebinding.
     delete grounding.entries[failingStep.id];
-    await overlay.storage.writeText(groundingFile, toCanonicalArtifactText(grounding as JsonValueT));
+    await writeStorageText(overlay.storage, groundingFile, toCanonicalArtifactText(grounding as JsonValueT), 'The grounding artifact could not be written.');
   }
   const measurement = await measureReplay(deps, options, file, overlay, plan, false, nextAttemptOrdinal());
   if (measurement.interrupted || measurement.firstFailureIndex <= baseline.firstFailureIndex) {
@@ -674,27 +716,33 @@ async function tryGroundingRepair(
 }
 
 /**
- * Records grants already owned by the untouched prefix before replacing a tail.
+ * Builds the prompt-grant offsets already owned outside a replacement step.
  *
- * The shared preparation policy validates all prompt grants, so pre-seeding
- * exact prefix offsets prevents a valid prefix-owned secret from appearing
- * uncovered when only replacement steps are provider-shaped input.
+ * Partial attribution receives only provider-shaped replacement steps, while
+ * prompt-wide coverage still includes untouched prefix and suffix ownership.
+ * The lookup excludes only `replacedIndex`, enumerates
+ * the remaining claims, and resolves `ref`, `startLine`, and `endLine` exactly
+ * to `grant.offsetStart` values. `offsetStart`, explicitly not `startLine`,
+ * is the ownership key because distinct grants can otherwise collide.
+ *
+ * @param plan - The committed plan whose untouched steps retain ownership.
+ * @param replacedIndex - The old step omitted so its replacement may reclaim a
+ * matching prompt grant.
+ * @param normalized - Canonical prompt from which exact grant offsets are read.
+ * @returns Offset-based ownership seed for partial secret attribution.
  */
-function claimedPrefixGrantOffsets(plan: TrustedPlan, start: number, normalized: NormalizedTestMd): ReadonlySet<number> {
-  const claimed = new Set<number>();
+export function claimedRetainedGrantOffsets(
+  plan: Pick<TrustedPlan, 'steps'>,
+  replacedIndex: number,
+  normalized: NormalizedTestMd,
+): ReadonlySet<number> {
   const grants = extractSecretGrants(normalized);
-  for (const step of plan.steps.slice(0, start)) {
-    const spans = step.kind === 'action' && step.action === 'fill-secret'
-      ? [step.secretGrantSpan]
-      : step.kind === 'ai'
-        ? (step.secrets ?? []).map((secret) => secret.sourceSpan)
-        : [];
-    for (const span of spans) {
-      const grant = grants.find((candidate) => candidate.startLine === span.startLine);
-      if (grant !== undefined) claimed.add(grant.offsetStart);
-    }
-  }
-  return claimed;
+  return new Set(enumerateSecretGrantClaims(plan.steps.filter((_, index) => index !== replacedIndex))
+    .flatMap((claim) => grants.filter((grant) => (
+      grant.ref === claim.ref
+      && grant.startLine === claim.sourceSpan.startLine
+      && grant.endLine === claim.sourceSpan.endLine
+    )).map((grant) => grant.offsetStart)));
 }
 
 /**
@@ -702,7 +750,12 @@ function claimedPrefixGrantOffsets(plan: TrustedPlan, start: number, normalized:
  *
  * The overlay snapshot keeps an invalid provider response or partial pair from
  * contaminating the later full-regeneration attempt; only a fully validated
- * candidate may become the next measurement input.
+ * candidate may become the next measurement input. Its rejection
+ * finalizer restores the snapshot, emits one rejection event, and then returns
+ * the typed result. Stage 2 is called only after admission succeeds, so a
+ * rejected admission emits neither its dispatch `ai-call` nor a rejection.
+ * When dispatched, its `ai-call` is emitted immediately before the executor
+ * invocation so reports distinguish this provider request from replay events.
  */
 async function trySingleStepRepair(
   deps: HealDeps,
@@ -718,15 +771,37 @@ async function trySingleStepRepair(
   measurement: ReplayMeasurement & { readonly interrupted: false },
   repairHistory: readonly RepairHistoryEntry[],
   nextAttemptOrdinal: () => number,
-): Promise<{ readonly plan: TrustedPlan; readonly measurement: ReplayMeasurement }> {
-  if (measurement.firstFailureIndex >= plan.steps.length) return { plan, measurement };
+): Promise<SingleStepRepairResult> {
+  if (measurement.firstFailureIndex >= plan.steps.length) return { kind: 'rejected', reason: 'no-advance' };
 
   const snapshot = overlay.snapshot();
   const start = measurement.firstFailureIndex;
   const step = plan.steps[start]!;
+  const reject = (reason: StageTwoRejectionReason): SingleStepRepairResult => {
+    overlay.restore(snapshot);
+    if (deps.signal?.aborted) return { kind: 'interrupted' };
+    deps.events.emit({ type: 'heal-stage2-rejected', stepId: step.id, reason });
+    return { kind: 'rejected', reason };
+  };
+  const propagate = (error: unknown): SingleStepRepairResult => {
+    overlay.restore(snapshot);
+    if (deps.signal?.aborted) return { kind: 'interrupted' };
+    throw error;
+  };
+
+  let executor: ResolvedAiExecutor;
   try {
-    const executor = await resolveAiExecutor();
-    const response = await executor.execute({
+    executor = await resolveAiExecutor();
+  } catch (error) {
+    if (deps.signal?.aborted) return reject('provider-error');
+    if (error instanceof AiExecutorUnavailableError || error instanceof AiResponseInvalidError) return reject('provider-error');
+    return propagate(error);
+  }
+
+  let response;
+  try {
+    deps.events.emit({ type: 'ai-call', stepId: step.id });
+    response = await executor.execute({
       prompt: buildGeneratorTask('Repair the requested failing plan step. Return exactly one replacement step with the requested ID, preserving its kind and obligations. Use the supplied test prompt, target definitions, plan continuity, and replay evidence to repair the failure.'),
       responseSchema: typedJsonSchema(GeneratedPlanResponse),
       context: {
@@ -750,51 +825,70 @@ async function trySingleStepRepair(
       } as unknown as JsonValueT,
       ...(deps.signal === undefined ? {} : { signal: deps.signal }),
     });
-    const generated = GeneratedPlanResponse.parse(response.data);
-    if (generated.steps.length !== 1 || generated.steps[0]?.id !== step.id) {
-      throw new Error('Replacement IDs mismatch.');
-    }
+  } catch (error) {
+    if (deps.signal?.aborted) return reject('provider-error');
+    if (error instanceof AiExecutorUnavailableError || error instanceof AiResponseInvalidError) return reject('provider-error');
+    return propagate(error);
+  }
 
-    const prepared = prepareInstructionCoveredSteps(generated, normalized, claimedPrefixGrantOffsets(plan, start, normalized));
-    if (!prepared.success) throw new Error('Instruction coverage is invalid.');
-    const replacement = normalizeAiStepSecretGrants(prepared.data)[0]!;
-    if (!obligationFingerprintMatches(step, replacement)) throw new Error('Replacement obligations mismatch.');
-    const candidate = PlanDocument.parse({
+  const parsed = GeneratedPlanResponse.safeParse(response.data);
+  if (!parsed.success || parsed.data.steps.length !== 1) return reject('response-shape');
+  const generated = parsed.data;
+  if (generated.steps[0]?.id !== step.id) return reject('id-mismatch');
+
+  let prepared;
+  try {
+    prepared = prepareInstructionCoveredSteps(generated, normalized, claimedRetainedGrantOffsets(plan, start, normalized));
+  } catch (error) {
+    if (error instanceof SecretGrantUnattributableError) return reject('secret-attribution');
+    return propagate(error);
+  }
+  if (!prepared.success) return reject('coverage-invalid');
+  const replacement = normalizeAiStepSecretGrants(prepared.data)[0]!;
+  if (!obligationFingerprintMatches(step, replacement)) return reject('obligation-mismatch');
+  const candidate = PlanDocument.parse({
       ...plan,
       steps: [...plan.steps.slice(0, start), replacement, ...plan.steps.slice(start + 1)],
-    });
+  });
+  try {
     assertCommittedSecretAttributionSound(candidate, normalized);
-    for (const step of candidate.steps) {
-      if (step.kind !== 'ai') continue;
-      const coverage = validateCommittedInstructionCoverage(step.instructionCoverage, normalized);
-      if (!coverage.success) throw new Error('Instruction coverage is invalid.');
-    }
+  } catch (error) {
+    if (error instanceof SecretGrantUnattributableError) return reject('secret-attribution');
+    return propagate(error);
+  }
+  for (const candidateStep of candidate.steps) {
+    if (candidateStep.kind !== 'ai') continue;
+    const coverage = validateCommittedInstructionCoverage(candidateStep.instructionCoverage, normalized);
+    if (!coverage.success) return reject('coverage-invalid');
+  }
+  try {
     assertNoLiteralSecrets(candidate);
+  } catch (error) {
+    if (error instanceof SecretLiteralRejectedError) return reject('literal-secret');
+    return propagate(error);
+  }
 
-    const previousGrounding = JSON.parse(await overlay.storage.readText(groundingFile)) as GroundingDocument;
+  let previousGrounding: GroundingDocument;
+  try {
+    previousGrounding = JSON.parse(await readStorageText(overlay.storage, groundingFile, 'The grounding artifact could not be read.')) as GroundingDocument;
     const entries = Object.fromEntries(Object.entries(previousGrounding.entries).filter(([id]) => id !== step.id));
-    await overlay.storage.writeText(planFile, toCanonicalArtifactText(candidate as JsonValueT));
-    await overlay.storage.writeText(groundingFile, toCanonicalArtifactText({
+    await writeStorageText(overlay.storage, planFile, toCanonicalArtifactText(candidate as JsonValueT), 'The repaired plan could not be written.');
+    await writeStorageText(overlay.storage, groundingFile, toCanonicalArtifactText({
       schemaVersion: GROUNDING_SCHEMA_VERSION,
       planDigest: computePlanDigest(candidate),
       entries,
-    } as JsonValueT));
-
-    const replay = await measureReplay(deps, options, file, overlay, candidate, false, nextAttemptOrdinal());
-    if (replay.interrupted) {
-      overlay.restore(snapshot);
-      return { plan, measurement: { interrupted: true } };
-    }
-    if (replay.firstFailureIndex <= measurement.firstFailureIndex) {
-      overlay.restore(snapshot);
-      return { plan, measurement };
-    }
-    return { plan: candidate, measurement: replay };
-  } catch {
-    overlay.restore(snapshot);
-    if (deps.signal?.aborted) return { plan, measurement: { interrupted: true } };
-    return { plan, measurement };
+    } as JsonValueT), 'The repaired grounding artifact could not be written.');
+  } catch (error) {
+    return propagate(error);
   }
+
+  const replay = await measureReplay(deps, options, file, overlay, candidate, false, nextAttemptOrdinal());
+  if (replay.interrupted) {
+    overlay.restore(snapshot);
+    return { kind: 'interrupted' };
+  }
+  if (replay.firstFailureIndex <= measurement.firstFailureIndex) return reject('no-advance');
+  return { kind: 'accepted', plan: candidate, measurement: replay };
 }
 
 /**
@@ -977,7 +1071,7 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
   };
   const groundingRepairDispatches = async (frontier: number, mode: ReturnType<typeof groundingRecoveryModeForStep>): Promise<boolean> => {
     if (mode !== 'ai-retrace') return false;
-    const grounding = JSON.parse(await overlay.storage.readText(groundingFile)) as GroundingDocument;
+    const grounding = JSON.parse(await readStorageText(overlay.storage, groundingFile, 'The grounding artifact could not be read.')) as GroundingDocument;
     const entry = grounding.entries[plan.steps[frontier]!.id];
     return entry === undefined || entry.kind !== 'ai' || isLegacyShapedTrace(entry.trace);
   };
@@ -1009,10 +1103,12 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
     const beforePlan = plan;
     const beforeMeasurement = measurement;
     const repaired = await trySingleStepRepair(caseDeps, resolveCaseAiExecutor, options, file, planFile, groundingFile, overlay, preflight.normalized, plan, beforeGrounding, measurement, repairHistory, nextAttemptOrdinal);
+    if (repaired.kind === 'interrupted') return { interrupted: true };
+    if (repaired.kind === 'rejected') break;
     plan = repaired.plan;
     measurement = repaired.measurement;
     if (measurement.interrupted) return measurement;
-    if (plan === beforePlan || measurement.firstFailureIndex <= frontier) break;
+    if (measurement.firstFailureIndex <= frontier) break;
     repairKind = 'tail';
     repairHistory.push({
       stepId: beforePlan.steps[frontier]!.id,
@@ -1109,7 +1205,7 @@ export async function heal(
           file,
           error: error instanceof AmbercastErrorClass
             ? error
-            : new FsIoErrorClass('Healing failed for this case.', undefined, { cause: error }),
+            : new UnexpectedCrashError('Healing failed for this case.', undefined, { cause: error }),
         });
       } finally {
         tracker.markTerminal(file);

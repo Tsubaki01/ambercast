@@ -1,16 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import { extractSecretGrants } from '#core/ir/secret-grant-source.js';
-import type { GeneratedStep, PlanDocument, Step } from '#core/ir/schema.js';
+import { Step, type GeneratedStep, type PlanDocument } from '#core/ir/schema.js';
 import { SecretGrantUnattributableError } from '#core/errors/secret-grant-unattributable-error.js';
 import { SecretLiteralRejectedError } from '#core/errors/secret-literal-rejected-error.js';
 import {
   assertNoLiteralSecrets,
   assertCommittedSecretAttributionSound,
   attributeSecretGrants,
+  enumerateSecretGrantClaims,
   normalizeAiStepSecretGrants,
   SECRET_GRANT_UNATTRIBUTABLE_HINTS,
 } from '#usecases/generator-secret-policy.js';
+import { claimedRetainedGrantOffsets } from '#usecases/heal.js';
 
 const INPUTS_DIGEST = '0123456789abcdef'.repeat(4);
 const TARGET = { strategy: 'accessibility', role: 'textbox', name: 'Password' } as const;
@@ -28,6 +30,56 @@ function prompt(...grantRefs: readonly string[]) {
     '',
   ].join('\n'));
 }
+
+describe('enumerateSecretGrantClaims', () => {
+  it('enumerates fill-secret and AI claims in supplied step and secret order without mutating input', () => {
+    const steps: readonly Step[] = [
+      committedFill(FIRST_REF, 3, 'prefix-fill'),
+      Step.parse({ id: 'plain-action', kind: 'action', action: 'navigate', url: '/' }),
+      committedAi([
+        { ref: SECOND_REF, startLine: 4 },
+        { ref: FIRST_REF, startLine: 6 },
+      ], 'suffix-ai'),
+      committedFill(SECOND_REF, 7, 'suffix-fill'),
+    ];
+    const snapshot = structuredClone(steps);
+
+    expect(enumerateSecretGrantClaims(steps)).toEqual([
+      { ref: FIRST_REF, sourceSpan: { startLine: 3, endLine: 3 }, stepId: 'prefix-fill' },
+      { ref: SECOND_REF, sourceSpan: { startLine: 4, endLine: 4 }, stepId: 'suffix-ai' },
+      { ref: FIRST_REF, sourceSpan: { startLine: 6, endLine: 6 }, stepId: 'suffix-ai' },
+      { ref: SECOND_REF, sourceSpan: { startLine: 7, endLine: 7 }, stepId: 'suffix-fill' },
+    ]);
+    expect(steps).toStrictEqual(snapshot);
+  });
+
+  it('retains same-reference claims with distinct spans and lets the caller exclude only the replacement index', () => {
+    const steps: readonly Step[] = [
+      committedFill(FIRST_REF, 3, 'prefix'),
+      committedFill(FIRST_REF, 4, 'replace-me'),
+      committedAi([{ ref: FIRST_REF, startLine: 5 }], 'suffix'),
+    ];
+
+    expect(enumerateSecretGrantClaims(steps.filter((_, index) => index !== 1))).toEqual([
+      { ref: FIRST_REF, sourceSpan: { startLine: 3, endLine: 3 }, stepId: 'prefix' },
+      { ref: FIRST_REF, sourceSpan: { startLine: 5, endLine: 5 }, stepId: 'suffix' },
+    ]);
+  });
+
+  it('does not seed a retained grant when its ref or end line differs from the prompt occurrence', () => {
+    const steps: readonly Step[] = [
+      committedFill(FIRST_REF, 3, 'wrong-ref'),
+      {
+        ...committedFill(SECOND_REF, 3, 'wrong-end-line'),
+        secretGrantSpan: { startLine: 3, endLine: 4 },
+      },
+    ];
+
+    const normalized = prompt(SECOND_REF);
+
+    expect(claimedRetainedGrantOffsets(plan(steps), -1, normalized)).toEqual(new Set());
+  });
+});
 
 function grantLine(ref: string): string {
   return `@ambercast-secret ${ref}`;

@@ -36,6 +36,55 @@ export type SecretDetector =
   | 'credential-prefix-aws-access-key'
   | 'high-entropy-token';
 
+/**
+ * Identifies one committed secret-use claim without deciding whether it is
+ * valid against the current prompt.
+ *
+ * Shared enumeration lets repair seed ownership and committed-plan validation
+ * recognize the same persisted claim shapes. Verification deliberately stays
+ * in {@link assertCommittedSecretAttributionSound}: it must preserve the
+ * deterministic stale-then-duplicate-then-uncovered priority and retain the
+ * truthful `ref` and `stepId` diagnostics that a flattened offset set loses.
+ */
+export interface SecretGrantClaimCandidate {
+  readonly ref: string;
+  readonly sourceSpan: { readonly startLine: number; readonly endLine: number };
+  readonly stepId: string;
+}
+
+/**
+ * Enumerates committed secret-use claim candidates from the supplied steps.
+ *
+ * Repair callers remove the replaced step before invoking this helper so
+ * the generic policy boundary never learns a repair-only index sentinel. The
+ * resulting candidates retain complete spans and identities for callers that
+ * need either diagnostics or an exact local grant lookup.
+ *
+ * @param steps - Committed plan steps whose persisted secret uses are examined.
+ * @returns Candidates in the supplied step and secret-use order.
+ *
+ * @example
+ * const claims = enumerateSecretGrantClaims(plan.steps);
+ * const passwordClaim = claims.find((claim) => claim.ref === '{{secrets.password}}');
+ */
+export function enumerateSecretGrantClaims(
+  steps: readonly PlanDocumentType['steps'][number][],
+): readonly SecretGrantClaimCandidate[] {
+  return steps.flatMap((step): readonly SecretGrantClaimCandidate[] => {
+    if (step.kind === 'action' && step.action === 'fill-secret') {
+      return [{ ref: step.secretRef, sourceSpan: step.secretGrantSpan, stepId: step.id }];
+    }
+    if (step.kind === 'ai') {
+      return (step.secrets ?? []).map((secret) => ({
+        ref: secret.ref,
+        sourceSpan: secret.sourceSpan,
+        stepId: step.id,
+      }));
+    }
+    return [];
+  });
+}
+
 const REDACTED_KEY_PATH_SEGMENT = '[redacted-key]';
 
 /**
@@ -338,16 +387,8 @@ export function assertCommittedSecretAttributionSound(
     claimed.add(grant.startLine);
   };
 
-  for (const step of plan.steps) {
-    if (step.kind === 'action' && step.action === 'fill-secret') {
-      verifyGrant(step.secretRef, step.secretGrantSpan, step.id);
-      continue;
-    }
-    if (step.kind === 'ai') {
-      for (const secret of step.secrets ?? []) {
-        verifyGrant(secret.ref, secret.sourceSpan, step.id);
-      }
-    }
+  for (const claim of enumerateSecretGrantClaims(plan.steps)) {
+    verifyGrant(claim.ref, claim.sourceSpan, claim.stepId);
   }
 
   const uncoveredGrant = grants.find((grant) => !claimed.has(grant.startLine));

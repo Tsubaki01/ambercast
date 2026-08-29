@@ -5,6 +5,27 @@
 import type { StepId } from '#core/ir/schema.js';
 
 /**
+ * Explains why Stage 2 declined a single-step repair candidate.
+ *
+ * The closed vocabulary keeps reports and event consumers aligned with the
+ * repair boundary. Its evaluation order prioritizes cancellation,
+ * then provider failures before local response-shape checks, and proceeds
+ * through the remaining validation boundaries to a lack of replay progress.
+ * An `AiResponseInvalidError` originates at the executor and is therefore a
+ * provider error; `response-shape` is reserved for Stage 2's defensive
+ * safe-parse or replacement-count check after the executor returned a value.
+ */
+export type StageTwoRejectionReason =
+  | 'provider-error'
+  | 'response-shape'
+  | 'id-mismatch'
+  | 'secret-attribution'
+  | 'coverage-invalid'
+  | 'obligation-mismatch'
+  | 'literal-secret'
+  | 'no-advance';
+
+/**
  * Supplies wall-clock instants and elapsed-time readings.
  *
  * @remarks
@@ -89,7 +110,9 @@ export interface EnvironmentInfo {
  * invocation happens before a plan supplies any step identity, so its
  * `ai-call` event may omit `stepId`. The variants intentionally carry only
  * that available identity and, for results, the resolution path, keeping the
- * reporting boundary narrow while allowing richer payloads when needed.
+ * reporting boundary narrow while allowing richer payloads when needed. A
+ * rejected Stage 2 candidate is emitted only after its overlay snapshot is
+ * restored, once per normal rejection; interruption is not a rejection event.
  */
 export type RunEvent =
   | { readonly type: 'step-start'; readonly stepId: StepId }
@@ -98,7 +121,12 @@ export type RunEvent =
       readonly stepId: StepId;
       readonly via: 'grounding' | 'ai-resolve' | 'trace-replay';
     }
-  | { readonly type: 'ai-call'; readonly stepId?: StepId };
+  | { readonly type: 'ai-call'; readonly stepId?: StepId }
+  | {
+      readonly type: 'heal-stage2-rejected';
+      readonly stepId: StepId;
+      readonly reason: StageTwoRejectionReason;
+    };
 
 /**
  * Receives use-case lifecycle events without coupling generation or replay to
