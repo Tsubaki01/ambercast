@@ -31,6 +31,10 @@ const RUN_EVENT_CASES: readonly { readonly description: string; readonly event: 
   { description: 'a trace-replayed step-result event', event: { type: 'step-result', stepId: 'replay-trace', via: 'trace-replay' } },
   { description: 'an ai-call event', event: { type: 'ai-call', stepId: 'resolve-form' } },
   { description: 'an unscoped ai-call event', event: { type: 'ai-call' } },
+  ...(['provider-error', 'response-shape', 'id-mismatch', 'secret-attribution', 'coverage-invalid', 'obligation-mismatch', 'literal-secret', 'no-advance'] as const).map((reason) => ({
+    description: `a Stage 2 ${reason} rejection event`,
+    event: { type: 'heal-stage2-rejected' as const, stepId: 'resolve-form', reason },
+  })),
 ];
 
 describe('createNoopEventSink()', () => {

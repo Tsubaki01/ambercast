@@ -15,6 +15,11 @@ const AI_RESOLVED_EVENT: RunEvent = { type: 'step-result', stepId: 'resolve-form
 const TRACE_REPLAYED_EVENT: RunEvent = { type: 'step-result', stepId: 'replay-trace', via: 'trace-replay' };
 const AI_CALL_EVENT: RunEvent = { type: 'ai-call', stepId: 'resolve-form' };
 const UNSCOPED_AI_CALL_EVENT: RunEvent = { type: 'ai-call' };
+const STAGE_TWO_REJECTED_EVENTS: readonly RunEvent[] = [
+  'provider-error', 'response-shape', 'id-mismatch', 'secret-attribution',
+  'coverage-invalid', 'obligation-mismatch', 'literal-secret', 'no-advance',
+].map((reason) => ({ type: 'heal-stage2-rejected', stepId: 'resolve-form', reason } as RunEvent));
+const STAGE_TWO_REJECTED_EVENT = STAGE_TWO_REJECTED_EVENTS[7]!;
 
 export function registerEventSinkContract(harness: EventSinkContractHarness): void {
   describe('EventSink contract', () => {
@@ -29,8 +34,9 @@ export function registerEventSinkContract(harness: EventSinkContractHarness): vo
         expect(recording.emitted()).toEqual([START_EVENT]);
 
         recording.sink.emit(RESULT_EVENT);
+        recording.sink.emit(STAGE_TWO_REJECTED_EVENT);
 
-        expect(recording.emitted()).toEqual([START_EVENT, RESULT_EVENT]);
+        expect(recording.emitted()).toEqual([START_EVENT, RESULT_EVENT, STAGE_TWO_REJECTED_EVENT]);
       } finally {
         await harness.dispose?.();
       }
@@ -58,6 +64,9 @@ export function registerEventSinkContract(harness: EventSinkContractHarness): vo
         expect(() => recording.sink.emit(TRACE_REPLAYED_EVENT)).not.toThrow();
         expect(() => recording.sink.emit(AI_CALL_EVENT)).not.toThrow();
         expect(() => recording.sink.emit(UNSCOPED_AI_CALL_EVENT)).not.toThrow();
+        for (const event of STAGE_TWO_REJECTED_EVENTS) {
+          expect(() => recording.sink.emit(event)).not.toThrow();
+        }
 
         expect(recording.emitted()).toEqual([
           START_EVENT,
@@ -66,6 +75,7 @@ export function registerEventSinkContract(harness: EventSinkContractHarness): vo
           TRACE_REPLAYED_EVENT,
           AI_CALL_EVENT,
           UNSCOPED_AI_CALL_EVENT,
+          ...STAGE_TWO_REJECTED_EVENTS,
         ]);
       } finally {
         await harness.dispose?.();

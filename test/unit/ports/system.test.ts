@@ -24,6 +24,11 @@ describe('system port shapes', () => {
       | { readonly type: 'step-start'; readonly stepId: StepId }
       | { readonly type: 'step-result'; readonly stepId: StepId; readonly via: 'grounding' | 'ai-resolve' | 'trace-replay' }
       | { readonly type: 'ai-call'; readonly stepId?: StepId }
+      | {
+        readonly type: 'heal-stage2-rejected';
+        readonly stepId: StepId;
+        readonly reason: 'provider-error' | 'response-shape' | 'id-mismatch' | 'secret-attribution' | 'coverage-invalid' | 'obligation-mismatch' | 'literal-secret' | 'no-advance';
+      }
     >();
     expectTypeOf<EventSink['emit']>().toEqualTypeOf<(event: RunEvent) => void>();
   });
