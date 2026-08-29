@@ -4,9 +4,9 @@ import type { FsIoError } from '#core/errors/fs-io-error.js';
 import type { StepResult } from '#report/schema.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import type { RunCaseOutcome, RunDeps } from './run.js';
-import { run, readTrustedInstructionCoveredPlan } from './run.js';
+import { run, readTrustedInstructionCoveredPlan, validateTrustedInstructionCoveredPlanText } from './run.js';
 import { generate, prepareInstructionCoveredSteps } from './generate.js';
-import { inspectGroundingArtifact } from './check-grounding.js';
+import { inspectGroundingArtifactText } from './check-grounding.js';
 import { computePlanDigest } from '#core/ir/digest.js';
 import { deriveCurrentPlanInputProvenance } from '#core/ai/plan-input-provenance.js';
 import { normalizeTestMd, type NormalizedTestMd } from '#core/ir/normalize.js';
@@ -21,6 +21,7 @@ import { extractSecretGrants } from '#core/ir/secret-grant-source.js';
 import { assertCommittedSecretAttributionSound, assertNoLiteralSecrets, normalizeAiStepSecretGrants } from './generator-secret-policy.js';
 import { isLegacyShapedTrace, validateCommittedInstructionCoverage } from './instruction-coverage-policy.js';
 import { FsIoError as FsIoErrorClass } from '#core/errors/fs-io-error.js';
+import { MissingPlanError } from '#core/errors/missing-plan-error.js';
 import { AmbercastError as AmbercastErrorClass } from '#core/errors/types.js';
 import { UnexpectedCrashError } from '#core/errors/unexpected-crash-error.js';
 import { BatchInterruptionTracker } from './batch-interruption.js';
@@ -269,39 +270,58 @@ export interface HealOverlayStorage {
   hasBufferedWrites(): boolean;
 
   /**
-   * Writes buffered tracked artifacts only while their captured preimage is intact.
+   * Writes buffered tracked artifacts only while their validated snapshot preimage is intact.
    *
    * @remarks
-   * Before writing anything, the overlay re-reads both tracked artifacts' real
-   * bytes and compares them with the preimage retained by `capturePreimage()`.
-   * Any mismatch, including either artifact having been deleted, throws
-   * `IntegrityViolationError` before either write begins, so an integrity
-   * failure can never produce a partial commit. A filesystem read error other
-   * than a missing artifact, such as a permission error, is not reclassified
-   * as a mismatch and propagates as an ordinary I/O failure, like a write-loop
-   * error. The pre-pass detects changes completed before it starts, but the
-   * accepted TOCTOU boundary means it cannot detect a change landing strictly
-   * between the pre-pass finishing and the write loop's write call completing.
+   * The pre-pass compares plan and grounding in that order before selecting an
+   * outcome. A mismatch or missing artifact on either side takes precedence over
+   * any non-missing read failure, preserving the zero-write guarantee. Only when
+   * neither side establishes a changed preimage does the first ordinary I/O
+   * failure propagate. This accepts the existing boundary after comparison
+   * finishes and before a write completes.
    */
   flush(): Promise<void>;
-
-  /**
-   * Captures the current real bytes for the tracked artifact pair before repair.
-   *
-   * @remarks
-   * The overlay retains this preimage instead of accepting one from `flush`, so
-   * a caller cannot pair a commit with bytes captured for another case. `healCase`
-   * must call this only after preflight succeeds: preflight owns the established
-   * classification of missing or invalid artifacts, while this capture observes
-   * only changes that occur after those checks.
-   */
-  capturePreimage(): Promise<void>;
 
   /** Captures immutable buffered contents before an all-or-nothing stage attempt. */
   snapshot(): OverlaySnapshot;
 
   /** Discards stage-local buffering by restoring a prior in-memory snapshot. */
   restore(snapshot: OverlaySnapshot): void;
+}
+
+/**
+ * Capability produced only after a case has validated the exact artifacts it
+ * may later repair.
+ *
+ * @remarks
+ * Preflight retains detached plan and grounding bytes in this capability's
+ * closure and exposes no argument through
+ * which a caller can substitute a preimage. Overlay creation is delayed until
+ * this value exists, so an invalid artifact cannot acquire buffered-write
+ * authority merely by entering the healing path. The module-private raw
+ * factory below remains an implementation detail for the same reason.
+ */
+interface ValidatedHealPreflight {
+  readonly normalized: NormalizedTestMd;
+  readonly digest: string;
+  readonly plan: TrustedPlan;
+
+  /**
+   * Creates the write-capable overlay associated with this validation.
+   *
+   * @param containedWrites - Evidence-directory writer already contained by
+   * the runtime for this case.
+   * @returns An overlay whose tracked reads return detached
+   * validated snapshots before buffering and detached buffered bytes after it.
+   *
+   * @remarks
+   * The narrow argument intentionally excludes both base storage and preimage
+   * data. That keeps snapshot ownership inside the successful-preflight
+   * closure, while allowing the runtime to retain its established evidence
+   * containment boundary. Repeated creation is tolerated while preserving
+   * that boundary.
+   */
+  createOverlay(containedWrites: Pick<StorageAdapter, 'writeText' | 'writeBinary' | 'ensureDir'>): HealOverlayStorage;
 }
 
 /**
@@ -321,17 +341,24 @@ export interface HealOverlayStorage {
  * committed through the unwrapped base storage because they legitimately lie
  * outside the evidence directory.
  */
-export function createHealOverlayStorage(
+function createHealOverlayStorage(
   base: StorageAdapter,
   trackedPaths: { readonly planPath: string; readonly groundingPath: string },
   containedWrites: Pick<StorageAdapter, 'writeText' | 'writeBinary' | 'ensureDir'>,
+  validatedSnapshots: { readonly plan: { readonly text: string; readonly bytes: Uint8Array }; readonly grounding: { readonly text: string; readonly bytes: Uint8Array } },
 ): HealOverlayStorage {
   let buffered = new Map<string, string>();
-  let preimage: { readonly plan: Uint8Array; readonly grounding: Uint8Array } | undefined;
   const tracked = (path: string) => path === trackedPaths.planPath || path === trackedPaths.groundingPath;
+  const snapshotFor = (path: string) => path === trackedPaths.planPath ? validatedSnapshots.plan : validatedSnapshots.grounding;
+  const bufferedBytes = (path: string) => new TextEncoder().encode(buffered.get(path)!);
   const storage: StorageAdapter = {
-    readText: async (path) => buffered.has(path) ? buffered.get(path)! : base.readText(path),
-    exists: async (path) => buffered.has(path) ? true : base.exists(path),
+    readText: async (path) => tracked(path) ? (buffered.has(path) ? buffered.get(path)! : snapshotFor(path).text) : base.readText(path),
+    readTextSnapshot: async (path) => {
+      if (!tracked(path)) return base.readTextSnapshot(path);
+      const bytes = buffered.has(path) ? bufferedBytes(path) : new Uint8Array(snapshotFor(path).bytes);
+      return { text: buffered.has(path) ? buffered.get(path)! : snapshotFor(path).text, bytes };
+    },
+    exists: async (path) => tracked(path) ? true : base.exists(path),
     writeText: async (path, text) => {
       if (tracked(path)) {
         buffered.set(path, text);
@@ -339,7 +366,7 @@ export function createHealOverlayStorage(
       }
       await containedWrites.writeText(path, text);
     },
-    readBinary: (path) => base.readBinary(path),
+    readBinary: async (path) => tracked(path) ? (buffered.has(path) ? bufferedBytes(path) : new Uint8Array(snapshotFor(path).bytes)) : base.readBinary(path),
     writeBinary: (path, text) => containedWrites.writeBinary(path, text),
     listFiles: (path) => base.listFiles(path),
     ensureDir: (path) => containedWrites.ensureDir(path),
@@ -347,25 +374,16 @@ export function createHealOverlayStorage(
   return {
     storage,
     hasBufferedWrites: () => buffered.size > 0,
-    capturePreimage: async () => {
-      preimage = {
-        plan: await base.readBinary(trackedPaths.planPath),
-        grounding: await base.readBinary(trackedPaths.groundingPath),
-      };
-    },
     flush: async () => {
       if (buffered.size === 0) return;
 
       const written: ('plan' | 'grounding')[] = [];
       try {
-        if (preimage === undefined) {
-          throw new Error('Healing artifact preimage was not captured.');
-        }
-
         const mismatched: ('plan' | 'grounding')[] = [];
+        let firstReadError: unknown;
         for (const [kind, path, expected] of [
-          ['plan', trackedPaths.planPath, preimage.plan],
-          ['grounding', trackedPaths.groundingPath, preimage.grounding],
+          ['plan', trackedPaths.planPath, validatedSnapshots.plan.bytes],
+          ['grounding', trackedPaths.groundingPath, validatedSnapshots.grounding.bytes],
         ] as const) {
           try {
             const actual = await base.readBinary(path);
@@ -377,12 +395,13 @@ export function createHealOverlayStorage(
               mismatched.push(kind);
               continue;
             }
-            throw error;
+            firstReadError ??= error;
           }
         }
         if (mismatched.length > 0) {
           throw new IntegrityViolationError('Healing artifacts changed after preflight.', { mismatched });
         }
+        if (firstReadError !== undefined) throw firstReadError;
 
         for (const [kind, path] of [['plan', trackedPaths.planPath], ['grounding', trackedPaths.groundingPath]] as const) {
           if (!buffered.has(path)) continue;
@@ -545,8 +564,7 @@ async function preflightCase(
   file: string,
   planFile: string,
   groundingFile: string,
-  overlay: HealOverlayStorage,
-): Promise<{ readonly normalized: NormalizedTestMd; readonly digest: string; readonly plan: TrustedPlan }> {
+): Promise<ValidatedHealPreflight> {
   const normalized = normalizeTestMd(await deps.storage.readText(file));
   const target = resolveTarget({
     targets: deps.config.targets,
@@ -559,17 +577,47 @@ async function preflightCase(
     normalizedTestMd: normalized,
     targetDefinitions: target.definitions,
   }).inputsDigest;
-  const plan = (await readTrustedInstructionCoveredPlan(overlay.storage, planFile, digest, normalized)).plan;
+  let planSnapshot: { readonly text: string; readonly bytes: Uint8Array };
+  try {
+    if (!(await deps.storage.exists(planFile))) {
+      throw new MissingPlanError('The generated plan artifact is missing.', { planPath: planFile });
+    }
+    planSnapshot = await deps.storage.readTextSnapshot(planFile);
+  } catch (error) {
+    if (error instanceof MissingPlanError) throw error;
+    throw new FsIoErrorClass('The generated plan could not be read.', undefined, { cause: error });
+  }
+  const plan = validateTrustedInstructionCoveredPlanText(planSnapshot.text, planFile, digest, normalized).plan;
   assertCommittedSecretAttributionSound(plan, normalized);
 
   let inspection;
   try {
-    inspection = await inspectGroundingArtifact(overlay.storage, groundingFile, plan);
+    if (!(await deps.storage.exists(groundingFile))) {
+      inspection = { kind: 'missing' } as const;
+    } else {
+      const groundingSnapshot = await deps.storage.readTextSnapshot(groundingFile);
+      inspection = inspectGroundingArtifactText(groundingSnapshot.text, plan);
+      if (inspection.kind === 'valid') {
+        return {
+          normalized,
+          digest,
+          plan,
+          createOverlay: (containedWrites) => createHealOverlayStorage(
+            deps.storage,
+            { planPath: planFile, groundingPath: groundingFile },
+            containedWrites,
+            {
+              plan: { text: planSnapshot.text, bytes: new Uint8Array(planSnapshot.bytes) },
+              grounding: { text: groundingSnapshot.text, bytes: new Uint8Array(groundingSnapshot.bytes) },
+            },
+          ),
+        };
+      }
+    }
   } catch (error) {
     throw new FsIoErrorClass('The grounding artifact could not be inspected.', undefined, { cause: error });
   }
-  if (inspection.kind !== 'valid') throw new FsIoErrorClass('The grounding artifact is not valid and current.');
-  return { normalized, digest, plan };
+  throw new FsIoErrorClass('The grounding artifact is not valid and current.');
 }
 
 /**
@@ -885,13 +933,8 @@ function caseOutcome(
 async function healCase(deps: HealDeps, options: HealOptions, file: string): Promise<CaseProcessingResult> {
   const planFile = deps.layout.planPathFor(file);
   const groundingFile = deps.layout.groundingPathFor(file);
-  const overlay = createHealOverlayStorage(
-    deps.storage,
-    { planPath: planFile, groundingPath: groundingFile },
-    deps.containWrites(deps.layout.runsDirFor(file, deps.runId)),
-  );
-  const preflight = await preflightCase(deps, options, file, planFile, groundingFile, overlay);
-  await overlay.capturePreimage();
+  const preflight = await preflightCase(deps, options, file, planFile, groundingFile);
+  const overlay = preflight.createOverlay(deps.containWrites(deps.layout.runsDirFor(file, deps.runId)));
   let resolvedAiExecutor: ResolvedAiExecutor | undefined;
   const resolveCaseAiExecutor: ResolveCaseAiExecutor = async () => {
     if (resolvedAiExecutor !== undefined) return resolvedAiExecutor;

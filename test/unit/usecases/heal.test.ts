@@ -27,7 +27,6 @@ import { createLayoutResolver } from '#core/layout/resolve.js';
 import type { AssertOutcome, BrowserEngine, BrowserSession } from '#ports/browser.js';
 import type { StorageAdapter } from '#ports/storage.js';
 import {
-  createHealOverlayStorage,
   heal,
   type HealDeps,
   type HealOptions,
@@ -42,7 +41,7 @@ import { createFakeBrowserSession, elementRefKey, type FakeBrowserSessionEntry }
 import { createFakeSecretsProvider } from '../../doubles/fake-secrets-provider.js';
 
 const replayRunObserver = vi.hoisted(() => ({
-  afterRun: undefined as undefined | ((deps: Pick<HealDeps, 'layout' | 'runId'>, storage: { readonly readText: (path: string) => Promise<string> }, options: { readonly files: readonly string[]; readonly cacheOnly?: boolean }) => void | Promise<void>),
+  afterRun: undefined as undefined | ((deps: Pick<HealDeps, 'layout' | 'runId'>, storage: StorageAdapter, options: { readonly files: readonly string[]; readonly cacheOnly?: boolean }) => void | Promise<void>),
 }));
 
 vi.mock('#usecases/run.js', async (importOriginal) => {
@@ -145,12 +144,6 @@ function liveEntries(...refs: readonly ElementRef[]): Map<string, FakeBrowserSes
   return entries;
 }
 
-function recordingStorage(): { readonly storage: StorageAdapter; readonly textWrites: ReturnType<typeof vi.fn>; } {
-  const base = createInMemoryStorage();
-  const textWrites = vi.fn<StorageAdapter['writeText']>(base.writeText);
-  return { storage: { ...base, writeText: textWrites }, textWrites };
-}
-
 function createDeletableStorage(): { readonly storage: StorageAdapter; readonly deleteFile: (path: string) => void; } {
   const base = createInMemoryStorage();
   const deleted = new Set<string>();
@@ -162,6 +155,10 @@ function createDeletableStorage(): { readonly storage: StorageAdapter; readonly 
       async readText(path) {
         if (deleted.has(path)) throw missing(path);
         return base.readText(path);
+      },
+      async readTextSnapshot(path) {
+        if (deleted.has(path)) throw missing(path);
+        return base.readTextSnapshot(path);
       },
       async writeText(path, content) {
         deleted.delete(path);
@@ -181,6 +178,28 @@ function createDeletableStorage(): { readonly storage: StorageAdapter; readonly 
     },
     deleteFile(path) {
       deleted.add(path);
+    },
+  };
+}
+
+function isTrackedArtifact(path: string): boolean {
+  return path === PLAN || path === GROUNDING;
+}
+
+function textSnapshot(text: string): { readonly text: string; readonly bytes: Uint8Array } {
+  return { text, bytes: new TextEncoder().encode(text) };
+}
+
+function withTrackedLegacyReadTrap(storage: StorageAdapter): StorageAdapter {
+  return {
+    ...storage,
+    async readText(path) {
+      if (isTrackedArtifact(path)) throw new Error(`Legacy tracked text read: ${path}`);
+      return storage.readText(path);
+    },
+    async readBinary(path) {
+      if (isTrackedArtifact(path)) throw new Error(`Legacy tracked binary read: ${path}`);
+      return storage.readBinary(path);
     },
   };
 }
@@ -292,263 +311,77 @@ async function createScenario(options: {
   };
 }
 
-describe('createHealOverlayStorage', () => {
-  it('reads buffered plan and grounding text and reports both paths as existing', async () => {
-    const { storage: base } = recordingStorage();
-    await base.writeText(PLAN, 'old-plan');
-    await base.writeText(GROUNDING, 'old-grounding');
-    const overlay = createHealOverlayStorage(base, { planPath: PLAN, groundingPath: GROUNDING }, permissiveContainedWrites(base));
-
-    await overlay.storage.writeText(PLAN, 'candidate-plan');
-    await overlay.storage.writeText(GROUNDING, 'candidate-grounding');
-
-    await expect(overlay.storage.readText(PLAN)).resolves.toBe('candidate-plan');
-    await expect(overlay.storage.readText(GROUNDING)).resolves.toBe('candidate-grounding');
-    await expect(overlay.storage.exists(PLAN)).resolves.toBe(true);
-    await expect(overlay.storage.exists(GROUNDING)).resolves.toBe(true);
-    await expect(base.readText(PLAN)).resolves.toBe('old-plan');
-    await expect(base.readText(GROUNDING)).resolves.toBe('old-grounding');
+async function createBothArtifactRepairScenario(storage?: StorageAdapter): Promise<HealScenario> {
+  const repaired: GeneratedPlanResponse = {
+    steps: [{ id: 'navigate-dashboard', kind: 'action', action: 'navigate', url: '/dashboard' }],
+    ambiguities: [],
+  };
+  return createScenario({
+    ...(storage === undefined ? {} : { storage }),
+    steps: [Step.parse({ id: 'navigate-dashboard', kind: 'action', action: 'navigate', url: 'http://[' })],
+    grounding: {},
+    aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: repaired, raw: JSON.stringify(repaired) }) }),
   });
+}
 
-  it('passes every untracked storage operation through to the base adapter', async () => {
-    const { storage: base } = recordingStorage();
-    const overlay = createHealOverlayStorage(base, { planPath: PLAN, groundingPath: GROUNDING }, permissiveContainedWrites(base));
-    const evidence = '/workspace/tests/.runs/run/evidence.png';
-    const otherText = '/workspace/tests/notes.txt';
-
-    await overlay.storage.writeText(otherText, 'visible immediately');
-    await overlay.storage.writeBinary(evidence, new Uint8Array([1, 2, 3]));
-    await overlay.storage.ensureDir('/workspace/tests/.runs/run/empty');
-
-    await expect(base.readText(otherText)).resolves.toBe('visible immediately');
-    await expect(base.readBinary(evidence)).resolves.toEqual(new Uint8Array([1, 2, 3]));
-    await expect(overlay.storage.listFiles('/workspace/tests/.runs/run')).resolves.toEqual(['evidence.png']);
-  });
-
-  it('flushes no paths for an empty buffer', async () => {
-    const { storage, textWrites } = recordingStorage();
-    const overlay = createHealOverlayStorage(storage, { planPath: PLAN, groundingPath: GROUNDING }, permissiveContainedWrites(storage));
-
-    await overlay.flush();
-
-    expect(textWrites).not.toHaveBeenCalled();
-    expect(overlay.hasBufferedWrites()).toBe(false);
-  });
-
-  it('flushes only grounding for an element-only Stage-1 candidate', async () => {
-    const { storage, textWrites } = recordingStorage();
-    await storage.writeText(PLAN, 'old-plan');
-    await storage.writeText(GROUNDING, 'old-grounding');
-    textWrites.mockClear();
-    const overlay = createHealOverlayStorage(storage, { planPath: PLAN, groundingPath: GROUNDING }, permissiveContainedWrites(storage));
-    await overlay.capturePreimage();
-    await overlay.storage.writeText(GROUNDING, 'stage-1-grounding');
-
-    await overlay.flush();
-
-    expect(textWrites).toHaveBeenCalledTimes(1);
-    expect(textWrites).toHaveBeenCalledWith(GROUNDING, 'stage-1-grounding');
-    await expect(storage.exists(PLAN)).resolves.toBe(true);
-  });
-
-  it('flushes plan before grounding for a Stage-2 or Stage-3 candidate', async () => {
-    const { storage, textWrites } = recordingStorage();
-    await storage.writeText(PLAN, 'old-plan');
-    await storage.writeText(GROUNDING, 'old-grounding');
-    textWrites.mockClear();
-    const overlay = createHealOverlayStorage(storage, { planPath: PLAN, groundingPath: GROUNDING }, permissiveContainedWrites(storage));
-    await overlay.capturePreimage();
-    await overlay.storage.writeText(PLAN, 'healed-plan');
-    await overlay.storage.writeText(GROUNDING, 'healed-grounding');
-
-    await overlay.flush();
-
-    expect(textWrites.mock.calls).toEqual([[PLAN, 'healed-plan'], [GROUNDING, 'healed-grounding']]);
-  });
-
-  it('restores a snapshot and discards a partial Stage-3 pair before any commit', async () => {
-    const { storage } = recordingStorage();
-    await storage.writeText(PLAN, 'old-plan');
-    await storage.writeText(GROUNDING, 'old-grounding');
-    const overlay = createHealOverlayStorage(storage, { planPath: PLAN, groundingPath: GROUNDING }, permissiveContainedWrites(storage));
-    await overlay.capturePreimage();
-    await overlay.storage.writeText(GROUNDING, 'stage-1-grounding');
-    const snapshot = overlay.snapshot();
-    await overlay.storage.writeText(PLAN, 'partially-generated-plan');
-
-    overlay.restore(snapshot);
-
-    await expect(overlay.storage.readText(GROUNDING)).resolves.toBe('stage-1-grounding');
-    await expect(overlay.storage.exists(PLAN)).resolves.toBe(true);
-    await overlay.flush();
-    await expect(storage.exists(PLAN)).resolves.toBe(true);
-    await expect(storage.readText(GROUNDING)).resolves.toBe('stage-1-grounding');
-  });
-
-  it('keeps base artifact bytes unchanged when a dry-run candidate is replayed only from the overlay', async () => {
-    const { storage } = recordingStorage();
-    await storage.writeText(PLAN, 'base-plan');
-    await storage.writeText(GROUNDING, 'base-grounding');
-    const overlay = createHealOverlayStorage(storage, { planPath: PLAN, groundingPath: GROUNDING }, permissiveContainedWrites(storage));
-    await overlay.storage.writeText(PLAN, 'stage-3-plan');
-    await overlay.storage.writeText(GROUNDING, 'stage-3-grounding');
-
-    // This is the storage boundary used by the Stage-3 replay: it must observe the
-    // regenerated pair even though dry-run deliberately never invokes flush().
-    await expect(Promise.all([overlay.storage.readText(PLAN), overlay.storage.readText(GROUNDING)]))
-      .resolves.toEqual(['stage-3-plan', 'stage-3-grounding']);
-    await expect(Promise.all([storage.readText(PLAN), storage.readText(GROUNDING)]))
-      .resolves.toEqual(['base-plan', 'base-grounding']);
-  });
-
-  it.each([
-    ['plan only', ['plan'] as const],
-    ['grounding only', ['grounding'] as const],
-    ['both artifacts', ['plan', 'grounding'] as const],
-  ])('rejects a preimage mismatch on $0 before any write', async (_name, mismatched) => {
-    const { storage: base, textWrites } = recordingStorage();
-    await base.writeText(PLAN, 'preflight-plan');
-    await base.writeText(GROUNDING, 'preflight-grounding');
-    textWrites.mockClear();
-    const overlay = createHealOverlayStorage(base, { planPath: PLAN, groundingPath: GROUNDING }, permissiveContainedWrites(base));
-    await overlay.capturePreimage();
-    await overlay.storage.writeText(PLAN, 'candidate-plan');
-    await overlay.storage.writeText(GROUNDING, 'candidate-grounding');
-    if ((mismatched as readonly string[]).includes('plan')) await base.writeText(PLAN, 'externally-mutated-plan');
-    if ((mismatched as readonly string[]).includes('grounding')) await base.writeText(GROUNDING, 'externally-mutated-grounding');
-    textWrites.mockClear();
-
-    await expect(overlay.flush()).rejects.toMatchObject({
-      constructor: IntegrityViolationError,
-      details: { mismatched },
+describe('heal validated overlay capability', () => {
+  it('exposes tracked snapshots only through successful heal preflight', async () => {
+    const scenario = await createScenario({
+      sessionEntries: new Map([[elementRefKey(SUBMIT), { exists: true, currentFingerprint: FINGERPRINT }]]),
     });
-    expect(textWrites).not.toHaveBeenCalled();
-    await expect(base.readText(PLAN)).resolves.toBe((mismatched as readonly string[]).includes('plan') ? 'externally-mutated-plan' : 'preflight-plan');
-    await expect(base.readText(GROUNDING)).resolves.toBe((mismatched as readonly string[]).includes('grounding') ? 'externally-mutated-grounding' : 'preflight-grounding');
+    const captured: StorageAdapter[] = [];
+    replayRunObserver.afterRun = async (_deps, storage) => { captured.push(storage as StorageAdapter); };
+
+    await heal(scenario.deps, OPTIONS);
+
+    expect(captured).not.toHaveLength(0);
+    await expect(captured[0]!.readText(PLAN)).resolves.toBe(await scenario.storage.readText(PLAN));
   });
 
-  it('re-verifies an unbuffered plan before committing a grounding-only candidate', async () => {
-    const { storage: base, textWrites } = recordingStorage();
-    await base.writeText(PLAN, 'preflight-plan');
-    await base.writeText(GROUNDING, 'preflight-grounding');
-    textWrites.mockClear();
-    const overlay = createHealOverlayStorage(base, { planPath: PLAN, groundingPath: GROUNDING }, permissiveContainedWrites(base));
-    await overlay.capturePreimage();
-    await overlay.storage.writeText(GROUNDING, 'candidate-grounding');
-    await base.writeText(PLAN, 'externally-mutated-plan');
-    textWrites.mockClear();
-
-    await expect(overlay.flush()).rejects.toBeInstanceOf(IntegrityViolationError);
-    expect(textWrites).not.toHaveBeenCalled();
-    await expect(base.readText(GROUNDING)).resolves.toBe('preflight-grounding');
-  });
-
-  it.each([
-    ['plan', ['plan'] as const],
-    ['grounding', ['grounding'] as const],
-    ['both', ['plan', 'grounding'] as const],
-  ])('classifies commit-time deletion of $0 as a zero-write integrity failure', async (_name, missing) => {
-    const base = createInMemoryStorage();
-    const textWrites = vi.fn<StorageAdapter['writeText']>(base.writeText);
-    const storage: StorageAdapter = { ...base, writeText: textWrites };
-    await storage.writeText(PLAN, 'preflight-plan');
-    await storage.writeText(GROUNDING, 'preflight-grounding');
-    textWrites.mockClear();
-    const captured = new Set<string>();
-    const readBinary: StorageAdapter['readBinary'] = async (path) => {
-      const deletedAfterPreimage = (path === PLAN && (missing as readonly string[]).includes('plan')) || (path === GROUNDING && (missing as readonly string[]).includes('grounding'));
-      if (deletedAfterPreimage && captured.has(path)) {
-        throw Object.assign(new Error('deleted after preflight'), { code: 'ENOENT' });
-      }
-      captured.add(path);
-      return base.readBinary(path);
-    };
-    const overlay = createHealOverlayStorage({ ...storage, readBinary }, { planPath: PLAN, groundingPath: GROUNDING }, permissiveContainedWrites(storage));
-    await overlay.capturePreimage();
-    await overlay.storage.writeText(PLAN, 'candidate-plan');
-    await overlay.storage.writeText(GROUNDING, 'candidate-grounding');
-
-    await expect(overlay.flush()).rejects.toMatchObject({ constructor: IntegrityViolationError, details: { mismatched: missing } });
-    expect(textWrites).not.toHaveBeenCalled();
-  });
-
-  it('detects byte-distinct malformed UTF-8 preimage and commit-time bytes', async () => {
-    const base = createInMemoryStorage();
-    const preimage = new Uint8Array([0x80]);
-    const reread = new Uint8Array([0x81]);
-    const decoder = new TextDecoder();
-    const textWrites = vi.fn<StorageAdapter['writeText']>(base.writeText);
-    await base.writeBinary(PLAN, preimage);
-    await base.writeText(GROUNDING, 'preflight-grounding');
-    textWrites.mockClear();
-    let useCommitTimeBytes = false;
-    const storage: StorageAdapter = {
-      ...base,
-      writeText: textWrites,
-      async readBinary(path) {
-        if (path === PLAN && useCommitTimeBytes) return reread;
-        return base.readBinary(path);
-      },
-    };
-    const overlay = createHealOverlayStorage(storage, { planPath: PLAN, groundingPath: GROUNDING }, permissiveContainedWrites(storage));
-
-    expect(decoder.decode(preimage)).toBe(decoder.decode(reread));
-    await overlay.capturePreimage();
-    useCommitTimeBytes = true;
-    await overlay.storage.writeText(PLAN, 'candidate-plan');
-
-    await expect(overlay.flush()).rejects.toMatchObject({
-      constructor: IntegrityViolationError,
-      details: { mismatched: ['plan'] },
+  it.each(['', 'こんにちは世界'] as const)('keeps validated preimages after base mutation/deletion and then exposes buffered %j through all read views', async (content) => {
+    const deletable = createDeletableStorage();
+    const scenario = await createScenario({
+      storage: deletable.storage,
+      sessionEntries: new Map([[elementRefKey(SUBMIT), { exists: true, currentFingerprint: FINGERPRINT }]]),
     });
-    expect(textWrites).not.toHaveBeenCalled();
-  });
+    const planSnapshot = await scenario.storage.readTextSnapshot(PLAN);
+    const groundingSnapshot = await scenario.storage.readTextSnapshot(GROUNDING);
+    let observed = false;
+    replayRunObserver.afterRun = async (_deps, storage) => {
+      if (observed) return;
+      observed = true;
+      await scenario.storage.writeText(PLAN, 'base changed after preflight');
+      deletable.deleteFile(GROUNDING);
 
-  it('preserves a non-missing pre-pass read failure as an ordinary I/O failure at commit', async () => {
-    const base = createInMemoryStorage();
-    await base.writeText(PLAN, 'preflight-plan');
-    await base.writeText(GROUNDING, 'preflight-grounding');
-    let failRead = false;
-    const storage: StorageAdapter = {
-      ...base,
-      readBinary: async (path) => {
-        if (failRead && path === PLAN) throw new Error('disk fault');
-        return base.readBinary(path);
-      },
+      const callerOwned = await storage.readTextSnapshot(PLAN);
+      callerOwned.bytes.fill(0);
+      await expect(storage.readTextSnapshot(PLAN)).resolves.toEqual(planSnapshot);
+
+      await expect(Promise.all([
+        storage.readText(PLAN), storage.readTextSnapshot(PLAN), storage.readBinary(PLAN), storage.exists(PLAN),
+        storage.readText(GROUNDING), storage.readTextSnapshot(GROUNDING), storage.readBinary(GROUNDING), storage.exists(GROUNDING),
+      ])).resolves.toEqual([
+        planSnapshot.text, planSnapshot, planSnapshot.bytes, true,
+        groundingSnapshot.text, groundingSnapshot, groundingSnapshot.bytes, true,
+      ]);
+
+      await storage.writeText(PLAN, content);
+      await expect(Promise.all([
+        storage.readText(PLAN), storage.readTextSnapshot(PLAN), storage.readBinary(PLAN), storage.exists(PLAN),
+      ])).resolves.toEqual([
+        content, textSnapshot(content), new TextEncoder().encode(content), true,
+      ]);
+
+      await storage.writeText(GROUNDING, content);
+      await expect(Promise.all([
+        storage.readText(GROUNDING), storage.readTextSnapshot(GROUNDING), storage.readBinary(GROUNDING), storage.exists(GROUNDING),
+      ])).resolves.toEqual([
+        content, textSnapshot(content), new TextEncoder().encode(content), true,
+      ]);
     };
-    const overlay = createHealOverlayStorage(storage, { planPath: PLAN, groundingPath: GROUNDING }, permissiveContainedWrites(storage));
-    await overlay.capturePreimage();
-    failRead = true;
-    await overlay.storage.writeText(PLAN, 'candidate-plan');
 
-    await expect(overlay.flush()).rejects.toThrow('disk fault');
-  });
-
-  it('routes untracked writes through containment while tracked text bypasses it', async () => {
-    const { storage: base } = recordingStorage();
-    await base.writeText(PLAN, 'preflight-plan');
-    await base.writeText(GROUNDING, 'preflight-grounding');
-    const rejected = new IntegrityViolationError('outside runs directory');
-    const containedWrites = {
-      writeText: vi.fn<StorageAdapter['writeText']>(async () => { throw rejected; }),
-      writeBinary: vi.fn<StorageAdapter['writeBinary']>(async () => { throw rejected; }),
-      ensureDir: vi.fn<StorageAdapter['ensureDir']>(async () => { throw rejected; }),
-    };
-    const overlay = createHealOverlayStorage(base, { planPath: PLAN, groundingPath: GROUNDING }, containedWrites);
-
-    await expect(overlay.storage.writeText('/workspace/tests/.runs/note.txt', 'note')).rejects.toBe(rejected);
-    await expect(overlay.storage.writeBinary('/workspace/tests/.runs/evidence.png', new Uint8Array([1]))).rejects.toBe(rejected);
-    await expect(overlay.storage.ensureDir('/workspace/tests/.runs/empty')).rejects.toBe(rejected);
-    await overlay.capturePreimage();
-    await overlay.storage.writeText(PLAN, 'candidate-plan');
-    await overlay.storage.writeText(GROUNDING, 'candidate-grounding');
-    await overlay.flush();
-
-    expect(containedWrites.writeText).toHaveBeenCalledOnce();
-    expect(containedWrites.writeBinary).toHaveBeenCalledOnce();
-    expect(containedWrites.ensureDir).toHaveBeenCalledOnce();
-    await expect(base.readText(PLAN)).resolves.toBe('candidate-plan');
-    await expect(base.readText(GROUNDING)).resolves.toBe('candidate-grounding');
+    await heal(scenario.deps, OPTIONS);
+    expect(observed).toBe(true);
   });
 });
 
@@ -630,11 +463,30 @@ describe('heal state-machine contract', () => {
     expect(scenario.textWrites).not.toHaveBeenCalled();
   });
 
-  it('returns no-changes-needed for a fully replayable trusted plan and never creates a commit', async () => {
+  it('reads each tracked artifact exactly once through snapshots during preflight and never uses legacy tracked reads', async () => {
     const base = createInMemoryStorage();
-    const readBinary = vi.fn<StorageAdapter['readBinary']>(base.readBinary);
+    const trackedReads: string[] = [];
+    const snapshotReads = new Map<string, number>();
+    const storage: StorageAdapter = {
+      ...base,
+      async readText(path) {
+        if (isTrackedArtifact(path)) trackedReads.push(`readText:${path}`);
+        return base.readText(path);
+      },
+      async readTextSnapshot(path) {
+        if (isTrackedArtifact(path)) trackedReads.push(`readTextSnapshot:${path}`);
+        const count = (snapshotReads.get(path) ?? 0) + 1;
+        snapshotReads.set(path, count);
+        if (isTrackedArtifact(path) && count > 1) return textSnapshot('{"changed":"between reads"}');
+        return base.readTextSnapshot(path);
+      },
+      async readBinary(path) {
+        if (isTrackedArtifact(path)) trackedReads.push(`readBinary:${path}`);
+        return base.readBinary(path);
+      },
+    };
     const scenario = await createScenario({
-      storage: { ...base, readBinary },
+      storage,
       sessionEntries: new Map([[elementRefKey(SUBMIT), { exists: true, currentFingerprint: FINGERPRINT }]]),
     });
     const derive = vi.spyOn(planInputProvenance, 'deriveCurrentPlanInputProvenance');
@@ -647,9 +499,57 @@ describe('heal state-machine contract', () => {
     });
     expect(result.commits.size).toBe(0);
     expect(derive).toHaveBeenCalled();
-    expect(readBinary).toHaveBeenCalledTimes(2);
-    expect(readBinary).toHaveBeenNthCalledWith(1, PLAN);
-    expect(readBinary).toHaveBeenNthCalledWith(2, GROUNDING);
+    expect(trackedReads).toEqual([
+      `readTextSnapshot:${PLAN}`,
+      `readTextSnapshot:${GROUNDING}`,
+    ]);
+  });
+
+  it('classifies a plan snapshot rejection from the snapshot operation itself', async () => {
+    const base = createInMemoryStorage();
+    const snapshotFailure = new Error('snapshot read failed');
+    const readTextSnapshot = vi.fn<StorageAdapter['readTextSnapshot']>(async (path) => {
+      if (path === PLAN) throw snapshotFailure;
+      return base.readTextSnapshot(path);
+    });
+    const scenario = await createScenario({ storage: {
+      ...withTrackedLegacyReadTrap(base),
+      readTextSnapshot,
+    } });
+
+    const result = await heal(scenario.deps, OPTIONS);
+
+    expect(readTextSnapshot).toHaveBeenCalledOnce();
+    expect(readTextSnapshot).toHaveBeenCalledWith(PLAN);
+    expect(result.outcome.results).toEqual([]);
+    expect(result.outcome.errors).toHaveLength(1);
+    expect(result.outcome.errors[0]?.error).toBeInstanceOf(FsIoError);
+    expect(result.outcome.errors[0]?.error.cause).toBe(snapshotFailure);
+  });
+
+  it('stops after the plan snapshot when secret attribution fails and never reads grounding', async () => {
+    const base = createInMemoryStorage();
+    const trackedReads: string[] = [];
+    const scenario = await createScenario({ storage: {
+      ...base,
+      async readText(path) {
+        if (isTrackedArtifact(path)) trackedReads.push(`readText:${path}`);
+        return base.readText(path);
+      },
+      async readTextSnapshot(path) {
+        if (isTrackedArtifact(path)) trackedReads.push(`readTextSnapshot:${path}`);
+        return base.readTextSnapshot(path);
+      },
+      async readBinary(path) {
+        if (isTrackedArtifact(path)) trackedReads.push(`readBinary:${path}`);
+        return base.readBinary(path);
+      },
+    }, prompt: SECRET_PROMPT });
+
+    const result = await heal(scenario.deps, OPTIONS);
+
+    expect(result.outcome.errors[0]?.error).toBeInstanceOf(SecretGrantUnattributableError);
+    expect(trackedReads).toEqual([`readTextSnapshot:${PLAN}`]);
   });
 
   it.each([
@@ -661,6 +561,71 @@ describe('heal state-machine contract', () => {
         storage: { ...scenario.storage, exists: async (path) => path === PLAN ? false : scenario.storage.exists(path) },
       }),
       error: MissingPlanError,
+    },
+    {
+      title: 'a rejected plan snapshot read',
+      create: () => createScenario(),
+      arrange: async (scenario: HealScenario): Promise<HealDeps> => ({
+        ...scenario.deps,
+        storage: {
+          ...withTrackedLegacyReadTrap(scenario.storage),
+          async readTextSnapshot(path) {
+            if (path === PLAN) throw new Error('plan snapshot storage is unavailable');
+            return scenario.storage.readTextSnapshot(path);
+          },
+        },
+      }),
+      error: FsIoError,
+    },
+    {
+      title: 'a JSON-invalid plan snapshot',
+      create: () => createScenario(),
+      arrange: async (scenario: HealScenario): Promise<HealDeps> => {
+        await scenario.storage.writeText(PLAN, '{');
+        return { ...scenario.deps, storage: withTrackedLegacyReadTrap(scenario.storage) };
+      },
+      error: IntegrityViolationError,
+    },
+    {
+      title: 'a schema-invalid plan snapshot',
+      create: () => createScenario(),
+      arrange: async (scenario: HealScenario): Promise<HealDeps> => {
+        await scenario.storage.writeText(PLAN, toCanonicalArtifactText({}));
+        return { ...scenario.deps, storage: withTrackedLegacyReadTrap(scenario.storage) };
+      },
+      error: IntegrityViolationError,
+    },
+    {
+      title: 'a canonically invalid plan snapshot',
+      create: () => createScenario(),
+      arrange: async (scenario: HealScenario): Promise<HealDeps> => {
+        const parsed = JSON.parse(await scenario.storage.readText(PLAN)) as JsonValueT;
+        await scenario.storage.writeText(PLAN, JSON.stringify(parsed));
+        return { ...scenario.deps, storage: withTrackedLegacyReadTrap(scenario.storage) };
+      },
+      error: IntegrityViolationError,
+    },
+    {
+      title: 'an instruction-coverage-invalid plan snapshot',
+      create: () => createScenario(),
+      arrange: async (scenario: HealScenario): Promise<HealDeps> => {
+        const coverageInvalid = {
+          ...scenario.plan,
+          steps: [{
+            id: 'recorded-ai',
+            kind: 'ai',
+            instruction: 'Reach the dashboard.',
+            instructionCoverage: [{
+              id: 'outside-prompt',
+              kind: 'success',
+              sourceSpan: { startLine: 99, startColumn: 1, endLine: 99, endColumn: 2 },
+            }],
+          }],
+        } as unknown as JsonValueT;
+        await scenario.storage.writeText(PLAN, toCanonicalArtifactText(coverageInvalid));
+        return { ...scenario.deps, storage: withTrackedLegacyReadTrap(scenario.storage) };
+      },
+      error: IntegrityViolationError,
     },
     {
       title: 'a stale plan',
@@ -736,13 +701,15 @@ describe('heal state-machine contract', () => {
   ])('reports $title as a case-scoped preflight error', async ({ create, arrange, error }) => {
     const scenario = await create();
     const deps = await arrange(scenario);
-    const result = await heal(deps, OPTIONS);
+    const containWrites = vi.fn(deps.containWrites);
+    const result = await heal({ ...deps, containWrites }, OPTIONS);
 
     expect(result.outcome.results).toEqual([]);
     expect(result.outcome.errors).toHaveLength(1);
     expect(result.outcome.errors[0]).toMatchObject({ file: OPTIONS.files[0] });
     expect(result.outcome.errors[0]?.error).toBeInstanceOf(error);
     expect(deps.browserDriver).not.toHaveBeenCalled();
+    expect(containWrites).not.toHaveBeenCalled();
   });
 
   it('keeps a cache-hit baseline replay browser-visible and persists failure evidence', async () => {
@@ -1338,6 +1305,189 @@ describe('heal state-machine contract', () => {
 
     const settled = await commit!.commit();
     expect(settled).toMatchObject({ outcome: 'failed', error: expect.any(IntegrityViolationError), partiallyWritten: [] });
+    expect(scenario.textWrites).not.toHaveBeenCalled();
+  });
+
+  it('compares plan then grounding before committing both buffered artifacts in that order', async () => {
+    const base = createInMemoryStorage();
+    const comparisons: string[] = [];
+    let commitStarted = false;
+    const storage: StorageAdapter = {
+      ...base,
+      async readBinary(path) {
+        if (commitStarted && isTrackedArtifact(path)) comparisons.push(path);
+        return base.readBinary(path);
+      },
+    };
+    const scenario = await createBothArtifactRepairScenario(storage);
+    const result = await heal(scenario.deps, OPTIONS);
+    const commit = result.commits.get(OPTIONS.files[0]!);
+    expect(commit).toBeDefined();
+    scenario.textWrites.mockClear();
+    commitStarted = true;
+
+    await expect(commit!.commit()).resolves.toEqual({ outcome: 'committed' });
+
+    expect(comparisons).toEqual([PLAN, GROUNDING]);
+    expect(scenario.textWrites.mock.calls.map(([path]) => path)).toEqual([PLAN, GROUNDING]);
+  });
+
+  it.each([
+    ['plan mismatch, grounding ok', 'mismatch', 'ok', ['plan']],
+    ['plan missing, grounding ok', 'missing', 'ok', ['plan']],
+    ['plan ok, grounding mismatch', 'ok', 'mismatch', ['grounding']],
+    ['plan ok, grounding missing', 'ok', 'missing', ['grounding']],
+    ['plan mismatch, grounding read error', 'mismatch', 'error', ['plan']],
+    ['plan read error, grounding missing', 'error', 'missing', ['grounding']],
+  ] as const)('gives integrity precedence with zero writes for %s while still comparing both sides', async (_label, planBehavior, groundingBehavior, mismatched) => {
+    const base = createInMemoryStorage();
+    const comparisons: string[] = [];
+    let commitStarted = false;
+    const storage: StorageAdapter = {
+      ...base,
+      async readBinary(path) {
+        if (!commitStarted || !isTrackedArtifact(path)) return base.readBinary(path);
+        comparisons.push(path);
+        const behavior = path === PLAN ? planBehavior : groundingBehavior;
+        if (behavior === 'missing') throw Object.assign(new Error(`${path} missing`), { code: 'ENOENT' });
+        if (behavior === 'error') throw new Error(`${path} read failed`);
+        const bytes = await base.readBinary(path);
+        return behavior === 'mismatch' ? new Uint8Array([...bytes, 0]) : bytes;
+      },
+    };
+    const scenario = await createBothArtifactRepairScenario(storage);
+    const commit = (await heal(scenario.deps, OPTIONS)).commits.get(OPTIONS.files[0]!);
+    expect(commit).toBeDefined();
+    scenario.textWrites.mockClear();
+    commitStarted = true;
+
+    const outcome = await commit!.commit();
+
+    expect(outcome).toMatchObject({
+      outcome: 'failed',
+      error: expect.any(IntegrityViolationError),
+      partiallyWritten: [],
+    });
+    if (outcome.outcome === 'failed') {
+      expect(outcome.error).toMatchObject({ details: { mismatched } });
+    }
+    expect(comparisons).toEqual([PLAN, GROUNDING]);
+    expect(scenario.textWrites).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['plan read error, grounding ok', 'plan'],
+    ['plan ok, grounding read error', 'grounding'],
+  ] as const)('wraps %s as FsIoError only after both comparisons have been attempted', async (_label, failedSide) => {
+    const base = createInMemoryStorage();
+    const readFailure = new Error(`${failedSide} comparison failed`);
+    const comparisons: string[] = [];
+    let commitStarted = false;
+    const storage: StorageAdapter = {
+      ...base,
+      async readBinary(path) {
+        if (commitStarted && isTrackedArtifact(path)) {
+          comparisons.push(path);
+          if ((failedSide === 'plan' && path === PLAN) || (failedSide === 'grounding' && path === GROUNDING)) {
+            throw readFailure;
+          }
+        }
+        return base.readBinary(path);
+      },
+    };
+    const scenario = await createBothArtifactRepairScenario(storage);
+    const commit = (await heal(scenario.deps, OPTIONS)).commits.get(OPTIONS.files[0]!);
+    expect(commit).toBeDefined();
+    scenario.textWrites.mockClear();
+    commitStarted = true;
+
+    const outcome = await commit!.commit();
+
+    expect(outcome).toMatchObject({ outcome: 'failed', error: expect.any(FsIoError), partiallyWritten: [] });
+    if (outcome.outcome === 'failed') expect(outcome.error.cause).toBe(readFailure);
+    expect(comparisons).toEqual([PLAN, GROUNDING]);
+    expect(scenario.textWrites).not.toHaveBeenCalled();
+  });
+
+  it('preserves the plan read error when both comparisons fail without short-circuiting grounding', async () => {
+    const base = createInMemoryStorage();
+    const planFailure = new Error('plan comparison failed first');
+    const groundingFailure = new Error('grounding comparison also failed');
+    const comparisons: string[] = [];
+    let commitStarted = false;
+    const storage: StorageAdapter = {
+      ...base,
+      async readBinary(path) {
+        if (!commitStarted || !isTrackedArtifact(path)) return base.readBinary(path);
+        comparisons.push(path);
+        throw path === PLAN ? planFailure : groundingFailure;
+      },
+    };
+    const scenario = await createBothArtifactRepairScenario(storage);
+    const commit = (await heal(scenario.deps, OPTIONS)).commits.get(OPTIONS.files[0]!);
+    expect(commit).toBeDefined();
+    scenario.textWrites.mockClear();
+    commitStarted = true;
+
+    const outcome = await commit!.commit();
+
+    expect(outcome).toMatchObject({ outcome: 'failed', error: expect.any(FsIoError), partiallyWritten: [] });
+    if (outcome.outcome === 'failed') expect(outcome.error.cause).toBe(planFailure);
+    expect(comparisons).toEqual([PLAN, GROUNDING]);
+    expect(scenario.textWrites).not.toHaveBeenCalled();
+  });
+
+  it('uses malformed UTF-8 bytes from the real validated snapshot as the commit preimage', async () => {
+    const base = createInMemoryStorage();
+    let commitStarted = false;
+    const commitPreimage = { bytes: undefined as Uint8Array | undefined };
+    const storage: StorageAdapter = {
+      ...base,
+      async readBinary(path) {
+        if (commitStarted && path === PLAN && commitPreimage.bytes !== undefined) return new Uint8Array(commitPreimage.bytes);
+        return base.readBinary(path);
+      },
+    };
+    const repaired: GeneratedPlanResponse = {
+      steps: [{ id: 'navigate-dashboard', kind: 'action', action: 'navigate', url: '/dashboard' }],
+      ambiguities: [],
+    };
+    const scenario = await createScenario({
+      storage,
+      steps: [Step.parse({ id: 'navigate-dashboard', kind: 'action', action: 'navigate', url: 'http://[�' })],
+      grounding: {},
+      aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: repaired, raw: JSON.stringify(repaired) }) }),
+    });
+    const canonicalBytes = await base.readBinary(PLAN);
+    const replacementOffset = canonicalBytes.findIndex((byte, index) => byte === 0xef && canonicalBytes[index + 1] === 0xbf && canonicalBytes[index + 2] === 0xbd);
+    expect(replacementOffset).toBeGreaterThanOrEqual(0);
+    const malformedPreimage = new Uint8Array([
+      ...canonicalBytes.slice(0, replacementOffset),
+      0x80,
+      ...canonicalBytes.slice(replacementOffset + 3),
+    ]);
+    commitPreimage.bytes = new Uint8Array([
+      ...canonicalBytes.slice(0, replacementOffset),
+      0x81,
+      ...canonicalBytes.slice(replacementOffset + 3),
+    ]);
+    expect(new TextDecoder().decode(malformedPreimage)).toBe(new TextDecoder().decode(commitPreimage.bytes));
+    await base.writeBinary(PLAN, malformedPreimage);
+
+    const result = await heal(scenario.deps, OPTIONS);
+    const commit = result.commits.get(OPTIONS.files[0]!);
+    expect(commit).toBeDefined();
+    scenario.textWrites.mockClear();
+    commitStarted = true;
+
+    const outcome = await commit!.commit();
+
+    expect(outcome).toMatchObject({
+      outcome: 'failed',
+      error: expect.any(IntegrityViolationError),
+      partiallyWritten: [],
+    });
+    if (outcome.outcome === 'failed') expect(outcome.error).toMatchObject({ details: { mismatched: ['plan'] } });
     expect(scenario.textWrites).not.toHaveBeenCalled();
   });
 

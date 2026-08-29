@@ -303,6 +303,37 @@ export interface TrustedInstructionCoveredPlan {
 }
 
 /**
+ * Validates an already-observed Plan artifact.
+ *
+ * @remarks
+ * Parsing, canonical serialization, freshness, and instruction-coverage
+ * checks stay pure over supplied text. Preflight validates a one-read snapshot
+ * without rereading storage, while established public readers delegate here
+ * with unchanged consumer-facing signatures and error behavior.
+ */
+export function validateTrustedInstructionCoveredPlanText(
+  text: string,
+  planPath: string,
+  inputsDigest: string,
+  normalizedTestMd: NormalizedTestMd,
+): TrustedInstructionCoveredPlan {
+  const plan = validateTrustedPlanText(text, planPath, inputsDigest);
+  const instructionCoverageByStepId = new Map<StepId, readonly TrustedInstructionCriterion[]>();
+  for (const step of plan.steps) {
+    if (step.kind !== 'ai') continue;
+    const result = validateCommittedInstructionCoverage(step.instructionCoverage, normalizedTestMd);
+    if (!result.success) {
+      throw new IntegrityViolationError('The generated plan contains invalid instruction coverage or source spans.', {
+        planPath,
+        issues: result.issues,
+      });
+    }
+    instructionCoverageByStepId.set(step.id, result.data);
+  }
+  return { plan, instructionCoverageByStepId };
+}
+
+/**
  * Loads a Plan-v2 artifact through every execution trust boundary.
  *
  * @param storage - Read capability for the committed Plan artifact.
@@ -322,20 +353,12 @@ export async function readTrustedInstructionCoveredPlan(
   inputsDigest: string,
   normalizedTestMd: NormalizedTestMd,
 ): Promise<TrustedInstructionCoveredPlan> {
-  const plan = await readTrustedPlan(storage, planPath, inputsDigest);
-  const instructionCoverageByStepId = new Map<StepId, readonly TrustedInstructionCriterion[]>();
-  for (const step of plan.steps) {
-    if (step.kind !== 'ai') continue;
-    const result = validateCommittedInstructionCoverage(step.instructionCoverage, normalizedTestMd);
-    if (!result.success) {
-      throw new IntegrityViolationError('The generated plan contains invalid instruction coverage or source spans.', {
-        planPath,
-        issues: result.issues,
-      });
-    }
-    instructionCoverageByStepId.set(step.id, result.data);
-  }
-  return { plan, instructionCoverageByStepId };
+  return validateTrustedInstructionCoveredPlanText(
+    await readTrustedPlanText(storage, planPath),
+    planPath,
+    inputsDigest,
+    normalizedTestMd,
+  );
 }
 
 /**
@@ -348,11 +371,10 @@ export async function readTrustedInstructionCoveredPlan(
  * freshness and is never migrated during run. Grounding remains version 1 and
  * is classified independently because its nested trace extension is additive.
  */
-async function readTrustedPlan(
+async function readTrustedPlanText(
   storage: StorageAdapter,
   planPath: string,
-  inputsDigest: string,
-): Promise<PlanDocumentType> {
+): Promise<string> {
   let exists: boolean;
   try {
     exists = await storage.exists(planPath);
@@ -371,6 +393,14 @@ async function readTrustedPlan(
     throw fsIoError('The generated plan could not be read.', error);
   }
 
+  return text;
+}
+
+function validateTrustedPlanText(
+  text: string,
+  planPath: string,
+  inputsDigest: string,
+): PlanDocumentType {
   let parsed: ReturnType<typeof PlanDocument.safeParse>;
   try {
     parsed = PlanDocument.safeParse(JSON.parse(text));

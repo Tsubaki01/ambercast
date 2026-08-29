@@ -58,6 +58,26 @@ export function registerStorageContract(harness: StorageContractHarness): void {
       });
     });
 
+    it('returns a detached UTF-8 text snapshot from one observed byte sequence', async () => {
+      await withStorage(harness, async (storage) => {
+        const path = 'artifacts/snapshot.txt';
+        const bytes = new Uint8Array([0x68, 0x69, 0x80]);
+        await storage.writeBinary(path, bytes);
+
+        const snapshot = await storage.readTextSnapshot(path);
+        expect(snapshot.text).toBe(new TextDecoder().decode(snapshot.bytes));
+        expect(snapshot.bytes).toEqual(bytes);
+
+        snapshot.bytes[0] = 0;
+        await expect(storage.readBinary(path)).resolves.toEqual(bytes);
+
+        const retained = await storage.readTextSnapshot(path);
+        await storage.writeBinary(path, new Uint8Array([0x78]));
+        expect(retained.bytes).toEqual(bytes);
+        expect(retained.text).toBe(new TextDecoder().decode(bytes));
+      });
+    });
+
     it('round-trips binary data', async () => {
       await withStorage(harness, async (storage) => {
         const bytes = new Uint8Array([0, 1, 255]);
@@ -182,6 +202,7 @@ export function registerStorageContract(harness: StorageContractHarness): void {
       await withStorage(harness, async (storage) => {
         await expect(storage.readText('missing.txt')).rejects.toBeInstanceOf(Error);
         await expect(storage.readBinary('missing.bin')).rejects.toBeInstanceOf(Error);
+        await expect(storage.readTextSnapshot('missing.snapshot')).rejects.toBeInstanceOf(Error);
 
         await storage.writeText('missing.txt', 'now present');
         await storage.writeBinary('missing.bin', new Uint8Array([1]));
@@ -197,6 +218,7 @@ export function registerStorageContract(harness: StorageContractHarness): void {
 
         await expect(storage.readText('directory')).rejects.toBeInstanceOf(Error);
         await expect(storage.readBinary('directory')).rejects.toBeInstanceOf(Error);
+        await expect(storage.readTextSnapshot('directory')).rejects.toBeInstanceOf(Error);
       });
     });
   });

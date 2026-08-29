@@ -61,6 +61,32 @@ export interface ReadStorageAdapter {
 export interface StorageAdapter extends ReadStorageAdapter {
 
   /**
+   * Reads one immutable UTF-8 text-and-byte snapshot of a regular file.
+   *
+   * @param path - Opaque path of the file to read.
+   * @returns Text decoded from exactly the returned byte sequence, together
+   * with a detached byte copy for later byte-level verification.
+   * @throws An `Error` if the path is missing, names a directory, or cannot be
+   * read.
+   *
+   * @example
+   * ```ts
+   * const snapshot = await storage.readTextSnapshot(planPath);
+   * const plan = JSON.parse(snapshot.text);
+   * ```
+   *
+   * @remarks
+   * Implementations acquire content through one logical read
+   * before decoding it as UTF-8. `text` and `bytes` must therefore describe
+   * the same observed file version; composing independent `readText` and
+   * `readBinary` calls would leave validation and later comparison vulnerable
+   * to an intervening replacement. The returned bytes and any implementation
+   * retained bytes are mutually detached, so mutation through either reference
+   * cannot alter the other side of the contract.
+   */
+  readTextSnapshot(path: string): Promise<{ readonly text: string; readonly bytes: Uint8Array }>;
+
+  /**
    * Writes UTF-8 text to a file with atomic visibility.
    *
    * Missing parent directories are created automatically. While a write is in
