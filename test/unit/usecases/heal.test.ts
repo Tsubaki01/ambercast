@@ -2053,6 +2053,7 @@ describe('heal state-machine contract', () => {
     error: new IntegrityViolationError('artifacts changed before commit'),
     partiallyWritten: ['plan'],
   };
+  void invalidIntegrityCommitOutcome;
 
   it('returns a commit capability only for healed or partially-healed candidates and never flushes during heal()', async () => {
     const scenario = await createScenario({

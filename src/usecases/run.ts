@@ -289,7 +289,10 @@ class TraceProviderExposureIntegrityError extends IntegrityViolationError {}
  */
 export class PlanNavigationResolutionError extends IntegrityViolationError {}
 
-const REPAIRABLE_NAVIGATION_FAILURE_CLASSES = new Set<Function>([
+const REPAIRABLE_NAVIGATION_FAILURE_CLASSES = new Set<new (
+  message: string,
+  details?: Record<string, unknown>,
+) => IntegrityViolationError>([
   PlanNavigationResolutionError,
 ]);
 
@@ -300,7 +303,10 @@ const REPAIRABLE_NAVIGATION_FAILURE_CLASSES = new Set<Function>([
  */
 export function isRepairableNavigationFailure(error: unknown): error is PlanNavigationResolutionError {
   return error instanceof IntegrityViolationError
-    && REPAIRABLE_NAVIGATION_FAILURE_CLASSES.has(error.constructor);
+    && REPAIRABLE_NAVIGATION_FAILURE_CLASSES.has(error.constructor as new (
+      message: string,
+      details?: Record<string, unknown>,
+    ) => IntegrityViolationError);
 }
 
 function fsIoError(message: string, cause: unknown): FsIoError {
