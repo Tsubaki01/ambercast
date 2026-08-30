@@ -31,9 +31,11 @@ import type { StorageAdapter } from '#ports/storage.js';
 import type { EventSink, RunEvent, StageTwoRejectionReason } from '#ports/system.js';
 import {
   heal,
+  type HealCommitOutcome,
   type HealDeps,
   type HealOptions,
 } from '#usecases/heal.js';
+import { PlanNavigationResolutionError, type RunOutcome } from '#usecases/run.js';
 import { BatchInterruptionTracker } from '#usecases/batch-interruption.js';
 import { createInMemoryStorage } from '../../doubles/create-in-memory-storage.js';
 import { createFixedClock } from '../../doubles/create-fixed-clock.js';
@@ -44,7 +46,7 @@ import { createFakeBrowserSession, elementRefKey, type FakeBrowserSessionEntry }
 import { createFakeSecretsProvider } from '../../doubles/fake-secrets-provider.js';
 
 const replayRunObserver = vi.hoisted(() => ({
-  afterRun: undefined as undefined | ((deps: Pick<HealDeps, 'layout' | 'runId'>, storage: StorageAdapter, options: { readonly files: readonly string[]; readonly cacheOnly?: boolean }) => void | Promise<void>),
+  afterRun: undefined as undefined | ((deps: Pick<HealDeps, 'layout' | 'runId'>, storage: StorageAdapter, options: { readonly files: readonly string[]; readonly cacheOnly?: boolean }, outcome: RunOutcome) => void | Promise<void>),
 }));
 
 vi.mock('#usecases/run.js', async (importOriginal) => {
@@ -53,7 +55,7 @@ vi.mock('#usecases/run.js', async (importOriginal) => {
     ...actual,
     run: async (...args: Parameters<typeof actual.run>) => {
       const outcome = await actual.run(...args);
-      await replayRunObserver.afterRun?.(args[0], args[0].storage, args[1]);
+      await replayRunObserver.afterRun?.(args[0], args[0].storage, args[1], outcome);
       return outcome;
     },
   };
@@ -400,6 +402,231 @@ describe('heal validated overlay capability', () => {
 });
 
 describe('heal state-machine contract', () => {
+  function injectReplayIntegrityViolation(when: (call: number, options: { readonly cacheOnly?: boolean }) => boolean, violation: IntegrityViolationError): () => number {
+    let call = 0;
+    replayRunObserver.afterRun = (_deps, _storage, options, outcome) => {
+      call += 1;
+      if (when(call, options)) {
+        (outcome.results[0] as { error?: IntegrityViolationError } | undefined)!.error = violation;
+      }
+    };
+    return () => call;
+  }
+
+  function expectCaseScopedIntegrityFailure(result: Awaited<ReturnType<typeof heal>>, violation: IntegrityViolationError): void {
+    expect(result.outcome.results).toEqual([]);
+    expect(result.outcome.errors).toEqual([{ file: OPTIONS.files[0], error: violation }]);
+    expect(result.commits.size).toBe(0);
+  }
+
+  it('aborts at the cache-only baseline when its replay carries an integrity violation', async () => {
+    const violation = new IntegrityViolationError('baseline evidence escaped containment');
+    const scenario = await createScenario();
+    const calls = injectReplayIntegrityViolation((call, options) => call === 1 && options.cacheOnly === true, violation);
+
+    const result = await heal(scenario.deps, OPTIONS);
+
+    expectCaseScopedIntegrityFailure(result, violation);
+    expect(calls()).toBe(1);
+    expect(scenario.deps.resolveAiExecutor).not.toHaveBeenCalled();
+  });
+
+  it('aborts at the initial live measurement when its replay carries an integrity violation', async () => {
+    const violation = new IntegrityViolationError('initial live evidence escaped containment');
+    const scenario = await createScenario();
+    const calls = injectReplayIntegrityViolation((call, options) => call === 2 && options.cacheOnly === false, violation);
+
+    const result = await heal(scenario.deps, OPTIONS);
+
+    expectCaseScopedIntegrityFailure(result, violation);
+    expect(calls()).toBe(2);
+    expect(scenario.deps.resolveAiExecutor).not.toHaveBeenCalled();
+  });
+
+  it('aborts at the Stage-1 replay when its replay carries an integrity violation', async () => {
+    const violation = new IntegrityViolationError('stage one evidence escaped containment');
+    const scenario = await createScenario({
+      grounding: {},
+      aiExecutor: createFakeAiExecutor({ execute: async () => { throw new AiExecutorUnavailableError('AI is unavailable.'); } }),
+    });
+    const calls = injectReplayIntegrityViolation((call, options) => call === 3 && options.cacheOnly === false, violation);
+
+    const result = await heal(scenario.deps, OPTIONS);
+
+    expect(calls()).toBe(3);
+    expect(scenario.deps.resolveAiExecutor).not.toHaveBeenCalled();
+    expectCaseScopedIntegrityFailure(result, violation);
+    expect(calls()).toBe(3);
+  });
+
+  it('aborts at a Stage-2 candidate replay even when its failure index would advance the frontier', async () => {
+    const violation = new IntegrityViolationError('stage two candidate evidence escaped containment');
+    const response: GeneratedPlanResponse = {
+      steps: [{ id: 'click-submit', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [],
+    };
+    const scenario = await createScenario({
+      steps: [
+        Step.parse({ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }),
+        Step.parse({ id: 'after-submit', kind: 'assert', check: 'text-visible', text: 'Dashboard' }),
+      ],
+      sessionEntries: new Map([
+        [elementRefKey(SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }],
+        [elementRefKey(AFTER_SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }],
+        ...liveEntries(REPAIRED_SUBMIT),
+      ]),
+      aiExecutor: createFakeAiExecutor({ execute: async (request) => request.prompt.startsWith('Confirm whether')
+        ? { data: { confirmed: true }, raw: '{"confirmed":true}' }
+        : { data: response, raw: JSON.stringify(response) } }),
+      assertOutcome: { passed: false, message: 'Dashboard is absent.' },
+    });
+    let candidateSteps: readonly { readonly id: string; readonly status: string }[] | undefined;
+    const calls = injectReplayIntegrityViolation((call, options) => call === 4 && options.cacheOnly === false, violation);
+    const injectViolation = replayRunObserver.afterRun;
+    replayRunObserver.afterRun = (deps, storage, options, outcome) => {
+      if (calls() === 3 && options.cacheOnly === false) {
+        candidateSteps = outcome.results[0]?.result.steps.map(({ id, status }) => ({ id, status }));
+      }
+      return injectViolation?.(deps, storage, options, outcome);
+    };
+
+    const result = await heal(scenario.deps, OPTIONS);
+
+    expect(candidateSteps).toEqual([
+      { id: 'click-submit', status: 'passed' },
+      { id: 'after-submit', status: 'failed' },
+    ]);
+    expectCaseScopedIntegrityFailure(result, violation);
+    expect(calls()).toBe(4);
+  });
+
+  it('aborts at the Stage-3 replay when its replay carries an integrity violation', async () => {
+    const violation = new IntegrityViolationError('stage three evidence escaped containment');
+    const invalidStage2: GeneratedPlanResponse = { steps: [{ id: 'wrong-id', kind: 'action', action: 'click', target: SUBMIT }], ambiguities: [] };
+    const stage3: GeneratedPlanResponse = { steps: [{ id: 'regenerated-submit', kind: 'action', action: 'click', target: SUBMIT }], ambiguities: [] };
+    let generation = 0;
+    const scenario = await createScenario({
+      grounding: {},
+      aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: generation++ === 0 ? invalidStage2 : stage3, raw: '{}' }) }),
+    });
+    const calls = injectReplayIntegrityViolation((call, options) => call === 4 && options.cacheOnly === false, violation);
+
+    const result = await heal(scenario.deps, OPTIONS);
+
+    expectCaseScopedIntegrityFailure(result, violation);
+    expect(calls()).toBe(4);
+  });
+
+  it('does not absorb an IntegrityViolationError thrown directly by Stage-3 generation', async () => {
+    const violation = new IntegrityViolationError('Stage three generator crossed a containment boundary');
+    const invalidStage2: GeneratedPlanResponse = { steps: [{ id: 'wrong-id', kind: 'action', action: 'click', target: SUBMIT }], ambiguities: [] };
+    let generation = 0;
+    const scenario = await createScenario({
+      grounding: {},
+      aiExecutor: createFakeAiExecutor({ execute: async () => {
+        if (generation++ === 0) return { data: invalidStage2, raw: '{}' };
+        throw violation;
+      } }),
+    });
+
+    const result = await heal(scenario.deps, OPTIONS);
+
+    expectCaseScopedIntegrityFailure(result, violation);
+  });
+
+  it('gives an in-flight initial replay integrity violation precedence over interruption', async () => {
+    const controller = new AbortController();
+    const violation = new IntegrityViolationError('Interrupted replay still observed a containment escape.');
+    let performs = 0;
+    let replayInterrupted = false;
+    const browserDriver = vi.fn<HealDeps['browserDriver']>(() => createFakeBrowserDriver(() => createFakeBrowserSession(liveEntries(SUBMIT), {
+      baseUrl: TARGETS.web.baseUrl,
+      currentUrl: TARGETS.web.baseUrl,
+      snapshot: healSnapshot(liveEntries(SUBMIT)),
+      onPerform() {
+        performs += 1;
+        if (performs === 1) {
+          controller.abort();
+          throw violation;
+        }
+      },
+    })));
+    const scenario = await createScenario({
+      signal: controller.signal,
+      browserDriver,
+      grounding: {},
+    });
+    replayRunObserver.afterRun = (_deps, _storage, _options, outcome) => {
+      replayInterrupted = outcome.interrupted;
+    };
+
+    const result = await heal(scenario.deps, OPTIONS);
+
+    expect(controller.signal.aborted).toBe(true);
+    expect(performs).toBe(1);
+    expect(replayInterrupted).toBe(true);
+    expect(result.outcome).toMatchObject({ interrupted: false, results: [] });
+    expect(result.outcome.errors).toEqual([{ file: OPTIONS.files[0], error: violation }]);
+    expect(result.outcome.skipped).toEqual([]);
+  });
+
+  it('continues the batch after the first case reports a replay integrity violation', async () => {
+    const first = OPTIONS.files[0]!;
+    const second = '/workspace/tests/second.test.md';
+    const violation = new IntegrityViolationError('First-case replay escaped containment.');
+    const scenario = await createScenario({ sessionEntries: liveEntries(SUBMIT) });
+    await scenario.storage.writeText(second, PROMPT);
+    await scenario.storage.writeText(scenario.deps.layout.planPathFor(second), await scenario.storage.readText(PLAN));
+    await scenario.storage.writeText(scenario.deps.layout.groundingPathFor(second), await scenario.storage.readText(GROUNDING));
+    let firstReplay = true;
+    replayRunObserver.afterRun = (_deps, _storage, _options, outcome) => {
+      if (firstReplay) {
+        firstReplay = false;
+        (outcome.results[0] as { error?: IntegrityViolationError } | undefined)!.error = violation;
+      }
+    };
+
+    const result = await heal(scenario.deps, { ...OPTIONS, files: [first, second] });
+
+    expect(result.outcome.errors).toEqual([{ file: first, error: violation }]);
+    expect(result.outcome.results).toEqual([expect.objectContaining({ file: second })]);
+    expect(result.commits.has(first)).toBe(false);
+  });
+
+  it('keeps a genuinely cancelled pending case interrupted when another case has an integrity error', async () => {
+    const controller = new AbortController();
+    const first = OPTIONS.files[0]!;
+    const second = '/workspace/tests/second.test.md';
+    const violation = new IntegrityViolationError('First-case replay escaped its trusted boundary.');
+    const scenario = await createScenario({ signal: controller.signal });
+    await scenario.storage.writeText(second, PROMPT);
+    await scenario.storage.writeText(scenario.deps.layout.planPathFor(second), await scenario.storage.readText(PLAN));
+    await scenario.storage.writeText(scenario.deps.layout.groundingPathFor(second), await scenario.storage.readText(GROUNDING));
+    replayRunObserver.afterRun = (_deps, _storage, _options, outcome) => {
+      (outcome.results[0] as { error?: IntegrityViolationError } | undefined)!.error = violation;
+      controller.abort();
+    };
+
+    const result = await heal(scenario.deps, { ...OPTIONS, files: [first, second] });
+
+    expect(result.outcome).toMatchObject({ interrupted: true, results: [] });
+    expect(result.outcome.errors).toEqual([{ file: first, error: violation }]);
+    expect(result.outcome.skipped).toEqual([{ file: second }]);
+  });
+
+  it('fails closed when a plan-sourced navigation uses a non-HTTP(S) scheme', async () => {
+    const scenario = await createScenario({
+      steps: [Step.parse({ id: 'leave-target', kind: 'action', action: 'navigate', url: 'blob:https://example.test/guard-test' })],
+    });
+
+    const result = await heal(scenario.deps, OPTIONS);
+
+    const error = result.outcome.errors[0]?.error;
+    expect(error).toBeInstanceOf(IntegrityViolationError);
+    expect(error).not.toBeInstanceOf(PlanNavigationResolutionError);
+    expect(result.outcome.errors).toHaveLength(1);
+    expect(result.outcome.results).toEqual([]);
+    expect(result.commits.size).toBe(0);
+  });
   it('keeps every replay attempt in a distinct monotonically numbered evidence directory and never reports discarded evidence', async () => {
     const base = createInMemoryStorage();
     const writeBinary = vi.fn<StorageAdapter['writeBinary']>(base.writeBinary);
@@ -1820,6 +2047,14 @@ describe('heal state-machine contract', () => {
     expect(scenario.textWrites).not.toHaveBeenCalled();
   });
 
+  // @ts-expect-error Integrity failures expose no partially written artifacts because their pre-write comparison is fail-closed.
+  const invalidIntegrityCommitOutcome: HealCommitOutcome = {
+    outcome: 'failed',
+    error: new IntegrityViolationError('artifacts changed before commit'),
+    partiallyWritten: ['plan'],
+  };
+  void invalidIntegrityCommitOutcome;
+
   it('returns a commit capability only for healed or partially-healed candidates and never flushes during heal()', async () => {
     const scenario = await createScenario({
       sessionEntries: liveEntries(SUBMIT),
@@ -1893,6 +2128,7 @@ describe('heal state-machine contract', () => {
     ['plan read error, grounding missing', 'error', 'missing', ['grounding']],
   ] as const)('gives integrity precedence with zero writes for %s while still comparing both sides', async (_label, planBehavior, groundingBehavior, mismatched) => {
     const base = createInMemoryStorage();
+    const baseWriteText = vi.spyOn(base, 'writeText');
     const comparisons: string[] = [];
     let commitStarted = false;
     const storage: StorageAdapter = {
@@ -1908,6 +2144,7 @@ describe('heal state-machine contract', () => {
       },
     };
     const scenario = await createBothArtifactRepairScenario(storage);
+    baseWriteText.mockClear();
     const commit = (await heal(scenario.deps, OPTIONS)).commits.get(OPTIONS.files[0]!);
     expect(commit).toBeDefined();
     scenario.textWrites.mockClear();
@@ -1924,6 +2161,7 @@ describe('heal state-machine contract', () => {
       expect(outcome.error).toMatchObject({ details: { mismatched } });
     }
     expect(comparisons).toEqual([PLAN, GROUNDING]);
+    expect(baseWriteText).not.toHaveBeenCalled();
     expect(scenario.textWrites).not.toHaveBeenCalled();
   });
 

@@ -282,6 +282,33 @@ class CaseAbort extends Error {}
 class AgenticCoverageAbort extends CaseAbort {}
 class TraceProviderExposureIntegrityError extends IntegrityViolationError {}
 
+/**
+ * Marks the sole navigation-integrity failure that healing may treat as an
+ * ordinary candidate failure. Only deterministic plan navigation can create
+ * it, after the fixed replay-target base has already parsed successfully.
+ */
+export class PlanNavigationResolutionError extends IntegrityViolationError {}
+
+const REPAIRABLE_NAVIGATION_FAILURE_CLASSES = new Set<new (
+  message: string,
+  details?: Record<string, unknown>,
+) => IntegrityViolationError>([
+  PlanNavigationResolutionError,
+]);
+
+/**
+ * Returns whether an integrity failure belongs to healing's closed repairable
+ * navigation allowlist. Exact constructors keep future subclasses fail-closed
+ * until a design decision explicitly adds them to this authority.
+ */
+export function isRepairableNavigationFailure(error: unknown): error is PlanNavigationResolutionError {
+  return error instanceof IntegrityViolationError
+    && REPAIRABLE_NAVIGATION_FAILURE_CLASSES.has(error.constructor as new (
+      message: string,
+      details?: Record<string, unknown>,
+    ) => IntegrityViolationError);
+}
+
 function fsIoError(message: string, cause: unknown): FsIoError {
   return new FsIoError(message, undefined, { cause });
 }
@@ -591,7 +618,7 @@ function materializeStep(
       switch (step.action) {
         case 'navigate': {
           const url = materializeText(step.url, runState);
-          assertSameOriginNavigation(url, baseUrl);
+          assertSameOriginNavigation(url, baseUrl, { planStepNavigation: true });
           return { ...step, url };
         }
         case 'fill':
@@ -704,15 +731,25 @@ function materializeTrustedRunText(value: string, context: TraceTrustContext): s
  *   uses a non-HTTP(S) scheme, or does not remain on the replay target's
  *   origin.
  */
-function assertSameOriginNavigation(url: string, baseUrl: string): void {
+function assertSameOriginNavigation(
+  url: string,
+  baseUrl: string,
+  options?: { readonly planStepNavigation?: boolean },
+): void {
   let baseOrigin: string;
-  let destination: URL;
-
   try {
     baseOrigin = new URL(baseUrl).origin;
+  } catch {
+    throw new IntegrityViolationError('The replay target base URL cannot be resolved.');
+  }
+
+  let destination: URL;
+  try {
     destination = new URL(url, baseUrl);
   } catch {
-    throw new IntegrityViolationError('A navigation URL cannot be resolved against the replay target.');
+    throw options?.planStepNavigation
+      ? new PlanNavigationResolutionError('A navigation URL cannot be resolved against the replay target.')
+      : new IntegrityViolationError('A navigation URL cannot be resolved against the replay target.');
   }
 
   if (destination.protocol !== 'http:' && destination.protocol !== 'https:') {
@@ -2486,8 +2523,12 @@ async function executeCapture(step: Step, context: DispatchContext): Promise<Dis
  * the step's raw text evidence contains no resolved secret. Keeping the
  * screenshot decision there makes the security guard auditable in one place,
  * while this helper owns the independent best-effort browser and storage
- * boundary. Evidence failures must never replace the failure being diagnosed,
- * and layout has already established the destination's containment.
+ * boundary. Ordinary diagnostic failures, such as a browser crash or disk
+ * error, leave the diagnosed failure authoritative and degrade to omitted
+ * screenshot evidence. A containment-derived `IntegrityViolationError` is the
+ * narrow exception: it is a correctness and safety signal rather than a
+ * diagnostic-quality concern, so it takes precedence.
+ * Layout has already established the destination's containment.
  */
 async function captureScreenshotEvidence(
   session: BrowserSession,
@@ -2499,7 +2540,8 @@ async function captureScreenshotEvidence(
     const path = joinPath(evidenceDir, `${stepId}.png`);
     await storage.writeBinary(path, await session.screenshot());
     return { screenshot: path };
-  } catch {
+  } catch (error) {
+    if (error instanceof IntegrityViolationError) throw error;
     return {};
   }
 }
@@ -3307,29 +3349,47 @@ async function runCase(deps: RunDeps, options: RunOptions, file: string): Promis
      * errors retain the fixed fallback explanation without examining their
      * message, so neither branch carries materialized case data.
      */
-    const evidence = error instanceof AgenticCoverageAbort
-      || error instanceof TraceProviderExposureIntegrityError
-      || session === undefined
-      || currentStep === undefined
-      ? undefined
-      : await captureFailureEvidence(
-        session,
-        deps.storage,
-        deps.layout.runsDirFor(file, deps.runId),
-        currentStep.id,
-        resolvedSecrets ?? new Map(),
-        runState ?? new Map(),
-      );
-    if (error instanceof AmbercastError) {
+    // The class-wide IntegrityViolationError guard prevents an
+    // integrity failure from starting another capture on the same unsafe
+    // browser or storage boundary. The specific trace-provider subclass is
+    // already covered by that class.
+    //
+    // The capture attempt below can itself surface an integrity violation.
+    // `classificationError` retains it separately
+    // from this catch parameter, so final classification can prefer a real
+    // containment failure discovered during the sole capture attempt without
+    // rebinding the original error. A violation remains equally real
+    // regardless of when diagnostics discover it, so it supersedes the
+    // unrelated failure that prompted capture.
+    let classificationError: unknown = error;
+    let evidence: FailureDetail | undefined;
+    if (!(error instanceof AgenticCoverageAbort)
+      && !(error instanceof IntegrityViolationError)
+      && session !== undefined
+      && currentStep !== undefined) {
+      try {
+        evidence = await captureFailureEvidence(
+          session,
+          deps.storage,
+          deps.layout.runsDirFor(file, deps.runId),
+          currentStep.id,
+          resolvedSecrets ?? new Map(),
+          runState ?? new Map(),
+        );
+      } catch (evidenceError) {
+        if (evidenceError instanceof IntegrityViolationError) classificationError = evidenceError;
+      }
+    }
+    if (classificationError instanceof AmbercastError) {
       classifiedError = redactedError(
-        error,
+        classificationError,
         resolvedSecrets ?? new Map(),
         runState ?? new Map(),
       ) as AmbercastErrorType;
       result = resultForAbort(identity, planSteps, completed, currentStep, classifiedError.message, evidence);
     } else {
-      const explanation = error instanceof CaseAbort
-        ? error.message
+      const explanation = classificationError instanceof CaseAbort
+        ? classificationError.message
         : 'The browser session could not complete this case and no deterministic fallback is available.';
       result = resultForAbort(identity, planSteps, completed, currentStep, explanation, evidence);
     }
