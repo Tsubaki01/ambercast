@@ -1,6 +1,6 @@
 import { readFile, readdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import * as ts from 'typescript';
 import { describe, expect, test } from 'vitest';
 import { computeInputsDigest as aliasComputeInputsDigest } from '#core/ir/digest.js';
@@ -9,6 +9,7 @@ import { scanAccessibilityCaptureFieldAccess } from '../tools/accessibility-capt
 import { scanComputeInputsDigestCalls } from '../tools/digest-scanner.js';
 import { scanSchemaVersionLiteralViolations } from '../tools/schema-version-literal-scanner.js';
 import { scanFillSecretCallSites } from '../tools/fill-secret-call-scanner.js';
+import { scanIntegrityViolationInventory } from '../tools/integrity-violation-scanner.js';
 import {
   liveProducerBundleInputs,
   planProducerBundleManifest,
@@ -27,6 +28,7 @@ const CHECK_COMMAND_MODULE_FILE = fileURLToPath(new URL('../src/runtime/check-co
 const HEAL_MODULE_FILE = fileURLToPath(new URL('../src/usecases/heal.ts', import.meta.url));
 const PLAN_INPUT_PROVENANCE_MODULE_FILE = fileURLToPath(new URL('../src/core/ai/plan-input-provenance.ts', import.meta.url));
 const IR_SCHEMA_MODULE_FILE = fileURLToPath(new URL('../src/core/ir/schema.ts', import.meta.url));
+const INTEGRITY_VIOLATION_MODULE_FILE = fileURLToPath(new URL('../src/core/errors/integrity-violation-error.ts', import.meta.url));
 
 const PROMPT_ENVELOPE_SPECIFIER = '#core/ai/prompt-envelope.js';
 const IR_SCHEMA_SPECIFIER = '#core/ir/schema.js';
@@ -364,6 +366,226 @@ function exportedType(
 }
 
 describe('architecture guardrails', () => {
+  test('keeps the reviewed integrity-construction and navigation-checkpoint inventory exact', async () => {
+    const sourceFiles = await findTypeScriptFiles(SOURCE_ROOT);
+    const tsconfigFileName = ts.sys.resolvePath('tsconfig.json');
+    const configFile = ts.readConfigFile(tsconfigFileName, ts.sys.readFile);
+    if (configFile.error !== undefined) throw new Error(`The architecture test could not read ${tsconfigFileName}.`);
+    const parsedConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, dirname(tsconfigFileName));
+    const program = ts.createProgram({ rootNames: sourceFiles, options: { ...parsedConfig.options, noEmit: true } });
+    const inventory = scanIntegrityViolationInventory(program, INTEGRITY_VIOLATION_MODULE_FILE, RUN_MODULE_FILE);
+    const portableConstructions = inventory.constructions.map((construction) => ({
+      ...construction,
+      fileName: relative(SOURCE_ROOT, construction.fileName),
+    }));
+    const portableDeclarations = inventory.declarations.map((declaration) => ({
+      ...declaration,
+      fileName: relative(SOURCE_ROOT, declaration.fileName),
+    }));
+
+    expect(portableConstructions).toMatchInlineSnapshot(`
+      [
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "adapters/browser/chromium.ts",
+          "functionName": "assertSecretSinkOrigin",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "adapters/storage/runs-dir-contained-storage.ts",
+          "functionName": "createRunsDirContainedStorage",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "validateTrustedInstructionCoveredPlanText",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "validateTrustedPlanText",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "validateTrustedPlanText",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "validateTrustedPlanText",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "validateTrustedPlanText",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "readUsableGrounding",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "assertTrustedRunReferences",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "assertTrustedRunReferences",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "assertTrustedRunReferences",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "materializeTrustedRunText",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "assertSameOriginNavigation",
+        },
+        {
+          "className": "PlanNavigationResolutionError",
+          "fileName": "usecases/run.ts",
+          "functionName": "assertSameOriginNavigation",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "assertSameOriginNavigation",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "assertSameOriginNavigation",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "assertSameOriginNavigation",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "assertAllowedSecretSinkOrigin",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "materializeTraceAction",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "preScanTraceEntry",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "preScanTraceEntry",
+        },
+        {
+          "className": "TraceProviderExposureIntegrityError",
+          "fileName": "usecases/run.ts",
+          "functionName": "preScanTraceEntry",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "preScanTrace",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "assertNoCredentialShapedFillValue",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "assertNoCredentialShapedFillValue",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "assertNoMaterializedLiteral",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "assertNoMaterializedLiteral",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "perform",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "evaluateAssert",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "finalize",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "finalize",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "executeAiStep",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "runCase",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/run.ts",
+          "functionName": "runCase",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "usecases/heal.ts",
+          "functionName": "createHealOverlayStorage",
+        },
+        {
+          "className": "IntegrityViolationError",
+          "fileName": "runtime/heal-command.ts",
+          "functionName": "settleHealOutcome",
+        },
+      ]
+    `);
+    expect(portableDeclarations).toMatchInlineSnapshot(`
+      [
+        {
+          "className": "TraceProviderExposureIntegrityError",
+          "fileName": "usecases/run.ts",
+        },
+        {
+          "className": "PlanNavigationResolutionError",
+          "fileName": "usecases/run.ts",
+        },
+      ]
+    `);
+    expect(inventory.checkpoints).toEqual([
+      { functionName: 'materializeStep', planStepNavigation: true },
+      { functionName: 'materializeTraceAction', planStepNavigation: false },
+      { functionName: 'preScanTraceEntry', planStepNavigation: false },
+    ]);
+  });
+
   test('routes the generated AI request through the shared generator task composer', async () => {
     const composedRequest = ts.createSourceFile(
       '/virtual/composed-generator-request.ts',

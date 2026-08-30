@@ -29,6 +29,7 @@ import { BatchInterruptionTracker } from './batch-interruption.js';
 import { obligationFingerprintMatches } from '#core/ir/obligation-fingerprint.js';
 import { joinPath } from '#core/paths.js';
 import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
+import { isRepairableNavigationFailure } from '#usecases/run.js';
 import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
 import { SecretGrantUnattributableError } from '#core/errors/secret-grant-unattributable-error.js';
@@ -503,7 +504,12 @@ function replayOptions(file: string, options: HealOptions, cacheOnly: boolean) {
  *
  * A skipped inner identity means cancellation reached the same case while an
  * attempt was in flight; it is not a failed repair and must not manufacture a
- * result row from absent evidence.
+ * result row from absent evidence. The integrity check precedes
+ * that interruption decision: an interrupted measurement otherwise discards
+ * its replay and embedded error together, making a genuine integrity
+ * violation permanently unobservable. Integrity observation has precedence
+ * here, including when cancellation or interruption is present, except for
+ * the closed repairable deterministic-navigation resolution class.
  */
 async function measureReplay(
   deps: HealDeps,
@@ -517,6 +523,7 @@ async function measureReplay(
   const evidenceDir = attemptScopedLayout(deps.layout, attemptOrdinal).runsDirFor(file, deps.runId);
   const batch = await run({ ...deps, storage: overlay.storage, layout: attemptScopedLayout(deps.layout, attemptOrdinal) }, replayOptions(file, options, cacheOnly));
   const replay = batch.results[0];
+  if (replay?.error instanceof IntegrityViolationError && !isRepairableNavigationFailure(replay.error)) throw replay.error;
   if (batch.interrupted || replay === undefined) return { interrupted: true };
 
   return {
@@ -852,7 +859,9 @@ async function trySingleStepRepair(
  *
  * A generation result that is interrupted, failed, or partially buffered is
  * never replayed: restoring the snapshot preserves the last trustworthy
- * evidence and keeps an inconsistent candidate out of a later commit.
+ * evidence and keeps an inconsistent candidate out of a later commit. The
+ * sole exception is a non-repairable integrity violation, which is rethrown
+ * before restoration so it remains fail-closed.
  */
 async function tryFullPlanRepair(
   deps: HealDeps,
@@ -893,6 +902,7 @@ async function tryFullPlanRepair(
       return { plan, measurement: { interrupted: true }, stage3Error: undefined, replayed: false };
     }
     if (item.status !== 'generated') {
+      if (item.error instanceof IntegrityViolationError && !isRepairableNavigationFailure(item.error)) throw item.error;
       overlay.restore(snapshot);
       return { plan, measurement, stage3Error: item.error, replayed: false };
     }
@@ -905,6 +915,11 @@ async function tryFullPlanRepair(
     }
     return { plan: regeneratedPlan, measurement: replay, stage3Error: undefined, replayed: true };
   } catch (error) {
+    // The non-repairable IntegrityViolationError rethrow precedes snapshot
+    // restoration and generic stage-three packaging, so every such violation
+    // remains fail-closed instead of becoming a recoverable regeneration
+    // error, including ones thrown directly by generation.
+    if (error instanceof IntegrityViolationError && !isRepairableNavigationFailure(error)) throw error;
     overlay.restore(snapshot);
     if (deps.signal?.aborted) return { plan, measurement: { interrupted: true }, stage3Error: undefined, replayed: false };
     return {
@@ -1193,14 +1208,19 @@ export async function heal(
     }
 
     const pending = new Set([...tracker.pendingIdentities, ...interruptedMidCase]);
+    const skipped = files
+      .filter((file) => pending.has(file) && !errors.some((error) => error.file === file))
+      .map((file) => ({ file }));
     return {
       outcome: {
         results,
         errors,
         noTestsFound: files.length === 0,
         listed: [],
-        skipped: files.filter((file) => pending.has(file)).map((file) => ({ file })),
-        interrupted: tracker.interrupted || interruptedMidCase.size > 0,
+        skipped,
+        // A skipped file can only result from the batch stopping early; an
+        // erroring file is excluded so it is never reported twice as skipped.
+        interrupted: skipped.length > 0,
       },
       commits,
     };

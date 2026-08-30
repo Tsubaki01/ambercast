@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
+import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
 import { createHealAiDispatchBudget, type HealAiDispatchPhaseDeps } from '#usecases/heal-ai-dispatch-budget.js';
+import { PlanNavigationResolutionError } from '#usecases/run.js';
 import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
 
 const request = {} as never;
@@ -101,6 +103,78 @@ describe('createHealAiDispatchBudget', () => {
     const outcome = await fixture.budget.runPhase('incremental', async () => { throw error; });
 
     expect(outcome).toEqual({ admitted: true, result: { ok: false, error } });
+  });
+
+  it.each([
+    {
+      label: 'attempt-limit',
+      budget: { maxDispatches: 1 },
+      beforeDeniedDispatch: () => undefined,
+    },
+    {
+      label: 'deadline',
+      budget: { maxDispatches: Infinity },
+      beforeDeniedDispatch: (fixture: ReturnType<typeof createBudget>) => fixture.setNow(100),
+    },
+  ] as const)('preserves a later integrity violation after an internally caught %s denial', async ({ budget, beforeDeniedDispatch }) => {
+    const fixture = createBudget(budget);
+    const violation = new IntegrityViolationError('A later replay observation escaped containment.');
+    const execute = vi.spyOn(fixture.executor, 'execute');
+
+    const outcome = await fixture.budget.runPhase('incremental', async (deps) => {
+      const executor = await deps.resolveAiExecutor();
+      await executor.execute(request);
+      beforeDeniedDispatch(fixture);
+      try {
+        await executor.execute(request);
+      } catch {
+        // The work models run() swallowing the private budget sentinel.
+      }
+      throw violation;
+    });
+
+    expect(execute).toHaveBeenCalledOnce();
+    expect(outcome).toEqual({ admitted: true, result: { ok: false, error: violation } });
+  });
+
+  it('keeps denial precedence when an ordinary error was swallowed before the denial', async () => {
+    const fixture = createBudget({ maxDispatches: 1 });
+
+    const outcome = await fixture.budget.runPhase('incremental', async (deps) => {
+      try {
+        throw new Error('ordinary replay failure');
+      } catch {
+        // A non-integrity error does not activate the narrow precedence exception.
+      }
+      const executor = await deps.resolveAiExecutor();
+      await executor.execute(request);
+      try {
+        await executor.execute(request);
+      } catch {
+        // This is the later, decisive denial.
+      }
+      return 'discarded by denial';
+    });
+
+    expect(outcome).toEqual({ admitted: false, deniedReason: 'attempt-limit' });
+  });
+
+  it('keeps denial precedence over the closed repairable navigation exception', async () => {
+    const fixture = createBudget({ maxDispatches: 1 });
+    const repairable = new PlanNavigationResolutionError('The plan destination cannot be resolved.');
+
+    const outcome = await fixture.budget.runPhase('incremental', async (deps) => {
+      const executor = await deps.resolveAiExecutor();
+      await executor.execute(request);
+      try {
+        await executor.execute(request);
+      } catch {
+        // The work models run() swallowing the private budget sentinel.
+      }
+      throw repairable;
+    });
+
+    expect(outcome).toEqual({ admitted: false, deniedReason: 'attempt-limit' });
   });
 
   it('passes through executor identity members and does not meter isAvailable', async () => {

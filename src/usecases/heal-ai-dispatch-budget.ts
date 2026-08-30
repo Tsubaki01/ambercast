@@ -1,5 +1,7 @@
 import type { InstructionCoveredAiExecutor } from '#ports/ai.js';
 import type { Clock } from '#ports/system.js';
+import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
+import { isRepairableNavigationFailure } from '#usecases/run.js';
 
 const DISPATCH_DENIED: unique symbol = Symbol('dispatch-denied');
 
@@ -39,7 +41,9 @@ export type DispatchBudgetDenialReason = 'attempt-limit' | 'deadline';
  * never use `instanceof`, error-message matching, or any inspection of what
  * `work` threw or returned for that decision. A denial deliberately hides the
  * captured result so report-facing callers cannot accidentally retain partial
- * phase output.
+ * phase output. The integrity-precedence check is this controller's
+ * internal admission decision, not permission for callers to override an
+ * outcome after inspecting its result.
  */
 export type DispatchBudgetPhaseOutcome<T> =
   | { readonly admitted: true; readonly result: { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown } }
@@ -63,7 +67,18 @@ export interface HealAiDispatchBudget {
    * `stage3` phase skips that allowance check entirely: it is deadline-gated
    * only and is never denied for reaching the dispatch limit. One denied
    * dispatch latches the entire phase as denied, discarding both `work`'s
-   * value and any error it threw.
+   * value and any error it threw, except for a settled
+   * non-repairable `IntegrityViolationError`: integrity correctness takes
+   * precedence over denial and is returned as an admitted failed result so
+   * existing callers rethrow it rather than adopt any phase output. The
+   * closed repairable navigation-resolution exception remains discarded by a
+   * denial like every ordinary phase failure.
+   *
+   * Callers must convert every embedded non-repairable integrity violation to
+   * a thrown error before `work` settles. This method only inspects
+   * `result.error`, never `result.value`, to decide that precedence; its
+   * generic result type cannot safely inspect a successfully resolved value
+   * for caller-specific state.
    *
    * A second phase from the same controller is a programming error while the
    * first remains open. The controller throws its reentrancy assertion at
@@ -226,7 +241,11 @@ export function createHealAiDispatchBudget(params: {
       } finally {
         openPhase = undefined;
       }
-      if (phase.deniedReason !== undefined) return { admitted: false, deniedReason: phase.deniedReason };
+      if (phase.deniedReason !== undefined && !(result.ok === false
+        && result.error instanceof IntegrityViolationError
+        && !isRepairableNavigationFailure(result.error))) {
+        return { admitted: false, deniedReason: phase.deniedReason };
+      }
       return { admitted: true, result };
     },
   };

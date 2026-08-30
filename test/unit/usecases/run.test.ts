@@ -42,7 +42,7 @@ import type { BrowserDriver, BrowserEngine, BrowserSession, PerformableAction } 
 import type { StorageAdapter } from '#ports/storage.js';
 import type { Clock, RunEvent } from '#ports/system.js';
 import { generate, type GenerateDeps, type GenerateOptions } from '#usecases/generate.js';
-import { run, type RunDeps, type RunOptions } from '#usecases/run.js';
+import { PlanNavigationResolutionError, run, type RunDeps, type RunOptions } from '#usecases/run.js';
 import { BatchInterruptionTracker } from '#usecases/batch-interruption.js';
 import { validateCommittedInstructionCoverage } from '#usecases/instruction-coverage-policy.js';
 import { buildRunReport } from '#usecases/run-report.js';
@@ -1132,6 +1132,7 @@ describe('run', () => {
     const outcome = await run(deps, DEFAULT_OPTIONS);
 
     expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+    expect(outcome.results[0]?.error).not.toBeInstanceOf(PlanNavigationResolutionError);
     expect(session.operations()).toEqual([]);
   });
 
@@ -1149,6 +1150,7 @@ describe('run', () => {
     const error = outcome.results[0]?.error;
 
     expect(error).toBeInstanceOf(IntegrityViolationError);
+    expect(error).not.toBeInstanceOf(PlanNavigationResolutionError);
     expect(error?.message).toBe('A navigation URL must use the replay target\'s HTTP(S) scheme.');
     expect(session.operations()).toEqual([]);
   });
@@ -1173,7 +1175,7 @@ describe('run', () => {
     ]);
   });
 
-  it('classifies an unresolvable deterministic navigate URL as an integrity violation', async () => {
+  it('preserves the repairable class for an unresolvable deterministic navigate URL through redaction', async () => {
     const session = createFakeBrowserSession(new Map());
     const { deps, recordingStorage } = createScenario({
       browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
@@ -1185,7 +1187,30 @@ describe('run', () => {
 
     const outcome = await run(deps, DEFAULT_OPTIONS);
 
-    expect(outcome.results[0]?.error).toBeInstanceOf(IntegrityViolationError);
+    expect(outcome.results[0]?.error).toBeInstanceOf(PlanNavigationResolutionError);
+    expect(session.operations()).toEqual([]);
+  });
+
+  it('keeps an unresolvable fresh agentic navigate URL fail-closed as the base integrity class', async () => {
+    const session = createFakeBrowserSession(new Map());
+    const executor = createFakeAiExecutor({
+      async executeAgentic(request) {
+        await request.controller.perform({ type: 'navigate', url: 'https://[::1' });
+        return { outcome: 'success' };
+      },
+    });
+    const { deps, recordingStorage } = createScenario({
+      browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)),
+      resolveAiExecutor: async () => executor,
+    });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [aiStep()]);
+
+    const outcome = await run(deps, DEFAULT_OPTIONS);
+    const error = outcome.results[0]?.error;
+
+    expect(error).toBeInstanceOf(IntegrityViolationError);
+    expect(error).not.toBeInstanceOf(PlanNavigationResolutionError);
     expect(session.operations()).toEqual([]);
   });
 
@@ -6326,6 +6351,57 @@ describe('run failure evidence', () => {
       expect(step).not.toHaveProperty('screenshot');
       expect(step).toHaveProperty('observed');
     }
+  });
+
+  it('fails closed when assertion evidence storage rejects the screenshot with an integrity violation', async () => {
+    const violation = new IntegrityViolationError('Evidence path escaped its containment boundary.');
+    const session = createFakeBrowserSession(new Map(), {
+      assertOutcome: { passed: false, message: 'The dashboard is absent.' },
+      snapshot: { accessibilityTree: { role: 'document' }, screenshot: new Uint8Array([61]) },
+    });
+    const accessibilitySnapshot = vi.spyOn(session, 'accessibilitySnapshot');
+    const screenshot = vi.spyOn(session, 'screenshot');
+    const { deps, recordingStorage } = createScenario({ browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)) });
+    const writeBinary = vi.spyOn(recordingStorage.storage, 'writeBinary').mockRejectedValue(violation);
+    const testPath = await writePrompt(recordingStorage.storage, 'integrity-evidence.test.md');
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'assert-dashboard', kind: 'assert', check: 'text-visible', text: 'Dashboard' },
+    ]);
+
+    const outcome = await run(deps, { ...DEFAULT_OPTIONS, files: [testPath] });
+    const result = outcome.results[0];
+
+    expect(result?.result).toMatchObject({ status: 'error' });
+    // run() reconstructs case-level errors through redactedError()'s secret-redaction contract,
+    // so it promises a same-class, same-message, same-details rebuild rather than object identity.
+    expect(result?.error).toStrictEqual(violation);
+    expect(result?.result.steps[0]).not.toHaveProperty('screenshot');
+    expect(accessibilitySnapshot).toHaveBeenCalledOnce();
+    expect(screenshot).toHaveBeenCalledOnce();
+    expect(writeBinary).toHaveBeenCalledOnce();
+  });
+
+  it('lets an integrity violation from outer-catch evidence supersede the original dispatch failure', async () => {
+    const original = new Error('Browser disconnected during dispatch.');
+    const violation = new IntegrityViolationError('Evidence path escaped its containment boundary.');
+    const session = createFakeBrowserSession(new Map(), {
+      snapshot: { accessibilityTree: { role: 'document' }, screenshot: new Uint8Array([62]) },
+      onPerform() { throw original; },
+    });
+    const { deps, recordingStorage } = createScenario({ browserDriver: vi.fn(() => createFakeBrowserDriver(() => session)) });
+    vi.spyOn(recordingStorage.storage, 'writeBinary').mockRejectedValue(violation);
+    const testPath = await writePrompt(recordingStorage.storage, 'integrity-outer-catch.test.md');
+    await seedFreshArtifacts(recordingStorage.storage, testPath, [
+      { id: 'navigate', kind: 'action', action: 'navigate', url: '/dashboard' },
+    ]);
+
+    const outcome = await run(deps, { ...DEFAULT_OPTIONS, files: [testPath] });
+
+    expect(outcome.results[0]?.result).toMatchObject({ status: 'error' });
+    // run() reconstructs case-level errors through redactedError()'s secret-redaction contract,
+    // so it promises a same-class, same-message, same-details rebuild rather than object identity.
+    expect(outcome.results[0]?.error).toStrictEqual(violation);
+    expect(outcome.results[0]?.error).not.toBe(original);
   });
 
   it('omits a caught-error screenshot when only its raw accessibility tree contains a resolved secret', async () => {

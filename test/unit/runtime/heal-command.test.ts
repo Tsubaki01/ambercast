@@ -882,6 +882,32 @@ describe('runHealCommand', () => {
     expect(settled).toMatchObject({ cause, details: { mismatched: ['plan'], partiallyWritten: [] } });
   });
 
+  it('reports a Stage-2 candidate replay integrity violation as one errored case with exit code 4', async () => {
+    const file = '/workspace/tests/stage2-integrity.test.md';
+    const violation = new IntegrityViolationError('Stage-2 candidate replay escaped containment.');
+    const integrityOutcome: HealOutcome = {
+      results: [],
+      errors: [{ file, error: violation }],
+      noTestsFound: false,
+      listed: [],
+      skipped: [],
+      interrupted: false,
+    };
+    configure({ result: { outcome: integrityOutcome, commits: new Map() } });
+    await useActualBuildHealReport();
+
+    const output = await runHealCommand(input({ yes: true }));
+
+    expect(output).toMatchObject({
+      exitCode: 4,
+      envelope: {
+        summary: { errored: 1 },
+        errors: [expect.objectContaining({ scope: 'case', code: 'INTEGRITY_VIOLATION', caseId: 'tests/stage2-integrity.test.md' })],
+      },
+    });
+    expect(output.envelope.results).toEqual([]);
+  });
+
   it('uses settlement partial-write evidence for a partially-applied public report', async () => {
     const failed = capability('failed-after-plan-write.test.md', {
       outcome: 'failed',
