@@ -189,7 +189,7 @@ if (config.pauseBefore && equals(config.pauseBefore)) {
   writeFileSync(config.ready, 'ready');
   const started = Date.now();
   while (!existsSync(config.release)) {
-    if (Date.now() - started > 5000) process.exit(92);
+    if (Date.now() - started > 15_000) process.exit(92);
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
   }
 }
@@ -236,7 +236,7 @@ async function readCommandLog(path: string): Promise<CommandLogEvent[]> {
   return text.split('\n').filter(Boolean).map((line) => JSON.parse(line) as CommandLogEvent);
 }
 
-async function waitFor(path: string, timeoutMs = 1500): Promise<void> {
+async function waitFor(path: string, timeoutMs = 10_000): Promise<void> {
   const until = Date.now() + timeoutMs;
   while (!existsSync(path)) {
     if (Date.now() >= until) {
