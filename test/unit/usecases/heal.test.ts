@@ -1693,6 +1693,7 @@ describe('heal state-machine contract', () => {
     ))).toEqual([
       { type: 'heal-stage2-rejected', stepId: 'repair-me', reason: 'provider-error' },
     ]);
+    expect(events.emitted().some((event) => event.type === 'ai-call')).toBe(false);
   });
 
   it('orders Stage-2 ai-call before an executor-classified rejection', async () => {
@@ -1723,6 +1724,15 @@ describe('heal state-machine contract', () => {
     ))).toEqual([
       { type: 'ai-call', stepId: 'repair-me' },
       { type: 'heal-stage2-rejected', stepId: 'repair-me', reason: 'provider-error' },
+    ]);
+    expect(recording.emitted().filter((event) => (
+      event.type === 'ai-call' && event.stepId === undefined
+    ))).toEqual([
+      { type: 'ai-call' },
+    ]);
+    expect(recording.emitted().filter((event) => event.type === 'step-start')).toEqual([
+      { type: 'step-start', stepId: 'repair-me' },
+      { type: 'step-start', stepId: 'repair-me' },
     ]);
     expect(order.slice(0, 3)).toEqual(['ai-call', 'execute', 'rejection']);
   });
@@ -2601,6 +2611,25 @@ describe('heal state-machine contract', () => {
     expect(execute.mock.calls.filter(([request]) => stage2Frontier(request) !== undefined)).toHaveLength(0);
   });
 
+  it('retains only the initial step-scoped ai-retrace event when the exhausted Stage 1 dispatch is denied', async () => {
+    const recording = createRecordingEventSink();
+    const execute = vi.fn(async (_request: { readonly context?: unknown }) => { throw new Error('Stage 3 remains unresolved.'); });
+    const executeAgentic = vi.fn(async () => ({ outcome: 'failure' as const }));
+    const scenario = await createScenario({ steps: [AI_STEP], grounding: {}, aiExecutor: createFakeAiExecutor({ execute, executeAgentic }) });
+
+    const result = await heal({
+      ...scenario.deps,
+      events: recording.sink,
+      config: { ...scenario.deps.config, heal: { caseTimeoutMs: 300_000, maxStepRepairs: 1 } },
+    }, OPTIONS);
+
+    expect(result.outcome.results[0]).toMatchObject({ stopReason: 'attempt-limit' });
+    expect(recording.emitted().filter((event) => event.type === 'ai-call' && event.stepId === 'ai-step')).toEqual([
+      { type: 'ai-call', stepId: 'ai-step' },
+    ]);
+    expect(executeAgentic).toHaveBeenCalledOnce();
+  });
+
   it('restores the best incremental candidate when Stage 3 replay does not fully pass', async () => {
     const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: unknown }) => {
       if (request.prompt.startsWith('Confirm whether')) return { data: { confirmed: true }, raw: '{}' };
@@ -2807,11 +2836,8 @@ describe('heal state-machine contract', () => {
     ])).resolves.toEqual([originalPlan, originalGrounding]);
     expect(events.emitted().filter((event) => event.type === 'ai-call' && event.stepId === 'click-submit')).toEqual([
       { type: 'ai-call', stepId: 'click-submit' },
-      { type: 'ai-call', stepId: 'click-submit' },
     ]);
-    expect(events.emitted().filter((event) => event.type === 'heal-stage2-rejected')).toEqual([
-      { type: 'heal-stage2-rejected', stepId: 'click-submit', reason: 'no-advance' },
-    ]);
+    expect(events.emitted().filter((event) => event.type === 'heal-stage2-rejected')).toEqual([]);
   });
 
   it('starts the case deadline after preflight and does not charge preflight elapsed time', async () => {
