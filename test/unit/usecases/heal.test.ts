@@ -499,6 +499,35 @@ describe('heal state-machine contract', () => {
     expect(calls()).toBe(4);
   });
 
+  it('keeps a repairable Stage-2 candidate replay on the ordinary no-advance path', async () => {
+    const violation = new PlanNavigationResolutionError('The Stage two candidate replay could not resolve its navigation.');
+    const events = createRecordingEventSink();
+    const candidate: GeneratedPlanResponse = {
+      steps: [{ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }], ambiguities: [],
+    };
+    const scenario = await createScenario({
+      aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: candidate, raw: JSON.stringify(candidate) }) }),
+    });
+    let replayCalls = 0;
+    let candidateFirstFailureIndex: number | undefined;
+    replayRunObserver.afterRun = (_deps, _storage, options, outcome) => {
+      replayCalls += 1;
+      if (replayCalls !== 4 || options.cacheOnly === true) return;
+      const replay = outcome.results[0];
+      candidateFirstFailureIndex = replay?.result.steps.findIndex((step) => step.status === 'failed' || step.status === 'error');
+      (replay as { error?: IntegrityViolationError } | undefined)!.error = violation;
+    };
+
+    const result = await heal({ ...scenario.deps, events: events.sink }, OPTIONS);
+    const outcome = result.outcome.results[0]!;
+
+    expect(candidateFirstFailureIndex).toBe(0);
+    expect(outcome.baselineFirstFailureIndex).toBe(0);
+    expect(events.emitted()).toContainEqual({ type: 'heal-stage2-rejected', stepId: 'click-submit', reason: 'no-advance' });
+    expect(result.outcome.errors).toEqual([]);
+    expect(result.commits.size).toBe(0);
+  });
+
   it('aborts at the Stage-3 replay when its replay carries an integrity violation', async () => {
     const violation = new IntegrityViolationError('stage three evidence escaped containment');
     const invalidStage2: GeneratedPlanResponse = { steps: [{ id: 'wrong-id', kind: 'action', action: 'click', target: SUBMIT }], ambiguities: [] };
@@ -530,6 +559,74 @@ describe('heal state-machine contract', () => {
 
     const result = await heal(scenario.deps, OPTIONS);
 
+    expectCaseScopedIntegrityFailure(result, violation);
+  });
+
+  it('does not absorb an exact PlanNavigationResolutionError from Stage-3 generation', async () => {
+    const violation = new PlanNavigationResolutionError('Stage three generation produced a navigation-resolution failure.');
+    const invalidStage2: GeneratedPlanResponse = { steps: [{ id: 'wrong-id', kind: 'action', action: 'click', target: SUBMIT }], ambiguities: [] };
+    let generation = 0;
+    const scenario = await createScenario({
+      grounding: {},
+      aiExecutor: createFakeAiExecutor({ execute: async () => {
+        if (generation++ === 0) return { data: invalidStage2, raw: '{}' };
+        throw violation;
+      } }),
+    });
+
+    const result = await heal(scenario.deps, OPTIONS);
+
+    expectCaseScopedIntegrityFailure(result, violation);
+  });
+
+  it('does not absorb a PlanNavigationResolutionError subclass from Stage-3 generation', async () => {
+    class TestIntegritySubclass extends PlanNavigationResolutionError {}
+
+    const violation = new TestIntegritySubclass('Stage three generation produced a subclassed navigation-resolution failure.');
+    const invalidStage2: GeneratedPlanResponse = { steps: [{ id: 'wrong-id', kind: 'action', action: 'click', target: SUBMIT }], ambiguities: [] };
+    let generation = 0;
+    const scenario = await createScenario({
+      grounding: {},
+      aiExecutor: createFakeAiExecutor({ execute: async () => {
+        if (generation++ === 0) return { data: invalidStage2, raw: '{}' };
+        throw violation;
+      } }),
+    });
+
+    const result = await heal(scenario.deps, OPTIONS);
+
+    expectCaseScopedIntegrityFailure(result, violation);
+  });
+
+  it('does not absorb a PlanNavigationResolutionError from the Stage-3 executor resolver', async () => {
+    const violation = new PlanNavigationResolutionError('The Stage three executor resolver reported a navigation-resolution failure.');
+    const scenario = await createScenario({ launchFailure: true });
+
+    const result = await heal({
+      ...scenario.deps,
+      resolveAiExecutor: vi.fn(async () => { throw violation; }),
+    }, OPTIONS);
+
+    expectCaseScopedIntegrityFailure(result, violation);
+  });
+
+  it('gives an in-flight Stage-3 executor resolver navigation violation precedence over interruption', async () => {
+    const controller = new AbortController();
+    const violation = new PlanNavigationResolutionError('The interrupted Stage three executor resolver reported a navigation-resolution failure.');
+    const scenario = await createScenario({
+      launchFailure: true,
+      signal: controller.signal,
+    });
+
+    const result = await heal({
+      ...scenario.deps,
+      resolveAiExecutor: vi.fn(async () => {
+        controller.abort();
+        throw violation;
+      }),
+    }, OPTIONS);
+
+    expect(controller.signal.aborted).toBe(true);
     expectCaseScopedIntegrityFailure(result, violation);
   });
 
@@ -2643,6 +2740,61 @@ describe('heal state-machine contract', () => {
     const outcome = result.outcome.results[0]!;
     expect({ repairOutcome: outcome.repairOutcome, stopReason: outcome.stopReason, finalFirstFailureIndex: outcome.finalFirstFailureIndex }).toEqual({ repairOutcome: 'partially-healed', stopReason: 'settled', finalFirstFailureIndex: 1 });
     expect(result.commits.has(OPTIONS.files[0]!)).toBe(true);
+  });
+
+  it('restores the pre-Stage-3 best replay when the Stage-3 candidate has a repairable navigation failure', async () => {
+    const violation = new PlanNavigationResolutionError('The regenerated candidate could not resolve its navigation.');
+    const stage2Invalid: GeneratedPlanResponse = {
+      steps: [{ id: 'wrong-id', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [],
+    };
+    const stage3Candidate: GeneratedPlanResponse = {
+      steps: [
+        { id: 'stage3-candidate-submit', kind: 'action', action: 'click', target: REPAIRED_SUBMIT },
+        { id: 'stage3-candidate-after', kind: 'action', action: 'click', target: AFTER_SUBMIT },
+      ],
+      ambiguities: [],
+    };
+    const scenario = await createScenario({
+      steps: [
+        Step.parse({ id: 'best-submit', kind: 'action', action: 'click', target: SUBMIT }),
+        Step.parse({ id: 'best-after', kind: 'action', action: 'click', target: AFTER_SUBMIT }),
+      ],
+      sessionEntries: new Map([
+        [elementRefKey(SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }],
+        [elementRefKey(AFTER_SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }],
+        ...liveEntries(REPAIRED_SUBMIT),
+      ]),
+      aiExecutor: createFakeAiExecutor({ execute: async (request) => {
+        if (request.prompt.startsWith('Confirm whether')) return { data: { confirmed: true }, raw: '{"confirmed":true}' };
+        const response = stage2Frontier(request) === undefined ? stage3Candidate : stage2Invalid;
+        return { data: response, raw: JSON.stringify(response) };
+      } }),
+    });
+    let injectedStage3CandidateReplay = false;
+    replayRunObserver.afterRun = (_deps, _storage, options, outcome) => {
+      const replay = outcome.results[0];
+      if (options.cacheOnly === true || replay?.result.steps[0]?.id !== 'stage3-candidate-submit') return;
+      (replay as { error?: IntegrityViolationError } | undefined)!.error = violation;
+      injectedStage3CandidateReplay = true;
+    };
+
+    const result = await heal(scenario.deps, OPTIONS);
+    const outcome = result.outcome.results[0]!;
+
+    expect(injectedStage3CandidateReplay).toBe(true);
+    expect({
+      repairOutcome: outcome.repairOutcome,
+      baselineFirstFailureIndex: outcome.baselineFirstFailureIndex,
+      finalFirstFailureIndex: outcome.finalFirstFailureIndex,
+      stage3Error: outcome.stage3Error,
+    }).toEqual({
+      repairOutcome: 'unresolved',
+      baselineFirstFailureIndex: 0,
+      finalFirstFailureIndex: 0,
+      stage3Error: undefined,
+    });
+    expect(outcome.steps.map(({ id }) => id)).toEqual(['best-submit', 'best-after']);
+    expect(result.commits.size).toBe(0);
   });
 
   it('classifies an unchanged no-Stage-3 measurement as no-changes-needed under R11', async () => {

@@ -382,6 +382,10 @@ describe('architecture guardrails', () => {
       ...declaration,
       fileName: relative(SOURCE_ROOT, declaration.fileName),
     }));
+    const portableAllowlistCallSites = inventory.allowlistCallSites.map((callSite) => ({
+      ...callSite,
+      fileName: relative(SOURCE_ROOT, callSite.fileName),
+    }));
 
     expect(portableConstructions).toMatchInlineSnapshot(`
       [
@@ -579,6 +583,10 @@ describe('architecture guardrails', () => {
         },
       ]
     `);
+    expect(portableAllowlistCallSites).toEqual([
+      { fileName: 'usecases/heal-ai-dispatch-budget.ts', functionName: 'runPhase' },
+      { fileName: 'usecases/heal.ts', functionName: 'measureReplay' },
+    ]);
     expect(inventory.checkpoints).toEqual([
       { functionName: 'materializeStep', planStepNavigation: true },
       { functionName: 'materializeTraceAction', planStepNavigation: false },

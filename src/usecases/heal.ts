@@ -863,9 +863,12 @@ async function trySingleStepRepair(
  *
  * A generation result that is interrupted, failed, or partially buffered is
  * never replayed: restoring the snapshot preserves the last trustworthy
- * evidence and keeps an inconsistent candidate out of a later commit. The
- * sole exception is a non-repairable integrity violation, which is rethrown
- * before restoration so it remains fail-closed.
+ * evidence and keeps an inconsistent candidate out of a later commit. Every
+ * integrity violation surfaced by generation, whether the exact class
+ * or a subclass, is rethrown unconditionally before restoration so it remains
+ * fail-closed. Generation output is not a `RunCaseOutcome`; the
+ * repairable-navigation allowlist applies only to replay-observed errors in
+ * {@link measureReplay}.
  */
 async function tryFullPlanRepair(
   deps: HealDeps,
@@ -906,7 +909,7 @@ async function tryFullPlanRepair(
       return { plan, measurement: { interrupted: true }, stage3Error: undefined, replayed: false };
     }
     if (item.status !== 'generated') {
-      if (item.error instanceof IntegrityViolationError && !isRepairableNavigationFailure(item.error)) throw item.error;
+      if (item.error instanceof IntegrityViolationError) throw item.error;
       overlay.restore(snapshot);
       return { plan, measurement, stage3Error: item.error, replayed: false };
     }
@@ -919,11 +922,14 @@ async function tryFullPlanRepair(
     }
     return { plan: regeneratedPlan, measurement: replay, stage3Error: undefined, replayed: true };
   } catch (error) {
-    // The non-repairable IntegrityViolationError rethrow precedes snapshot
-    // restoration and generic stage-three packaging, so every such violation
-    // remains fail-closed instead of becoming a recoverable regeneration
-    // error, including ones thrown directly by generation.
-    if (error instanceof IntegrityViolationError && !isRepairableNavigationFailure(error)) throw error;
+    // Every IntegrityViolationError, whether an exact class or subclass and
+    // whether from generation or the internal measureReplay call, is rethrown
+    // unconditionally before restoration and generic stage-three packaging.
+    // measureReplay classifies replay-observed errors before they reach this
+    // catch: a repairable error never escapes as a throw, so any replay error
+    // arriving here is already non-repairable. This catch does not duplicate
+    // that classification.
+    if (error instanceof IntegrityViolationError) throw error;
     overlay.restore(snapshot);
     if (deps.signal?.aborted) return { plan, measurement: { interrupted: true }, stage3Error: undefined, replayed: false };
     return {
