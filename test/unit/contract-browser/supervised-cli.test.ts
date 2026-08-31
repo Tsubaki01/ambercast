@@ -5,8 +5,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { spawnSupervised, spawnSupervisedCli, type SupervisedCli } from '../../contract-browser/support/supervised-cli.js';
 
 const shortTimings = { sigtermAfterMs: 250, sigkillAfterMs: 30, failAfterMs: 30, pollIntervalMs: 5 };
+const naturalExitTimings = { ...shortTimings, sigtermAfterMs: 5_000 };
 const childScript = (source: string): readonly string[] => ['-e', source];
-const waitDeadlineMs = 1_000;
+const waitDeadlineMs = 5_000;
 
 function signalsSent(kill: { mock: { calls: unknown[][] } }): unknown[] {
   return kill.mock.calls.map((call) => call[1]).filter((signal) => signal !== 0);
@@ -88,7 +89,7 @@ describe('supervised process spawning', () => {
 
   it('returns stdout and exit code for a quick cooperative process without signaling', async () => {
     const kill = vi.spyOn(process, 'kill');
-    const invocation = track(spawnSupervised(process.execPath, childScript("process.stdout.write('ok')"), process.cwd(), process.env, shortTimings));
+    const invocation = track(spawnSupervised(process.execPath, childScript("process.stdout.write('ok')"), process.cwd(), process.env, naturalExitTimings));
 
     await expect(invocation.result).resolves.toMatchObject({ stdout: Buffer.from('ok'), exitCode: 0, signalCode: null });
     expect(invocation.terminated()).toBe(true);
@@ -98,12 +99,16 @@ describe('supervised process spawning', () => {
   it('escalates a SIGTERM-ignoring child to SIGKILL and confirms it', async () => {
     const invocation = track(spawnSupervised(
       process.execPath,
-      childScript("process.on('SIGTERM', () => {}); setInterval(() => {}, 1_000);"),
+      childScript("process.on('SIGTERM', () => {}); process.stdout.write('ready'); setInterval(() => {}, 1_000);"),
       process.cwd(),
       process.env,
-      shortTimings,
+      { ...shortTimings, sigtermAfterMs: naturalExitTimings.sigtermAfterMs },
     ));
 
+    const stdout = invocation.child.stdout;
+    if (stdout === null) throw new Error('Expected supervised child stdout to be piped');
+    await new Promise<void>((resolve) => stdout.once('data', () => resolve()));
+    await invocation.terminateAndConfirm();
     await expect(invocation.result).resolves.toMatchObject({ signalCode: 'SIGKILL' });
     expect(invocation.terminated()).toBe(true);
   });
@@ -139,7 +144,7 @@ describe('supervised process spawning', () => {
 
   it('keeps spawn failure separate from empty-group confirmation', async () => {
     const kill = vi.spyOn(process, 'kill');
-    const invocation = track(spawnSupervised('/definitely/not/an-ambercast-command', [], process.cwd(), process.env, shortTimings));
+    const invocation = track(spawnSupervised('/definitely/not/an-ambercast-command', [], process.cwd(), process.env, naturalExitTimings));
 
     await expect(invocation.result).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(invocation.terminateAndConfirm()).resolves.toBeUndefined();
@@ -149,7 +154,6 @@ describe('supervised process spawning', () => {
 
   it('settles once when close races the watchdog deadline', async () => {
     const kill = vi.spyOn(process, 'kill');
-    const naturalExitTimings = { ...shortTimings, sigtermAfterMs: 500 };
     const invocation = track(spawnSupervised(process.execPath, childScript('setTimeout(() => process.exit(0), 25)'), process.cwd(), process.env, naturalExitTimings));
     const result = invocation.result;
 
@@ -161,7 +165,7 @@ describe('supervised process spawning', () => {
 
   it('preserves the original spawn error if a fabricated close follows it', async () => {
     const kill = vi.spyOn(process, 'kill');
-    const invocation: SupervisedCli = track(spawnSupervised('/definitely/not/an-ambercast-command', [], process.cwd(), process.env, shortTimings));
+    const invocation: SupervisedCli = track(spawnSupervised('/definitely/not/an-ambercast-command', [], process.cwd(), process.env, naturalExitTimings));
     const result = invocation.result;
     await expect(result).rejects.toMatchObject({ code: 'ENOENT' });
     expect(invocation.child.emit).toBeTypeOf('function');
@@ -172,10 +176,13 @@ describe('supervised process spawning', () => {
   });
 
   it('adapts the built CLI through spawnSupervisedCli', async () => {
-    const cliStartupTimings = { ...shortTimings, sigtermAfterMs: 500 };
+    const cliStartupTimings = { ...shortTimings, sigtermAfterMs: 5_000 };
     const invocation = track(spawnSupervisedCli(['--version'], process.cwd(), process.env, cliStartupTimings));
+    const result = await invocation.result;
 
-    await expect(invocation.result).resolves.toMatchObject({ exitCode: 0 });
+    // build-test (22.14) reported exitCode: null after 531ms, well before the watchdog; the prior exit-code-only matcher left a recurrence opaque.
+    expect(result.signalCode, result.stderr.toString()).toBeNull();
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
     expect(invocation.terminated()).toBe(true);
   });
 });
