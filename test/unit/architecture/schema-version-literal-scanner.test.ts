@@ -2,141 +2,228 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import * as ts from 'typescript';
-import { describe, expect, it } from 'vitest';
-import {
-  scanSchemaVersionLiteralViolations,
-  type SchemaVersionLiteralViolation,
-} from '../../../tools/schema-version-literal-scanner.js';
+import { describe, expect, test } from 'vitest';
+import { scanSchemaVersionLiteralViolations, type SchemaVersionLiteralViolation } from '../../../tools/schema-version-literal-scanner.js';
 
-async function scan(
-  source: string,
-  schemaSource = 'export const PLAN_SCHEMA_VERSION = 2 as const;\nexport const GROUNDING_SCHEMA_VERSION = 1 as const;',
-  extraFiles: Readonly<Record<string, string>> = {},
-): Promise<readonly SchemaVersionLiteralViolation[]> {
+const authority = 'export const PLAN_SCHEMA_VERSION = 2 as const;\nexport const GROUNDING_SCHEMA_VERSION = 1 as const;';
+
+interface ScanResult {
+  readonly callerFileName: string;
+  readonly violations: readonly SchemaVersionLiteralViolation[];
+}
+
+async function scanWithCaller(source: string, schemaSource = authority, extra: Readonly<Record<string, string>> = {}): Promise<ScanResult> {
   const root = await mkdtemp(join(tmpdir(), 'ambercast-schema-version-scanner-'));
   const schema = join(root, 'src/core/ir/schema.ts');
   const caller = join(root, 'src/usecases/synthetic.ts');
+  const files = Object.fromEntries(Object.keys(extra).map((path) => [path, join(root, path)]));
   try {
-    await mkdir(join(root, 'src/core/ir'), { recursive: true });
-    await mkdir(join(root, 'src/usecases'), { recursive: true });
-    const extraFileNames = Object.keys(extraFiles).map((relativePath) => join(root, relativePath));
     await Promise.all([
-      writeFile(schema, schemaSource),
-      writeFile(caller, source),
-      ...Object.entries(extraFiles).map(async ([relativePath, contents]) => {
-        const fileName = join(root, relativePath);
-        await mkdir(dirname(fileName), { recursive: true });
-        await writeFile(fileName, contents);
-      }),
+      mkdir(dirname(schema), { recursive: true }), mkdir(dirname(caller), { recursive: true }),
+      ...Object.values(files).map((fileName) => mkdir(dirname(fileName), { recursive: true })),
     ]);
-    const program = ts.createProgram({ rootNames: [schema, caller, ...extraFileNames], options: { module: ts.ModuleKind.NodeNext, moduleResolution: ts.ModuleResolutionKind.NodeNext, noEmit: true, strict: true, target: ts.ScriptTarget.ES2023 } });
+    await Promise.all([writeFile(schema, schemaSource), writeFile(caller, source), ...Object.entries(extra).map(([path, text]) => writeFile(files[path] ?? '', text))]);
+    const program = ts.createProgram({ rootNames: [schema, caller, ...Object.values(files)], options: { module: ts.ModuleKind.NodeNext, moduleResolution: ts.ModuleResolutionKind.NodeNext, noEmit: true, strict: true, target: ts.ScriptTarget.ES2023 } });
     expect(program.getSyntacticDiagnostics()).toEqual([]);
     expect(program.getSemanticDiagnostics()).toEqual([]);
-    return scanSchemaVersionLiteralViolations(program, schema);
-  } finally {
-    await rm(root, { force: true, recursive: true });
-  }
+    return { callerFileName: caller, violations: scanSchemaVersionLiteralViolations(program, schema) };
+  } finally { await rm(root, { force: true, recursive: true }); }
+}
+
+async function scan(source: string, schemaSource = authority, extra: Readonly<Record<string, string>> = {}): Promise<readonly SchemaVersionLiteralViolation[]> {
+  return (await scanWithCaller(source, schemaSource, extra)).violations;
+}
+
+async function expectOneFromSource(source: string, coordinate: Readonly<Pick<SchemaVersionLiteralViolation, 'line' | 'column'>>): Promise<void> {
+  const result = await scanWithCaller(source);
+  expect(result.violations).toEqual([{ fileName: result.callerFileName, ...coordinate }]);
+}
+
+function expectOne(result: readonly SchemaVersionLiteralViolation[], coordinate: Readonly<Pick<SchemaVersionLiteralViolation, 'line' | 'column'>>): void {
+  expect(result).toEqual([expect.objectContaining({ fileName: expect.stringMatching(/\/src\/usecases\/synthetic\.ts$/), ...coordinate })]);
 }
 
 describe('scanSchemaVersionLiteralViolations()', () => {
-  it.each([
+  test.each([
     ['parenthesized literal', 'const value = { schemaVersion: (2) };'],
     ['as-const literal', 'const value = { schemaVersion: (2 as const) };'],
-    ['type-asserted literal', 'const value = { schemaVersion: (2 as number) };'],
+    ['type assertion', 'const value = { schemaVersion: (2 as number) };'],
     ['signed numeric literal', 'const value = { schemaVersion: -2 };'],
-    ['quoted string-literal property name', 'const value = { "schemaVersion": 2 };'],
-    ['computed string-literal property name', 'const value = { ["schemaVersion"]: 2 };'],
-    ['non-null-asserted literal', 'const value = { schemaVersion: 2! };'],
+    ['quoted property name', 'const value = { "schemaVersion": 2 };', 17],
+    ['computed property name', 'const value = { ["schemaVersion"]: 2 };', 17],
+    ['non-null asserted literal', 'const value = { schemaVersion: 2! };'],
     ['shorthand numeric property', 'const schemaVersion = 2; const value = { schemaVersion };'],
     ['class property', 'class Value { schemaVersion = 2; }'],
-    ['local numeric indirection', 'const LOCAL_SCHEMA_VERSION = 2; const value = { schemaVersion: LOCAL_SCHEMA_VERSION };'],
-  ])('reports a %s', async (_name, source) => {
-    expect(await scan(source)).toHaveLength(1);
+    ['class computed property', 'class Value { ["schemaVersion"] = 2; }', 15],
+    ['local numeric indirection', 'const local = 2; const value = { schemaVersion: local };'],
+    ['arithmetic', 'const value = { schemaVersion: 1 + 1 };'],
+    ['Number call', 'const x: number = 1; const value = { schemaVersion: Number(x) };'],
+    ['numeric conditional union', 'declare const cond: boolean; const value = { schemaVersion: cond ? 1 : 2 };'],
+    ['mixed numeric/string union', "const value: number | string = Math.random() ? 1 : 'one'; const result = { schemaVersion: value };"],
+    ['any source', 'declare const value: any; const result = { schemaVersion: value };'],
+    ['unknown source', 'declare const value: unknown; const result = { schemaVersion: value };'],
+  ])('rejects a %s source', async (_name, source, column?: number) => { await expectOneFromSource(source, { line: 1, column: column ?? source.lastIndexOf('schemaVersion') + 1 }); });
+
+  test.each([
+    ['=', 'obj.schemaVersion = 2;'], ['+=', 'obj.schemaVersion += 1;'], ['-=', 'obj.schemaVersion -= 1;'], ['*=', 'obj.schemaVersion *= 1;'], ['/=', 'obj.schemaVersion /= 1;'], ['%=', 'obj.schemaVersion %= 1;'], ['**=', 'obj.schemaVersion **= 1;'], ['<<=', 'obj.schemaVersion <<= 1;'], ['>>=', 'obj.schemaVersion >>= 1;'], ['>>>=', 'obj.schemaVersion >>>= 1;'], ['&=', 'obj.schemaVersion &= 1;'], ['|=', 'obj.schemaVersion |= 1;'], ['^=', 'obj.schemaVersion ^= 1;'], ['&&=', 'obj.schemaVersion &&= 1;'], ['||=', 'obj.schemaVersion ||= 1;'], ['??=', 'obj.schemaVersion ??= 1;'],
+  ])('rejects non-authority %s assignment', async (_operator, assignment) => { expectOne(await scan(["import { PLAN_SCHEMA_VERSION } from '../core/ir/schema.js';", `let obj: { schemaVersion: number } = { schemaVersion: PLAN_SCHEMA_VERSION }; ${assignment}`].join('\n')), { line: 2, column: 78 }); });
+
+  test.each([
+    ['==', 'plan.schemaVersion == 2'], ['!=', 'plan.schemaVersion != 2'], ['===', 'plan.schemaVersion === 2'], ['!==', 'plan.schemaVersion !== 2'], ['<', 'plan.schemaVersion < 2'], ['<=', 'plan.schemaVersion <= 2'], ['>', 'plan.schemaVersion > 2'], ['>=', 'plan.schemaVersion >= 2'],
+  ])('rejects both operand directions of %s comparison', async (_operator, expression) => {
+    const reversed = expression.replace('plan.schemaVersion', '2').replace(/ 2$/, ' plan.schemaVersion');
+    const callerSource = `const plan = { schemaVersion: PLAN_SCHEMA_VERSION }; void (${expression}); void (${reversed});`;
+    const source = ["import { PLAN_SCHEMA_VERSION } from '../core/ir/schema.js';", callerSource].join('\n');
+    const result = await scanWithCaller(source);
+    expect(result.violations).toEqual([
+      { fileName: result.callerFileName, line: 2, column: callerSource.indexOf('plan.schemaVersion', callerSource.indexOf('void')) + 1 },
+      { fileName: result.callerFileName, line: 2, column: callerSource.lastIndexOf('plan.schemaVersion') + 1 },
+    ]);
   });
 
-  it.each([
-    [
-      'a literal comparison',
-      [
-        'const plan = { schemaVersion: 2 };',
-        'if (plan.schemaVersion !== 2) throw new Error();',
-      ].join('\n'),
-      { line: 2, column: 10 },
-    ],
-    [
-      'an indirect numeric constant in a comparison at the comparison use site',
-      [
-        'const LOCAL_SCHEMA_VERSION = 2;',
-        'const plan = { schemaVersion: 2 };',
-        'if (plan.schemaVersion !== LOCAL_SCHEMA_VERSION) throw new Error();',
-      ].join('\n'),
-      { line: 3, column: 10 },
-    ],
-    [
-      'a parenthesized schemaVersion comparison left-hand side',
-      [
-        'const plan = { schemaVersion: 2 };',
-        'if ((plan.schemaVersion) !== 2) throw new Error();',
-      ].join('\n'),
-      { line: 2, column: 11 },
-    ],
-  ] as const)('reports %s at the schemaVersion use coordinate', async (_name, source, coordinate) => {
-    expect(await scan(source)).toEqual(expect.arrayContaining([
-      expect.objectContaining(coordinate),
-    ]));
+  test('recognizes computed schemaVersion assignment and comparison sinks', async () => {
+    expectOne(await scan(["import { PLAN_SCHEMA_VERSION } from '../core/ir/schema.js';", "let obj = { schemaVersion: PLAN_SCHEMA_VERSION }; obj['schemaVersion'] = 2;"].join('\n')), { line: 2, column: 51 });
+    expectOne(await scan(["import { PLAN_SCHEMA_VERSION } from '../core/ir/schema.js';", "const obj = { schemaVersion: PLAN_SCHEMA_VERSION }; void (2 === obj['schemaVersion']);"].join('\n')), { line: 2, column: 65 });
   });
 
-  it('allows direct named imports of either canonical authority', async () => {
-    expect(await scan([
-      "import { PLAN_SCHEMA_VERSION, GROUNDING_SCHEMA_VERSION } from '../core/ir/schema.js';",
-      'const plan = { schemaVersion: PLAN_SCHEMA_VERSION };',
-      'const grounding = { schemaVersion: GROUNDING_SCHEMA_VERSION };',
-      'if (plan.schemaVersion !== PLAN_SCHEMA_VERSION) throw new Error();',
-    ].join('\n'))).toEqual([]);
+  test('recognizes transparent wrappers around computed keys and schemaVersion accesses', async () => {
+    const callerSource = 'const plan = { schemaVersion: PLAN_SCHEMA_VERSION }; const invalid = { [("schemaVersion" as const)]: 2 }; void ((plan.schemaVersion) !== 2); void (2 !== (plan[("schemaVersion" as const)]));';
+    const source = [
+      "import { PLAN_SCHEMA_VERSION } from '../core/ir/schema.js';",
+      callerSource,
+    ].join('\n');
+    const result = await scanWithCaller(source);
+    expect(result.violations).toEqual([
+      { fileName: result.callerFileName, line: 2, column: callerSource.indexOf('[("schemaVersion"') + 1 },
+      { fileName: result.callerFileName, line: 2, column: callerSource.indexOf('(plan.schemaVersion)') + 1 },
+      { fileName: result.callerFileName, line: 2, column: callerSource.lastIndexOf('(plan[("schemaVersion"') + 1 },
+    ]);
   });
 
-  it('allows a direct named authority import in shorthand form but reports a local numeric shorthand', async () => {
-    expect(await scan([
-      "import { PLAN_SCHEMA_VERSION as schemaVersion } from '../core/ir/schema.js';",
-      'const plan = { schemaVersion };',
-    ].join('\n'))).toEqual([]);
-
-    expect(await scan([
-      'const schemaVersion = 2;',
-      'const plan = { schemaVersion };',
-    ].join('\n'))).toHaveLength(1);
+  test('rejects both direct destructuring-default forms and computed binding keys', async () => {
+    expectOne(await scan('declare const value: { schemaVersion?: number }; const { schemaVersion = 2 } = value;'), { line: 1, column: 58 });
+    expectOne(await scan('let schemaVersion: number; declare const value: { schemaVersion?: number }; ({ schemaVersion = 2 } = value);'), { line: 1, column: 80 });
+    expectOne(await scan('declare const value: { schemaVersion?: number }; const { ["schemaVersion"]: schemaVersion = 2 } = value;'), { line: 1, column: 58 });
   });
 
-  it('documents that namespace imports are outside the supported direct-binding contract', async () => {
-    expect(await scan([
-      "import * as Schema from '../core/ir/schema.js';",
-      'const plan = { schemaVersion: Schema.PLAN_SCHEMA_VERSION };',
-    ].join('\n'))).toHaveLength(1);
+  test('rejects an assignment-pattern default to a canonical authority', async () => {
+    const source = [
+      "import { PLAN_SCHEMA_VERSION } from '../core/ir/schema.js';",
+      'declare const optional: { schemaVersion?: number }; let assigned: number;',
+      '({ schemaVersion: assigned = PLAN_SCHEMA_VERSION } = optional);',
+    ].join('\n');
+    await expectOneFromSource(source, { line: 3, column: 4 });
   });
 
-  it('documents that barrel re-exports are outside the supported direct-binding contract', async () => {
-    expect(await scan([
-      "import { PLAN_SCHEMA_VERSION } from '../core/ir/schema-barrel.js';",
-      'const plan = { schemaVersion: PLAN_SCHEMA_VERSION };',
-    ].join('\n'), undefined, {
-      'src/core/ir/schema-barrel.ts': "export { PLAN_SCHEMA_VERSION } from './schema.js';",
-    })).toHaveLength(1);
+  test('rejects an assignment-pattern default to a numeric literal', async () => {
+    const source = [
+      'declare const optional: { schemaVersion?: number }; let assigned: number;',
+      '({ schemaVersion: assigned = 3 } = optional);',
+    ].join('\n');
+    await expectOneFromSource(source, { line: 2, column: 4 });
   });
 
-  it('allows only canonical constant declarations in schema.ts, not literal object fields there', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'ambercast-schema-version-scanner-boundary-'));
-    const schema = join(root, 'src/core/ir/schema.ts');
+  test('rejects an assignment-pattern default to schemaVersion propagation', async () => {
+    const source = [
+      "import { PLAN_SCHEMA_VERSION } from '../core/ir/schema.js';",
+      'const from = { schemaVersion: PLAN_SCHEMA_VERSION }; declare const optional: { schemaVersion?: number }; let assigned: number;',
+      '({ schemaVersion: assigned = from.schemaVersion } = optional);',
+    ].join('\n');
+    await expectOneFromSource(source, { line: 3, column: 4 });
+  });
+
+  test('allows a direct non-renamed assignment destructuring default to a canonical authority', async () => {
+    const source = [
+      "import { PLAN_SCHEMA_VERSION } from '../core/ir/schema.js';",
+      'declare const optional: { schemaVersion?: number }; let schemaVersion: number;',
+      '({ schemaVersion = PLAN_SCHEMA_VERSION } = optional);',
+    ].join('\n');
+    expect(await scan(source)).toEqual([]);
+  });
+
+  test('allows a renamed binding-element default to a canonical authority', async () => {
+    const source = [
+      "import { PLAN_SCHEMA_VERSION } from '../core/ir/schema.js';",
+      'declare const optional: { schemaVersion?: number };',
+      'const { schemaVersion: assigned = PLAN_SCHEMA_VERSION } = optional;',
+    ].join('\n');
+    expect(await scan(source)).toEqual([]);
+  });
+
+  test('allows a string assignment-pattern default through the ordinary type gate', async () => {
+    const source = [
+      'declare const optional: { schemaVersion?: string }; let assigned: string;',
+      "({ schemaVersion: assigned = '3.0' } = optional);",
+    ].join('\n');
+    expect(await scan(source)).toEqual([]);
+  });
+
+  test.each([
+    ['namespace authority', "import * as Schema from '../core/ir/schema.js'; const value = { schemaVersion: Schema.PLAN_SCHEMA_VERSION };", {}],
+    ['barrel authority', "import { PLAN_SCHEMA_VERSION } from '../core/ir/schema-barrel.js'; const value = { schemaVersion: PLAN_SCHEMA_VERSION };", { 'src/core/ir/schema-barrel.ts': "export { PLAN_SCHEMA_VERSION } from './schema.js';" }],
+    ['multi-hop barrel authority', "import { PLAN_SCHEMA_VERSION } from '../core/ir/two.js'; const value = { schemaVersion: PLAN_SCHEMA_VERSION };", { 'src/core/ir/one.ts': "export { PLAN_SCHEMA_VERSION } from './schema.js';", 'src/core/ir/two.ts': "export { PLAN_SCHEMA_VERSION } from './one.js';" }],
+  ])('allows %s', async (_name, source, extra) => { expect(await scan(source, authority, extra)).toEqual([]); });
+
+  test('allows direct authorities and schemaVersion propagation in every sink form', async () => {
+    const source = [
+      "import { PLAN_SCHEMA_VERSION } from '../core/ir/schema.js';",
+      'const from = { schemaVersion: PLAN_SCHEMA_VERSION }; const obj: { schemaVersion: number } = { schemaVersion: PLAN_SCHEMA_VERSION };',
+      'const property = { schemaVersion: PLAN_SCHEMA_VERSION }; class Value { schemaVersion = from.schemaVersion; }',
+      'obj.schemaVersion = PLAN_SCHEMA_VERSION; obj.schemaVersion += PLAN_SCHEMA_VERSION;',
+      'obj.schemaVersion = from.schemaVersion; obj.schemaVersion += from.schemaVersion;',
+      'void (obj.schemaVersion === PLAN_SCHEMA_VERSION); void (from.schemaVersion !== obj.schemaVersion);',
+      'declare const optional: { schemaVersion?: number }; const { schemaVersion: declared = from.schemaVersion } = optional;',
+    ].join('\n');
+    expect(await scan(source)).toEqual([]);
+  });
+
+  test('allows a string sink and declaration-only non-value positions', async () => {
+    expect(await scan("const report = { schemaVersion: '3.0' as const }; interface I { schemaVersion: number; } type T = { schemaVersion: number }; declare class D { schemaVersion: number; }")).toEqual([]);
+  });
+
+  test('rejects a canonical-authority-derived local re-bind', async () => {
+    expectOne(await scan("import { PLAN_SCHEMA_VERSION } from '../core/ir/schema.js'; const local = PLAN_SCHEMA_VERSION; const value = { schemaVersion: local };"), { line: 1, column: 112 });
+  });
+
+  test.each([
+    ['T extends number', 'function value<T extends number>(schemaVersion: T) { return { schemaVersion }; }'],
+    ['T extends number | string', 'function value<T extends number | string>(schemaVersion: T) { return { schemaVersion }; }'],
+    ['an unconstrained T', 'function value<T>(schemaVersion: T) { return { schemaVersion }; }'],
+  ])('rejects %s through the type gate without hanging', async (_name, source) => { await expectOneFromSource(source, { line: 1, column: source.lastIndexOf('schemaVersion') + 1 }); });
+
+  test('allows non-numeric and recursively constrained generic parameters without hanging', async () => {
+    expect(await scan('function value<T extends string>(schemaVersion: T) { return { schemaVersion }; }')).toEqual([]);
+    expect(await scan('interface Recursive<T extends Recursive<T>> { next?: T; } function value<T extends Recursive<T>>(schemaVersion: T) { return { schemaVersion }; }')).toEqual([]);
+  });
+
+  test('reports exact report-node coordinates for every sink family', async () => {
+    expectOne(await scan('const value = { schemaVersion: 2 };'), { line: 1, column: 17 });
+    expectOne(await scan('const schemaVersion = 2; const value = { schemaVersion };'), { line: 1, column: 42 });
+    expectOne(await scan(["import { PLAN_SCHEMA_VERSION } from '../core/ir/schema.js';", 'let obj = { schemaVersion: PLAN_SCHEMA_VERSION }; obj.schemaVersion = 2;'].join('\n')), { line: 2, column: 51 });
+    expectOne(await scan('declare const value: { schemaVersion?: number }; const { schemaVersion = 2 } = value;'), { line: 1, column: 58 });
+    expectOne(await scan('const value = { ["schemaVersion"]: 2 };'), { line: 1, column: 17 });
+    expectOne(await scan('let schemaVersion: number; declare const value: { schemaVersion?: number }; ({ schemaVersion = 2 } = value);'), { line: 1, column: 80 });
+  });
+
+  test('throws for missing canonical exports, including partial schema modules', async () => {
+    await expect(scan('const value = { schemaVersion: 2 };', 'export const other = 1;')).rejects.toThrow(/PLAN_SCHEMA_VERSION|GROUNDING_SCHEMA_VERSION/);
+    await expect(scan('const value = { schemaVersion: 2 };', 'export const GROUNDING_SCHEMA_VERSION = 1 as const;')).rejects.toThrow(/PLAN_SCHEMA_VERSION/);
+    await expect(scan('const value = { schemaVersion: 2 };', 'export const PLAN_SCHEMA_VERSION = 2 as const;')).rejects.toThrow(/GROUNDING_SCHEMA_VERSION/);
+  });
+
+  test('throws when the schema module is absent from the program', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ambercast-schema-version-scanner-missing-'));
+    const caller = join(root, 'src/usecases/synthetic.ts');
+    const missingSchema = join(root, 'src/core/ir/schema.ts');
     try {
-      await mkdir(join(root, 'src/core/ir'), { recursive: true });
-      await writeFile(schema, [
-        'export const PLAN_SCHEMA_VERSION = 2 as const;',
-        'export const GROUNDING_SCHEMA_VERSION = 1 as const;',
-        'export const invalid = { schemaVersion: 2 };',
-      ].join('\n'));
-      const program = ts.createProgram({ rootNames: [schema], options: { noEmit: true, strict: true, target: ts.ScriptTarget.ES2023 } });
-      expect(scanSchemaVersionLiteralViolations(program, schema)).toHaveLength(1);
-    } finally {
-      await rm(root, { force: true, recursive: true });
-    }
+      await mkdir(dirname(caller), { recursive: true });
+      await writeFile(caller, 'const value = { schemaVersion: 2 };');
+      const program = ts.createProgram({ rootNames: [caller], options: { noEmit: true, strict: true, target: ts.ScriptTarget.ES2023 } });
+      expect(() => scanSchemaVersionLiteralViolations(program, missingSchema)).toThrow(/schema module.*schema\.ts/i);
+    } finally { await rm(root, { force: true, recursive: true }); }
+  });
+
+  test('scans literal object fields inside the schema authority module too', async () => {
+    expect(await scan('export {};', `${authority}\nexport const invalid = { schemaVersion: 2 };`)).toHaveLength(1);
   });
 });
