@@ -53,8 +53,11 @@ export interface SchemaVersionLiteralViolation {
  *
  * A source is allowed when its resolved declaration is one of the canonical
  * constants, including renamed, namespace, and multi-hop barrel bindings, or
- * when it is itself a `.schemaVersion`/`['schemaVersion']` propagation. Every
- * other source is tested recursively for number-like, `any`, or `unknown`
+ * when it is itself a `.schemaVersion`/`['schemaVersion']` propagation.
+ * Renamed assignment-pattern defaults are an exception: they are rejected
+ * because their source is the compound assignment expression rather than the
+ * canonical symbol directly, unlike equivalent renamed variable-declaration
+ * binding defaults. Every other source is tested recursively for number-like, `any`, or `unknown`
  * constituents, so arithmetic, calls, conditionals, mixed unions, and
  * untrusted values cannot introduce a literal version through an indirect
  * binding. Declaration-only properties without an initializer have no source

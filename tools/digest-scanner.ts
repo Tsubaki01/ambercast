@@ -192,7 +192,7 @@ export function scanComputeInputsDigestAuthority(
   const hasSpread = (node: ts.Node): boolean => {
     let found = false;
     const visit = (child: ts.Node): void => {
-      if (ts.isSpreadAssignment(child)) {
+      if (ts.isSpreadAssignment(child) || ts.isSpreadElement(child)) {
         found = true;
         return;
       }
@@ -220,7 +220,27 @@ export function scanComputeInputsDigestAuthority(
     if (ts.isParameter(container)) {
       return checker.getTypeAtLocation(container.initializer ?? container);
     }
+    if (ts.isBindingElement(container)) {
+      const outerSourceType = destructuringSourceType(container);
+      const outerPropertyName = container.propertyName ?? container.name;
+      if (outerSourceType !== undefined && ts.isIdentifier(outerPropertyName)) {
+        const outerProperty = checker.getPropertyOfType(outerSourceType, outerPropertyName.text);
+        if (outerProperty !== undefined) return checker.getTypeOfSymbolAtLocation(outerProperty, outerPropertyName);
+      }
+    }
     return undefined;
+  };
+  const assignmentDestructuringTarget = (
+    node: ts.ShorthandPropertyAssignment | ts.PropertyAssignment,
+  ): ts.Expression | undefined => {
+    const objectLiteral = node.parent;
+    if (!ts.isObjectLiteralExpression(objectLiteral)) return undefined;
+    const assignment = objectLiteral.parent;
+    return ts.isBinaryExpression(assignment)
+      && assignment.left === objectLiteral
+      && assignment.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      ? assignment.right
+      : undefined;
   };
   const classifiedCallees = new Set<ts.Node>();
   const destructuringBindingSymbols = new Set<ts.Symbol>();
@@ -260,27 +280,16 @@ export function scanComputeInputsDigestAuthority(
         recordViolation(sourceFile, node.name, 'value-reference-outside-authority-call');
         return;
       }
-    } else if (
-      ts.isShorthandPropertyAssignment(node)
-      && ts.isObjectLiteralExpression(node.parent)
-      && ts.isBinaryExpression(node.parent.parent)
-      && node.parent.parent.left === node.parent
-      && node.parent.parent.operatorToken.kind === ts.SyntaxKind.EqualsToken
-      && propertyResolvesToCanonical(checker.getTypeAtLocation(node.parent.parent.right), node.name.text)
-    ) {
-      recordViolation(sourceFile, node.name, 'value-reference-outside-authority-call');
-    } else if (
-      ts.isPropertyAssignment(node)
-      && ts.isObjectLiteralExpression(node.parent)
-      && ts.isBinaryExpression(node.parent.parent)
-      && node.parent.parent.left === node.parent
-      && node.parent.parent.operatorToken.kind === ts.SyntaxKind.EqualsToken
-      && ts.isIdentifier(node.name)
-      && propertyResolvesToCanonical(checker.getTypeAtLocation(node.parent.parent.right), node.name.text)
-    ) {
-      recordViolation(sourceFile, node.name, 'value-reference-outside-authority-call');
-    } else if (ts.isShorthandPropertyAssignment(node) && node.objectAssignmentInitializer === undefined) {
-      if (resolvesToCanonical(checker.getShorthandAssignmentValueSymbol(node))) {
+    } else if (ts.isShorthandPropertyAssignment(node)) {
+      const target = assignmentDestructuringTarget(node);
+      if (target !== undefined && propertyResolvesToCanonical(checker.getTypeAtLocation(target), node.name.text)) {
+        recordViolation(sourceFile, node.name, 'value-reference-outside-authority-call');
+      } else if (node.objectAssignmentInitializer === undefined && resolvesToCanonical(checker.getShorthandAssignmentValueSymbol(node))) {
+        recordViolation(sourceFile, node.name, 'value-reference-outside-authority-call');
+      }
+    } else if (ts.isPropertyAssignment(node)) {
+      const target = assignmentDestructuringTarget(node);
+      if (target !== undefined && ts.isIdentifier(node.name) && propertyResolvesToCanonical(checker.getTypeAtLocation(target), node.name.text)) {
         recordViolation(sourceFile, node.name, 'value-reference-outside-authority-call');
       }
     } else if (

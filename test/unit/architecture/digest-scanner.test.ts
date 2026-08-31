@@ -189,6 +189,20 @@ describe('scanComputeInputsDigestAuthority()', () => {
     });
   });
 
+  test('rejects an array spread nested within an inline object-literal argument', async () => {
+    await withCaller("import { computeInputsDigest, type DigestInputs } from '../ir/digest.js';\nconst values = [1];\ncomputeInputsDigest({ schemaVersion: 1, items: [...values] } as DigestInputs);", (result) => {
+      expect(result.calls).toHaveLength(1);
+      expectKinds(result, ['argument-must-not-contain-spread']);
+    });
+  });
+
+  test('rejects a nested destructuring rebind of the canonical digest function', async () => {
+    await withCaller("import * as digest from '../ir/digest.js';\nconst source: { outer: typeof digest } = { outer: digest };\nconst { outer: { computeInputsDigest } } = source;", (result) => {
+      expect(result.calls).toEqual([]);
+      expectKinds(result, ['value-reference-outside-authority-call']);
+    });
+  });
+
   test('throws when the digest module is absent or lacks the canonical export', async () => {
     await withProgram({ 'src/core/ai/plan-input-provenance.ts': 'export {};' }, (program, names) => { expect(() => scanComputeInputsDigestAuthority(program, join(dirname(names['src/core/ai/plan-input-provenance.ts'] ?? ''), '../ir/digest.ts'), names['src/core/ai/plan-input-provenance.ts'] ?? '')).toThrow(/digest|computeInputsDigest/i); });
     await withProgram({ 'src/core/ir/digest.ts': 'export const other = 1;', 'src/core/ai/plan-input-provenance.ts': 'export {};' }, (program, names) => { expect(() => scanComputeInputsDigestAuthority(program, names['src/core/ir/digest.ts'] ?? '', names['src/core/ai/plan-input-provenance.ts'] ?? '')).toThrow(/computeInputsDigest/i); });
