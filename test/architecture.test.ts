@@ -6,7 +6,7 @@ import { describe, expect, test } from 'vitest';
 import { computeInputsDigest as aliasComputeInputsDigest } from '#core/ir/digest.js';
 import { computeInputsDigest as relativeComputeInputsDigest } from '../src/core/ir/digest.js';
 import { scanAccessibilityCaptureFieldAccess } from '../tools/accessibility-capture-scanner.js';
-import { scanComputeInputsDigestCalls } from '../tools/digest-scanner.js';
+import { scanComputeInputsDigestAuthority } from '../tools/digest-scanner.js';
 import { scanSchemaVersionLiteralViolations } from '../tools/schema-version-literal-scanner.js';
 import { scanFillSecretCallSites } from '../tools/fill-secret-call-scanner.js';
 import { scanIntegrityViolationInventory } from '../tools/integrity-violation-scanner.js';
@@ -901,17 +901,16 @@ describe('architecture guardrails', () => {
     expect(sourceFiles.length).toBeGreaterThan(0);
     expect(program.getSyntacticDiagnostics()).toEqual([]);
     expect(program.getSemanticDiagnostics()).toEqual([]);
-    const callSites = scanComputeInputsDigestCalls(
+    const result = scanComputeInputsDigestAuthority(
       program,
       DIGEST_MODULE_FILE,
       PLAN_INPUT_PROVENANCE_MODULE_FILE,
     );
 
-    expect(callSites.flatMap((site) => site.violations)).toEqual([]);
-    expect(callSites).toEqual([
+    expect(result.violations).toEqual([]);
+    expect(result.calls).toEqual([
       expect.objectContaining({
         fileName: PLAN_INPUT_PROVENANCE_MODULE_FILE,
-        violations: [],
       }),
     ]);
   });
@@ -950,9 +949,9 @@ describe('architecture guardrails', () => {
     ));
     const program = ts.createProgram({ rootNames: [...sources.keys()], options: { noEmit: true, target: ts.ScriptTarget.ES2023 }, host });
 
-    expect(scanComputeInputsDigestCalls(program, digest.fileName, authority.fileName)).toEqual(expect.arrayContaining([
-      expect.objectContaining({ fileName: impostor.fileName, violations: ['call-site-outside-authority'] }),
-    ]));
+    expect(scanComputeInputsDigestAuthority(program, digest.fileName, authority.fileName)).toEqual(expect.objectContaining({
+      violations: [expect.objectContaining({ fileName: impostor.fileName, kind: 'call-site-outside-authority' })],
+    }));
   });
 
   test('scans every production source file without schemaVersion literal violations', async () => {

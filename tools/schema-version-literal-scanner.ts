@@ -1,23 +1,23 @@
 /**
- * Declares the repository-wide guard against bypassing schema-version
- * authorities with numeric literals.
+ * Provides the checker-backed architecture tripwire for schema-version
+ * authorities.
  *
- * The scanner normalizes transparent TypeScript wrappers before inspecting an
- * expression and follows local numeric constants used by
- * `schemaVersion`, so parentheses, assertions, and local indirection cannot
- * conceal a competing version. Its exception is limited to the canonical
- * constant declarations in `core/ir/schema.ts`; even a literal object field in
- * that file remains a violation. Direct named imports are the supported
- * authority reference form: barrel and namespace imports are intentionally
- * outside this scanner's syntactic binding-resolution boundary.
+ * The scanner recognizes sink syntax across the whole program, then admits
+ * only declaration-identity references to the two canonical constants or a
+ * direct `.schemaVersion` propagation. A recursive type gate rejects every
+ * other number-like, `any`, or `unknown` source, including values hidden in
+ * union or intersection members. This keeps the policy default-deny while
+ * leaving non-value declarations and string-valued schema metadata outside
+ * the sink contract.
  *
  * This checker-based whole-program scan remains independent from
  * `scanSchemaVersionAuthorities` in `architecture.test.ts`. That helper is a
  * test-local, syntax-based direct-import binding check, whereas this scanner
- * must resolve local numeric constants and distinguish the canonical
- * declaration module across a `ts.Program`. Extracting their superficially
- * similar recognition would either leak test-only helpers into production
- * tooling or weaken one scanner's deliberately different contract.
+ * resolves declaration identity through the type checker's alias chain and
+ * recursively rejects every number-like, `any`, or `unknown` source across
+ * the whole program. Extracting their superficially similar recognition
+ * would either leak a test-only helper into production tooling or weaken one
+ * scanner's deliberately different, default-deny contract.
  */
 import * as ts from 'typescript';
 
@@ -25,37 +25,52 @@ import * as ts from 'typescript';
  * Identifies a source location that encodes a schema version without a
  * recognized schema authority.
  *
- * Results retain source coordinates rather than merely a
- * count, so architecture failures can direct maintainers to the bypass while
- * the scanner stays independent of test-framework reporting.
- * For an indirect numeric constant, the reported coordinate is the
- * `schemaVersion` property or comparison use site, rather than the constant
- * declaration. This makes the result identify the authority bypass that must
- * be replaced and remains stable when a local declaration has multiple uses.
+ * Coordinates point to the property or access that bypasses the authority,
+ * rather than to a local constant declaration that may be shared by several
+ * sinks. This makes each finding actionable and keeps reporting independent
+ * from any test framework.
  */
 export interface SchemaVersionLiteralViolation {
+  /** The source file containing the bypass. */
   readonly fileName: string;
+  /** The one-based line containing the bypass. */
   readonly line: number;
+  /** The one-based column at the start of the reported property or access. */
   readonly column: number;
 }
 
 /**
- * Finds schema-version literals and unrecognized numeric indirections in a
- * TypeScript program.
+ * Finds schema-version sinks whose value does not come from an approved
+ * authority or direct schema-version propagation.
  *
- * The caller supplies the canonical schema module path so the narrow
- * declaration exception is based on declaration identity rather than a
- * repository-relative string guess. The scan examines every
- * non-declaration source file in the supplied program; constructing that
- * program from the production source root remains the architecture test's
- * responsibility.
+ * The scanner resolves both canonical constants from the supplied schema
+ * module before walking the program and throws if either export is missing.
+ * It examines object and class properties, shorthand properties, ordinary and
+ * compound assignments, comparisons, and both direct destructuring-default
+ * forms. Transparent TypeScript wrappers are removed before source and type
+ * checks; static computed keys for `"schemaVersion"` are treated like ordinary
+ * keys, while dynamic keys remain outside the statically knowable contract.
  *
- * @param program - The TypeScript program containing production sources to
- * inspect.
- * @param schemaModuleFileName - The canonical module allowed to declare the
+ * A source is allowed when its resolved declaration is one of the canonical
+ * constants, including renamed, namespace, and multi-hop barrel bindings, or
+ * when it is itself a `.schemaVersion`/`['schemaVersion']` propagation.
+ * Renamed assignment-pattern defaults are an exception: they are rejected
+ * because their source is the compound assignment expression rather than the
+ * canonical symbol directly, unlike equivalent renamed variable-declaration
+ * binding defaults. Every other source is tested recursively for number-like, `any`, or `unknown`
+ * constituents, so arithmetic, calls, conditionals, mixed unions, and
+ * untrusted values cannot introduce a literal version through an indirect
+ * binding. Declaration-only properties without an initializer have no source
+ * to evaluate and are therefore not sinks.
+ *
+ * @param program - The TypeScript program whose non-declaration source files
+ * are inspected.
+ * @param schemaModuleFileName - The source-file name exporting both canonical
  * schema-version constants.
- * @returns Every location that bypasses the supported direct-import
- * authorities.
+ * @returns Source coordinates for every unapproved schema-version sink,
+ * sorted by file name, line, and column.
+ * @throws {Error} If the schema module is absent or fails to export either
+ * `PLAN_SCHEMA_VERSION` or `GROUNDING_SCHEMA_VERSION`.
  * @example
  * ```ts
  * const violations = scanSchemaVersionLiteralViolations(
@@ -69,150 +84,151 @@ export function scanSchemaVersionLiteralViolations(
   program: ts.Program,
   schemaModuleFileName: string,
 ): SchemaVersionLiteralViolation[] {
-  const checker = program.getTypeChecker();
-  const canonicalSchemaFileName = ts.sys.resolvePath(schemaModuleFileName);
-  const canonicalAuthorities = new Set(['PLAN_SCHEMA_VERSION', 'GROUNDING_SCHEMA_VERSION']);
-  const violations: SchemaVersionLiteralViolation[] = [];
-
-  function unwrap(expression: ts.Expression): ts.Expression {
-    let current = expression;
-    while (
-      ts.isParenthesizedExpression(current)
-      || ts.isAsExpression(current)
-      || ts.isSatisfiesExpression(current)
-      || ts.isTypeAssertionExpression(current)
-      || ts.isNonNullExpression(current)
-    ) {
-      current = current.expression;
-    }
-    return current;
+  const canonicalSchemaModuleFileName = ts.sys.resolvePath(schemaModuleFileName);
+  const schemaModule = program.getSourceFiles().find((sourceFile) => (
+    ts.sys.resolvePath(sourceFile.fileName) === canonicalSchemaModuleFileName
+  ));
+  if (schemaModule === undefined) {
+    throw new Error(`The schema module is not part of this TypeScript program: ${schemaModuleFileName}`);
   }
 
-  function isNumericSymbol(symbol: ts.Symbol | undefined, seen: Set<ts.Symbol>): boolean {
+  const checker = program.getTypeChecker();
+  const moduleSymbol = checker.getSymbolAtLocation(schemaModule);
+  const authorities = ['PLAN_SCHEMA_VERSION', 'GROUNDING_SCHEMA_VERSION'].map((name) => {
+    const exported = moduleSymbol === undefined
+      ? undefined
+      : checker.getExportsOfModule(moduleSymbol).find((symbol) => symbol.name === name);
+    const resolved = exported !== undefined && exported.flags & ts.SymbolFlags.Alias
+      ? checker.getAliasedSymbol(exported)
+      : exported;
+    const declaration = resolved?.declarations?.find(ts.isVariableDeclaration);
+    if (declaration === undefined) {
+      throw new Error(`The schema module does not export ${name}: ${schemaModuleFileName}`);
+    }
+    return declaration;
+  });
+
+  type Sink = {
+    readonly reportNode: ts.Node;
+    readonly sourceExpression?: ts.Expression | undefined;
+    readonly sourceSymbol?: ts.Symbol | undefined;
+  };
+  const authorityDeclarations = new Set(authorities);
+  const violations: SchemaVersionLiteralViolation[] = [];
+  const unwrapExpression = (expression: ts.Expression): ts.Expression => {
+    let unwrapped = expression;
+    while (
+      ts.isParenthesizedExpression(unwrapped)
+      || ts.isAsExpression(unwrapped)
+      || ts.isTypeAssertionExpression(unwrapped)
+      || ts.isSatisfiesExpression(unwrapped)
+      || ts.isNonNullExpression(unwrapped)
+    ) {
+      unwrapped = unwrapped.expression;
+    }
+    return unwrapped;
+  };
+  const propertyNameText = (name: ts.PropertyName | ts.BindingName): string | undefined => {
+    if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) return name.text;
+    const expression = ts.isComputedPropertyName(name) ? unwrapExpression(name.expression) : undefined;
+    if (expression !== undefined && ts.isStringLiteral(expression)) {
+      return expression.text;
+    }
+    return undefined;
+  };
+  const isSchemaVersionAccess = (node: ts.Expression): boolean => {
+    const access = unwrapExpression(node);
+    const key = ts.isElementAccessExpression(access) && access.argumentExpression !== undefined
+      ? unwrapExpression(access.argumentExpression)
+      : undefined;
+    return (
+      ts.isPropertyAccessExpression(access) && access.name.text === 'schemaVersion'
+    ) || (
+      ts.isElementAccessExpression(access)
+      && key !== undefined
+      && ts.isStringLiteral(key)
+      && key.text === 'schemaVersion'
+    );
+  };
+  const resolvesToAuthority = (symbol: ts.Symbol | undefined): boolean => {
     const resolved = symbol !== undefined && symbol.flags & ts.SymbolFlags.Alias
       ? checker.getAliasedSymbol(symbol)
       : symbol;
-    if (resolved === undefined || seen.has(resolved)) return false;
-    const declaration = resolved.declarations?.find(ts.isVariableDeclaration);
-    if (
-      declaration === undefined
-      || !ts.isIdentifier(declaration.name)
-      || declaration.initializer === undefined
-    ) {
-      return false;
+    return resolved?.declarations?.some((declaration) => authorityDeclarations.has(declaration as ts.VariableDeclaration)) ?? false;
+  };
+  const isNumberLikeAnyOrUnknown = (type: ts.Type, visited = new Set<ts.Type>()): boolean => {
+    if (visited.has(type)) return false;
+    visited.add(type);
+    if (type.flags & (ts.TypeFlags.NumberLike | ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return true;
+    if (type.isUnionOrIntersection()) return type.types.some((member) => isNumberLikeAnyOrUnknown(member, visited));
+    if (type.flags & ts.TypeFlags.TypeParameter) {
+      const constraint = checker.getBaseConstraintOfType(type);
+      return constraint === undefined || isNumberLikeAnyOrUnknown(constraint, visited);
     }
-    seen.add(resolved);
-    return isNumericExpression(declaration.initializer, seen);
-  }
-
-  function isNumericExpression(expression: ts.Expression, seen = new Set<ts.Symbol>()): boolean {
-    const current = unwrap(expression);
-    if (ts.isNumericLiteral(current)) return true;
-    if (
-      ts.isPrefixUnaryExpression(current)
-      && (current.operator === ts.SyntaxKind.MinusToken || current.operator === ts.SyntaxKind.PlusToken)
-    ) {
-      return ts.isNumericLiteral(unwrap(current.operand));
+    return false;
+  };
+  const isAllowedSource = (sink: Sink): boolean => {
+    if (sink.sourceSymbol !== undefined) return resolvesToAuthority(sink.sourceSymbol);
+    if (sink.sourceExpression === undefined) return true;
+    const source = unwrapExpression(sink.sourceExpression);
+    if (isSchemaVersionAccess(source)) return true;
+    return (ts.isIdentifier(source) || ts.isPropertyAccessExpression(source))
+      && resolvesToAuthority(checker.getSymbolAtLocation(source));
+  };
+  const reportSink = (sourceFile: ts.SourceFile, sink: Sink): void => {
+    if (sink.sourceExpression === undefined && sink.sourceSymbol === undefined) return;
+    if (isAllowedSource(sink)) return;
+    const sourceType = sink.sourceExpression === undefined
+      ? checker.getTypeOfSymbolAtLocation(sink.sourceSymbol as ts.Symbol, sink.reportNode)
+      : checker.getTypeAtLocation(unwrapExpression(sink.sourceExpression));
+    if (!isNumberLikeAnyOrUnknown(sourceType)) return;
+    const position = sourceFile.getLineAndCharacterOfPosition(sink.reportNode.getStart(sourceFile));
+    violations.push({ fileName: sourceFile.fileName, line: position.line + 1, column: position.character + 1 });
+  };
+  const comparisonOperators = new Set<ts.SyntaxKind>([
+    ts.SyntaxKind.EqualsEqualsToken, ts.SyntaxKind.ExclamationEqualsToken,
+    ts.SyntaxKind.EqualsEqualsEqualsToken, ts.SyntaxKind.ExclamationEqualsEqualsToken,
+    ts.SyntaxKind.LessThanToken, ts.SyntaxKind.LessThanEqualsToken,
+    ts.SyntaxKind.GreaterThanToken, ts.SyntaxKind.GreaterThanEqualsToken,
+  ]);
+  const assignmentOperators = new Set<ts.SyntaxKind>([
+    ts.SyntaxKind.EqualsToken, ts.SyntaxKind.PlusEqualsToken,
+    ts.SyntaxKind.MinusEqualsToken, ts.SyntaxKind.AsteriskEqualsToken,
+    ts.SyntaxKind.SlashEqualsToken, ts.SyntaxKind.PercentEqualsToken,
+    ts.SyntaxKind.AsteriskAsteriskEqualsToken, ts.SyntaxKind.LessThanLessThanEqualsToken,
+    ts.SyntaxKind.GreaterThanGreaterThanEqualsToken,
+    ts.SyntaxKind.GreaterThanGreaterThanGreaterThanEqualsToken,
+    ts.SyntaxKind.AmpersandEqualsToken, ts.SyntaxKind.BarEqualsToken,
+    ts.SyntaxKind.CaretEqualsToken, ts.SyntaxKind.AmpersandAmpersandEqualsToken,
+    ts.SyntaxKind.BarBarEqualsToken, ts.SyntaxKind.QuestionQuestionEqualsToken,
+  ]);
+  const visit = (sourceFile: ts.SourceFile, node: ts.Node): void => {
+    if ((ts.isPropertyAssignment(node) || ts.isPropertyDeclaration(node)) && propertyNameText(node.name) === 'schemaVersion') {
+      reportSink(sourceFile, { reportNode: node.name, sourceExpression: node.initializer });
+    } else if (ts.isShorthandPropertyAssignment(node)) {
+      if (node.objectAssignmentInitializer !== undefined && node.name.text === 'schemaVersion') {
+        reportSink(sourceFile, { reportNode: node.name, sourceExpression: node.objectAssignmentInitializer });
+      } else if (node.objectAssignmentInitializer === undefined && node.name.text === 'schemaVersion') {
+        reportSink(sourceFile, { reportNode: node.name, sourceSymbol: checker.getShorthandAssignmentValueSymbol(node) });
+      }
+    } else if (ts.isBinaryExpression(node) && assignmentOperators.has(node.operatorToken.kind) && isSchemaVersionAccess(node.left)) {
+      reportSink(sourceFile, { reportNode: node.left, sourceExpression: node.right });
+    } else if (ts.isBinaryExpression(node) && comparisonOperators.has(node.operatorToken.kind)) {
+      if (isSchemaVersionAccess(node.left)) reportSink(sourceFile, { reportNode: node.left, sourceExpression: node.right });
+      else if (isSchemaVersionAccess(node.right)) reportSink(sourceFile, { reportNode: node.right, sourceExpression: node.left });
+    } else if (ts.isBindingElement(node) && node.initializer !== undefined && propertyNameText(node.propertyName ?? node.name) === 'schemaVersion') {
+      reportSink(sourceFile, { reportNode: node.propertyName ?? node.name, sourceExpression: node.initializer });
     }
-    if (!ts.isIdentifier(current) && !ts.isPropertyAccessExpression(current)) return false;
-
-    return isNumericSymbol(checker.getSymbolAtLocation(current), seen);
-  }
-
-  function isDirectNamedSchemaAuthoritySymbol(symbol: ts.Symbol | undefined): boolean {
-    const declaration = symbol?.declarations?.find(ts.isImportSpecifier);
-    if (declaration === undefined) return false;
-    const authorityName = declaration.propertyName?.text ?? declaration.name.text;
-    const importDeclaration = declaration.parent.parent.parent;
-    if (!ts.isImportDeclaration(importDeclaration) || !ts.isStringLiteral(importDeclaration.moduleSpecifier)) {
-      return false;
-    }
-    const resolution = ts.resolveModuleName(
-      importDeclaration.moduleSpecifier.text,
-      declaration.getSourceFile().fileName,
-      program.getCompilerOptions(),
-      ts.sys,
-    ).resolvedModule;
-    return canonicalAuthorities.has(authorityName)
-      && resolution !== undefined
-      && ts.sys.resolvePath(resolution.resolvedFileName) === canonicalSchemaFileName;
-  }
-
-  function isDirectNamedSchemaAuthority(expression: ts.Expression): boolean {
-    const current = unwrap(expression);
-    return ts.isIdentifier(current)
-      && isDirectNamedSchemaAuthoritySymbol(checker.getSymbolAtLocation(current));
-  }
-
-  function isSchemaVersionAccess(expression: ts.Expression): boolean {
-    const current = unwrap(expression);
-    const argument = ts.isElementAccessExpression(current) && current.argumentExpression !== undefined
-      ? unwrap(current.argumentExpression)
-      : undefined;
-    return (
-      ts.isPropertyAccessExpression(current)
-      && current.name.text === 'schemaVersion'
-    ) || (
-      argument !== undefined
-      && ts.isStringLiteral(argument)
-      && argument.text === 'schemaVersion'
-    );
-  }
-
-  function schemaVersionCoordinate(expression: ts.Expression): ts.Node {
-    const current = unwrap(expression);
-    return ts.isPropertyAccessExpression(current) ? current.name : current;
-  }
-
-  /**
-   * Recognizes ordinary and computed string property names. A computed name
-   * is in scope only when its transparent-wrapped expression is the literal
-   * `"schemaVersion"`; dynamic computed keys remain out of scope because this
-   * syntax-directed scanner cannot know their runtime binding.
-   */
-  function isSchemaVersionPropertyName(name: ts.PropertyName): boolean {
-    if (ts.isIdentifier(name) || ts.isStringLiteral(name)) return name.text === 'schemaVersion';
-    if (!ts.isComputedPropertyName(name)) return false;
-    const expression = unwrap(name.expression);
-    return ts.isStringLiteral(expression) && expression.text === 'schemaVersion';
-  }
-
-  function report(sourceFile: ts.SourceFile, node: ts.Node): void {
-    const position = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
-    const violation = { fileName: sourceFile.fileName, line: position.line + 1, column: position.character + 1 };
-    violations.push(violation);
-  }
-
-  function isBypass(expression: ts.Expression): boolean {
-    return !isDirectNamedSchemaAuthority(expression) && isNumericExpression(expression);
-  }
+    ts.forEachChild(node, (child) => visit(sourceFile, child));
+  };
 
   for (const sourceFile of program.getSourceFiles()) {
-    if (sourceFile.isDeclarationFile) continue;
-
-    function visit(node: ts.Node): void {
-      if (ts.isPropertyAssignment(node) && isSchemaVersionPropertyName(node.name)) {
-        if (isBypass(node.initializer)) report(sourceFile, node);
-      } else if (ts.isShorthandPropertyAssignment(node) && node.name.text === 'schemaVersion') {
-        if (
-          !isDirectNamedSchemaAuthoritySymbol(checker.getShorthandAssignmentValueSymbol(node))
-          && isNumericSymbol(checker.getShorthandAssignmentValueSymbol(node), new Set())
-        ) report(sourceFile, node);
-      } else if (ts.isPropertyDeclaration(node) && isSchemaVersionPropertyName(node.name) && node.initializer !== undefined) {
-        if (isBypass(node.initializer)) report(sourceFile, node);
-      } else if (ts.isBinaryExpression(node)) {
-        if (isSchemaVersionAccess(node.left) && isBypass(node.right)) report(sourceFile, schemaVersionCoordinate(node.left));
-        if (isSchemaVersionAccess(node.right) && isBypass(node.left)) report(sourceFile, schemaVersionCoordinate(node.right));
-      }
-      ts.forEachChild(node, visit);
-    }
-
-    visit(sourceFile);
+    if (!sourceFile.isDeclarationFile) visit(sourceFile, sourceFile);
   }
-
-  return violations.sort((left, right) => {
-    if (left.fileName !== right.fileName) return left.fileName < right.fileName ? -1 : 1;
-    if (left.line !== right.line) return left.line - right.line;
-    return left.column - right.column;
-  });
+  violations.sort((left, right) => (
+    ts.sys.resolvePath(left.fileName).localeCompare(ts.sys.resolvePath(right.fileName))
+    || left.line - right.line
+    || left.column - right.column
+  ));
+  return violations;
 }
