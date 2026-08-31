@@ -1,6 +1,7 @@
 /**
- * Provides the architecture-test inventory for integrity-error construction
- * sites and same-origin navigation checkpoints.
+ * Provides the architecture-test inventories for integrity-error construction
+ * sites, same-origin navigation checkpoints, repairable-navigation-allowlist
+ * call sites, and integrity-violation subclass declarations.
  *
  * The scan resolves direct imports, re-exports, local aliases, and wrapped
  * expressions through TypeScript rather than matching text. It inventories
@@ -22,6 +23,17 @@ export type SameOriginNavigationCheckpoint = {
   readonly planStepNavigation: boolean;
 };
 
+/**
+ * Identifies one reviewed caller of run.ts's repairable-navigation allowlist.
+ *
+ * `fileName` locates the caller's source file, while `functionName` retains
+ * stable structural context as source lines move.
+ */
+export type RepairableNavigationAllowlistCallSite = {
+  readonly fileName: string;
+  readonly functionName: string;
+};
+
 export type IntegrityViolationSubclassDeclaration = {
   readonly fileName: string;
   readonly className: string;
@@ -34,6 +46,31 @@ export function scanIntegrityViolationInventory(
 ): {
   readonly constructions: readonly IntegrityViolationConstructionSite[];
   readonly checkpoints: readonly SameOriginNavigationCheckpoint[];
+  /**
+   * Every call expression whose callee resolves to run.ts's exported
+   * `isRepairableNavigationFailure`.
+   *
+   * The scan walks every non-declaration source file in the program and uses
+   * `functionDeclarationFor` to resolve each call expression's callee,
+   * matching it to the `isRepairableNavigationFailure` declaration in `run.ts`
+   * rather than applying the `runModule` gate used by `checkpoints`. The
+   * exact-match assertion in `test/architecture.test.ts` enumerates every
+   * caller precisely. Any new caller anywhere in the program changes this
+   * inventory and requires that assertion, and a conscious review of the new
+   * call site, to be updated. `heal-ai-dispatch-budget.ts` belongs to a
+   * separately governed admission-decision boundary, distinct from the
+   * replay-observed allowlist this scan confines.
+   *
+   * As a documented boundary, call-expression callees resolve with the same
+   * coverage as `checkpoints`: renamed imports, namespace-qualified calls,
+   * and local re-binds are handled. The scan does not additionally resolve a
+   * destructuring alias of the function or an indirect `.call()`/`.apply()`
+   * invocation. A full default-deny value-reference walk, such as the ones in
+   * `tools/digest-scanner.ts` and `tools/schema-version-literal-scanner.ts`
+   * for different symbols, is out of proportion to this tripwire; unhandled
+   * forms are outside its resolution contract.
+   */
+  readonly allowlistCallSites: readonly RepairableNavigationAllowlistCallSite[];
   readonly declarations: readonly IntegrityViolationSubclassDeclaration[];
 } {
   const checker = program.getTypeChecker();
@@ -112,6 +149,7 @@ export function scanIntegrityViolationInventory(
 
   const constructions: IntegrityViolationConstructionSite[] = [];
   const checkpoints: SameOriginNavigationCheckpoint[] = [];
+  const allowlistCallSites: RepairableNavigationAllowlistCallSite[] = [];
   const declarations: IntegrityViolationSubclassDeclaration[] = [];
   const visit = (sourceFile: ts.SourceFile, node: ts.Node): void => {
     if (ts.isClassDeclaration(node) && node.name !== undefined) {
@@ -135,11 +173,17 @@ export function scanIntegrityViolationInventory(
           && property.initializer.kind === ts.SyntaxKind.TrueKeyword);
       checkpoints.push({ functionName: enclosingFunctionName(node), planStepNavigation });
     }
+    if (ts.isCallExpression(node)) {
+      const declaration = functionDeclarationFor(node.expression);
+      if (declaration?.name?.text === 'isRepairableNavigationFailure' && declaration.getSourceFile() === runModule) {
+        allowlistCallSites.push({ fileName: sourceFile.fileName, functionName: enclosingFunctionName(node) });
+      }
+    }
     ts.forEachChild(node, (child) => visit(sourceFile, child));
   };
 
   for (const sourceFile of program.getSourceFiles()) {
     if (!sourceFile.isDeclarationFile) visit(sourceFile, sourceFile);
   }
-  return { constructions, checkpoints, declarations };
+  return { constructions, checkpoints, allowlistCallSites, declarations };
 }
