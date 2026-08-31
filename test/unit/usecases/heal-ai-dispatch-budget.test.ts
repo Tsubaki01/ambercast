@@ -2,12 +2,23 @@ import { describe, expect, it, vi } from 'vitest';
 import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
 import { createHealAiDispatchBudget, type HealAiDispatchPhaseDeps } from '#usecases/heal-ai-dispatch-budget.js';
 import { PlanNavigationResolutionError } from '#usecases/run.js';
+import { createRecordingEventSink } from '../../doubles/create-recording-event-sink.js';
 import { createFakeAiExecutor } from '../../doubles/fake-ai-executor.js';
 
 const request = {} as never;
 
+async function dispatchOnce(
+  deps: HealAiDispatchPhaseDeps,
+  kind: 'execute' | 'executeAgentic' = 'execute',
+) {
+  const executor = await deps.resolveAiExecutor();
+  deps.events.emit({ type: 'ai-call' });
+  return executor[kind](request);
+}
+
 function createBudget(params: Partial<Parameters<typeof createHealAiDispatchBudget>[0]> = {}) {
   let now = 0;
+  const recording = createRecordingEventSink();
   const executor = createFakeAiExecutor({
     execute: async () => ({ data: { ok: true }, raw: '{}' }),
     executeAgentic: async () => ({ outcome: 'success' }),
@@ -17,12 +28,13 @@ function createBudget(params: Partial<Parameters<typeof createHealAiDispatchBudg
     resolveAiExecutor,
     signal: undefined,
     clock: { monotonicMs: () => now },
+    events: recording.sink,
     deadlineMs: 100,
     maxDispatches: Infinity,
     ...params,
   });
 
-  return { budget, executor, resolveAiExecutor, setNow: (value: number) => { now = value; } };
+  return { budget, executor, recording, resolveAiExecutor, setNow: (value: number) => { now = value; } };
 }
 
 describe('createHealAiDispatchBudget', () => {
@@ -42,8 +54,7 @@ describe('createHealAiDispatchBudget', () => {
     const fixture = createBudget({ maxDispatches: 1 });
 
     await expect(fixture.budget.runPhase('incremental', async (deps) => {
-      const executor = await deps.resolveAiExecutor();
-      await executor.execute(request);
+      await dispatchOnce(deps);
       return 'consumed the only dispatch';
     })).resolves.toEqual({ admitted: true, result: { ok: true, value: 'consumed the only dispatch' } });
 
@@ -59,14 +70,12 @@ describe('createHealAiDispatchBudget', () => {
     const fixture = createBudget({ maxDispatches: 1 });
 
     await expect(fixture.budget.runPhase('incremental', async (deps) => {
-      const executor = await deps.resolveAiExecutor();
-      await executor.execute(request);
+      await dispatchOnce(deps);
       return 'consumed the only dispatch';
     })).resolves.toEqual({ admitted: true, result: { ok: true, value: 'consumed the only dispatch' } });
 
     await expect(fixture.budget.runPhase('stage3', async (deps) => {
-      const executor = await deps.resolveAiExecutor();
-      await executor.execute(request);
+      await dispatchOnce(deps);
       return 'allowed';
     })).resolves.toEqual({ admitted: true, result: { ok: true, value: 'allowed' } });
 
@@ -89,9 +98,8 @@ describe('createHealAiDispatchBudget', () => {
     const fixture = createBudget({ maxDispatches: 1 });
 
     await expect(fixture.budget.runPhase('incremental', async (deps) => {
-      const executor = await deps.resolveAiExecutor();
-      await executor.execute(request);
-      await executor.execute(request);
+      await dispatchOnce(deps);
+      await dispatchOnce(deps);
       return 'must be discarded';
     })).resolves.toEqual({ admitted: false, deniedReason: 'attempt-limit' });
   });
@@ -122,11 +130,10 @@ describe('createHealAiDispatchBudget', () => {
     const execute = vi.spyOn(fixture.executor, 'execute');
 
     const outcome = await fixture.budget.runPhase('incremental', async (deps) => {
-      const executor = await deps.resolveAiExecutor();
-      await executor.execute(request);
+      await dispatchOnce(deps);
       beforeDeniedDispatch(fixture);
       try {
-        await executor.execute(request);
+        await dispatchOnce(deps);
       } catch {
         // The work models run() swallowing the private budget sentinel.
       }
@@ -146,10 +153,9 @@ describe('createHealAiDispatchBudget', () => {
       } catch {
         // A non-integrity error does not activate the narrow precedence exception.
       }
-      const executor = await deps.resolveAiExecutor();
-      await executor.execute(request);
+      await dispatchOnce(deps);
       try {
-        await executor.execute(request);
+        await dispatchOnce(deps);
       } catch {
         // This is the later, decisive denial.
       }
@@ -164,10 +170,9 @@ describe('createHealAiDispatchBudget', () => {
     const repairable = new PlanNavigationResolutionError('The plan destination cannot be resolved.');
 
     const outcome = await fixture.budget.runPhase('incremental', async (deps) => {
-      const executor = await deps.resolveAiExecutor();
-      await executor.execute(request);
+      await dispatchOnce(deps);
       try {
-        await executor.execute(request);
+        await dispatchOnce(deps);
       } catch {
         // The work models run() swallowing the private budget sentinel.
       }
@@ -213,9 +218,8 @@ describe('createHealAiDispatchBudget', () => {
     const fixture = createBudget({ maxDispatches: 1 });
 
     await expect(fixture.budget.runPhase('incremental', async (deps) => {
-      const executor = await deps.resolveAiExecutor();
-      await executor.execute(request);
-      await executor.executeAgentic(request);
+      await dispatchOnce(deps);
+      await dispatchOnce(deps, 'executeAgentic');
       return 'must be discarded';
     })).resolves.toEqual({ admitted: false, deniedReason: 'attempt-limit' });
   });
@@ -224,11 +228,233 @@ describe('createHealAiDispatchBudget', () => {
     const fixture = createBudget({ maxDispatches: Infinity });
 
     await expect(fixture.budget.runPhase('incremental', async (deps) => {
-      const executor = await deps.resolveAiExecutor();
-      await executor.execute(request);
-      await executor.executeAgentic(request);
-      await executor.execute(request);
+      await dispatchOnce(deps);
+      await dispatchOnce(deps, 'executeAgentic');
+      await dispatchOnce(deps);
       return 'unbounded';
     })).resolves.toEqual({ admitted: true, result: { ok: true, value: 'unbounded' } });
+  });
+
+  it.each(['execute', 'executeAgentic'] as const)('delivers an admitted %s event before delegating to the base executor', async (kind) => {
+    const fixture = createBudget();
+    const sinkEmit = vi.spyOn(fixture.recording.sink, 'emit');
+    const baseMethod = vi.spyOn(fixture.executor, kind);
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      await dispatchOnce(deps, kind);
+      return 'completed';
+    })).resolves.toEqual({ admitted: true, result: { ok: true, value: 'completed' } });
+
+    expect(sinkEmit).toHaveBeenCalledOnce();
+    expect(sinkEmit).toHaveBeenCalledWith({ type: 'ai-call' });
+    expect(baseMethod).toHaveBeenCalledOnce();
+    expect(sinkEmit.mock.invocationCallOrder[0]!).toBeLessThan(baseMethod.mock.invocationCallOrder[0]!);
+  });
+
+  it.each(['execute', 'executeAgentic'] as const)('does not emit or delegate a denied second %s dispatch', async (kind) => {
+    const fixture = createBudget({ maxDispatches: 1 });
+    const sinkEmit = vi.spyOn(fixture.recording.sink, 'emit');
+    const baseMethod = vi.spyOn(fixture.executor, kind);
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      await dispatchOnce(deps, kind);
+      const eventsAfterFirstDispatch = fixture.recording.emitted();
+      const baseCallsAfterFirstDispatch = baseMethod.mock.calls.length;
+
+      await expect(dispatchOnce(deps, kind)).rejects.toThrow();
+
+      expect(fixture.recording.emitted()).toEqual(eventsAfterFirstDispatch);
+      expect(baseMethod).toHaveBeenCalledTimes(baseCallsAfterFirstDispatch);
+      return 'discarded';
+    })).resolves.toEqual({ admitted: false, deniedReason: 'attempt-limit' });
+
+    expect(sinkEmit).toHaveBeenCalledOnce();
+    expect(baseMethod).toHaveBeenCalledOnce();
+  });
+
+  it('retains an admitted dispatch event when a later dispatch in the phase is denied', async () => {
+    const fixture = createBudget({ maxDispatches: 1 });
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      await dispatchOnce(deps);
+      await expect(dispatchOnce(deps)).rejects.toThrow();
+      return 'discarded';
+    })).resolves.toEqual({ admitted: false, deniedReason: 'attempt-limit' });
+
+    expect(fixture.recording.emitted()).toEqual([{ type: 'ai-call' }]);
+  });
+
+  it('holds a Stage 2 rejection during an open phase and discards it when the phase is denied', async () => {
+    const fixture = createBudget({ maxDispatches: 1 });
+    const rejection = { type: 'heal-stage2-rejected' as const, stepId: 'repair-step', reason: 'no-advance' as const };
+    const passthrough = { type: 'step-start' as const, stepId: 'after-rejection' };
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      await dispatchOnce(deps);
+      const eventsBeforeDeferral = fixture.recording.emitted();
+
+      deps.events.emit(rejection);
+      deps.events.emit(passthrough);
+
+      expect(fixture.recording.emitted().slice(eventsBeforeDeferral.length)).toEqual([passthrough]);
+
+      await expect(dispatchOnce(deps)).rejects.toThrow();
+      return 'discarded';
+    })).resolves.toEqual({ admitted: false, deniedReason: 'attempt-limit' });
+
+    expect(fixture.recording.emitted()).toEqual([{ type: 'ai-call' }, passthrough]);
+    expect(fixture.recording.emitted()).not.toContainEqual(rejection);
+  });
+
+  it('flushes an admitted Stage 2 rejection exactly once after the phase events that precede settlement', async () => {
+    const fixture = createBudget();
+    const rejection = { type: 'heal-stage2-rejected' as const, stepId: 'repair-step', reason: 'no-advance' as const };
+    const passthrough = { type: 'step-start' as const, stepId: 'after-rejection' };
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      await dispatchOnce(deps);
+      const eventsBeforeDeferral = fixture.recording.emitted();
+
+      deps.events.emit(rejection);
+      deps.events.emit(passthrough);
+
+      expect(fixture.recording.emitted().slice(eventsBeforeDeferral.length)).toEqual([passthrough]);
+      return 'completed';
+    })).resolves.toEqual({ admitted: true, result: { ok: true, value: 'completed' } });
+
+    expect(fixture.recording.emitted()).toEqual([{ type: 'ai-call' }, passthrough, rejection]);
+    expect(fixture.recording.emitted().filter((event) => event.type === 'heal-stage2-rejected')).toHaveLength(1);
+  });
+
+  it('rejects a retained event proxy while a later phase is open without leaking state', async () => {
+    const fixture = createBudget();
+    let retainedEvents: HealAiDispatchPhaseDeps['events'] | undefined;
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      retainedEvents = deps.events;
+      await dispatchOnce(deps);
+      return 'first phase';
+    })).resolves.toEqual({ admitted: true, result: { ok: true, value: 'first phase' } });
+
+    if (retainedEvents === undefined) throw new Error('The test must retain the phase event proxy.');
+
+    let markSecondPhaseOpen!: () => void;
+    const secondPhaseOpen = new Promise<void>((resolve) => { markSecondPhaseOpen = resolve; });
+    let continueSecondPhase!: () => void;
+    const continueSecondPhaseWork = new Promise<void>((resolve) => { continueSecondPhase = resolve; });
+    const secondPhase = fixture.budget.runPhase('incremental', async (deps) => {
+      markSecondPhaseOpen();
+      await continueSecondPhaseWork;
+      await dispatchOnce(deps);
+      return 'second phase';
+    });
+    await secondPhaseOpen;
+
+    let staleProxyError: unknown;
+    try {
+      retainedEvents.emit({ type: 'step-start', stepId: 'stale-event' });
+    } catch (error) {
+      staleProxyError = error;
+    }
+    expect(staleProxyError).toMatchObject({ reason: 'stale-events-proxy' });
+
+    continueSecondPhase();
+    await expect(secondPhase).resolves.toEqual({ admitted: true, result: { ok: true, value: 'second phase' } });
+
+    expect(fixture.recording.emitted()).toEqual([{ type: 'ai-call' }, { type: 'ai-call' }]);
+  });
+
+  it('rejects a retained executor after settlement and recovers for a later valid phase', async () => {
+    const fixture = createBudget();
+    let retainedExecutor: Awaited<ReturnType<HealAiDispatchPhaseDeps['resolveAiExecutor']>> | undefined;
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      retainedExecutor = await deps.resolveAiExecutor();
+      deps.events.emit({ type: 'ai-call' });
+      await retainedExecutor.execute(request);
+      return 'first phase';
+    })).resolves.toEqual({ admitted: true, result: { ok: true, value: 'first phase' } });
+
+    if (retainedExecutor === undefined) throw new Error('The test must retain the decorated executor.');
+
+    await expect(retainedExecutor.execute(request)).rejects.toMatchObject({
+      name: 'Error',
+      message: expect.stringMatching(/outside an open budget phase/i),
+    });
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      await dispatchOnce(deps);
+      return 'recovered';
+    })).resolves.toEqual({ admitted: true, result: { ok: true, value: 'recovered' } });
+  });
+
+  it('rejects a duplicate pending AI call and recovers for a later valid phase', async () => {
+    const fixture = createBudget();
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      deps.events.emit({ type: 'ai-call' });
+      deps.events.emit({ type: 'ai-call' });
+      return 'unreachable';
+    })).rejects.toMatchObject({ reason: 'duplicate-pending-ai-call' });
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      await dispatchOnce(deps);
+      return 'recovered';
+    })).resolves.toEqual({ admitted: true, result: { ok: true, value: 'recovered' } });
+
+    expect(fixture.recording.emitted()).toEqual([{ type: 'ai-call' }]);
+  });
+
+  it('rejects a dispatch without a pending AI call and recovers for a later valid phase', async () => {
+    const fixture = createBudget();
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      const executor = await deps.resolveAiExecutor();
+      await executor.execute(request);
+      return 'unreachable';
+    })).rejects.toMatchObject({ reason: 'missing-pending-ai-call' });
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      await dispatchOnce(deps);
+      return 'recovered';
+    })).resolves.toEqual({ admitted: true, result: { ok: true, value: 'recovered' } });
+
+    expect(fixture.recording.emitted()).toEqual([{ type: 'ai-call' }]);
+  });
+
+  it('rejects an unconsumed pending AI call and recovers for a later valid phase', async () => {
+    const fixture = createBudget();
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      deps.events.emit({ type: 'ai-call' });
+      return 'unreachable';
+    })).rejects.toMatchObject({ reason: 'unconsumed-pending-ai-call' });
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      await dispatchOnce(deps);
+      return 'recovered';
+    })).resolves.toEqual({ admitted: true, result: { ok: true, value: 'recovered' } });
+
+    expect(fixture.recording.emitted()).toEqual([{ type: 'ai-call' }]);
+  });
+
+  it('rejects an unconsumed pending AI call before flushing a deferred Stage 2 rejection', async () => {
+    const fixture = createBudget();
+    const rejection = { type: 'heal-stage2-rejected' as const, stepId: 'repair-step', reason: 'no-advance' as const };
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      deps.events.emit(rejection);
+      deps.events.emit({ type: 'ai-call' });
+      return 'unreachable';
+    })).rejects.toMatchObject({ reason: 'unconsumed-pending-ai-call' });
+
+    expect(fixture.recording.emitted()).not.toContainEqual(rejection);
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      await dispatchOnce(deps);
+      return 'recovered';
+    })).resolves.toEqual({ admitted: true, result: { ok: true, value: 'recovered' } });
+
+    expect(fixture.recording.emitted()).toEqual([{ type: 'ai-call' }]);
   });
 });

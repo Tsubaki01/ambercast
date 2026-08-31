@@ -724,11 +724,15 @@ export function claimedRetainedGrantOffsets(
  *
  * The overlay snapshot keeps an invalid provider response or partial pair from
  * contaminating the later full-regeneration attempt; only a fully validated
- * candidate may become the next measurement input. Its rejection
- * finalizer restores the snapshot, emits one rejection event, and then returns
- * the typed result. A phase rejected before work starts emits neither event.
- * Once Stage 2 starts, its `ai-call` remains an attempted-dispatch diagnostic
- * even if dispatch-time admission later rejects the phase.
+ * candidate may become the next measurement input. Its rejection finalizer
+ * restores the snapshot, records the phase's rejection event, and then returns
+ * the typed result. A phase rejected before work starts produces neither
+ * event. This function's `ai-call` becomes observable by the real sink only
+ * when its named dispatch is admitted, and that admitted event remains there
+ * even if a later dispatch denies the phase. A denied dispatch discards only
+ * its own still-pending event. The rejection recorded by `reject()` follows
+ * the same phase-final decision: it flushes once for an admitted phase and is
+ * discarded when that phase is denied.
  */
 async function trySingleStepRepair(
   deps: HealDeps,
@@ -1011,6 +1015,7 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
     resolveAiExecutor: deps.resolveAiExecutor,
     signal: deps.signal,
     clock: deps.clock,
+    events: caseDeps.events,
     deadlineMs: deadline,
     maxDispatches: caseDeps.config.heal.maxStepRepairs ?? Infinity,
   });
@@ -1022,7 +1027,7 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
   if (measurement.firstFailureIndex !== plan.steps.length) {
     const snapshot = overlay.snapshot();
     const initial = await budget.runPhase('incremental', (phaseDeps) => measureReplay(
-      { ...caseDeps, resolveAiExecutor: phaseDeps.resolveAiExecutor },
+      { ...caseDeps, resolveAiExecutor: phaseDeps.resolveAiExecutor, events: phaseDeps.events },
       options,
       file,
       overlay,
@@ -1062,7 +1067,7 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
     const mode = groundingRecoveryModeForStep(plan.steps[frontier]!);
     const stage1Snapshot = overlay.snapshot();
     const stage1 = await budget.runPhase('incremental', (phaseDeps) => tryGroundingRepair(
-      { ...caseDeps, resolveAiExecutor: phaseDeps.resolveAiExecutor }, options, file, groundingFile, overlay, plan, measurement, nextAttemptOrdinal,
+      { ...caseDeps, resolveAiExecutor: phaseDeps.resolveAiExecutor, events: phaseDeps.events }, options, file, groundingFile, overlay, plan, measurement, nextAttemptOrdinal,
     ));
     if (!stage1.admitted) {
       overlay.restore(stage1Snapshot);
@@ -1081,7 +1086,7 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
     const beforePlan = plan;
     const beforeMeasurement = measurement;
     const stage2 = await budget.runPhase('incremental', (phaseDeps) => trySingleStepRepair(
-      { ...caseDeps, resolveAiExecutor: phaseDeps.resolveAiExecutor }, phaseDeps.resolveAiExecutor, options, file, planFile, groundingFile, overlay, preflight.normalized, plan, caseBaseline, measurement, repairHistory, nextAttemptOrdinal,
+      { ...caseDeps, resolveAiExecutor: phaseDeps.resolveAiExecutor, events: phaseDeps.events }, phaseDeps.resolveAiExecutor, options, file, planFile, groundingFile, overlay, preflight.normalized, plan, caseBaseline, measurement, repairHistory, nextAttemptOrdinal,
     ));
     if (!stage2.admitted) {
       overlay.restore(stage2Snapshot);
@@ -1113,7 +1118,7 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
       const bestMeasurement = measurement;
       const bestSnapshot = overlay.snapshot();
       const fullPhase = await budget.runPhase('stage3', (phaseDeps) => tryFullPlanRepair(
-        { ...caseDeps, resolveAiExecutor: phaseDeps.resolveAiExecutor }, phaseDeps.resolveAiExecutor, options, file, planFile, overlay, preflight.normalized, preflight.digest, plan, measurement, nextAttemptOrdinal,
+        { ...caseDeps, resolveAiExecutor: phaseDeps.resolveAiExecutor, events: phaseDeps.events }, phaseDeps.resolveAiExecutor, options, file, planFile, overlay, preflight.normalized, preflight.digest, plan, measurement, nextAttemptOrdinal,
       ));
       if (!fullPhase.admitted) {
         overlay.restore(bestSnapshot);
