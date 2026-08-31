@@ -3,9 +3,9 @@
 // Git's worktree inventory is the authority for both target selection and the
 // primary checkout that receives files copied back from a linked worktree.
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { relative, resolve } from 'node:path';
-import { fail, getErrorMessage, parseWorktreeList, runGit } from './lib/worktree.mjs';
+import { fail, getErrorMessage, isSameOrDescendant, isStrictDescendant, listWorktrees, resolveCwdRealpath, resolveMainWorktree, resolveReceptacle, runGit } from './lib/worktree.mjs';
 
 const USAGE = 'Usage: node scripts/worktree-remove.mjs <issue-number|worktree-path> [--force] [--with-branch]';
 const ISSUE_NUMBER = /^[1-9]\d*$/;
@@ -60,6 +60,85 @@ function selectWorktree(target, worktrees) {
   return match;
 }
 
+// This helper creates `<receptacle>/.cleanup-lock` without recursion. Only
+// EEXIST signals competing or stale cleanup; that refusal names the mutex,
+// prints any `transaction.json` it contains, and instructs the operator to
+// verify that no cleanup is running before deleting the mutex manually. Other
+// creation failures, including EACCES, propagate as their own errors rather
+// than being misreported as competition. The successful acquirer is its sole
+// owner, so rejected competitors never release another invocation's mutex. A
+// surviving journal is operator evidence, not crash recovery, in this
+// single-OS-user tool.
+function acquireCleanupMutex(receptacle) {
+  const mutex = resolve(receptacle, '.cleanup-lock');
+  try {
+    mkdirSync(mutex);
+  } catch (error) {
+    if (!(error instanceof Error) || !('code' in error) || error.code !== 'EEXIST') {
+      throw error;
+    }
+
+    let journal = '';
+    try {
+      journal = `\ntransaction.json: ${readFileSync(resolve(mutex, 'transaction.json'), 'utf8')}`;
+    } catch {}
+    throw new Error(`Cleanup mutex already exists: ${mutex}. Verify that no cleanup is running before deleting it manually.${journal}`);
+  }
+
+  return mutex;
+}
+
+// Only an acquirer whose operation restores the target's lock state releases
+// `<receptacle>/.cleanup-lock`. Degraded outcomes retain the mutex and journal
+// as operator evidence, while a failed release is reported to stderr.
+function releaseCleanupMutex(mutex) {
+  rmSync(mutex, { recursive: true });
+}
+
+// Validation checks the main worktree before receptacle containment
+// so its specific refusal stays meaningful even when the receptacle is absent.
+// It then realpaths the registered target and requires strict, not same-or-below,
+// containment beneath the real receptacle; accepting the receptacle itself
+// would turn a boundary check into a deletion target.
+function validateTarget(targetWorktree, mainWorktree, receptacle) {
+  if (resolve(targetWorktree.path) === resolve(mainWorktree.path)) {
+    throw new Error(`Refusing to remove the main worktree: ${mainWorktree.path}`);
+  }
+
+  let targetPath;
+  try {
+    targetPath = realpathSync(targetWorktree.path);
+  } catch (error) {
+    throw new Error(`Unable to realpath worktree ${targetWorktree.path}: ${getErrorMessage(error)}`);
+  }
+
+  let receptaclePath;
+  try {
+    receptaclePath = realpathSync(receptacle);
+  } catch (error) {
+    throw new Error(`Unable to realpath worktree receptacle ${receptacle}: ${getErrorMessage(error)}`);
+  }
+
+  if (!isStrictDescendant(receptaclePath, targetPath)) {
+    throw new Error(`Worktree is outside the managed receptacle: ${targetWorktree.path}`);
+  }
+
+  return targetPath;
+}
+
+// Self-removal is refused after resolving the current directory so symlinked
+// and nested invocations cannot delete the tree that executes this command.
+function guardSelfRemoval(targetWorktree, mainWorktree, targetPath) {
+  const cwd = resolveCwdRealpath();
+  if (!cwd.ok) {
+    throw new Error(`Refusing to remove ${targetWorktree.path}: unable to resolve the current directory: ${cwd.error.message}`);
+  }
+
+  if (isSameOrDescendant(targetPath, cwd.path)) {
+    throw new Error(`Refusing to remove the worktree containing this command. Run from the main checkout: ${mainWorktree.path}`);
+  }
+}
+
 // Only ordinary files are copied. Ignoring symlinks prevents a worktree from
 // turning record preservation into an unexpected read outside its own tree.
 function copyMissingFiles(sourceDirectory, destinationDirectory, category, categoryRoot = sourceDirectory) {
@@ -105,12 +184,11 @@ function preserveIssueRecords(worktree, mainWorktree) {
   );
 }
 
+// Dirtiness is evaluated before copy-back. A non-forced refusal must leave the
+// primary checkout untouched, including its implementation records, instead of
+// partially preserving a rejected tree.
 function isDirty(worktreePath) {
   return runGit(['-C', worktreePath, 'status', '--porcelain']).trim() !== '';
-}
-
-function resolveCurrentWorktree() {
-  return runGit(['rev-parse', '--show-toplevel']).trim();
 }
 
 function removeWorktree(worktreePath, force) {
@@ -126,6 +204,16 @@ function removeBranch(branch, force) {
   execFileSync('git', ['branch', force ? '-D' : '-d', branch], { stdio: 'inherit' });
 }
 
+// Refreshing the inventory under the mutex prevents stale target and lock data
+// from defining a transaction. The recorded lock state is the restoration
+// invariant; unlock failures remain fatal because inventory, not stderr
+// wording, is authoritative.
+//
+// Journal phases preserve the target and original lock as operator evidence.
+// A failed removal restores that lock only while the target remains present;
+// successful removal, pre-destruction refusal, and successful restoration are
+// releasable states. Degraded outcomes retain the mutex and journal because
+// this single-user tool has no automatic crash recovery.
 function main() {
   const parsed = parseArguments(process.argv.slice(2));
   if (parsed === undefined) {
@@ -133,41 +221,90 @@ function main() {
     return;
   }
 
-  const worktrees = parseWorktreeList();
-  const [mainWorktree] = worktrees;
-  if (mainWorktree === undefined) {
-    throw new Error('Git did not report a main worktree.');
+  const preMutexWorktrees = listWorktrees();
+  const mainPath = resolveMainWorktree(preMutexWorktrees);
+  const receptacle = resolveReceptacle(mainPath);
+  mkdirSync(receptacle, { recursive: true });
+  const cleanupMutex = acquireCleanupMutex(receptacle);
+  let releaseMutex = true;
+
+  try {
+    const worktrees = listWorktrees();
+    const mainWorktree = { path: resolveMainWorktree(worktrees) };
+    const targetWorktree = selectWorktree(parsed.target, worktrees);
+    const targetPath = validateTarget(targetWorktree, mainWorktree, receptacle);
+    guardSelfRemoval(targetWorktree, mainWorktree, targetPath);
+
+    if (parsed.withBranch && targetWorktree.branch === undefined) {
+      throw new Error(`Worktree ${targetWorktree.path} has no local branch to delete.`);
+    }
+
+    if (!parsed.force && isDirty(targetWorktree.path)) {
+      throw new Error(`Worktree is dirty: ${targetWorktree.path}. Re-run with --force to remove it.`);
+    }
+
+    preserveIssueRecords(targetWorktree, mainWorktree);
+    const originalLock = targetWorktree.locked;
+    let phase = 'pre-unlock';
+    const writeJournal = () => writeFileSync(resolve(cleanupMutex, 'transaction.json'), JSON.stringify({ target: targetWorktree.path, originalLock: originalLock ?? null, phase }));
+    writeJournal();
+
+    if (originalLock !== undefined) {
+      runGit(['worktree', 'unlock', targetWorktree.path]);
+      releaseMutex = false;
+    }
+    phase = 'unlocked';
+    writeJournal();
+
+    releaseMutex = false;
+    try {
+      removeWorktree(targetWorktree.path, parsed.force);
+    } catch (removeError) {
+      if (!existsSync(targetWorktree.path)) {
+        throw new Error(`Failed to remove worktree: ${getErrorMessage(removeError)}`);
+      }
+
+      if (originalLock !== undefined) {
+        try {
+          runGit(originalLock === true
+            ? ['worktree', 'lock', targetWorktree.path]
+            : ['worktree', 'lock', '--reason', originalLock, targetWorktree.path]);
+          releaseMutex = true;
+        } catch (relockError) {
+          throw new Error(`Failed to remove worktree: ${getErrorMessage(removeError)}; failed to restore lock: ${getErrorMessage(relockError)}`);
+        }
+
+        phase = 'relocked';
+        try {
+          writeJournal();
+        } catch (journalError) {
+          throw new Error(`Failed to remove worktree: ${getErrorMessage(removeError)}; lock restoration succeeded; failed to update transaction journal: ${getErrorMessage(journalError)}`);
+        }
+        throw new Error(`Failed to remove worktree: ${getErrorMessage(removeError)}; lock restoration succeeded.`);
+      } else {
+        releaseMutex = true;
+      }
+
+      throw removeError;
+    }
+
+    phase = 'removed';
+    writeJournal();
+    if (parsed.withBranch && targetWorktree.branch !== undefined) {
+      removeBranch(targetWorktree.branch, parsed.force);
+    }
+
+    console.log(`Removed worktree: ${targetWorktree.path}`);
+    releaseMutex = true;
+  } finally {
+    if (releaseMutex) {
+      try {
+        releaseCleanupMutex(cleanupMutex);
+      } catch (error) {
+        console.error(`worktree-remove: Failed to release cleanup mutex ${cleanupMutex}: ${getErrorMessage(error)}`);
+      }
+    }
   }
-
-  const targetWorktree = selectWorktree(parsed.target, worktrees);
-  if (resolve(targetWorktree.path) === resolve(mainWorktree.path)) {
-    fail('worktree-remove', `Refusing to remove the main worktree: ${mainWorktree.path}`);
-    return;
-  }
-
-  if (resolve(targetWorktree.path) === resolve(resolveCurrentWorktree())) {
-    fail('worktree-remove', `Refusing to remove the worktree containing this command. Run from the main checkout: ${mainWorktree.path}`);
-    return;
-  }
-
-  if (parsed.withBranch && targetWorktree.branch === undefined) {
-    fail('worktree-remove', `Worktree ${targetWorktree.path} has no local branch to delete.`);
-    return;
-  }
-
-  if (!parsed.force && isDirty(targetWorktree.path)) {
-    fail('worktree-remove', `Worktree is dirty: ${targetWorktree.path}. Re-run with --force to remove it.`);
-    return;
-  }
-
-  preserveIssueRecords(targetWorktree, mainWorktree);
-  removeWorktree(targetWorktree.path, parsed.force);
-
-  if (parsed.withBranch && targetWorktree.branch !== undefined) {
-    removeBranch(targetWorktree.branch, parsed.force);
-  }
-
-  console.log(`Removed worktree: ${targetWorktree.path}`);
 }
 
 try {
