@@ -203,6 +203,13 @@ describe('scanComputeInputsDigestAuthority()', () => {
     });
   });
 
+  test('rejects a nested destructuring rebind through a dynamic outer key', async () => {
+    await withCaller("import * as digest from '../ir/digest.js';\ndeclare const key: string;\ndeclare const source: Record<string, typeof digest>;\nconst { [key]: { computeInputsDigest } } = source;", (result) => {
+      expect(result.calls).toEqual([]);
+      expectKinds(result, ['value-reference-outside-authority-call']);
+    });
+  });
+
   test.each([
     ['a call', "import * as digest from '../ir/digest.js';\nconst key = 'computeInputsDigest' as const;\ndigest[key]({ schemaVersion: 1 });", true],
     ['a value reference', "import * as digest from '../ir/digest.js';\nconst key = 'computeInputsDigest' as const;\nconst local = digest[key];\nvoid local;", false],

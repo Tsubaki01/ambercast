@@ -235,32 +235,58 @@ export function scanComputeInputsDigestAuthority(
   /**
    * Finds the type from which a destructuring binding obtains its value.
    *
-   * The nested walk resolves both direct and outer binding names
-   * through the shared resolver's finite key candidates. Identifier, quoted,
-   * and resolvable computed names therefore follow the same property
-   * identity path; a dynamic or multi-candidate outer key remains deliberately
-   * unresolved rather than guessing a deep destructuring source.
+   * The nested walk keeps every plausible source type when an outer binding
+   * key is dynamic or has multiple finite candidates, because an unprovable
+   * selection must not hide a canonical value reference. A single resolved
+   * key retains the existing exact property walk, while ambiguous keys expand
+   * through their declared properties and index types so the leaf continues
+   * through the same resolver-backed canonical-property check.
    */
-  const destructuringSourceType = (node: ts.BindingElement): ts.Type | undefined => {
+  const destructuringSourceTypes = (node: ts.BindingElement): readonly ts.Type[] | undefined => {
     const pattern = node.parent;
     const container = pattern.parent;
     if (ts.isVariableDeclaration(container) && container.initializer !== undefined) {
-      return checker.getTypeAtLocation(container.initializer);
+      return [checker.getTypeAtLocation(container.initializer)];
     }
     if (ts.isParameter(container)) {
-      return checker.getTypeAtLocation(container.initializer ?? container);
+      return [checker.getTypeAtLocation(container.initializer ?? container)];
     }
     if (ts.isBindingElement(container)) {
-      const outerSourceType = destructuringSourceType(container);
+      const outerSourceTypes = destructuringSourceTypes(container);
       const outerPropertyName = container.propertyName ?? container.name;
       const outerNames = bindingElementPropertyCandidateNames(outerPropertyName);
-      if (outerSourceType !== undefined && outerNames?.length === 1) {
+      if (outerSourceTypes === undefined) return undefined;
+      if (outerNames?.length === 1) {
         const [outerName] = outerNames;
         if (outerName !== undefined) {
-          const outerProperty = checker.getPropertyOfType(outerSourceType, outerName);
-          if (outerProperty !== undefined) return checker.getTypeOfSymbolAtLocation(outerProperty, outerPropertyName);
+          const sourceTypes = outerSourceTypes.flatMap((outerSourceType) => {
+            const outerProperty = checker.getPropertyOfType(outerSourceType, outerName);
+            return outerProperty === undefined
+              ? []
+              : [checker.getTypeOfSymbolAtLocation(outerProperty, outerPropertyName)];
+          });
+          return sourceTypes.length === 0 ? undefined : sourceTypes;
         }
       }
+      const sourceTypes = outerSourceTypes.flatMap((outerSourceType) => {
+        const properties = outerNames === undefined
+          ? checker.getPropertiesOfType(outerSourceType)
+          : outerNames.flatMap((outerName) => {
+            const outerProperty = checker.getPropertyOfType(outerSourceType, outerName);
+            return outerProperty === undefined ? [] : [outerProperty];
+          });
+        const indexTypes = outerNames === undefined
+          ? [
+            checker.getIndexTypeOfType(outerSourceType, ts.IndexKind.String),
+            checker.getIndexTypeOfType(outerSourceType, ts.IndexKind.Number),
+          ].filter((indexType): indexType is ts.Type => indexType !== undefined)
+          : [];
+        return [
+          ...properties.map((property) => checker.getTypeOfSymbolAtLocation(property, outerPropertyName)),
+          ...indexTypes,
+        ];
+      });
+      return sourceTypes.length === 0 ? undefined : sourceTypes;
     }
     return undefined;
   };
@@ -345,11 +371,10 @@ export function scanComputeInputsDigestAuthority(
         recordViolation(sourceFile, node, 'value-reference-outside-authority-call');
       }
     } else if (ts.isBindingElement(node)) {
-      const sourceType = destructuringSourceType(node);
+      const sourceTypes = destructuringSourceTypes(node);
       const propertyName = node.propertyName ?? node.name;
       if (
-        sourceType !== undefined
-        && bindingElementResolvesToCanonical(sourceType, propertyName)
+        sourceTypes?.some((sourceType) => bindingElementResolvesToCanonical(sourceType, propertyName))
       ) {
         if (ts.isIdentifier(node.name)) {
           const bindingSymbol = checker.getSymbolAtLocation(node.name);
