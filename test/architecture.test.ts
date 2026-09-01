@@ -584,7 +584,6 @@ describe('architecture guardrails', () => {
       ]
     `);
     expect(portableAllowlistCallSites).toEqual([
-      { fileName: 'usecases/heal-ai-dispatch-budget.ts', functionName: 'runPhase' },
       { fileName: 'usecases/heal.ts', functionName: 'measureReplay' },
     ]);
     expect(inventory.checkpoints).toEqual([
