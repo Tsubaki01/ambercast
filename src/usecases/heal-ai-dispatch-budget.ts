@@ -1,7 +1,6 @@
 import type { InstructionCoveredAiExecutor } from '#ports/ai.js';
 import type { Clock, EventSink, RunEvent } from '#ports/system.js';
 import { IntegrityViolationError } from '#core/errors/integrity-violation-error.js';
-import { isRepairableNavigationFailure } from '#usecases/run.js';
 
 const DISPATCH_DENIED: unique symbol = Symbol('dispatch-denied');
 
@@ -76,21 +75,22 @@ export type DispatchBudgetDenialReason = 'attempt-limit' | 'deadline';
  * The settled outcome of one dispatch-budget phase.
  *
  * `runPhase` can reject with `DispatchProtocolError` when callers break the
- * event-to-dispatch protocol; this union instead captures ordinary completion
- * or failure from `work` after the phase settles. The `admitted` field is the
- * only authority a caller may use to decide whether to keep or discard
- * `work`'s result and any caller-owned effects gated on it; it does not govern
+ * event-to-dispatch protocol; this union instead captures a completed phase,
+ * a denial, or a thrown integrity failure after the phase settles. `status` is
+ * the only authority a caller may use to decide whether to keep or discard
+ * `work`'s result and caller-owned effects gated on it; it does not govern
  * events the controller already admitted and published to the real sink. Never
- * use `instanceof`, error-message matching, or any inspection of what
- * `work` threw or returned for that decision. A denial deliberately hides the
+ * use `instanceof`, error-message matching, or any inspection of what `work`
+ * threw or returned for that decision. A denied outcome deliberately hides the
  * captured result so report-facing callers cannot accidentally retain partial
- * phase output. The integrity-precedence check is this controller's
- * internal admission decision, not permission for callers to override an
- * outcome after inspecting its result.
+ * phase output. An `integrity-failure` outcome exposes every thrown
+ * `IntegrityViolationError`, including subclasses, so callers rethrow it
+ * without overriding this controller's arbitration.
  */
 export type DispatchBudgetPhaseOutcome<T> =
-  | { readonly admitted: true; readonly result: { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown } }
-  | { readonly admitted: false; readonly deniedReason: DispatchBudgetDenialReason };
+  | { readonly status: 'completed'; readonly result: { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown } }
+  | { readonly status: 'denied'; readonly deniedReason: DispatchBudgetDenialReason }
+  | { readonly status: 'integrity-failure'; readonly error: IntegrityViolationError };
 
 /**
  * Controls the case-scoped admission boundary around AI-backed repair work.
@@ -110,18 +110,18 @@ export interface HealAiDispatchBudget {
    * `stage3` phase skips that allowance check entirely: it is deadline-gated
    * only and is never denied for reaching the dispatch limit. One denied
    * dispatch latches the entire phase as denied, discarding both `work`'s
-   * value and any error it threw, except for a settled
-   * non-repairable `IntegrityViolationError`: integrity correctness takes
-   * precedence over denial and is returned as an admitted failed result so
-   * existing callers rethrow it rather than adopt any phase output. The
-   * closed repairable navigation-resolution exception remains discarded by a
-   * denial like every ordinary phase failure.
+   * value and any ordinary error it threw. Every `IntegrityViolationError`
+   * thrown by `work`, exact class or subclass, instead produces an
+   * `integrity-failure` outcome regardless of the denial state. Embedded
+   * integrity failures remain caller-specific values, so callers convert them
+   * to thrown errors before `work` settles when they require this arbitration.
+   * The controller inspects only a failed result's error, never a successful
+   * result's value.
    *
-   * Callers must convert every embedded non-repairable integrity violation to
-   * a thrown error before `work` settles. This method only inspects
-   * `result.error`, never `result.value`, to decide that precedence; its
-   * generic result type cannot safely inspect a successfully resolved value
-   * for caller-specific state.
+   * A `DispatchProtocolError` from the phase event proxy bypasses status
+   * arbitration and is immediately rethrown before `work` receives a settled
+   * result. After `work` settles, an unconsumed `ai-call` is likewise a
+   * protocol error and takes precedence over integrity failure or denial.
    *
    * A second phase from the same controller is a programming error while the
    * first remains open. The controller throws its reentrancy assertion at
@@ -132,33 +132,54 @@ export interface HealAiDispatchBudget {
    * deadline-gated only.
    * @param work - Async repair work that must use the supplied phase resolver
    * for every path that can dispatch AI work.
-   * @returns The only keep-or-discard authority for the completed phase. An
-   * admitted result preserves `work`'s success or ordinary failure; a denied
-   * result contains the controlling reason instead.
+   * @returns The only keep-or-discard authority for the settled phase. A
+   * `completed` outcome preserves `work`'s success or ordinary failure, a
+   * `denied` outcome contains the controlling reason, and an
+   * `integrity-failure` outcome contains the thrown integrity error.
    * @throws {Error} If another phase from this controller is already open.
    * @throws {DispatchProtocolError} If an `ai-call` is duplicated, omitted
-   * before a dispatch, left unconsumed at an admitted phase boundary, or sent
+   * before a dispatch, left unconsumed at a phase boundary, or sent
    * through a proxy after that proxy's phase has settled.
    * @example
    * ```ts
-   * // `overlay` holds speculative changes that a denied phase must discard.
-   * const snapshot = overlay.snapshot();
-   * const outcome = await budget.runPhase('incremental', async (phaseDeps) => {
-   *   // Provider resolution may take arbitrarily long, so complete it first.
-   *   const executor = await phaseDeps.resolveAiExecutor();
-   *   // No await may separate this event from the dispatch it names.
-   *   phaseDeps.events.emit({ type: 'ai-call', stepId: 'repair-step' });
-   *   return executor.execute(request);
-   * });
+   * const assertNever = (value: never): never => {
+   *   throw new Error(`Unreachable dispatch-budget phase status: ${String(value)}`);
+   * };
    *
-   * if (!outcome.admitted) {
-   *   overlay.restore(snapshot);
-   *   return outcome.deniedReason;
+   * repairLoop: while (needsRepair()) {
+   *   // `overlay` holds speculative changes that a denied phase must discard.
+   *   const snapshot = overlay.snapshot();
+   *   const outcome = await budget.runPhase('incremental', async (phaseDeps) => {
+   *     // Provider resolution may take arbitrarily long, so complete it first.
+   *     const executor = await phaseDeps.resolveAiExecutor();
+   *     // No await may separate this event from the dispatch it names.
+   *     phaseDeps.events.emit({ type: 'ai-call', stepId: 'repair-step' });
+   *     return executor.execute(request);
+   *   });
+   *
+   *   switch (outcome.status) {
+   *     case 'denied': {
+   *       overlay.restore(snapshot);
+   *       stopReason = outcome.deniedReason;
+   *       break repairLoop;
+   *     }
+   *     case 'integrity-failure': {
+   *       overlay.restore(snapshot);
+   *       throw outcome.error;
+   *     }
+   *     case 'completed': {
+   *       if (!outcome.result.ok) throw outcome.result.error;
+   *       measurement = outcome.result.value;
+   *       break;
+   *     }
+   *     default: {
+   *       assertNever(outcome);
+   *     }
+   *   }
+   *
+   *   // Existing loop control remains outside the switch.
+   *   if (shouldRetry(measurement)) continue;
    * }
-   * if (!outcome.result.ok) {
-   *   throw outcome.result.error;
-   * }
-   * return outcome.result.value;
    * ```
    */
   runPhase<T>(
@@ -182,10 +203,11 @@ export interface HealAiDispatchPhaseDeps {
    * A phase-bound proxy, not the real case event sink. Phase work must emit
    * through this proxy so the budget can hold an `ai-call` until its named
    * dispatch is admitted and defer `heal-stage2-rejected` until the phase
-   * settles, when it becomes visible only for an admitted phase; every other
-   * event passes through to the real sink unchanged. The proxy rejects a
-   * duplicate `ai-call` before the decorated executor consumes it and rejects
-   * reuse after settlement.
+   * settles. The deferred rejection becomes visible only when the phase has
+   * `completed` status and a successful result; every other event passes
+   * through to the real sink unchanged. The proxy rejects a duplicate
+   * `ai-call` before the decorated executor consumes it and rejects reuse
+   * after settlement.
    */
   readonly events: EventSink;
 }
@@ -207,12 +229,13 @@ export interface HealAiDispatchPhaseDeps {
  * settles, and passes every other `RunEvent` straight to the real sink. It
  * retains those slots on the per-phase record and checks that record's
  * identity against `openPhase`, so a proxy retained beyond settlement cannot
- * affect a later phase. A denied phase discards its deferred rejection event.
- * For an otherwise admitted phase, the controller first checks for an
- * unconsumed pending `ai-call` and throws `unconsumed-pending-ai-call`; only
- * when no protocol violation exists does it flush one deferred
- * `heal-stage2-rejected` event. This ordering prevents an invalid phase from
- * publishing a rejection event to the real sink.
+ * affect a later phase. Denied and integrity-failure phases discard their
+ * deferred rejection event. After work settles, the controller first checks
+ * for an unconsumed pending `ai-call` and throws
+ * `unconsumed-pending-ai-call`; this protocol check precedes every status
+ * outcome. Only a `completed` phase with a successful result flushes one
+ * deferred `heal-stage2-rejected` event. This ordering prevents an invalid or
+ * unsuccessful phase from publishing a rejection event to the real sink.
  *
  * @param params - Case-local inputs for the controller.
  * @param params.resolveAiExecutor - The case's own unresolved, unbound lazy
@@ -314,7 +337,7 @@ export function createHealAiDispatchBudget(params: {
   return {
     async runPhase<T>(kind: DispatchBudgetPhaseKind, work: (deps: HealAiDispatchPhaseDeps) => Promise<T>): Promise<DispatchBudgetPhaseOutcome<T>> {
       if (openPhase !== undefined) throw new Error('A dispatch-budget phase is already open.');
-      if (params.clock.monotonicMs() >= params.deadlineMs) return { admitted: false, deniedReason: 'deadline' };
+      if (params.clock.monotonicMs() >= params.deadlineMs) return { status: 'denied', deniedReason: 'deadline' };
 
       const phase: OpenPhase = { kind };
       openPhase = phase;
@@ -347,14 +370,13 @@ export function createHealAiDispatchBudget(params: {
       } finally {
         openPhase = undefined;
       }
-      if (phase.deniedReason !== undefined && !(result.ok === false
-        && result.error instanceof IntegrityViolationError
-        && !isRepairableNavigationFailure(result.error))) {
-        return { admitted: false, deniedReason: phase.deniedReason };
-      }
       if (phase.pendingAiCall !== undefined) throw new DispatchProtocolError('unconsumed-pending-ai-call');
-      if (phase.deferredRejection !== undefined) params.events.emit(phase.deferredRejection);
-      return { admitted: true, result };
+      if (result.ok === false && result.error instanceof IntegrityViolationError) {
+        return { status: 'integrity-failure', error: result.error };
+      }
+      if (phase.deniedReason !== undefined) return { status: 'denied', deniedReason: phase.deniedReason };
+      if (result.ok === true && phase.deferredRejection !== undefined) params.events.emit(phase.deferredRejection);
+      return { status: 'completed', result };
     },
   };
 }
