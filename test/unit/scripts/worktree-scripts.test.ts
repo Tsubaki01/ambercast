@@ -6,6 +6,7 @@ import { delimiter, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  ensureTargetLocked,
   formatLockReason,
   isSameOrDescendant,
   isStrictDescendant,
@@ -135,6 +136,7 @@ function createUnlockedWorktree(issue: string): string {
 
 interface ShimOptions {
   readonly fail?: readonly GitArgvExpectation[];
+  readonly failOnOccurrence?: GitArgvExpectation & { readonly occurrence: number };
   readonly failNpm?: readonly string[];
   readonly pauseBefore?: readonly string[];
   readonly pauseBeforeOccurrence?: number;
@@ -166,7 +168,7 @@ async function installCommandShims(options: ShimOptions = {}): Promise<{ bin: st
   await writeFile(npmLog, '');
   await writeFile(commandLog, '');
   await writeFile(pauseCount, '0');
-  const config = JSON.stringify({ ...options, ready, release, pauseCount });
+  const config = JSON.stringify({ ...options, gitLog, ready, release, pauseCount });
   const gitShim = `#!/usr/bin/env node
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -175,9 +177,9 @@ const config = ${config};
 appendFileSync(process.env.AMBERCAST_GIT_LOG, JSON.stringify(args) + '\\n');
 appendFileSync(process.env.AMBERCAST_COMMAND_LOG, JSON.stringify({ command: 'git', args, timestamp: Date.now() }) + '\\n');
 const equals = (wanted) => wanted.length === args.length && wanted.every((item, index) => args[index] === item);
-const matches = (expected) => expected.args.length === args.length && expected.args.every((item, index) => {
-  if (index !== expected.timestampReasonIndex) return args[index] === item;
-  return /^issue-\\d+ owner=[a-z0-9][a-z0-9._-]* created=\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$/i.test(args[index] ?? '');
+const matches = (expected, actual = args) => expected.args.length === actual.length && expected.args.every((item, index) => {
+  if (index !== expected.timestampReasonIndex) return actual[index] === item;
+  return /^issue-\\d+ owner=[a-z0-9][a-z0-9._-]* created=\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$/i.test(actual[index] ?? '');
 });
 if (config.pauseBefore && equals(config.pauseBefore)) {
   const occurrence = Number(readFileSync(config.pauseCount, 'utf8')) + 1;
@@ -197,7 +199,12 @@ if (config.removeThenFail && matches(config.removeThenFail)) {
   execFileSync(process.env.AMBERCAST_REAL_GIT, args, { stdio: 'inherit' });
   process.exit(91);
 }
-if (config.fail && config.fail.some(matches)) process.exit(90);
+if (config.failOnOccurrence && matches(config.failOnOccurrence)) {
+  const occurrences = readFileSync(config.gitLog, 'utf8').split('\\n').filter(Boolean)
+    .map((line) => JSON.parse(line)).filter((recorded) => matches(config.failOnOccurrence, recorded)).length;
+  if (occurrences === config.failOnOccurrence.occurrence) process.exit(90);
+}
+if (config.fail && config.fail.some((expected) => matches(expected))) process.exit(90);
 execFileSync(process.env.AMBERCAST_REAL_GIT, args, { stdio: 'inherit' });
 `;
 const npmShim = `#!/usr/bin/env node
@@ -675,6 +682,83 @@ describe('worktree-add locking contract', () => {
   });
 });
 
+describe('ensureTargetLocked', () => {
+  const targetPath = '/worktrees/issues-241';
+  const expectedBranch = 'issues/241';
+
+  it('locks a present registered target that is currently unlocked', () => {
+    const calls: string[][] = [];
+
+    expect(ensureTargetLocked(
+      { targetPath, expectedBranch, originalLock: undefined },
+      {
+        listWorktreesFn: () => [{ path: targetPath, branch: expectedBranch }],
+        existsFn: () => true,
+        runGitFn: (args: string[]) => { calls.push(args); return ''; },
+      },
+    )).toEqual({ state: 'locked', detail: 'lock restoration succeeded' });
+    expect(calls).toEqual([['worktree', 'lock', targetPath]]);
+  });
+
+  it('leaves a present but unregistered path fail-closed', () => {
+    // Issue #241 uses a seam because unregistering a live fixture requires fragile Git administrative-file surgery.
+    expect(ensureTargetLocked(
+      { targetPath, expectedBranch, originalLock: undefined },
+      { listWorktreesFn: () => [], existsFn: () => true },
+    )).toEqual({ state: 'unknown', detail: 'target path exists but is no longer a registered worktree' });
+  });
+
+  it('retains an unknown state when recovery inventory cannot be read', () => {
+    expect(ensureTargetLocked(
+      { targetPath, expectedBranch, originalLock: undefined },
+      { listWorktreesFn: () => { throw new Error('inventory unavailable'); } },
+    )).toEqual({ state: 'unknown', detail: 'Unable to confirm target identity: inventory unavailable' });
+  });
+
+  it('retains an unknown state when target presence cannot be confirmed', () => {
+    const gitCalls: string[][] = [];
+    const runGitFn = (args: string[]): string => { gitCalls.push(args); return ''; };
+
+    expect(ensureTargetLocked(
+      { targetPath, expectedBranch, originalLock: undefined },
+      {
+        listWorktreesFn: () => [{ path: targetPath, branch: expectedBranch }],
+        existsFn: () => { throw new Error('presence check failed'); },
+        runGitFn,
+      },
+    )).toEqual({ state: 'unknown', detail: 'Unable to confirm target presence: presence check failed' });
+    expect(gitCalls).toEqual([]);
+  });
+
+  it('retains an unknown state when relocking fails', () => {
+    expect(ensureTargetLocked(
+      { targetPath, expectedBranch, originalLock: true },
+      {
+        listWorktreesFn: () => [{ path: targetPath, branch: expectedBranch }],
+        existsFn: () => true,
+        runGitFn: () => { throw new Error('lock failed'); },
+      },
+    )).toEqual({ state: 'unknown', detail: 'failed to restore lock: lock failed' });
+  });
+
+  it('treats branchless expected identity and a registered branch as drift', () => {
+    expect(ensureTargetLocked(
+      { targetPath, expectedBranch: undefined, originalLock: undefined },
+      {
+        listWorktreesFn: () => [{ path: targetPath, branch: expectedBranch }],
+        existsFn: () => true,
+      },
+    )).toEqual({ state: 'unknown', detail: 'registered branch does not match the expected target identity' });
+  });
+
+  it('reports gone only when the target is neither registered nor present', () => {
+    expect(ensureTargetLocked(
+      { targetPath, expectedBranch, originalLock: undefined },
+      { listWorktreesFn: () => [], existsFn: () => false },
+    )).toEqual({ state: 'gone', detail: 'target is no longer registered or present' });
+  });
+});
+
 describe('worktree-remove locking, validation, and mutex contract', () => {
   async function lock(path: string, reason?: string): Promise<void> {
     runGit(getFixture().repository, reason === undefined
@@ -786,36 +870,50 @@ describe('worktree-remove locking, validation, and mutex contract', () => {
 
   it('treats unlock failure as fatal and releases an owned mutex', async () => {
     const target = createWorktree('407');
+    const originalLock = parseWorktreePorcelain(runGit(getFixture().repository, ['worktree', 'list', '--porcelain', '-z']))
+      .find((worktree: { readonly path: string }) => worktree.path === target)?.locked;
     const shims = await installCommandShims({ fail: [{ args: ['worktree', 'unlock', target] }] });
     const error = expectScriptFailure(() => runRemove(['407'], { environment: shimEnvironment(shims) }));
     expect(error).toMatch(/unlock/i);
     const calls = await readJsonLines(shims.gitLog);
     expect(calls.some((args) => args[0] === 'worktree' && args[1] === 'remove')).toBe(false);
+    expect(calls.some((args) => args[0] === 'worktree' && args[1] === 'lock')).toBe(false);
     expect(existsSync(join(getFixture().receptacle, '.cleanup-lock'))).toBe(false);
     expect(existsSync(target)).toBe(true);
+    expect(parseWorktreePorcelain(runGit(getFixture().repository, ['worktree', 'list', '--porcelain', '-z']))
+      .find((worktree: { readonly path: string }) => worktree.path === target)?.locked).toBe(originalLock);
   });
 
-  it('retains the mutex and journal when the post-unlock journal write fails', async () => {
+  it('restores the exact reason after a post-unlock journal write failure and releases its mutex', async () => {
     const target = createWorktree('421');
+    const originalLock = parseWorktreePorcelain(runGit(getFixture().repository, ['worktree', 'list', '--porcelain', '-z']))
+      .find((worktree: { readonly path: string }) => worktree.path === target)?.locked;
     const shims = await installCommandShims({ pauseBefore: ['worktree', 'unlock', target] });
     const child = spawn(process.execPath, [REMOVE_SCRIPT, '421'], {
       cwd: getFixture().repository,
       env: { ...process.env, ...shimEnvironment(shims), AMBERCAST_WT_SKIP_SETUP: '1' },
-      stdio: 'ignore',
+      stdio: ['ignore', 'ignore', 'pipe'],
     });
     const mutex = join(getFixture().receptacle, '.cleanup-lock');
+    let stderr = '';
+    child.stderr?.on('data', (chunk) => {
+      stderr += chunk;
+    });
 
     try {
       await waitFor(shims.ready);
       await chmod(join(mutex, 'transaction.json'), 0o400);
       await writeFile(shims.release, 'release');
       await new Promise<void>((resolveChild, rejectChild) => child.once('exit', (code) => code === 1 ? resolveChild() : rejectChild(new Error(`remover exited ${code}`))));
-      expect(existsSync(mutex)).toBe(true);
-      expect(JSON.parse(await readFile(join(mutex, 'transaction.json'), 'utf8'))).toMatchObject({ target });
+      expect(stderr).toContain('lock restoration succeeded');
+      expect(stderr).toContain('failed to update transaction journal');
+      expect(stderr).toMatch(/EACCES|permission/i);
+      expect(existsSync(mutex)).toBe(false);
       const registeredTarget = parseWorktreePorcelain(runGit(getFixture().repository, ['worktree', 'list', '--porcelain', '-z']))
         .find((worktree: { readonly path: string }) => worktree.path === target);
       expect(registeredTarget).toBeDefined();
-      expect(registeredTarget).not.toHaveProperty('locked');
+      expect(registeredTarget?.locked).toBe(originalLock);
+      expect(await readJsonLines(shims.gitLog)).toContainEqual(['worktree', 'lock', '--reason', originalLock, target]);
     } finally {
       await chmod(join(mutex, 'transaction.json'), 0o600).catch(() => undefined);
       if (child.exitCode === null) {
@@ -824,6 +922,124 @@ describe('worktree-remove locking, validation, and mutex contract', () => {
       }
     }
   }, 30_000);
+
+  it('retains the mutex without overwriting a mismatched lock reason', async () => {
+    const target = createWorktree('426');
+    const shims = await installCommandShims({
+      fail: [{ args: ['worktree', 'remove', target] }],
+      pauseBefore: ['worktree', 'remove', target],
+    });
+    const child = spawn(process.execPath, [REMOVE_SCRIPT, '426'], {
+      cwd: getFixture().repository,
+      env: { ...process.env, ...shimEnvironment(shims), AMBERCAST_WT_SKIP_SETUP: '1' },
+      stdio: 'ignore',
+    });
+
+    try {
+      await waitFor(shims.ready);
+      runGit(getFixture().repository, ['worktree', 'lock', '--reason', 'third-party reason', target]);
+      await writeFile(shims.release, 'release');
+      await new Promise<void>((resolveChild, rejectChild) => child.once('exit', (code) => code === 1 ? resolveChild() : rejectChild(new Error(`remover exited ${code}`))));
+      const mutex = join(getFixture().receptacle, '.cleanup-lock');
+      const journal = join(mutex, 'transaction.json');
+      expect(existsSync(mutex)).toBe(true);
+      expect(existsSync(journal)).toBe(true);
+      expect(parseWorktreePorcelain(runGit(getFixture().repository, ['worktree', 'list', '--porcelain', '-z']))
+        .find((worktree: { readonly path: string }) => worktree.path === target)?.locked).toBe('third-party reason');
+      const calls = await readJsonLines(shims.gitLog);
+      expect(calls.filter((args) => args[0] === 'worktree' && args[1] === 'lock')).toHaveLength(0);
+      expect(calls.filter((args) => args.join('\0') === 'worktree\0list\0--porcelain\0-z')).toHaveLength(3);
+    } finally {
+      if (child.exitCode === null) {
+        child.kill('SIGTERM');
+        await new Promise<void>((resolveChild) => child.once('exit', () => resolveChild()));
+      }
+    }
+  }, 30_000);
+
+  it('retains the mutex when the registered target drifts to another branch', async () => {
+    const target = createWorktree('427');
+    const shims = await installCommandShims({
+      fail: [{ args: ['worktree', 'remove', target] }],
+      pauseBefore: ['worktree', 'remove', target],
+    });
+    const child = spawn(process.execPath, [REMOVE_SCRIPT, '427'], {
+      cwd: getFixture().repository,
+      env: { ...process.env, ...shimEnvironment(shims), AMBERCAST_WT_SKIP_SETUP: '1' },
+      stdio: 'ignore',
+    });
+
+    try {
+      await waitFor(shims.ready);
+      runGit(target, ['switch', '-c', 'issues/427-drift']);
+      await writeFile(shims.release, 'release');
+      await new Promise<void>((resolveChild, rejectChild) => child.once('exit', (code) => code === 1 ? resolveChild() : rejectChild(new Error(`remover exited ${code}`))));
+      expect(existsSync(join(getFixture().receptacle, '.cleanup-lock'))).toBe(true);
+      expect(existsSync(join(getFixture().receptacle, '.cleanup-lock', 'transaction.json'))).toBe(true);
+      expect((await readJsonLines(shims.gitLog)).some((args) => args[0] === 'worktree' && args[1] === 'lock')).toBe(false);
+    } finally {
+      if (child.exitCode === null) {
+        child.kill('SIGTERM');
+        await new Promise<void>((resolveChild) => child.once('exit', () => resolveChild()));
+      }
+    }
+  }, 30_000);
+
+  it('retains the mutex when a registered target disappears from disk', async () => {
+    const target = createWorktree('428');
+    const shims = await installCommandShims({
+      fail: [{ args: ['worktree', 'remove', target] }],
+      pauseBefore: ['worktree', 'remove', target],
+    });
+    const child = spawn(process.execPath, [REMOVE_SCRIPT, '428'], {
+      cwd: getFixture().repository,
+      env: { ...process.env, ...shimEnvironment(shims), AMBERCAST_WT_SKIP_SETUP: '1' },
+      stdio: 'ignore',
+    });
+
+    try {
+      await waitFor(shims.ready);
+      await rm(target, { force: true, recursive: true });
+      await writeFile(shims.release, 'release');
+      await new Promise<void>((resolveChild, rejectChild) => child.once('exit', (code) => code === 1 ? resolveChild() : rejectChild(new Error(`remover exited ${code}`))));
+      expect(existsSync(join(getFixture().receptacle, '.cleanup-lock'))).toBe(true);
+      expect(existsSync(join(getFixture().receptacle, '.cleanup-lock', 'transaction.json'))).toBe(true);
+      expect((await readJsonLines(shims.gitLog)).some((args) => args[0] === 'worktree' && args[1] === 'lock')).toBe(false);
+    } finally {
+      if (child.exitCode === null) {
+        child.kill('SIGTERM');
+        await new Promise<void>((resolveChild) => child.once('exit', () => resolveChild()));
+      }
+    }
+  }, 30_000);
+
+  it('retains the mutex when the recovery inventory command fails', async () => {
+    const target = createWorktree('429');
+    const shims = await installCommandShims({
+      fail: [{ args: ['worktree', 'remove', target] }],
+      failOnOccurrence: { args: ['worktree', 'list', '--porcelain', '-z'], occurrence: 3 },
+    });
+
+    expect(expectScriptFailure(() => runRemove(['429'], { environment: shimEnvironment(shims) }))).toMatch(/remove/i);
+    expect(existsSync(join(getFixture().receptacle, '.cleanup-lock'))).toBe(true);
+    expect(JSON.parse(await readFile(join(getFixture().receptacle, '.cleanup-lock', 'transaction.json'), 'utf8'))).toMatchObject({ target });
+  });
+
+  it('locks a detached worktree with matching branchless identity after removal failure', async () => {
+    const target = worktreePath('430');
+    await mkdir(getFixture().receptacle, { recursive: true });
+    runGit(getFixture().repository, ['worktree', 'add', '--detach', target, 'HEAD']);
+    const shims = await installCommandShims({ fail: [{ args: ['worktree', 'remove', target] }] });
+
+    expect(expectScriptFailure(() => runRemove([target], { environment: shimEnvironment(shims) }))).toMatch(/remove/i);
+    expect(parseWorktreePorcelain(runGit(getFixture().repository, ['worktree', 'list', '--porcelain', '-z']))).toContainEqual(
+      expect.objectContaining({ path: target, locked: true }),
+    );
+    expect((await readJsonLines(shims.gitLog)).filter((args) => args[0] === 'worktree' && args[1] === 'lock')).toEqual([
+      ['worktree', 'lock', target],
+    ]);
+    expect(existsSync(join(getFixture().receptacle, '.cleanup-lock'))).toBe(false);
+  });
 
   it('restores string and bare locks after a failed remove, reporting restoration success', async () => {
     const stringTarget = createUnlockedWorktree('408');
@@ -969,7 +1185,7 @@ describe('worktree-remove locking, validation, and mutex contract', () => {
     expect(existsSync(join(getFixture().receptacle, '.cleanup-lock'))).toBe(false);
   }, 30_000);
 
-  it('keeps a legacy-unlocked worktree unlocked and releases its mutex after a failed removal', async () => {
+  it('locks a previously-unlocked worktree that survives a failed removal and releases its mutex', async () => {
     const target = worktreePath('418');
     await mkdir(getFixture().receptacle, { recursive: true });
     runGit(getFixture().repository, ['worktree', 'add', '-b', 'issues/418', target]);
@@ -977,11 +1193,12 @@ describe('worktree-remove locking, validation, and mutex contract', () => {
 
     expect(expectScriptFailure(() => runRemove(['418'], { environment: shimEnvironment(shims) }))).toMatch(/remove/i);
     const calls = await readJsonLines(shims.gitLog);
-    expect(calls.some((args) => args[0] === 'worktree' && args[1] === 'lock')).toBe(false);
+    const relocks = calls.filter((args) => args[0] === 'worktree' && args[1] === 'lock');
+    expect(relocks).toEqual([['worktree', 'lock', target]]);
     expect(existsSync(join(getFixture().receptacle, '.cleanup-lock'))).toBe(false);
     expect(existsSync(join(getFixture().receptacle, '.cleanup-lock', 'transaction.json'))).toBe(false);
     expect(parseWorktreePorcelain(runGit(getFixture().repository, ['worktree', 'list', '--porcelain', '-z']))).toContainEqual(
-      expect.objectContaining({ path: target }),
+      expect.objectContaining({ path: target, locked: true }),
     );
   });
 

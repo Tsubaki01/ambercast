@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { realpathSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { basename, isAbsolute, relative, resolve, sep } from 'node:path';
 
 /**
@@ -194,6 +194,90 @@ export function resolveCwdRealpath(options = {}) {
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error : new Error(String(error)) };
   }
+}
+
+/**
+ * Classifies a failed removal's target identity and lock evidence, restoring a
+ * lock only when fresh evidence identifies an eligible unlocked target.
+ *
+ * @remarks
+ * SPEC-G3a/b for issue #241 classifies the target from fresh Git inventory,
+ * physical presence, and branch identity: absent from both is gone; a path
+ * present only on disk, registered only in Git, or registered for a different
+ * branch is unknown; the remaining same-path, same-branch, present case is
+ * eligible for locking. An existing lock short-circuits only when it exactly
+ * equals the expected terminal value, preserving a reason byte-for-byte and
+ * treating both an unlocked target and a bare original lock as a bare lock.
+ *
+ * Injectable functions are a second parameter, following
+ * `resolveCwdRealpath(options = {})`, so tests can exercise inventory,
+ * presence, and lock-command failures without widening the specified target
+ * identity contract. The operation is total: every internal failure becomes
+ * `state: 'unknown'` rather than escaping the recovery boundary.
+ *
+ * @param {{ targetPath: string, expectedBranch?: string, originalLock?: true | string }} target - Target identity and its pre-recovery lock value.
+ * @param {{ listWorktreesFn?: typeof listWorktrees, existsFn?: typeof import('node:fs').existsSync, runGitFn?: typeof runGit }} [seams={}] - Test-only functions defaulting to the shared inventory, presence, and Git helpers.
+ * @returns {{ state: 'locked' | 'unknown' | 'gone', detail: string }} A terminal state: `locked` confirms the matching lock, `unknown` leaves identity or lock evidence unresolved, and `gone` confirms absence from both inventory and disk. `detail` supplies an operator-facing diagnostic; callers derive mutex and journal disposition from `state === 'locked'`.
+ * @example
+ * ensureTargetLocked({ targetPath: '/worktrees/issues-241', expectedBranch: 'issues/241' });
+ */
+export function ensureTargetLocked({ targetPath, expectedBranch, originalLock }, seams = {}) {
+  const {
+    listWorktreesFn = listWorktrees,
+    existsFn = existsSync,
+    runGitFn = runGit,
+  } = seams;
+  let worktrees;
+
+  try {
+    worktrees = listWorktreesFn();
+  } catch (error) {
+    return { state: 'unknown', detail: `Unable to confirm target identity: ${getErrorMessage(error)}` };
+  }
+
+  const registeredTarget = worktrees.find((worktree) => worktree.path === targetPath);
+  let present;
+
+  try {
+    present = existsFn(targetPath);
+  } catch (error) {
+    return { state: 'unknown', detail: `Unable to confirm target presence: ${getErrorMessage(error)}` };
+  }
+
+  if (registeredTarget === undefined) {
+    return present
+      ? { state: 'unknown', detail: 'target path exists but is no longer a registered worktree' }
+      : { state: 'gone', detail: 'target is no longer registered or present' };
+  }
+
+  if (!present) {
+    return { state: 'unknown', detail: 'target is registered but not present on disk' };
+  }
+
+  if (registeredTarget.branch !== expectedBranch) {
+    return { state: 'unknown', detail: 'registered branch does not match the expected target identity' };
+  }
+
+  const expectedLock = originalLock === undefined || originalLock === true ? true : originalLock;
+  if (registeredTarget.locked !== undefined) {
+    return registeredTarget.locked === expectedLock
+      ? { state: 'locked', detail: 'target remains locked' }
+      : { state: 'unknown', detail: 'target is locked but not with the expected reason; leaving it untouched' };
+  }
+
+  const lockArgs = ['worktree', 'lock'];
+  if (typeof expectedLock === 'string') {
+    lockArgs.push('--reason', expectedLock);
+  }
+  lockArgs.push(targetPath);
+
+  try {
+    runGitFn(lockArgs);
+  } catch (error) {
+    return { state: 'unknown', detail: `failed to restore lock: ${getErrorMessage(error)}` };
+  }
+
+  return { state: 'locked', detail: 'lock restoration succeeded' };
 }
 
 /**
