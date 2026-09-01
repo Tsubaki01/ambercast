@@ -49,6 +49,11 @@ const replayRunObserver = vi.hoisted(() => ({
   afterRun: undefined as undefined | ((deps: Pick<HealDeps, 'layout' | 'runId'>, storage: StorageAdapter, options: { readonly files: readonly string[]; readonly cacheOnly?: boolean }, outcome: RunOutcome) => void | Promise<void>),
 }));
 
+const generateRunObserver = vi.hoisted(() => ({
+  rejectWith: undefined as Error | undefined,
+  afterGenerate: undefined as undefined | ((outcome: Awaited<ReturnType<typeof import('#usecases/generate.js').generate>>) => void | Promise<void>),
+}));
+
 vi.mock('#usecases/run.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('#usecases/run.js')>();
   return {
@@ -61,7 +66,24 @@ vi.mock('#usecases/run.js', async (importOriginal) => {
   };
 });
 
-afterEach(() => { replayRunObserver.afterRun = undefined; });
+vi.mock('#usecases/generate.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('#usecases/generate.js')>();
+  return {
+    ...actual,
+    generate: async (...args: Parameters<typeof actual.generate>) => {
+      if (generateRunObserver.rejectWith !== undefined) throw generateRunObserver.rejectWith;
+      const outcome = await actual.generate(...args);
+      await generateRunObserver.afterGenerate?.(outcome);
+      return outcome;
+    },
+  };
+});
+
+afterEach(() => {
+  replayRunObserver.afterRun = undefined;
+  generateRunObserver.rejectWith = undefined;
+  generateRunObserver.afterGenerate = undefined;
+});
 
 const PLAN = '/workspace/tests/login.ambercast.plan.json';
 const GROUNDING = '/workspace/tests/login.ambercast.grounding.json';
@@ -528,6 +550,49 @@ describe('heal state-machine contract', () => {
     expect(result.commits.size).toBe(0);
   });
 
+  it('fails closed when a Stage-2 candidate replay carries a PlanNavigationResolutionError subclass', async () => {
+    class TestSubclassNavigationError extends PlanNavigationResolutionError {}
+
+    const originalUrl = '/p239original';
+    const candidateUrl = '/p239candidate';
+    const violation = new TestSubclassNavigationError('The subclassed navigation failure escaped the Stage-2 candidate replay.');
+    const recording = createRecordingEventSink();
+    const candidate: GeneratedPlanResponse = {
+      steps: [{ id: 'repair-me', kind: 'action', action: 'navigate', url: candidateUrl }], ambiguities: [],
+    };
+    const scenario = await createScenario({
+      steps: [
+        Step.parse({ id: 'repair-me', kind: 'action', action: 'navigate', url: originalUrl }),
+        Step.parse({ id: 'after-repair', kind: 'assert', check: 'text-visible', text: 'Dashboard' }),
+      ],
+      grounding: {},
+      aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: candidate, raw: JSON.stringify(candidate) }) }),
+      assertOutcome: { passed: false, message: 'Dashboard is absent.' },
+      browserDriver: vi.fn<HealDeps['browserDriver']>(() => createFakeBrowserDriver(() => createFakeBrowserSession(new Map(), {
+        baseUrl: TARGETS.web.baseUrl,
+        currentUrl: TARGETS.web.baseUrl,
+        snapshot: healSnapshot(new Map()),
+        onPerform() { throw new Error('The Stage-2 navigation fixture must remain at its failing frontier.'); },
+      }))),
+    });
+    let dispatchEventsAtInjection: readonly RunEvent[] | undefined;
+    let injected = false;
+    replayRunObserver.afterRun = async (_deps, storage, _options, outcome) => {
+      const candidatePlan = await storage.readText(PLAN);
+      if (!candidatePlan.includes(candidateUrl)) return;
+
+      dispatchEventsAtInjection = recording.emitted().filter((event) => event.type === 'ai-call' || event.type === 'heal-stage2-rejected');
+      (outcome.results[0] as { error?: IntegrityViolationError } | undefined)!.error = violation;
+      injected = true;
+    };
+
+    const result = await heal({ ...scenario.deps, events: recording.sink }, OPTIONS);
+
+    expect(injected).toBe(true);
+    expect(recording.emitted().filter((event) => event.type === 'ai-call' || event.type === 'heal-stage2-rejected')).toEqual(dispatchEventsAtInjection);
+    expectCaseScopedIntegrityFailure(result, violation);
+  });
+
   it('aborts at the Stage-3 replay when its replay carries an integrity violation', async () => {
     const violation = new IntegrityViolationError('stage three evidence escaped containment');
     const invalidStage2: GeneratedPlanResponse = { steps: [{ id: 'wrong-id', kind: 'action', action: 'click', target: SUBMIT }], ambiguities: [] };
@@ -545,10 +610,12 @@ describe('heal state-machine contract', () => {
     expect(calls()).toBe(4);
   });
 
-  it('does not absorb an IntegrityViolationError thrown directly by Stage-3 generation', async () => {
+  it('does not absorb an IntegrityViolationError via GenerateFileOutcome.error from Stage-3 generation', async () => {
     const violation = new IntegrityViolationError('Stage three generator crossed a containment boundary');
     const invalidStage2: GeneratedPlanResponse = { steps: [{ id: 'wrong-id', kind: 'action', action: 'click', target: SUBMIT }], ambiguities: [] };
     let generation = 0;
+    let generatedItem: { readonly status: string; readonly error?: unknown } | undefined;
+    generateRunObserver.afterGenerate = (outcome) => { generatedItem = outcome.results[0]; };
     const scenario = await createScenario({
       grounding: {},
       aiExecutor: createFakeAiExecutor({ execute: async () => {
@@ -560,12 +627,15 @@ describe('heal state-machine contract', () => {
     const result = await heal(scenario.deps, OPTIONS);
 
     expectCaseScopedIntegrityFailure(result, violation);
+    expect(generatedItem).toMatchObject({ status: 'failed', error: violation });
   });
 
-  it('does not absorb an exact PlanNavigationResolutionError from Stage-3 generation', async () => {
+  it('does not absorb an exact PlanNavigationResolutionError via GenerateFileOutcome.error from Stage-3 generation', async () => {
     const violation = new PlanNavigationResolutionError('Stage three generation produced a navigation-resolution failure.');
     const invalidStage2: GeneratedPlanResponse = { steps: [{ id: 'wrong-id', kind: 'action', action: 'click', target: SUBMIT }], ambiguities: [] };
     let generation = 0;
+    let generatedItem: { readonly status: string; readonly error?: unknown } | undefined;
+    generateRunObserver.afterGenerate = (outcome) => { generatedItem = outcome.results[0]; };
     const scenario = await createScenario({
       grounding: {},
       aiExecutor: createFakeAiExecutor({ execute: async () => {
@@ -577,14 +647,17 @@ describe('heal state-machine contract', () => {
     const result = await heal(scenario.deps, OPTIONS);
 
     expectCaseScopedIntegrityFailure(result, violation);
+    expect(generatedItem).toMatchObject({ status: 'failed', error: violation });
   });
 
-  it('does not absorb a PlanNavigationResolutionError subclass from Stage-3 generation', async () => {
+  it('does not absorb a PlanNavigationResolutionError subclass via GenerateFileOutcome.error from Stage-3 generation', async () => {
     class TestIntegritySubclass extends PlanNavigationResolutionError {}
 
     const violation = new TestIntegritySubclass('Stage three generation produced a subclassed navigation-resolution failure.');
     const invalidStage2: GeneratedPlanResponse = { steps: [{ id: 'wrong-id', kind: 'action', action: 'click', target: SUBMIT }], ambiguities: [] };
     let generation = 0;
+    let generatedItem: { readonly status: string; readonly error?: unknown } | undefined;
+    generateRunObserver.afterGenerate = (outcome) => { generatedItem = outcome.results[0]; };
     const scenario = await createScenario({
       grounding: {},
       aiExecutor: createFakeAiExecutor({ execute: async () => {
@@ -595,6 +668,28 @@ describe('heal state-machine contract', () => {
 
     const result = await heal(scenario.deps, OPTIONS);
 
+    expectCaseScopedIntegrityFailure(result, violation);
+    expect(generatedItem).toMatchObject({ status: 'failed', error: violation });
+  });
+
+  it('fails closed when generate() itself rejects before producing a GenerateFileOutcome', async () => {
+    const violation = new IntegrityViolationError('Stage three generation rejected before producing an outcome.');
+    const invalidStage2: GeneratedPlanResponse = { steps: [{ id: 'wrong-id', kind: 'action', action: 'click', target: SUBMIT }], ambiguities: [] };
+    let generation = 0;
+    let afterGenerateRan = false;
+    generateRunObserver.rejectWith = violation;
+    generateRunObserver.afterGenerate = () => { afterGenerateRan = true; };
+    const scenario = await createScenario({
+      grounding: {},
+      aiExecutor: createFakeAiExecutor({ execute: async () => {
+        if (generation++ === 0) return { data: invalidStage2, raw: '{}' };
+        throw new Error('The mocked generate() rejection must happen before this executor call.');
+      } }),
+    });
+
+    const result = await heal(scenario.deps, OPTIONS);
+
+    expect(afterGenerateRan).toBe(false);
     expectCaseScopedIntegrityFailure(result, violation);
   });
 
@@ -1856,13 +1951,19 @@ describe('heal state-machine contract', () => {
   });
 
   it('restores both buffered artifacts before emitting a no-advance rejection', async () => {
+    const originalUrl = '/p239g5c-original';
+    const candidateUrl = '/p239g5c-candidate';
     const recording = createRecordingEventSink();
     let stageTwoStorage: StorageAdapter | undefined;
     let completedReplays = 0;
+    let observedCandidateBytes = false;
+    let originalPlan!: string;
     let artifactsObservedAtRejection: Promise<readonly [string, string]> | undefined;
-    replayRunObserver.afterRun = (_deps, storage) => {
+    replayRunObserver.afterRun = async (_deps, storage) => {
       completedReplays += 1;
       if (completedReplays === 2) stageTwoStorage = storage;
+      const currentPlan = await storage.readText(PLAN);
+      if (currentPlan.includes(candidateUrl)) observedCandidateBytes = true;
     };
     const events: EventSink = {
       emit(event: RunEvent): void {
@@ -1877,17 +1978,24 @@ describe('heal state-machine contract', () => {
         recording.sink.emit(event);
       },
     };
-    const response = { steps: [{ id: 'repair-me', kind: 'action', action: 'navigate', url: 'http://[' }], ambiguities: [] };
+    const response = { steps: [{ id: 'repair-me', kind: 'action', action: 'navigate', url: candidateUrl }], ambiguities: [] };
     const scenario = await createScenario({
-      steps: [Step.parse({ id: 'repair-me', kind: 'action', action: 'navigate', url: 'http://[' })],
+      steps: [Step.parse({ id: 'repair-me', kind: 'action', action: 'navigate', url: originalUrl })],
       grounding: {},
       aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: response, raw: JSON.stringify(response) }) }),
+      browserDriver: vi.fn<HealDeps['browserDriver']>(() => createFakeBrowserDriver(() => createFakeBrowserSession(new Map(), {
+        baseUrl: TARGETS.web.baseUrl,
+        currentUrl: TARGETS.web.baseUrl,
+        snapshot: healSnapshot(new Map()),
+        onPerform() { throw new Error('The Stage-2 navigation fixture must remain at its failing frontier.'); },
+      }))),
     });
-    const originalPlan = await scenario.storage.readText(PLAN);
+    originalPlan = await scenario.storage.readText(PLAN);
     const originalGrounding = await scenario.storage.readText(GROUNDING);
 
     await heal({ ...scenario.deps, events }, OPTIONS);
 
+    expect(observedCandidateBytes).toBe(true);
     expect(recording.emitted()).toContainEqual({ type: 'heal-stage2-rejected', stepId: 'repair-me', reason: 'no-advance' });
     expect(artifactsObservedAtRejection).toBeDefined();
     await expect(artifactsObservedAtRejection).resolves.toEqual([originalPlan, originalGrounding]);
@@ -2552,6 +2660,39 @@ describe('heal state-machine contract', () => {
     });
     const result = await heal({ ...scenario.deps, config: { ...scenario.deps.config, heal: { caseTimeoutMs: 300_000, maxStepRepairs: 1 } } }, OPTIONS);
     expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'unresolved', stopReason: 'attempt-limit' });
+  });
+
+  it('keeps attempt-limit precedence when the initial live measurement embeds a repairable navigation error', async () => {
+    const violation = new PlanNavigationResolutionError('The initial live measurement retained a repairable navigation error.');
+    const execute = vi.fn(async (request: { readonly prompt: string; readonly context?: unknown }) => {
+      if (request.prompt.startsWith('Confirm whether')) return { data: { confirmed: true }, raw: '{}' };
+      if (stage2Frontier(request)?.index === 0) return { data: { steps: [{ id: 'click-submit', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [] }, raw: '{}' };
+      throw new Error('Stage 3 remains unresolved.');
+    });
+    const scenario = await createScenario({
+      steps: [
+        Step.parse({ id: 'click-submit', kind: 'action', action: 'click', target: SUBMIT }),
+        Step.parse({ id: 'click-after', kind: 'action', action: 'click', target: AFTER_SUBMIT }),
+      ],
+      sessionEntries: new Map([
+        [elementRefKey(SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }],
+        [elementRefKey(AFTER_SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }],
+        ...liveEntries(REPAIRED_SUBMIT),
+      ]),
+      aiExecutor: createFakeAiExecutor({ execute }),
+    });
+    let replayCalls = 0;
+    replayRunObserver.afterRun = (_deps, _storage, options, outcome) => {
+      replayCalls += 1;
+      if (replayCalls === 2 && options.cacheOnly === false) {
+        (outcome.results[0] as { error?: IntegrityViolationError } | undefined)!.error = violation;
+      }
+    };
+
+    const result = await heal({ ...scenario.deps, config: { ...scenario.deps.config, heal: { caseTimeoutMs: 300_000, maxStepRepairs: 1 } } }, OPTIONS);
+
+    expect(result.outcome.results[0]).toMatchObject({ stopReason: 'attempt-limit' });
+    expect(result.outcome.errors).toEqual([]);
   });
 
   it('reports partially-healed when a first Stage 2 advance exhausts the next frontier allowance', async () => {
