@@ -196,6 +196,71 @@ describe('scanSchemaVersionLiteralViolations()', () => {
     expect(await scan('interface Recursive<T extends Recursive<T>> { next?: T; } function value<T extends Recursive<T>>(schemaVersion: T) { return { schemaVersion }; }')).toEqual([]);
   });
 
+  test.each([
+    ['an as-any assertion', "const value = { schemaVersion: '2' as any };"],
+    ['an as-unknown assertion', "const value = { schemaVersion: '2' as unknown };"],
+    ['an as-unknown-as-number assertion', "const value = { schemaVersion: '2' as unknown as number };"],
+  ])('rejects %s without unwrapping its asserted type', async (_name, source) => {
+    await expectOneFromSource(source, { line: 1, column: source.indexOf('schemaVersion') + 1 });
+  });
+
+  test('rejects a non-null-asserted unknown source', async () => {
+    const source = 'declare const value: unknown; const result = { schemaVersion: value! };';
+    await expectOneFromSource(source, { line: 1, column: source.indexOf('schemaVersion') + 1 });
+  });
+
+  test.each([
+    ['a parenthesized non-null assertion', 'declare const value: unknown; const result = { schemaVersion: (value!) };'],
+    ['a repeated non-null assertion', 'declare const value: unknown; const result = { schemaVersion: value!! };'],
+  ])('rejects %s of an unknown source', async (_name, source) => {
+    await expectOneFromSource(source, { line: 1, column: source.indexOf('schemaVersion') + 1 });
+  });
+
+  test.each([
+    ['a number-like constraint', "function value<T extends { v: number }>(source: T['v']) { return { schemaVersion: source }; }", true],
+    ['an unresolvable constraint', "function value<T extends Record<string, unknown>, K extends string>(source: T[K]) { return { schemaVersion: source }; }", true],
+    ['a circular constraint', "function value<T extends { v: T }>(source: T['v']) { return { schemaVersion: source }; }", true],
+    ['a string-only constraint', "function value<T extends { v: string }>(source: T['v']) { return { schemaVersion: source }; }", false],
+    ['a finite literal index parameter with only string properties', "function value<T extends Record<'a' | 'b', string>, K extends 'a' | 'b'>(source: T[K]) { return { schemaVersion: source }; }", false],
+    ['a finite literal index parameter with a number-like candidate', "function value<T extends { a: string; b: number }, K extends 'a' | 'b'>(source: T[K]) { return { schemaVersion: source }; }", true],
+  ])('handles IndexedAccess sources with %s', async (_name, source, rejected) => {
+    const result = await scan(source);
+    if (rejected) {
+      expectOne(result, { line: 1, column: source.indexOf('schemaVersion') + 1 });
+    } else {
+      expect(result).toEqual([]);
+    }
+  });
+
+  test('allows an exact namespace-bracket authority source', async () => {
+    expect(await scan("import * as Schema from '../core/ir/schema.js'; const value = { schemaVersion: Schema['PLAN_SCHEMA_VERSION'] };"))
+      .toEqual([]);
+  });
+
+  test.each([
+    ['a union that can select an authority and another export', "import * as Schema from '../core/ir/schema.js'; declare const key: 'PLAN_SCHEMA_VERSION' | 'OTHER'; const value = { schemaVersion: Schema[key] };", true],
+    ['a key narrowed to just the authority', "import * as Schema from '../core/ir/schema.js'; const key = 'PLAN_SCHEMA_VERSION' as const; const value = { schemaVersion: Schema[key] };", false],
+  ])('requires exact identity for %s', async (_name, source, rejected) => {
+    const schemaSource = `${authority}\nexport const OTHER = 3 as const;`;
+    const result = await scan(source, schemaSource);
+    if (rejected) {
+      expectOne(result, { line: 1, column: source.indexOf('schemaVersion') + 1 });
+    } else {
+      expect(result).toEqual([]);
+    }
+  });
+
+  test.each([
+    ['a const-bound key', "const key = 'schemaVersion' as const; const value = { [key]: 2 };"],
+    ['a finite-union key', "declare const key: 'schemaVersion' | 'other'; const value = { [key]: 2 };"],
+  ])('recognizes %s as a schemaVersion sink', async (_name, source) => {
+    await expectOneFromSource(source, { line: 1, column: source.indexOf('[key]') + 1 });
+  });
+
+  test('does not treat a bare local schemaVersion identifier as a property access', async () => {
+    expect(await scan('const schemaVersion = 2; void (schemaVersion === 2);')).toEqual([]);
+  });
+
   test('reports exact report-node coordinates for every sink family', async () => {
     expectOne(await scan('const value = { schemaVersion: 2 };'), { line: 1, column: 17 });
     expectOne(await scan('const schemaVersion = 2; const value = { schemaVersion };'), { line: 1, column: 42 });

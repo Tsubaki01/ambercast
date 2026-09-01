@@ -152,6 +152,23 @@ describe('supervised process spawning', () => {
     expect(signalsSent(kill)).toEqual([]);
   });
 
+  it('bounds termination to a rejection when close never fires after a spawn failure', async () => {
+    const kill = vi.spyOn(process, 'kill');
+    const invocation = track(spawnSupervised('/definitely/not/an-ambercast-command', [], process.cwd(), process.env, shortTimings));
+    // Starves the module's own 'close' listener before any event can reach
+    // it: spawn failures only emit events asynchronously, so removing every
+    // 'close' listener synchronously, in the same tick spawnSupervised
+    // returns in, is a real (not mocked) way to simulate the abnormal
+    // runtime where 'close' never arrives, without touching 'error' or
+    // changing any public signature.
+    invocation.child.removeAllListeners('close');
+
+    await expect(invocation.result).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(invocation.terminateAndConfirm()).rejects.toThrow(/did not confirm termination/i);
+    expect(invocation.terminated()).toBe(false);
+    expect(signalsSent(kill)).toEqual([]);
+  });
+
   it('settles once when close races the watchdog deadline', async () => {
     const kill = vi.spyOn(process, 'kill');
     const invocation = track(spawnSupervised(process.execPath, childScript('setTimeout(() => process.exit(0), 25)'), process.cwd(), process.env, naturalExitTimings));

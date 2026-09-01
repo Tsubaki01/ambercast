@@ -57,9 +57,7 @@ export function scanIntegrityViolationInventory(
    * exact-match assertion in `test/architecture.test.ts` enumerates every
    * caller precisely. Any new caller anywhere in the program changes this
    * inventory and requires that assertion, and a conscious review of the new
-   * call site, to be updated. `heal-ai-dispatch-budget.ts` belongs to a
-   * separately governed admission-decision boundary, distinct from the
-   * replay-observed allowlist this scan confines.
+   * call site, to be updated.
    *
    * As a documented boundary, call-expression callees resolve with the same
    * coverage as `checkpoints`: renamed imports, namespace-qualified calls,
