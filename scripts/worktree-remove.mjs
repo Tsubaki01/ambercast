@@ -5,7 +5,7 @@
 import { execFileSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { relative, resolve } from 'node:path';
-import { fail, getErrorMessage, isSameOrDescendant, isStrictDescendant, listWorktrees, resolveCwdRealpath, resolveMainWorktree, resolveReceptacle, runGit } from './lib/worktree.mjs';
+import { ensureTargetLocked, fail, getErrorMessage, isSameOrDescendant, isStrictDescendant, listWorktrees, resolveCwdRealpath, resolveMainWorktree, resolveReceptacle, runGit } from './lib/worktree.mjs';
 
 const USAGE = 'Usage: node scripts/worktree-remove.mjs <issue-number|worktree-path> [--force] [--with-branch]';
 const ISSUE_NUMBER = /^[1-9]\d*$/;
@@ -68,7 +68,9 @@ function selectWorktree(target, worktrees) {
 // than being misreported as competition. The successful acquirer is its sole
 // owner, so rejected competitors never release another invocation's mutex. A
 // surviving journal is operator evidence, not crash recovery, in this
-// single-OS-user tool.
+// single-OS-user tool. SIGKILL and OS crashes cannot run recovery, so a
+// surviving mutex or journal after either stop is fail-closed operator evidence,
+// not a recovery bug.
 function acquireCleanupMutex(receptacle) {
   const mutex = resolve(receptacle, '.cleanup-lock');
   try {
@@ -205,15 +207,11 @@ function removeBranch(branch, force) {
 }
 
 // Refreshing the inventory under the mutex prevents stale target and lock data
-// from defining a transaction. The recorded lock state is the restoration
-// invariant; unlock failures remain fatal because inventory, not stderr
-// wording, is authoritative.
-//
-// Journal phases preserve the target and original lock as operator evidence.
-// A failed removal restores that lock only while the target remains present;
-// successful removal, pre-destruction refusal, and successful restoration are
-// releasable states. Degraded outcomes retain the mutex and journal because
-// this single-user tool has no automatic crash recovery.
+// from defining a transaction. Once recovery is armed before the first
+// mutation, one catch covers every synchronous failure through branch removal.
+// It retains the mutex by default and releases it only after full success or a
+// confirmed locked terminal state, so degraded outcomes remain operator
+// evidence in this single-user tool with no automatic crash recovery.
 function main() {
   const parsed = parseArguments(process.argv.slice(2));
   if (parsed === undefined) {
@@ -249,53 +247,51 @@ function main() {
     const writeJournal = () => writeFileSync(resolve(cleanupMutex, 'transaction.json'), JSON.stringify({ target: targetWorktree.path, originalLock: originalLock ?? null, phase }));
     writeJournal();
 
-    if (originalLock !== undefined) {
-      runGit(['worktree', 'unlock', targetWorktree.path]);
-      releaseMutex = false;
-    }
-    phase = 'unlocked';
-    writeJournal();
-
+    // Arm before the first mutation so an unlock or journal failure cannot
+    // inherit the declaration-time releasable default by accident.
     releaseMutex = false;
     try {
+      if (originalLock !== undefined) {
+        runGit(['worktree', 'unlock', targetWorktree.path]);
+      }
+      phase = 'unlocked';
+      writeJournal();
+
       removeWorktree(targetWorktree.path, parsed.force);
-    } catch (removeError) {
-      if (!existsSync(targetWorktree.path)) {
-        throw new Error(`Failed to remove worktree: ${getErrorMessage(removeError)}`);
+
+      phase = 'removed';
+      writeJournal();
+      if (parsed.withBranch && targetWorktree.branch !== undefined) {
+        removeBranch(targetWorktree.branch, parsed.force);
       }
 
-      if (originalLock !== undefined) {
-        try {
-          runGit(originalLock === true
-            ? ['worktree', 'lock', targetWorktree.path]
-            : ['worktree', 'lock', '--reason', originalLock, targetWorktree.path]);
-          releaseMutex = true;
-        } catch (relockError) {
-          throw new Error(`Failed to remove worktree: ${getErrorMessage(removeError)}; failed to restore lock: ${getErrorMessage(relockError)}`);
-        }
+      console.log(`Removed worktree: ${targetWorktree.path}`);
+      releaseMutex = true;
+    } catch (primaryError) {
+      // One catch preserves the primary failure while recovery classifies fresh
+      // identity evidence instead of inferring a terminal state from its wording.
+      const recovery = ensureTargetLocked({
+        targetPath: targetWorktree.path,
+        expectedBranch: targetWorktree.branch,
+        originalLock,
+      });
+      releaseMutex = recovery.state === 'locked';
 
+      if (recovery.state === 'locked') {
         phase = 'relocked';
         try {
           writeJournal();
         } catch (journalError) {
-          throw new Error(`Failed to remove worktree: ${getErrorMessage(removeError)}; lock restoration succeeded; failed to update transaction journal: ${getErrorMessage(journalError)}`);
+          // A confirmed lock remains releasable even when its journal update
+          // fails, so both independent errors remain visible to the operator.
+          throw new Error(`${getErrorMessage(primaryError)}; ${recovery.detail}; failed to update transaction journal: ${getErrorMessage(journalError)}`);
         }
-        throw new Error(`Failed to remove worktree: ${getErrorMessage(removeError)}; lock restoration succeeded.`);
-      } else {
-        releaseMutex = true;
       }
 
-      throw removeError;
+      // The primary command already identifies its failed subcommand, while
+      // recovery contributes the only additional terminal-state context needed.
+      throw new Error(`${getErrorMessage(primaryError)}; ${recovery.detail}.`);
     }
-
-    phase = 'removed';
-    writeJournal();
-    if (parsed.withBranch && targetWorktree.branch !== undefined) {
-      removeBranch(targetWorktree.branch, parsed.force);
-    }
-
-    console.log(`Removed worktree: ${targetWorktree.path}`);
-    releaseMutex = true;
   } finally {
     if (releaseMutex) {
       try {
