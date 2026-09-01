@@ -730,9 +730,9 @@ export function claimedRetainedGrantOffsets(
  * event. This function's `ai-call` becomes observable by the real sink only
  * when its named dispatch is admitted, and that admitted event remains there
  * even if a later dispatch denies the phase. A denied dispatch discards only
- * its own still-pending event. The rejection recorded by `reject()` follows
- * the same phase-final decision: it flushes once for an admitted phase and is
- * discarded when that phase is denied.
+ * its own still-pending event. The rejection recorded by `reject()` flushes
+ * only for a `completed` phase whose result is a successful value and is
+ * discarded when the phase is denied or ends in `integrity-failure`.
  */
 async function trySingleStepRepair(
   deps: HealDeps,
@@ -1006,6 +1006,13 @@ function caseOutcome(
  * pass, resource-bound, and Stage-3 states are classified from the retained
  * measurement and stop reason, keeping measured progress separate from why
  * iteration stopped.
+ *
+ * Each status switch is deliberately limited to status arbitration and value
+ * extraction. Because a switch is itself a break target, placing repair-loop
+ * exit control in a case would silently keep the repair loop running instead
+ * of stopping it. The two arbitration points nested in the repair loop
+ * therefore use `break repairLoop`; an unlabeled `break` there would be
+ * consumed by the switch.
  */
 async function healCase(deps: HealDeps, options: HealOptions, file: string): Promise<CaseProcessingResult> {
   const planFile = deps.layout.planPathFor(file);
@@ -1025,6 +1032,7 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
     deadlineMs: deadline,
     maxDispatches: caseDeps.config.heal.maxStepRepairs ?? Infinity,
   });
+  const assertNever = (value: never): never => { throw new Error(`Unreachable dispatch-budget phase status: ${String(value)}`); };
   const cacheBaseline = await measureReplay(caseDeps, options, file, overlay, plan, true, nextAttemptOrdinal());
   if (cacheBaseline.interrupted) return cacheBaseline;
   let measurement = cacheBaseline;
@@ -1041,15 +1049,26 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
       false,
       nextAttemptOrdinal(),
     ));
-    if (!initial.admitted) {
-      overlay.restore(snapshot);
-      stopReason = initial.deniedReason;
-    } else if (!initial.result.ok) {
-      throw initial.result.error;
-    } else {
-      const initialMeasurement = initial.result.value;
-      if (initialMeasurement.interrupted) return initialMeasurement;
-      measurement = initialMeasurement;
+    switch (initial.status) {
+      case 'denied': {
+        overlay.restore(snapshot);
+        stopReason = initial.deniedReason;
+        break;
+      }
+      case 'integrity-failure': {
+        overlay.restore(snapshot);
+        throw initial.error;
+      }
+      case 'completed': {
+        if (!initial.result.ok) throw initial.result.error;
+        const initialMeasurement = initial.result.value;
+        if (initialMeasurement.interrupted) return initialMeasurement;
+        measurement = initialMeasurement;
+        break;
+      }
+      default: {
+        return assertNever(initial);
+      }
     }
   }
   const caseBaseline = { plan: preflight.plan, measurement: cacheBaseline };
@@ -1061,7 +1080,7 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
   const visitedFrontiers = new Set<number>();
   const repairHistory: RepairHistoryEntry[] = [];
 
-  while (stage3Required && stopReason === 'settled') {
+  repairLoop: while (stage3Required && stopReason === 'settled') {
     if (measurement.firstFailureIndex === plan.steps.length) {
       stage3Required = false;
       stopReason = 'settled';
@@ -1075,15 +1094,27 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
     const stage1 = await budget.runPhase('incremental', (phaseDeps) => tryGroundingRepair(
       { ...caseDeps, resolveAiExecutor: phaseDeps.resolveAiExecutor, events: phaseDeps.events }, options, file, groundingFile, overlay, plan, measurement, nextAttemptOrdinal,
     ));
-    if (!stage1.admitted) {
-      overlay.restore(stage1Snapshot);
-      stopReason = stage1.deniedReason;
-      break;
+    switch (stage1.status) {
+      case 'denied': {
+        overlay.restore(stage1Snapshot);
+        stopReason = stage1.deniedReason;
+        break repairLoop;
+      }
+      case 'integrity-failure': {
+        overlay.restore(stage1Snapshot);
+        throw stage1.error;
+      }
+      case 'completed': {
+        if (!stage1.result.ok) throw stage1.result.error;
+        const stage1Measurement = stage1.result.value;
+        if (stage1Measurement.interrupted) return stage1Measurement;
+        measurement = stage1Measurement;
+        break;
+      }
+      default: {
+        assertNever(stage1);
+      }
     }
-    if (!stage1.result.ok) throw stage1.result.error;
-    const stage1Measurement = stage1.result.value;
-    if (stage1Measurement.interrupted) return stage1Measurement;
-    measurement = stage1Measurement;
     if (measurement.firstFailureIndex > frontier) {
       repairKind = mode === 'element-reground' ? 'grounding-element' : 'grounding-ai-retrace';
       continue;
@@ -1094,13 +1125,26 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
     const stage2 = await budget.runPhase('incremental', (phaseDeps) => trySingleStepRepair(
       { ...caseDeps, resolveAiExecutor: phaseDeps.resolveAiExecutor, events: phaseDeps.events }, phaseDeps.resolveAiExecutor, options, file, planFile, groundingFile, overlay, preflight.normalized, plan, caseBaseline, measurement, repairHistory, nextAttemptOrdinal,
     ));
-    if (!stage2.admitted) {
-      overlay.restore(stage2Snapshot);
-      stopReason = stage2.deniedReason;
-      break;
+    let repaired!: SingleStepRepairResult;
+    switch (stage2.status) {
+      case 'denied': {
+        overlay.restore(stage2Snapshot);
+        stopReason = stage2.deniedReason;
+        break repairLoop;
+      }
+      case 'integrity-failure': {
+        overlay.restore(stage2Snapshot);
+        throw stage2.error;
+      }
+      case 'completed': {
+        if (!stage2.result.ok) throw stage2.result.error;
+        repaired = stage2.result.value;
+        break;
+      }
+      default: {
+        assertNever(stage2);
+      }
     }
-    if (!stage2.result.ok) throw stage2.result.error;
-    const repaired = stage2.result.value;
     if (repaired.kind === 'interrupted') return { interrupted: true };
     if (repaired.kind === 'rejected') break;
     plan = repaired.plan;
@@ -1126,26 +1170,37 @@ async function healCase(deps: HealDeps, options: HealOptions, file: string): Pro
       const fullPhase = await budget.runPhase('stage3', (phaseDeps) => tryFullPlanRepair(
         { ...caseDeps, resolveAiExecutor: phaseDeps.resolveAiExecutor, events: phaseDeps.events }, phaseDeps.resolveAiExecutor, options, file, planFile, overlay, preflight.normalized, preflight.digest, plan, measurement, nextAttemptOrdinal,
       ));
-      if (!fullPhase.admitted) {
-        overlay.restore(bestSnapshot);
-        stopReason = fullPhase.deniedReason;
-      } else if (!fullPhase.result.ok) {
-        throw fullPhase.result.error;
-      } else {
-      const full = fullPhase.result.value;
-      if (full.measurement.interrupted) return full.measurement;
-      stage3Error = full.stage3Error;
-      if (full.replayed && full.measurement.firstFailureIndex === full.plan.steps.length) {
-        plan = full.plan;
-        measurement = full.measurement;
-        repairKind = 'full-plan';
-        fullPlanReplayed = true;
-        stopReason = 'settled';
-      } else {
-        overlay.restore(bestSnapshot);
-        plan = bestPlan;
-        measurement = bestMeasurement;
-      }
+      switch (fullPhase.status) {
+        case 'denied': {
+          overlay.restore(bestSnapshot);
+          stopReason = fullPhase.deniedReason;
+          break;
+        }
+        case 'integrity-failure': {
+          overlay.restore(bestSnapshot);
+          throw fullPhase.error;
+        }
+        case 'completed': {
+          if (!fullPhase.result.ok) throw fullPhase.result.error;
+          const full = fullPhase.result.value;
+          if (full.measurement.interrupted) return full.measurement;
+          stage3Error = full.stage3Error;
+          if (full.replayed && full.measurement.firstFailureIndex === full.plan.steps.length) {
+            plan = full.plan;
+            measurement = full.measurement;
+            repairKind = 'full-plan';
+            fullPlanReplayed = true;
+            stopReason = 'settled';
+          } else {
+            overlay.restore(bestSnapshot);
+            plan = bestPlan;
+            measurement = bestMeasurement;
+          }
+          break;
+        }
+        default: {
+          return assertNever(fullPhase);
+        }
       }
   }
 

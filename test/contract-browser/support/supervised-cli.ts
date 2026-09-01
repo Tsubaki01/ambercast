@@ -117,7 +117,18 @@ export function spawnSupervised(
   };
   const supervisor = createProcessGroupSupervisor({
     isChildPidAlive: () => isAlive(pid),
-    hasClosed: () => closed || pid === undefined,
+    // An absent PID (spawn never produced a child, e.g. ENOENT) is a
+    // liveness fact only, never a substitute for observing the real
+    // `'close'` event: Node still emits `'close'` shortly after `'error'`
+    // even when spawn fails (#242), so `closed` alone is authoritative.
+    // Treating a missing PID as "closed" would let a CleanupRegistry
+    // release its resources -- via a Supervisor built from this
+    // function's `terminateAndConfirm` -- before that event
+    // fires. When `'close'` never arrives in some abnormal runtime, the
+    // existing SIGTERM/SIGKILL grace ladder in `createProcessGroupSupervisor`
+    // still bounds the wait and fails the supervisor closed, matching every
+    // other unconfirmed case.
+    hasClosed: () => closed,
     isGroupAlive: () => isAlive(pid === undefined ? undefined : -pid),
     signalGroup: (signal) => {
       if (pid === undefined) return;
