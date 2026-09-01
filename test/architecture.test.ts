@@ -961,6 +961,50 @@ describe('architecture guardrails', () => {
     }));
   });
 
+  test('detects a planted digest computed-key call through the architecture scan path', () => {
+    const authority = ts.createSourceFile(
+      '/virtual/src/core/ai/plan-input-provenance.ts',
+      "import { computeInputsDigest } from '../ir/digest.js';",
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    const planted = ts.createSourceFile(
+      '/virtual/src/usecases/planted-computed-digest.ts',
+      [
+        "import * as digest from '../core/ir/digest.js';",
+        "const key = 'computeInputsDigest' as const;",
+        'digest[key]({ schemaVersion: 2 });',
+      ].join('\n'),
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    const digest = ts.createSourceFile(
+      '/virtual/src/core/ir/digest.ts',
+      "export function computeInputsDigest(_input: object): string { return 'digest'; }",
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    const sources = new Map([[authority.fileName, authority], [planted.fileName, planted], [digest.fileName, digest]]);
+    const host = ts.createCompilerHost({ noEmit: true, target: ts.ScriptTarget.ES2023 });
+    const originalGetSourceFile = host.getSourceFile.bind(host);
+    const originalFileExists = host.fileExists.bind(host);
+    const originalReadFile = host.readFile.bind(host);
+    host.getSourceFile = (fileName, languageVersion) => sources.get(fileName) ?? originalGetSourceFile(fileName, languageVersion);
+    host.fileExists = (fileName) => sources.has(fileName) || originalFileExists(fileName);
+    host.readFile = (fileName) => sources.get(fileName)?.text ?? originalReadFile(fileName);
+    host.resolveModuleNames = (moduleNames) => moduleNames.map((moduleName) => (
+      moduleName.endsWith('/digest.js')
+        ? { resolvedFileName: digest.fileName, extension: ts.Extension.Ts }
+        : undefined
+    ));
+    const program = ts.createProgram({ rootNames: [...sources.keys()], options: { noEmit: true, target: ts.ScriptTarget.ES2023 }, host });
+
+    expect(scanComputeInputsDigestAuthority(program, digest.fileName, authority.fileName)).toEqual({
+      calls: [{ fileName: planted.fileName, line: 3, column: 1 }],
+      violations: [{ fileName: planted.fileName, line: 3, column: 1, kind: 'call-site-outside-authority' }],
+    });
+  });
+
   test('scans every production source file without schemaVersion literal violations', async () => {
     const sourceFiles = await findTypeScriptFiles(SOURCE_ROOT);
     const program = ts.createProgram({ rootNames: sourceFiles, options: { module: ts.ModuleKind.NodeNext, moduleResolution: ts.ModuleResolutionKind.NodeNext, noEmit: true, strict: true, target: ts.ScriptTarget.ES2023, types: ['node'] } });
@@ -977,6 +1021,30 @@ describe('architecture guardrails', () => {
     const program = ts.createProgram({ rootNames: [...originals.keys()], options: { noEmit: true, target: ts.ScriptTarget.ES2023 }, host });
     expect(scanSchemaVersionLiteralViolations(program, IR_SCHEMA_MODULE_FILE)).toEqual([
       expect.objectContaining({ fileName: source.fileName, line: 1, column: expect.any(Number) }),
+    ]);
+  });
+
+  test('detects a planted as-any schemaVersion bypass through the architecture scan path', () => {
+    const source = ts.createSourceFile(
+      '/virtual/src/usecases/planted-as-any.ts',
+      "const plan = { schemaVersion: '2' as any };",
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    const schema = ts.createSourceFile(
+      IR_SCHEMA_MODULE_FILE,
+      'export const PLAN_SCHEMA_VERSION = 2 as const; export const GROUNDING_SCHEMA_VERSION = 1 as const;',
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    const host = ts.createCompilerHost({ noEmit: true, target: ts.ScriptTarget.ES2023 });
+    const sources = new Map([[source.fileName, source], [schema.fileName, schema]]);
+    const originalGetSourceFile = host.getSourceFile.bind(host);
+    host.getSourceFile = (fileName, languageVersion) => sources.get(fileName) ?? originalGetSourceFile(fileName, languageVersion);
+    const program = ts.createProgram({ rootNames: [...sources.keys()], options: { noEmit: true, target: ts.ScriptTarget.ES2023 }, host });
+
+    expect(scanSchemaVersionLiteralViolations(program, IR_SCHEMA_MODULE_FILE)).toEqual([
+      { fileName: source.fileName, line: 1, column: source.text.indexOf('schemaVersion') + 1 },
     ]);
   });
 

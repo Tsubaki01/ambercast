@@ -12,8 +12,24 @@
  * examines value-bearing AST shapes that have no ordinary identifier at the
  * reference site, including namespace extraction, shorthand values, bracket
  * access, and star re-exports.
+ *
+ * The resolver-backed walk routes callee, ordinary value-reference,
+ * and destructuring-binding recognition through one checker-backed contract.
+ * That common path turns a finite computed key into candidates and retains
+ * a dynamic key as uncertainty, so quoted and computed binding names cannot
+ * bypass the same declaration-identity boundary that protects direct access.
+ * For nested destructuring, each outer binding key receives the same
+ * finite-candidate treatment before the walk follows its property type.
+ *
+ * Call classification distinguishes an exact canonical selection from a
+ * potential one. Exact calls remain inventory entries and receive the
+ * existing location and argument checks; potential calls instead become an
+ * immediate value-reference finding. Both outcomes mark their callee in
+ * `classifiedCallees`, preventing later traversal of a callee's children from
+ * reporting the same uncertain reference a second time.
  */
 import * as ts from 'typescript';
+import { createStaticReferenceResolver } from './typescript-static-reference.js';
 
 /**
  * Classifies one independently reportable violation in the digest authority
@@ -87,6 +103,13 @@ export interface DigestValueReferenceViolation {
  * passing, returning, storing, or re-exporting the function remains outside
  * the authority contract.
  *
+ * The resolver makes the classification explicit: only an exact
+ * canonical selection is a call-site inventory entry, while a potential
+ * selection is reported immediately as an unsafe value reference. The
+ * same resolver supplies ordinary value and element-access recognition,
+ * and destructuring uses its finite key candidates for identifier,
+ * quoted, and computed property names at both direct and nested positions.
+ *
  * @param program - The TypeScript program whose non-declaration source files
  * are inspected.
  * @param digestModuleFileName - The source-file name exporting the canonical
@@ -128,15 +151,12 @@ export function scanComputeInputsDigestAuthority(
   }
 
   const checker = program.getTypeChecker();
+  const resolver = createStaticReferenceResolver(checker);
   const moduleSymbol = checker.getSymbolAtLocation(digestModule);
   const exportedSymbol = moduleSymbol === undefined
     ? undefined
     : checker.getExportsOfModule(moduleSymbol).find(({ name }) => name === 'computeInputsDigest');
-  const canonicalSymbol = exportedSymbol === undefined
-    ? undefined
-    : exportedSymbol.flags & ts.SymbolFlags.Alias
-      ? checker.getAliasedSymbol(exportedSymbol)
-      : exportedSymbol;
+  const canonicalSymbol = resolver.resolveAliasedSymbol(exportedSymbol);
   const canonicalDeclaration = canonicalSymbol?.declarations?.find(ts.isFunctionDeclaration);
   if (canonicalDeclaration === undefined) {
     throw new Error(`The digest module does not export computeInputsDigest as a function: ${digestModuleFileName}`);
@@ -145,12 +165,20 @@ export function scanComputeInputsDigestAuthority(
   const calls: DigestCallSite[] = [];
   const violations: DigestValueReferenceViolation[] = [];
 
+  /**
+   * Tests whether a symbol identifies the canonical function declaration.
+   *
+   * One-hop alias normalization belongs to
+   * the shared resolver, leaving this predicate responsible only for the
+   * digest scanner's declaration-specific policy boundary.
+   */
   const resolvesToCanonical = (symbol: ts.Symbol | undefined): boolean => {
-    const resolved = symbol !== undefined && symbol.flags & ts.SymbolFlags.Alias
-      ? checker.getAliasedSymbol(symbol)
-      : symbol;
+    const resolved = resolver.resolveAliasedSymbol(symbol);
     return resolved?.declarations?.includes(canonicalDeclaration) ?? false;
   };
+  const isCanonicalSymbol = (symbol: ts.Symbol): boolean => (
+    symbol.declarations?.includes(canonicalDeclaration) ?? false
+  );
   const unwrapExpression = (expression: ts.Expression): ts.Expression => {
     let unwrapped = expression;
     while (
@@ -204,13 +232,15 @@ export function scanComputeInputsDigestAuthority(
   const propertyResolvesToCanonical = (sourceType: ts.Type, name: string): boolean => (
     resolvesToCanonical(checker.getPropertyOfType(sourceType, name))
   );
-  const expressionResolvesToCanonical = (expression: ts.Expression): boolean => {
-    if (resolvesToCanonical(checker.getSymbolAtLocation(expression))) return true;
-    return ts.isElementAccessExpression(expression)
-      && expression.argumentExpression !== undefined
-      && ts.isStringLiteral(expression.argumentExpression)
-      && propertyResolvesToCanonical(checker.getTypeAtLocation(expression.expression), expression.argumentExpression.text);
-  };
+  /**
+   * Finds the type from which a destructuring binding obtains its value.
+   *
+   * The nested walk resolves both direct and outer binding names
+   * through the shared resolver's finite key candidates. Identifier, quoted,
+   * and resolvable computed names therefore follow the same property
+   * identity path; a dynamic or multi-candidate outer key remains deliberately
+   * unresolved rather than guessing a deep destructuring source.
+   */
   const destructuringSourceType = (node: ts.BindingElement): ts.Type | undefined => {
     const pattern = node.parent;
     const container = pattern.parent;
@@ -223,9 +253,13 @@ export function scanComputeInputsDigestAuthority(
     if (ts.isBindingElement(container)) {
       const outerSourceType = destructuringSourceType(container);
       const outerPropertyName = container.propertyName ?? container.name;
-      if (outerSourceType !== undefined && ts.isIdentifier(outerPropertyName)) {
-        const outerProperty = checker.getPropertyOfType(outerSourceType, outerPropertyName.text);
-        if (outerProperty !== undefined) return checker.getTypeOfSymbolAtLocation(outerProperty, outerPropertyName);
+      const outerNames = bindingElementPropertyCandidateNames(outerPropertyName);
+      if (outerSourceType !== undefined && outerNames?.length === 1) {
+        const [outerName] = outerNames;
+        if (outerName !== undefined) {
+          const outerProperty = checker.getPropertyOfType(outerSourceType, outerName);
+          if (outerProperty !== undefined) return checker.getTypeOfSymbolAtLocation(outerProperty, outerPropertyName);
+        }
       }
     }
     return undefined;
@@ -242,27 +276,72 @@ export function scanComputeInputsDigestAuthority(
       ? assignment.right
       : undefined;
   };
+  /**
+   * Records callee expressions whose reference classification already owns
+   * their descendant traversal.
+   *
+   * The potential-call path enters this set as well as the exact
+   * call path, because a later visit to an element key or property name would
+   * otherwise turn one uncertain selection into duplicate value findings.
+   */
   const classifiedCallees = new Set<ts.Node>();
   const destructuringBindingSymbols = new Set<ts.Symbol>();
+  /**
+   * Resolves destructuring property names with the same finite-key rule as
+   * element access, so quoted and computed keys cannot bypass identity checks.
+   */
+  const bindingElementPropertyCandidateNames = (
+    keyNode: ts.PropertyName | ts.BindingName,
+  ): readonly string[] | undefined => {
+    if (ts.isIdentifier(keyNode) || ts.isStringLiteral(keyNode) || ts.isNumericLiteral(keyNode)) {
+      return [keyNode.text];
+    }
+    return ts.isComputedPropertyName(keyNode)
+      ? resolver.resolvePropertyKey(keyNode.expression)
+      : undefined;
+  };
+  const bindingElementResolvesToCanonical = (
+    sourceType: ts.Type,
+    keyNode: ts.PropertyName | ts.BindingName,
+  ): boolean => {
+    const names = bindingElementPropertyCandidateNames(keyNode);
+    return names === undefined
+      ? propertyResolvesToCanonical(sourceType, 'computeInputsDigest')
+      : names.some((name) => propertyResolvesToCanonical(sourceType, name));
+  };
 
   const visit = (sourceFile: ts.SourceFile, node: ts.Node): void => {
-    if (ts.isCallExpression(node) && expressionResolvesToCanonical(node.expression)) {
-      classifiedCallees.add(node.expression);
-      calls.push(sourceLocation(sourceFile, node));
-      if (ts.sys.resolvePath(sourceFile.fileName) !== canonicalAuthorityFileName) {
-        recordViolation(sourceFile, node, 'call-site-outside-authority');
-      }
-      const argument = node.arguments[0];
-      const unwrappedArgument = argument === undefined ? undefined : unwrapExpression(argument);
-      if (node.arguments.length !== 1 || unwrappedArgument === undefined || !ts.isObjectLiteralExpression(unwrappedArgument)) {
-        recordViolation(sourceFile, node, 'argument-must-be-inline-object-literal');
-      } else if (hasSpread(unwrappedArgument)) {
-        recordViolation(sourceFile, node, 'argument-must-not-contain-spread');
+    if (ts.isCallExpression(node)) {
+      const resolution = resolver.resolvePropertyReference(node.expression, isCanonicalSymbol);
+      if (resolution.kind === 'exact') {
+        classifiedCallees.add(node.expression);
+        calls.push(sourceLocation(sourceFile, node));
+        if (ts.sys.resolvePath(sourceFile.fileName) !== canonicalAuthorityFileName) {
+          recordViolation(sourceFile, node, 'call-site-outside-authority');
+        }
+        const argument = node.arguments[0];
+        const unwrappedArgument = argument === undefined ? undefined : unwrapExpression(argument);
+        if (node.arguments.length !== 1 || unwrappedArgument === undefined || !ts.isObjectLiteralExpression(unwrappedArgument)) {
+          recordViolation(sourceFile, node, 'argument-must-be-inline-object-literal');
+        } else if (hasSpread(unwrappedArgument)) {
+          recordViolation(sourceFile, node, 'argument-must-not-contain-spread');
+        }
+      } else if (resolution.kind === 'potential') {
+        classifiedCallees.add(node.expression);
+        recordViolation(sourceFile, node.expression, 'value-reference-outside-authority-call');
       }
     } else if (ts.isIdentifier(node)) {
       const symbol = checker.getSymbolAtLocation(node);
       const isDestructuringBinding = symbol !== undefined && destructuringBindingSymbols.has(symbol);
-      if (!isDestructuringBinding && !isDeclarationIntroduction(node) && !isWithinTypeNode(node) && resolvesToCanonical(symbol)) {
+      const reference = ts.isPropertyAccessExpression(node.parent) && node.parent.name === node
+        ? node.parent
+        : node;
+      if (
+        !isDestructuringBinding
+        && !isDeclarationIntroduction(node)
+        && !isWithinTypeNode(node)
+        && resolver.resolvePropertyReference(reference, isCanonicalSymbol).kind !== 'none'
+      ) {
         recordViolation(sourceFile, node, 'value-reference-outside-authority-call');
       }
     } else if (ts.isBindingElement(node)) {
@@ -270,8 +349,7 @@ export function scanComputeInputsDigestAuthority(
       const propertyName = node.propertyName ?? node.name;
       if (
         sourceType !== undefined
-        && ts.isIdentifier(propertyName)
-        && propertyResolvesToCanonical(sourceType, propertyName.text)
+        && bindingElementResolvesToCanonical(sourceType, propertyName)
       ) {
         if (ts.isIdentifier(node.name)) {
           const bindingSymbol = checker.getSymbolAtLocation(node.name);
@@ -294,9 +372,7 @@ export function scanComputeInputsDigestAuthority(
       }
     } else if (
       ts.isElementAccessExpression(node)
-      && node.argumentExpression !== undefined
-      && ts.isStringLiteral(node.argumentExpression)
-      && propertyResolvesToCanonical(checker.getTypeAtLocation(node.expression), node.argumentExpression.text)
+      && resolver.resolvePropertyReference(node, isCanonicalSymbol).kind !== 'none'
     ) {
       recordViolation(sourceFile, node, 'value-reference-outside-authority-call');
     } else if (
