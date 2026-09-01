@@ -1957,7 +1957,6 @@ describe('heal state-machine contract', () => {
     let stageTwoStorage: StorageAdapter | undefined;
     let completedReplays = 0;
     let observedCandidateBytes = false;
-    let originalPlan!: string;
     let artifactsObservedAtRejection: Promise<readonly [string, string]> | undefined;
     replayRunObserver.afterRun = async (_deps, storage) => {
       completedReplays += 1;
@@ -1990,7 +1989,7 @@ describe('heal state-machine contract', () => {
         onPerform() { throw new Error('The Stage-2 navigation fixture must remain at its failing frontier.'); },
       }))),
     });
-    originalPlan = await scenario.storage.readText(PLAN);
+    const originalPlan = await scenario.storage.readText(PLAN);
     const originalGrounding = await scenario.storage.readText(GROUNDING);
 
     await heal({ ...scenario.deps, events }, OPTIONS);
