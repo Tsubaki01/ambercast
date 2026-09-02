@@ -141,6 +141,7 @@ interface ShimOptions {
   readonly pauseBefore?: readonly string[];
   readonly pauseBeforeOccurrence?: number;
   readonly removeThenFail?: GitArgvExpectation;
+  readonly stripInventoryRecord?: { readonly path: string; readonly occurrence: number };
 }
 
 interface GitArgvExpectation {
@@ -154,7 +155,7 @@ interface CommandLogEvent {
   readonly timestamp: number;
 }
 
-async function installCommandShims(options: ShimOptions = {}): Promise<{ bin: string; gitLog: string; npmLog: string; commandLog: string; ready: string; release: string }> {
+async function installCommandShims(options: ShimOptions = {}): Promise<{ bin: string; gitLog: string; npmLog: string; commandLog: string; ready: string; release: string; filteredInventoryLog: string }> {
   const shimRoot = await mkdtemp(join(getFixture().root, 'command-shims-'));
   const bin = join(shimRoot, 'bin');
   const gitLog = join(shimRoot, 'git.jsonl');
@@ -162,13 +163,15 @@ async function installCommandShims(options: ShimOptions = {}): Promise<{ bin: st
   const commandLog = join(shimRoot, 'commands.jsonl');
   const ready = join(shimRoot, 'ready');
   const release = join(shimRoot, 'release');
+  const filteredInventoryLog = join(shimRoot, 'filtered-inventory.log');
   const pauseCount = join(shimRoot, 'pause-count');
   await mkdir(bin);
   await writeFile(gitLog, '');
   await writeFile(npmLog, '');
   await writeFile(commandLog, '');
   await writeFile(pauseCount, '0');
-  const config = JSON.stringify({ ...options, gitLog, ready, release, pauseCount });
+  await writeFile(filteredInventoryLog, '');
+  const config = JSON.stringify({ ...options, gitLog, ready, release, pauseCount, filteredInventoryLog });
   const gitShim = `#!/usr/bin/env node
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -204,6 +207,33 @@ if (config.failOnOccurrence && matches(config.failOnOccurrence)) {
     .map((line) => JSON.parse(line)).filter((recorded) => matches(config.failOnOccurrence, recorded)).length;
   if (occurrences === config.failOnOccurrence.occurrence) process.exit(90);
 }
+if (config.stripInventoryRecord && equals(['worktree', 'list', '--porcelain', '-z'])) {
+  const occurrences = readFileSync(config.gitLog, 'utf8').split('\\n').filter(Boolean)
+    .map((line) => JSON.parse(line)).filter((recorded) => matches({ args: ['worktree', 'list', '--porcelain', '-z'] }, recorded)).length;
+  if (occurrences === config.stripInventoryRecord.occurrence) {
+    const inventory = execFileSync(process.env.AMBERCAST_REAL_GIT, args, { encoding: 'utf8' });
+    const blocks = [];
+    let block = [];
+    for (const record of inventory.split('\\0')) {
+      if (record === '') {
+        if (block.length > 0) {
+          blocks.push(block);
+          block = [];
+        }
+        continue;
+      }
+      block.push(record);
+    }
+    if (block.length > 0) blocks.push(block);
+    const filtered = blocks
+      .filter((records) => records[0] !== 'worktree ' + config.stripInventoryRecord.path)
+      .map((records) => records.join('\\0'))
+      .join('\\0\\0');
+    writeFileSync(config.filteredInventoryLog, filtered);
+    process.stdout.write(filtered);
+    process.exit(0);
+  }
+}
 if (config.fail && config.fail.some((expected) => matches(expected))) process.exit(90);
 execFileSync(process.env.AMBERCAST_REAL_GIT, args, { stdio: 'inherit' });
 `;
@@ -220,7 +250,7 @@ if (config.failNpm && config.failNpm.some((expected) => expected === args.join('
     writeFile(join(bin, 'npm'), npmShim),
   ]);
   await Promise.all([chmod(join(bin, 'git'), 0o755), chmod(join(bin, 'npm'), 0o755)]);
-  return { bin, gitLog, npmLog, commandLog, ready, release };
+  return { bin, gitLog, npmLog, commandLog, ready, release, filteredInventoryLog };
 }
 
 function shimEnvironment(shims: { bin: string; gitLog: string; npmLog: string; commandLog: string }): NodeJS.ProcessEnv {
@@ -1023,6 +1053,43 @@ describe('worktree-remove locking, validation, and mutex contract', () => {
     expect(expectScriptFailure(() => runRemove(['429'], { environment: shimEnvironment(shims) }))).toMatch(/remove/i);
     expect(existsSync(join(getFixture().receptacle, '.cleanup-lock'))).toBe(true);
     expect(JSON.parse(await readFile(join(getFixture().receptacle, '.cleanup-lock', 'transaction.json'), 'utf8'))).toMatchObject({ target });
+  });
+
+  it('fails closed when recovery finds a present target that is no longer registered', async () => {
+    const target = createWorktree('431');
+    const bystander = createWorktree('432');
+    const shims = await installCommandShims({
+      fail: [{ args: ['worktree', 'remove', target] }],
+      stripInventoryRecord: { path: target, occurrence: 3 },
+    });
+    let error: { readonly status?: number | null; readonly stderr?: string | Buffer } | undefined;
+
+    try {
+      runRemove(['431'], { environment: shimEnvironment(shims) });
+    } catch (caught) {
+      if (typeof caught !== 'object' || caught === null) throw caught;
+      error = caught as { readonly status?: number | null; readonly stderr?: string | Buffer };
+    }
+
+    if (error === undefined) throw new Error('Expected worktree-remove to fail.');
+    const stderr = typeof error.stderr === 'string' ? error.stderr : error.stderr?.toString('utf8') ?? '';
+    expect(error.status).toBe(1);
+    expect(stderr).toContain('target path exists but is no longer a registered worktree');
+    expect(existsSync(target)).toBe(true);
+    expect((await readJsonLines(shims.gitLog)).some((args) => args.join('\0') === ['worktree', 'lock', target].join('\0'))).toBe(false);
+    const mutex = join(getFixture().receptacle, '.cleanup-lock');
+    expect(existsSync(mutex)).toBe(true);
+    expect(JSON.parse(await readFile(join(mutex, 'transaction.json'), 'utf8'))).toMatchObject({ phase: 'unlocked' });
+
+    const filtered = parseWorktreePorcelain(await readFile(shims.filteredInventoryLog, 'utf8')) as readonly { readonly path: string; readonly branch?: string; readonly locked?: true | string }[];
+    const unshimmed = parseWorktreePorcelain(runGit(getFixture().repository, ['worktree', 'list', '--porcelain', '-z'])) as readonly { readonly path: string; readonly branch?: string; readonly locked?: true | string }[];
+    const mainPath = getFixture().repository;
+    expect(filtered.find((worktree) => worktree.path === target)).toBeUndefined();
+    for (const path of [mainPath, bystander]) {
+      expect(filtered.find((worktree) => worktree.path === path)).toEqual(
+        unshimmed.find((worktree) => worktree.path === path),
+      );
+    }
   });
 
   it('locks a detached worktree with matching branchless identity after removal failure', async () => {
