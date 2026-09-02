@@ -2,15 +2,29 @@
  * Defines the shared checker-backed reference-resolution contract for the
  * architecture tripwire scanners.
  *
- * The resolver centralizes the narrow questions both scanners
+ * The resolver centralizes the narrow questions its consumer scanners
  * must answer: whether an alias preserves declaration identity, whether a
  * computed key has a finite set of static names, and whether a reference
  * proves, may select, or cannot select a consumer-supplied target. Keeping
  * those questions here prevents the digest and schema-version policies from
  * drifting into inconsistent default-deny boundaries while leaving their
  * distinct target declarations and reporting contracts in their own modules.
+ *
+ * Scanner modules build their SA-1 property/element-access guarantee on this
+ * primitive: it preserves declaration identity and uncertainty instead of
+ * allowing a missing checker fact to look like proof of absence. The primitive
+ * is deliberately policy-neutral, so scanners retain ownership of the
+ * protected declarations and of the findings they report.
  */
 import * as ts from 'typescript';
+
+export type IndexSignatureMaySelect = (
+  kind: 'string' | 'number',
+  valueType: ts.Type,
+  candidate: string | undefined,
+) => boolean;
+
+const anyIndexSignatureMaySelect: IndexSignatureMaySelect = () => true;
 
 /**
  * Classifies how conclusively a property-capable expression selects a target.
@@ -73,6 +87,23 @@ export interface StaticReferenceResolver {
   resolvePropertyKey(keyExpression: ts.Expression): readonly string[] | undefined;
 
   /**
+   * Determines which index-signature kinds a property key can address.
+   *
+   * @remarks
+   * Publishing this rule once prevents property-selection callers from
+   * drifting into different index-signature boundaries. The implementation
+   * delegates to the same transparent-wrapper unwrapping and constraint-chain
+   * walk as `resolvePropertyKey`, so finite names and index applicability are
+   * derived from one view of the key expression.
+   *
+   * @param keyExpression - The element or computed-property key, if one is
+   * available.
+   * @returns `'string'` or `'number'` for an unambiguous key type, or
+   * `'both'` for mixed, unknown, unresolved, or unavailable key information.
+   */
+  indexApplicabilityForKey(keyExpression: ts.Expression | undefined): 'string' | 'number' | 'both';
+
+  /**
    * Determines whether a finite or dynamic key set can select one target name.
    *
    * A dynamic key conservatively answers `true`: default-deny consumers must
@@ -87,20 +118,85 @@ export interface StaticReferenceResolver {
   propertyKeyMaySelect(names: readonly string[] | undefined, targetName: string): boolean;
 
   /**
+   * Classifies whether a property selection can resolve to a consumer-supplied
+   * target declaration.
+   *
+   * An `any` or `unknown` receiver returns `potential` before candidate
+   * handling, including when the finite candidate list is empty. Otherwise,
+   * explicit properties take precedence over index signatures because a
+   * declaration identity is stronger evidence than a structural fallback. For
+   * every finite candidate, an absent explicit property falls back to an
+   * index signature permitted by `indexApplicability`: an applicable index is
+   * `potential` only when `indexSignatureMaySelect` accepts its value type,
+   * kind, and candidate. The optional predicate defaults to `true`, preserving
+   * the legacy unconditional fallback for consumers that do not need stronger
+   * evidence; a supplied predicate can require consumer-specific type evidence.
+   * The resolver returns `exact` only when every finite
+   * candidate selects a target property, `none` only when checker information
+   * proves every candidate cannot select one, and `potential` for all
+   * remaining mixtures or uncertainty. A defined empty candidate list returns
+   * `none` only after the receiver short-circuit: it proves that no key can be
+   * selected rather than vacuously satisfying an aggregate classification.
+   *
+   * @remarks
+   * Candidate strings do not preserve whether a literal key was originally
+   * string- or number-typed, so applicability must be derived once from the
+   * key expression before resolving its names. Callers obtain the
+   * `indexApplicability` argument through
+   * `indexApplicabilityForKey(keyExpression)`. A string-literal key expression
+   * or an identifier/string-literal property name uses the string index kind,
+   * while a numeric-literal key expression or property name uses the number
+   * kind. The published method owns the remaining type and constraint
+   * handling so callers share one derivation boundary instead of duplicating
+   * its mechanics.
+   *
+   * When `keyCandidates` is `undefined`, the resolver handles one conceptual
+   * dynamic candidate. It returns `potential` when either a declared property
+   * satisfying `isTarget` exists or an index signature permitted by
+   * `indexApplicability` exists; it returns `none` otherwise. This preserves
+   * uncertainty without treating a dynamic key as proof that every declared
+   * property can be selected.
+   *
+   * @param receiverType - The checker type of the object being selected from.
+   * @param keyCandidates - Finite key names, an empty finite set, or
+   * `undefined` when the key is dynamic.
+   * @param indexApplicability - The index-signature kind justified by the
+   * key's own static type: `'string'` for `StringLike`-only,
+   * `'number'` for `NumberLike`-only, and `'both'` for mixed, `any`,
+   * `unknown`, unresolved, or unavailable key information.
+   * @param isTarget - Tests a checker-dealiased property symbol against the
+   * declaration set protected by the caller.
+   * @returns Whether the selection is proven to target, may target, or is
+   * proven unable to target the protected declaration.
+   * @example
+   * ```ts
+   * const result = resolver.resolvePropertySelection(
+   *   checker.getTypeAtLocation(receiver),
+   *   resolver.resolvePropertyKey(key),
+   *   'string',
+   *   isCanonicalSymbol,
+   *   indexSignatureMaySelect,
+   * );
+   * ```
+   */
+  resolvePropertySelection(
+    receiverType: ts.Type,
+    keyCandidates: readonly string[] | undefined,
+    indexApplicability: 'string' | 'number' | 'both',
+    isTarget: (symbol: ts.Symbol) => boolean,
+    indexSignatureMaySelect?: IndexSignatureMaySelect,
+  ): PropertyReferenceResolution;
+
+  /**
    * Classifies an expression's declaration-identity relationship to a target.
    *
    * The resolver unwraps transparent wrappers around the whole reference and
-   * classifies checker-resolved identifiers and property symbols as exact when
-   * their checker-dealiased symbol satisfies `isTarget`, or none otherwise.
-   * For an `ElementAccessExpression` with finite key candidates, all candidates
-   * matching the target produce exact, some but not all matching candidates
-   * produce potential, and no matching candidates produce none. For a dynamic
-   * (unresolvable) element key, the result is potential when the object type is
-   * `any` or `unknown`, or carries any property satisfying `isTarget`; it is
-   * none only when the object type is closed and demonstrably lacks a matching
-   * property. For a `PropertyAccessExpression` with an unresolved property
-   * symbol, an `any`- or `unknown`-typed receiver produces potential, while a
-   * closed or concrete receiver produces none.
+   * classifies checker-resolved identifiers directly. Its property
+   * and element branches delegate to `resolvePropertySelection`, giving dot
+   * access one string-kind candidate and element access the candidates plus
+   * index applicability derived from its argument expression. This keeps an
+   * unresolved dot property on an open index-signature receiver in the same
+   * default-deny boundary as the equivalent bracket access.
    *
    * @remarks
    * Unresolvable keys and receivers retain uncertainty so default-deny
@@ -108,6 +204,10 @@ export interface StaticReferenceResolver {
    * `PropertyAccessExpression` or `ElementAccessExpression` target match also
    * follows a shorthand property assignment's own value symbol when its direct
    * property symbol does not match.
+   * Property and element accesses judge both the receiver's declared type and
+   * its innermost transparent-wrapper type, retaining the strongest result.
+   * A non-matching explicit property therefore does not prevent the innermost
+   * type from supplying a target-compatible index fallback.
    *
    * @param expression - The value, property, or element-access expression to
    * classify.
@@ -118,6 +218,7 @@ export interface StaticReferenceResolver {
   resolvePropertyReference(
     expression: ts.Expression,
     isTarget: (symbol: ts.Symbol) => boolean,
+    indexSignatureMaySelect?: IndexSignatureMaySelect,
   ): PropertyReferenceResolution;
 }
 
@@ -172,6 +273,51 @@ export function createStaticReferenceResolver(checker: ts.TypeChecker): StaticRe
     return undefined;
   };
   const isAnyOrUnknown = (type: ts.Type): boolean => Boolean(type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown));
+  const matches = (symbol: ts.Symbol | undefined, isTarget: (candidate: ts.Symbol) => boolean): boolean => {
+    const resolved = symbol !== undefined && symbol.flags & ts.SymbolFlags.Alias
+      ? checker.getAliasedSymbol(symbol)
+      : symbol;
+    return resolved !== undefined && isTarget(resolved);
+  };
+  const propertyMatches = (symbol: ts.Symbol | undefined, isTarget: (candidate: ts.Symbol) => boolean): boolean => (
+    matches(symbol, isTarget)
+    || symbol?.declarations?.some((declaration) => (
+      ts.isShorthandPropertyAssignment(declaration)
+      && matches(checker.getShorthandAssignmentValueSymbol(declaration), isTarget)
+    ))
+    || false
+  );
+  const hasApplicableIndexSignature = (
+    receiverType: ts.Type,
+    indexApplicability: 'string' | 'number' | 'both',
+    indexSignatureMaySelect: IndexSignatureMaySelect,
+    candidate: string | undefined,
+  ): boolean => ([
+    ...(indexApplicability === 'string' || indexApplicability === 'both' ? [ts.IndexKind.String] : []),
+    ...(indexApplicability === 'number' || indexApplicability === 'both' ? [ts.IndexKind.Number] : []),
+  ] as const).some((kind) => {
+    const valueType = checker.getIndexTypeOfType(receiverType, kind);
+    return valueType !== undefined
+      && indexSignatureMaySelect(kind === ts.IndexKind.String ? 'string' : 'number', valueType, candidate);
+  });
+  const indexApplicabilityForKeyExpression = (
+    keyExpression: ts.Expression | undefined,
+  ): 'string' | 'number' | 'both' => {
+    if (keyExpression === undefined) return 'both';
+    const key = unwrapExpression(keyExpression);
+    if (ts.isStringLiteral(key)) return 'string';
+    if (ts.isNumericLiteral(key)) return 'number';
+
+    const type = checker.getTypeAtLocation(key);
+    const resolvedType = type.flags & (ts.TypeFlags.TypeParameter | ts.TypeFlags.IndexedAccess)
+      ? resolveConstraintChain(type)
+      : type;
+    if (resolvedType === undefined || isAnyOrUnknown(resolvedType)) return 'both';
+    const members = resolvedType.isUnion() ? resolvedType.types : [resolvedType];
+    const stringOnly = members.every((member) => Boolean(member.flags & ts.TypeFlags.StringLike));
+    const numberOnly = members.every((member) => Boolean(member.flags & ts.TypeFlags.NumberLike));
+    return stringOnly ? 'string' : numberOnly ? 'number' : 'both';
+  };
 
   return {
     /** Resolves aliases through the bound checker's alias chain. */
@@ -201,6 +347,9 @@ export function createStaticReferenceResolver(checker: ts.TypeChecker): StaticRe
       const name = literalTypeName(resolvedType);
       return name === undefined ? undefined : [name];
     },
+    indexApplicabilityForKey(keyExpression) {
+      return indexApplicabilityForKeyExpression(keyExpression);
+    },
     /**
      * Applies the shared default-deny rule that a dynamic key may select the
      * consumer's target.
@@ -208,55 +357,74 @@ export function createStaticReferenceResolver(checker: ts.TypeChecker): StaticRe
     propertyKeyMaySelect(names, targetName) {
       return names === undefined || names.includes(targetName);
     },
-    /**
-     * Classifies wrapped identifiers, dot access, and element access as
-     * exact, potential, or none without making consumers infer uncertainty.
-     */
-    resolvePropertyReference(expression, isTarget) {
-      const reference = unwrapExpression(expression);
-      const matches = (symbol: ts.Symbol | undefined): boolean => {
-        const resolved = symbol !== undefined && symbol.flags & ts.SymbolFlags.Alias
-          ? checker.getAliasedSymbol(symbol)
-          : symbol;
-        return resolved !== undefined && isTarget(resolved);
-      };
-      const propertyMatches = (symbol: ts.Symbol | undefined): boolean => (
-        matches(symbol)
-        || symbol?.declarations?.some((declaration) => (
-          ts.isShorthandPropertyAssignment(declaration)
-          && matches(checker.getShorthandAssignmentValueSymbol(declaration))
-        ))
-        || false
-      );
+    resolvePropertySelection(
+      receiverType,
+      keyCandidates,
+      indexApplicability,
+      isTarget,
+      indexSignatureMaySelect = anyIndexSignatureMaySelect,
+    ) {
+      if (isAnyOrUnknown(receiverType)) return { kind: 'potential' };
+      if (keyCandidates !== undefined && keyCandidates.length === 0) return { kind: 'none' };
 
-      if (ts.isIdentifier(reference)) {
-        return matches(checker.getSymbolAtLocation(reference)) ? { kind: 'exact' } : { kind: 'none' };
-      }
-
-      if (ts.isPropertyAccessExpression(reference)) {
-        const symbol = checker.getSymbolAtLocation(reference);
-        if (symbol !== undefined) return propertyMatches(symbol) ? { kind: 'exact' } : { kind: 'none' };
-        return isAnyOrUnknown(checker.getTypeAtLocation(reference.expression))
+      if (keyCandidates === undefined) {
+        return checker.getPropertiesOfType(receiverType).some((symbol) => propertyMatches(symbol, isTarget))
+          || hasApplicableIndexSignature(receiverType, indexApplicability, indexSignatureMaySelect, undefined)
           ? { kind: 'potential' }
           : { kind: 'none' };
       }
 
+      const candidateKinds = keyCandidates.map((key) => {
+        const property = checker.getPropertyOfType(receiverType, key);
+        if (property !== undefined) return propertyMatches(property, isTarget) ? 'exact' : 'none';
+        return hasApplicableIndexSignature(receiverType, indexApplicability, indexSignatureMaySelect, key) ? 'potential' : 'none';
+      });
+      if (candidateKinds.every((kind) => kind === 'exact')) return { kind: 'exact' };
+      if (candidateKinds.every((kind) => kind === 'none')) return { kind: 'none' };
+      return { kind: 'potential' };
+    },
+    /**
+     * Classifies wrapped identifiers, dot access, and element access as
+     * exact, potential, or none without making consumers infer uncertainty.
+     */
+    resolvePropertyReference(expression, isTarget, indexSignatureMaySelect = anyIndexSignatureMaySelect) {
+      const reference = unwrapExpression(expression);
+
+      if (ts.isIdentifier(reference)) {
+        return matches(checker.getSymbolAtLocation(reference), isTarget) ? { kind: 'exact' } : { kind: 'none' };
+      }
+
+      const receiverTypes = (receiver: ts.Expression): readonly ts.Type[] => {
+        const declared = checker.getTypeAtLocation(receiver);
+        const innermost = checker.getTypeAtLocation(unwrapExpression(receiver));
+        return declared === innermost ? [declared] : [declared, innermost];
+      };
+      const strongest = (results: readonly PropertyReferenceResolution[]): PropertyReferenceResolution => (
+        results.some((result) => result.kind === 'exact') ? { kind: 'exact' }
+          : results.some((result) => result.kind === 'potential') ? { kind: 'potential' }
+            : { kind: 'none' }
+      );
+
+      if (ts.isPropertyAccessExpression(reference)) {
+        const symbol = checker.getSymbolAtLocation(reference);
+        if (symbol !== undefined && propertyMatches(symbol, isTarget)) return { kind: 'exact' };
+        return strongest(receiverTypes(reference.expression).map((receiverType) => this.resolvePropertySelection(
+          receiverType,
+          [reference.name.text],
+          'string',
+          isTarget,
+          indexSignatureMaySelect,
+        )));
+      }
+
       if (ts.isElementAccessExpression(reference)) {
-        const receiverType = checker.getTypeAtLocation(reference.expression);
-        if (isAnyOrUnknown(receiverType)) return { kind: 'potential' };
-
-        const names = reference.argumentExpression === undefined
-          ? undefined
-          : this.resolvePropertyKey(reference.argumentExpression);
-        if (names === undefined) {
-          return checker.getPropertiesOfType(receiverType).some((symbol) => propertyMatches(symbol))
-            ? { kind: 'potential' }
-            : { kind: 'none' };
-        }
-
-        const matchingNames = names.filter((name) => propertyMatches(checker.getPropertyOfType(receiverType, name)));
-        if (matchingNames.length === names.length) return { kind: 'exact' };
-        return matchingNames.length > 0 ? { kind: 'potential' } : { kind: 'none' };
+        return strongest(receiverTypes(reference.expression).map((receiverType) => this.resolvePropertySelection(
+          receiverType,
+          reference.argumentExpression === undefined ? undefined : this.resolvePropertyKey(reference.argumentExpression),
+          this.indexApplicabilityForKey(reference.argumentExpression),
+          isTarget,
+          indexSignatureMaySelect,
+        )));
       }
 
       return { kind: 'none' };

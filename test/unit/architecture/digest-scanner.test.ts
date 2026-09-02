@@ -39,6 +39,14 @@ async function withCaller(source: string, assertion: (result: Scan, names: Reado
 
 function expectKinds(result: Scan, kinds: readonly DigestViolationKind[]): void { expect(result.violations.map(({ kind }) => kind)).toEqual(kinds); }
 
+function expectedCoordinate(fileName: string, source: string, line: number, marker: string): { fileName: string; line: number; column: number } {
+  const text = source.split('\n')[line - 1];
+  if (text === undefined) throw new Error(`Missing line ${line}.`);
+  const index = text.lastIndexOf(marker);
+  if (index < 0) throw new Error(`Missing marker ${marker} on line ${line}.`);
+  return { fileName, line, column: index + 1 };
+}
+
 describe('scanComputeInputsDigestAuthority()', () => {
   test.each([
     ['an inline literal', 'computeInputsDigest({ schemaVersion: 1 });'],
@@ -86,7 +94,11 @@ describe('scanComputeInputsDigestAuthority()', () => {
       ? body
       : ["import { computeInputsDigest } from '../ir/digest.js';", body].join('\n');
     await withCaller(source, (result, names) => {
-      expect(result.calls).toEqual([]); expectKinds(result, ['value-reference-outside-authority-call']);
+      const kinds: readonly DigestViolationKind[] = _name === 'storing it in an object literal'
+        || _name === 'storing it in an array literal'
+        ? ['value-reference-outside-authority-call', 'value-reference-outside-authority-call']
+        : ['value-reference-outside-authority-call'];
+      expect(result.calls).toEqual([]); expectKinds(result, kinds);
       expect(result.violations[0]).toMatchObject({ fileName: names['src/core/ai/plan-input-provenance.ts'], line: expectedLine, column: expect.any(Number) });
     });
   });
@@ -197,9 +209,11 @@ describe('scanComputeInputsDigestAuthority()', () => {
   });
 
   test('rejects a nested destructuring rebind of the canonical digest function', async () => {
-    await withCaller("import * as digest from '../ir/digest.js';\nconst source: { outer: typeof digest } = { outer: digest };\nconst { outer: { computeInputsDigest } } = source;", (result) => {
+    const source = "import * as digest from '../ir/digest.js';\nconst source: { outer: typeof digest } = { outer: digest };\nconst { outer: { computeInputsDigest } } = source;";
+    await withCaller(source, (result, names) => {
       expect(result.calls).toEqual([]);
-      expectKinds(result, ['value-reference-outside-authority-call']);
+      expectKinds(result, ['value-reference-outside-authority-call', 'value-reference-outside-authority-call']);
+      expect(result.violations[0]).toEqual({ ...expectedCoordinate(names['src/core/ai/plan-input-provenance.ts'] ?? '', source, 2, 'digest };'), kind: 'value-reference-outside-authority-call' });
     });
   });
 
@@ -224,15 +238,79 @@ describe('scanComputeInputsDigestAuthority()', () => {
     ['a call', "import * as digest from '../ir/digest.js';\ndeclare const key: string;\nconst namespace = digest as typeof digest & Record<string, (input: { schemaVersion: number }) => string>;\nnamespace[key]({ schemaVersion: 1 });"],
     ['a value reference', "import * as digest from '../ir/digest.js';\ndeclare const key: string;\nconst namespace = digest as typeof digest & Record<string, (input: { schemaVersion: number }) => string>;\nconst local = namespace[key];\nvoid local;"],
   ])('rejects a dynamic digest namespace computed key %s', async (_name, source) => {
-    await withCaller(source, (result) => {
+    await withCaller(source, (result, names) => {
       expect(result.calls).toEqual([]);
-      expectKinds(result, ['value-reference-outside-authority-call']);
+      expectKinds(result, ['value-reference-outside-authority-call', 'value-reference-outside-authority-call']);
+      expect(result.violations[0]).toEqual({ ...expectedCoordinate(names['src/core/ai/plan-input-provenance.ts'] ?? '', source, 3, 'digest as'), kind: 'value-reference-outside-authority-call' });
     });
   });
 
-  test('allows a dynamic computed key on an unrelated indexed object', async () => {
-    await withCaller('declare const key: string; declare const unrelated: Record<string, (input: { schemaVersion: number }) => string>; unrelated[key]({ schemaVersion: 1 });', (result) => {
+  test('allows a dynamic computed key on an unrelated closed object', async () => {
+    await withCaller([
+      'declare const key: string;',
+      'declare const unrelated: { other: (input: { schemaVersion: number }) => string };',
+      '// @ts-expect-error A closed receiver has no string index signature.',
+      'unrelated[key]({ schemaVersion: 1 });',
+    ].join('\n'), (result) => {
       expect(result).toEqual({ calls: [], violations: [] });
+    });
+  });
+
+  test('rejects a computed-key assignment destructuring rebind at the root', async () => {
+    const source = [
+      "import * as digest from '../ir/digest.js';",
+      'let local: unknown;',
+      "({ ['computeInputsDigest']: local } = digest);",
+    ].join('\n');
+    await withCaller(source, (result, names) => {
+      expect(result).toEqual({
+        calls: [],
+        violations: [{
+          fileName: names['src/core/ai/plan-input-provenance.ts'],
+          line: 3,
+          column: 4,
+          kind: 'value-reference-outside-authority-call',
+        }],
+      });
+    });
+  });
+
+  test('rejects a nested computed-key assignment destructuring rebind', async () => {
+    const source = [
+      "import * as digest from '../ir/digest.js';",
+      'declare const source: { outer: typeof digest };',
+      'let local: unknown;',
+      "({ outer: { ['computeInputsDigest']: local } } = source);",
+    ].join('\n');
+    await withCaller(source, (result, names) => {
+      expect(result).toEqual({
+        calls: [],
+        violations: [{
+          fileName: names['src/core/ai/plan-input-provenance.ts'],
+          line: 4,
+          column: 13,
+          kind: 'value-reference-outside-authority-call',
+        }],
+      });
+    });
+  });
+
+  test('rejects nested declaration destructuring through an applicable index signature', async () => {
+    const source = [
+      "import * as digest from '../ir/digest.js';",
+      'declare const source: { [key: string]: typeof digest };',
+      'const { outer: { computeInputsDigest } } = source;',
+    ].join('\n');
+    await withCaller(source, (result, names) => {
+      expect(result).toEqual({
+        calls: [],
+        violations: [{
+          fileName: names['src/core/ai/plan-input-provenance.ts'],
+          line: 3,
+          column: 18,
+          kind: 'value-reference-outside-authority-call',
+        }],
+      });
     });
   });
 
@@ -240,9 +318,14 @@ describe('scanComputeInputsDigestAuthority()', () => {
     ['a direct quoted binding', "import * as digest from '../ir/digest.js';\nconst { 'computeInputsDigest': local } = digest;\nvoid local;"],
     ['a one-level-nested quoted binding', "import * as digest from '../ir/digest.js';\nconst source: { outer: typeof digest } = { outer: digest };\nconst { 'outer': { 'computeInputsDigest': local } } = source;\nvoid local;"],
   ])('rejects %s', async (_name, source) => {
-    await withCaller(source, (result) => {
+    await withCaller(source, (result, names) => {
       expect(result.calls).toEqual([]);
-      expectKinds(result, ['value-reference-outside-authority-call']);
+      expectKinds(result, _name === 'a one-level-nested quoted binding'
+        ? ['value-reference-outside-authority-call', 'value-reference-outside-authority-call']
+        : ['value-reference-outside-authority-call']);
+      if (_name === 'a one-level-nested quoted binding') {
+        expect(result.violations[0]).toEqual({ ...expectedCoordinate(names['src/core/ai/plan-input-provenance.ts'] ?? '', source, 2, 'digest };'), kind: 'value-reference-outside-authority-call' });
+      }
     });
   });
 
@@ -250,9 +333,14 @@ describe('scanComputeInputsDigestAuthority()', () => {
     ['a resolvable computed binding', "import * as digest from '../ir/digest.js';\nconst key = 'computeInputsDigest' as const;\nconst { [key]: local } = digest;\nvoid local;"],
     ['a dynamic computed binding', "import * as digest from '../ir/digest.js';\ndeclare const key: string;\nconst namespace: typeof digest & Record<string, unknown> = digest;\nconst { [key]: local } = namespace;\nvoid local;"],
   ])('rejects %s', async (_name, source) => {
-    await withCaller(source, (result) => {
+    await withCaller(source, (result, names) => {
       expect(result.calls).toEqual([]);
-      expectKinds(result, ['value-reference-outside-authority-call']);
+      expectKinds(result, _name === 'a dynamic computed binding'
+        ? ['value-reference-outside-authority-call', 'value-reference-outside-authority-call']
+        : ['value-reference-outside-authority-call']);
+      if (_name === 'a dynamic computed binding') {
+        expect(result.violations[0]).toEqual({ ...expectedCoordinate(names['src/core/ai/plan-input-provenance.ts'] ?? '', source, 3, 'digest;'), kind: 'value-reference-outside-authority-call' });
+      }
     });
   });
 
@@ -285,16 +373,20 @@ describe('scanComputeInputsDigestAuthority()', () => {
   });
 
   test('rejects an any-typed alias of the digest namespace', async () => {
-    await withCaller("import * as digest from '../ir/digest.js';\nconst alias: any = digest;\nalias.computeInputsDigest({ schemaVersion: 1 });", (result) => {
+    const source = "import * as digest from '../ir/digest.js';\nconst alias: any = digest;\nalias.computeInputsDigest({ schemaVersion: 1 });";
+    await withCaller(source, (result, names) => {
       expect(result.calls).toEqual([]);
-      expectKinds(result, ['value-reference-outside-authority-call']);
+      expectKinds(result, ['value-reference-outside-authority-call', 'value-reference-outside-authority-call']);
+      expect(result.violations[0]).toEqual({ ...expectedCoordinate(names['src/core/ai/plan-input-provenance.ts'] ?? '', source, 2, 'digest;'), kind: 'value-reference-outside-authority-call' });
     });
   });
 
   test('rejects a non-call any-typed alias property reference', async () => {
-    await withCaller("import * as digest from '../ir/digest.js';\nconst alias: any = digest;\nconst fn = alias.computeInputsDigest;\nvoid fn;", (result, names) => {
+    const source = "import * as digest from '../ir/digest.js';\nconst alias: any = digest;\nconst fn = alias.computeInputsDigest;\nvoid fn;";
+    await withCaller(source, (result, names) => {
       expect(result.calls).toEqual([]);
       expect(result.violations).toEqual([
+        { ...expectedCoordinate(names['src/core/ai/plan-input-provenance.ts'] ?? '', source, 2, 'digest;'), kind: 'value-reference-outside-authority-call' },
         {
           fileName: names['src/core/ai/plan-input-provenance.ts'],
           line: 3,

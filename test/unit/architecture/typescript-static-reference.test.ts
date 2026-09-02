@@ -170,7 +170,11 @@ describe('createStaticReferenceResolver()', () => {
     ['a finite ambiguous element access', 'potential', 'potentialElement'],
     ['a non-target element access', 'none', 'noneElement'],
     ['a wrapped target property access', 'exact', 'wrappedReference'],
-    ['a dynamic element access on a closed receiver without the target', 'none', 'closedDynamicElement'],
+    ['a dynamic element access on an open string-index receiver', 'potential', 'closedDynamicElement'],
+    ['a dot access on an open string-index receiver', 'potential', 'openIndexDot'],
+    ['a cast-hidden dot receiver', 'potential', 'castHiddenDot'],
+    ['a cast-hidden element receiver', 'potential', 'castHiddenElement'],
+    ['a double-cast-hidden receiver', 'potential', 'doubleCastHidden'],
   ] as const)('classifies %s as %s', async (_name, kind, variable) => {
     await withProgram({
       'src/target.ts': 'export const target = (): void => undefined;',
@@ -190,6 +194,10 @@ describe('createStaticReferenceResolver()', () => {
         "const noneElement = values['other'];",
         'const wrappedReference = ((values.target)! as typeof target);',
         'const closedDynamicElement = closed[dynamic];',
+        'const openIndexDot = closed.target;',
+        "const castHiddenDot = (closed as unknown as { target: string }).target;",
+        "const castHiddenElement = (closed as unknown as { target: string })['target'];",
+        "const doubleCastHidden = ((closed as unknown) as { target: string }).target;",
       ].join('\n'),
     }, (program, names) => {
       const checker = program.getTypeChecker();
@@ -197,6 +205,40 @@ describe('createStaticReferenceResolver()', () => {
       const resolver = createStaticReferenceResolver(checker);
       const expression = variableExpression(sourceFile(program, names['src/synthetic.ts'] ?? ''), variable);
       expect(resolver.resolvePropertyReference(expression, (symbol) => symbol.declarations?.includes(target) ?? false)).toEqual({ kind });
+    });
+  });
+
+  test.each([
+    ['an empty finite candidate set', 'explicit', [], 'string', 'none'],
+    ['a finite candidate set with one target and one non-target', 'explicit', ['target', 'other'], 'string', 'potential'],
+    ['a string key without an explicit property on a string-index receiver', 'stringIndexed', ['missing'], 'string', 'potential'],
+    ['a number key without an explicit property on a number-index receiver', 'numberIndexed', ['1'], 'number', 'potential'],
+    ['a missing property on a receiver with no applicable index signature', 'closed', ['missing'], 'string', 'none'],
+    ['a string-only key on a receiver with only a number index signature', 'numberIndexed', ['target'], 'string', 'none'],
+  ] as const)('classifies %s through resolvePropertySelection()', async (_name, receiver, candidates, applicability, kind) => {
+    await withProgram({
+      'src/target.ts': 'export const target = (): void => undefined;',
+      'src/synthetic.ts': [
+        "import { target } from './target.js';",
+        'const other = (): void => undefined;',
+        'const explicit = { target, other };',
+        'declare const stringIndexed: Record<string, typeof target>;',
+        'declare const numberIndexed: { [key: number]: typeof target };',
+        'declare const closed: { other: typeof other };',
+      ].join('\n'),
+    }, (program, names) => {
+      const checker = program.getTypeChecker();
+      const target = exportedDeclaration(checker, sourceFile(program, names['src/target.ts'] ?? ''), 'target');
+      const resolver = createStaticReferenceResolver(checker);
+      const file = sourceFile(program, names['src/synthetic.ts'] ?? '');
+      const receiverType = checker.getTypeAtLocation(variableIdentifier(file, receiver));
+
+      expect(resolver.resolvePropertySelection(
+        receiverType,
+        candidates,
+        applicability,
+        (symbol) => symbol.declarations?.includes(target) ?? false,
+      )).toEqual({ kind });
     });
   });
 
