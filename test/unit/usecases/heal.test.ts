@@ -17,7 +17,7 @@ import { computeAccessibilityFingerprint } from '#core/ir/fingerprint.js';
 import { normalizeTestMd } from '#core/ir/normalize.js';
 import {
   type ElementRef,
-  type GroundingDocument,
+  GroundingDocument,
   GeneratedPlanResponse,
   type JsonValueT,
   GROUNDING_SCHEMA_VERSION,
@@ -47,6 +47,8 @@ import { createFakeSecretsProvider } from '../../doubles/fake-secrets-provider.j
 
 const replayRunObserver = vi.hoisted(() => ({
   afterRun: undefined as undefined | ((deps: Pick<HealDeps, 'layout' | 'runId'>, storage: StorageAdapter, options: { readonly files: readonly string[]; readonly cacheOnly?: boolean }, outcome: RunOutcome) => void | Promise<void>),
+  dropFirstLiveAiCall: false,
+  droppedCount: 0,
 }));
 
 const generateRunObserver = vi.hoisted(() => ({
@@ -59,8 +61,23 @@ vi.mock('#usecases/run.js', async (importOriginal) => {
   return {
     ...actual,
     run: async (...args: Parameters<typeof actual.run>) => {
-      const outcome = await actual.run(...args);
-      await replayRunObserver.afterRun?.(args[0], args[0].storage, args[1], outcome);
+      const [deps, options] = args;
+      const replayDeps = replayRunObserver.dropFirstLiveAiCall && options.cacheOnly === false
+        ? {
+          ...deps,
+          events: {
+            emit(event: RunEvent): void {
+              if (event.type === 'ai-call' && replayRunObserver.droppedCount === 0) {
+                replayRunObserver.droppedCount += 1;
+                return;
+              }
+              deps.events.emit(event);
+            },
+          },
+        }
+        : deps;
+      const outcome = await actual.run(replayDeps, options);
+      await replayRunObserver.afterRun?.(replayDeps, replayDeps.storage, options, outcome);
       return outcome;
     },
   };
@@ -81,6 +98,8 @@ vi.mock('#usecases/generate.js', async (importOriginal) => {
 
 afterEach(() => {
   replayRunObserver.afterRun = undefined;
+  replayRunObserver.dropFirstLiveAiCall = false;
+  replayRunObserver.droppedCount = 0;
   generateRunObserver.rejectWith = undefined;
   generateRunObserver.afterGenerate = undefined;
 });
@@ -456,13 +475,41 @@ describe('heal state-machine contract', () => {
   it('aborts at the initial live measurement when its replay carries an integrity violation', async () => {
     const violation = new IntegrityViolationError('initial live evidence escaped containment');
     const scenario = await createScenario();
-    const calls = injectReplayIntegrityViolation((call, options) => call === 2 && options.cacheOnly === false, violation);
+    let injected = false;
+    let injectionCount = 0;
+    replayRunObserver.afterRun = (_deps, _storage, options, outcome) => {
+      if (injected || options.cacheOnly !== false) return;
+      const replay = outcome.results[0] as { error?: IntegrityViolationError } | undefined;
+      if (replay === undefined) return;
+      replay.error = violation;
+      injected = true;
+      injectionCount += 1;
+    };
 
     const result = await heal(scenario.deps, OPTIONS);
 
     expectCaseScopedIntegrityFailure(result, violation);
-    expect(calls()).toBe(2);
+    expect(injectionCount).toBe(1);
+    expect(result.outcome.errors[0]?.error).toBe(violation);
     expect(scenario.deps.resolveAiExecutor).not.toHaveBeenCalled();
+  });
+
+  it('aborts a live AI replay when run swallows a missing pending dispatch', async () => {
+    const scenario = await createScenario({ steps: [AI_STEP], grounding: {} });
+    replayRunObserver.dropFirstLiveAiCall = true;
+
+    const result = await heal(scenario.deps, OPTIONS);
+
+    expect(replayRunObserver.droppedCount).toBe(1);
+    expect(result.outcome.results).toEqual([]);
+    expect(result.commits.size).toBe(0);
+    expect(result.outcome.errors).toEqual([
+      expect.objectContaining({
+        file: OPTIONS.files[0],
+        error: expect.any(UnexpectedCrashError),
+      }),
+    ]);
+    expect(result.outcome.errors[0]?.error.cause).toMatchObject({ reason: 'missing-pending-ai-call' });
   });
 
   it('aborts at the Stage-1 replay when its replay carries an integrity violation', async () => {
@@ -1951,18 +1998,29 @@ describe('heal state-machine contract', () => {
   });
 
   it('restores both buffered artifacts before emitting a no-advance rejection', async () => {
-    const originalUrl = '/p239g5c-original';
-    const candidateUrl = '/p239g5c-candidate';
     const recording = createRecordingEventSink();
+    const candidateEntries = new Map([
+      [elementRefKey(SUBMIT), { exists: false, currentFingerprint: FINGERPRINT }],
+      ...liveEntries(REPAIRED_SUBMIT),
+    ]);
     let stageTwoStorage: StorageAdapter | undefined;
     let completedReplays = 0;
     let observedCandidateBytes = false;
+    let observedCandidateGroundingBytes = false;
     let artifactsObservedAtRejection: Promise<readonly [string, string]> | undefined;
     replayRunObserver.afterRun = async (_deps, storage) => {
       completedReplays += 1;
       if (completedReplays === 2) stageTwoStorage = storage;
-      const currentPlan = await storage.readText(PLAN);
-      if (currentPlan.includes(candidateUrl)) observedCandidateBytes = true;
+      const currentPlan = PlanDocument.parse(JSON.parse(await storage.readText(PLAN)));
+      const repairStep = currentPlan.steps.find((step) => step.id === 'repair-me');
+      if (repairStep?.kind !== 'action' || repairStep.action !== 'click' || elementRefKey(repairStep.target) !== elementRefKey(REPAIRED_SUBMIT)) return;
+      observedCandidateBytes = true;
+      const candidateGrounding = GroundingDocument.parse(JSON.parse(await storage.readText(GROUNDING)));
+      expect(candidateGrounding.entries['repair-me']).toMatchObject({
+        kind: 'element',
+        fingerprint: freshFingerprint(candidateEntries, REPAIRED_SUBMIT),
+      });
+      observedCandidateGroundingBytes = true;
     };
     const events: EventSink = {
       emit(event: RunEvent): void {
@@ -1977,16 +2035,19 @@ describe('heal state-machine contract', () => {
         recording.sink.emit(event);
       },
     };
-    const response = { steps: [{ id: 'repair-me', kind: 'action', action: 'navigate', url: candidateUrl }], ambiguities: [] };
+    const response = { steps: [{ id: 'repair-me', kind: 'action', action: 'click', target: REPAIRED_SUBMIT }], ambiguities: [] };
     const scenario = await createScenario({
-      steps: [Step.parse({ id: 'repair-me', kind: 'action', action: 'navigate', url: originalUrl })],
+      steps: [Step.parse({ id: 'repair-me', kind: 'action', action: 'click', target: SUBMIT })],
       grounding: {},
-      aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: response, raw: JSON.stringify(response) }) }),
-      browserDriver: vi.fn<HealDeps['browserDriver']>(() => createFakeBrowserDriver(() => createFakeBrowserSession(new Map(), {
+      sessionEntries: candidateEntries,
+      aiExecutor: createFakeAiExecutor({ execute: async (request) => request.prompt.startsWith('Confirm whether')
+        ? { data: { confirmed: true }, raw: '{"confirmed":true}' }
+        : { data: response, raw: JSON.stringify(response) } }),
+      browserDriver: vi.fn<HealDeps['browserDriver']>(() => createFakeBrowserDriver(() => createFakeBrowserSession(candidateEntries, {
         baseUrl: TARGETS.web.baseUrl,
         currentUrl: TARGETS.web.baseUrl,
-        snapshot: healSnapshot(new Map()),
-        onPerform() { throw new Error('The Stage-2 navigation fixture must remain at its failing frontier.'); },
+        snapshot: healSnapshot(candidateEntries),
+        onPerform() { throw new Error('The Stage-2 click fixture must remain at its failing frontier.'); },
       }))),
     });
     const originalPlan = await scenario.storage.readText(PLAN);
@@ -1995,9 +2056,12 @@ describe('heal state-machine contract', () => {
     await heal({ ...scenario.deps, events }, OPTIONS);
 
     expect(observedCandidateBytes).toBe(true);
+    expect(observedCandidateGroundingBytes).toBe(true);
     expect(recording.emitted()).toContainEqual({ type: 'heal-stage2-rejected', stepId: 'repair-me', reason: 'no-advance' });
     expect(artifactsObservedAtRejection).toBeDefined();
-    await expect(artifactsObservedAtRejection).resolves.toEqual([originalPlan, originalGrounding]);
+    const [restoredPlan, restoredGrounding] = await artifactsObservedAtRejection!;
+    expect(restoredPlan).toBe(originalPlan);
+    expect(restoredGrounding).toBe(originalGrounding);
   });
 
   it('passes only the first accepted replacement in the next Stage-2 repairHistory', async () => {

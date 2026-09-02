@@ -50,6 +50,26 @@ type OpenPhase = {
   deniedReason?: DispatchBudgetDenialReason;
   pendingAiCall?: Extract<RunEvent, { type: 'ai-call' }> | undefined;
   deferredRejection?: Extract<RunEvent, { type: 'heal-stage2-rejected' }>;
+  /**
+   * Retains this token's first protocol violation. The token is set once and
+   * never overwritten so settle-time arbitration can reject the earliest
+   * broken contract ahead of every other outcome for the phase.
+   */
+  protocolViolation?: DispatchProtocolError;
+};
+
+/**
+ * Creates the error for one broken protocol event and preserves the first
+ * instance on the phase token. Callers throw the returned value directly;
+ * they do not need a separate catch-and-store path because settle-time code
+ * reads the latch itself. A later call still receives a fresh error that
+ * reports its own synchronous reason, while the existing token remains the
+ * phase's authoritative first violation.
+ */
+const recordProtocolViolation = (phase: OpenPhase, reason: DispatchProtocolError['reason']): DispatchProtocolError => {
+  const error = new DispatchProtocolError(reason);
+  phase.protocolViolation ??= error;
+  return error;
 };
 
 /**
@@ -118,10 +138,14 @@ export interface HealAiDispatchBudget {
    * The controller inspects only a failed result's error, never a successful
    * result's value.
    *
-   * A `DispatchProtocolError` from the phase event proxy bypasses status
-   * arbitration and is immediately rethrown before `work` receives a settled
-   * result. After `work` settles, an unconsumed `ai-call` is likewise a
-   * protocol error and takes precedence over integrity failure or denial.
+   * After `work` settles, the controller gives its own first-latched protocol
+   * violation priority, then turns an unconsumed `ai-call` into and latches a
+   * fresh protocol violation. It next returns a thrown
+   * `IntegrityViolationError`, then a latched denial, and otherwise completes
+   * the phase. This order keeps phase-local protocol integrity ahead of
+   * integrity and denial arbitration even when an intermediate caller catches
+   * the original error. Deferred Stage 2 rejection events are never flushed
+   * on any of the first four outcomes.
    *
    * A second phase from the same controller is a programming error while the
    * first remains open. The controller throws its reentrancy assertion at
@@ -229,13 +253,15 @@ export interface HealAiDispatchPhaseDeps {
  * settles, and passes every other `RunEvent` straight to the real sink. It
  * retains those slots on the per-phase record and checks that record's
  * identity against `openPhase`, so a proxy retained beyond settlement cannot
- * affect a later phase. Denied and integrity-failure phases discard their
- * deferred rejection event. After work settles, the controller first checks
- * for an unconsumed pending `ai-call` and throws
- * `unconsumed-pending-ai-call`; this protocol check precedes every status
- * outcome. Only a `completed` phase with a successful result flushes one
- * deferred `heal-stage2-rejected` event. This ordering prevents an invalid or
- * unsuccessful phase from publishing a rejection event to the real sink.
+ * affect a later phase. After work settles, its own first-latched protocol
+ * violation rejects first; an unconsumed pending `ai-call` becomes and
+ * latches a fresh protocol violation next; a thrown
+ * `IntegrityViolationError` follows; a latched denial follows that; and all
+ * remaining work completes. Protocol integrity must win over integrity and
+ * denial arbitration, so deferred Stage 2 rejection events are never flushed
+ * on any of those first four outcomes. Only a successful completed phase
+ * flushes one deferred `heal-stage2-rejected` event, preventing invalid or
+ * unsuccessful work from publishing it to the real sink.
  *
  * @param params - Case-local inputs for the controller.
  * @param params.resolveAiExecutor - The case's own unresolved, unbound lazy
@@ -305,13 +331,15 @@ export function createHealAiDispatchBudget(params: {
   /**
    * Binds one caller-owned `ai-call` to one executor attempt. Clearing the
    * pending slot before admission keeps a denied dispatch's event out of the
-   * real sink, while a dispatch without its caller-owned event remains a
-   * programming error.
+   * real sink, while a dispatch without its caller-owned event latches its
+   * protocol violation before throwing so settle-time code cannot lose it.
    */
   const dispatch = async <T>(phase: OpenPhase | undefined, perform: () => Promise<T>): Promise<T> => {
     if (phase === undefined) throw new Error('AI dispatch attempted outside an open budget phase.');
     const event = phase.pendingAiCall;
-    if (event === undefined) throw new DispatchProtocolError('missing-pending-ai-call');
+    // Latching this missing caller-owned event before throwing preserves it
+    // for settle-time arbitration even when an intermediate caller catches it.
+    if (event === undefined) throw recordProtocolViolation(phase, 'missing-pending-ai-call');
     phase.pendingAiCall = undefined;
     admitDispatch();
     params.events.emit(event);
@@ -348,10 +376,20 @@ export function createHealAiDispatchBudget(params: {
           value: await work({
             resolveAiExecutor,
             events: {
+              /**
+               * Keeps event ownership on this captured phase. A stale proxy,
+               * duplicate pending `ai-call`, or any other phase-local protocol
+               * breach latches on this token before throwing, so it cannot be
+               * downgraded by an intermediate catch or contaminate a later phase.
+              */
               emit(event): void {
-                if (openPhase !== phase) throw new DispatchProtocolError('stale-events-proxy');
+                // A retained proxy latches on its captured token before throwing,
+                // leaving later phases untouched.
+                if (openPhase !== phase) throw recordProtocolViolation(phase, 'stale-events-proxy');
                 if (event.type === 'ai-call') {
-                  if (phase.pendingAiCall !== undefined) throw new DispatchProtocolError('duplicate-pending-ai-call');
+                  // A second promise latches before throwing, preserving the first
+                  // failure for this phase's settle sequence.
+                  if (phase.pendingAiCall !== undefined) throw recordProtocolViolation(phase, 'duplicate-pending-ai-call');
                   phase.pendingAiCall = event;
                   return;
                 }
@@ -365,12 +403,14 @@ export function createHealAiDispatchBudget(params: {
           }),
         };
       } catch (error) {
-        if (error instanceof DispatchProtocolError) throw error;
         result = { ok: false, error };
       } finally {
         openPhase = undefined;
       }
-      if (phase.pendingAiCall !== undefined) throw new DispatchProtocolError('unconsumed-pending-ai-call');
+      // Settle checks preserve this phase's captured protocol violation before
+      // integrity or denial arbitration, and latch an unconsumed pending call too.
+      if (phase.protocolViolation !== undefined) throw phase.protocolViolation;
+      if (phase.pendingAiCall !== undefined) throw recordProtocolViolation(phase, 'unconsumed-pending-ai-call');
       if (result.ok === false && result.error instanceof IntegrityViolationError) {
         return { status: 'integrity-failure', error: result.error };
       }

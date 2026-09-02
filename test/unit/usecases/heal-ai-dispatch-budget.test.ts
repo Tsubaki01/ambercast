@@ -127,6 +127,91 @@ describe('createHealAiDispatchBudget', () => {
     expect(fixture.recording.emitted()).not.toContainEqual(rejection);
   });
 
+  it('rejects a swallowed protocol violation without flushing a deferred Stage 2 rejection', async () => {
+    const fixture = createBudget();
+    const rejection = { type: 'heal-stage2-rejected' as const, stepId: 'repair-step', reason: 'no-advance' as const };
+    let capturedError: unknown;
+
+    let rejectionFromPhase: unknown;
+    try {
+      await fixture.budget.runPhase('incremental', async (deps) => {
+        const executor = await deps.resolveAiExecutor();
+        try {
+          await executor.execute(request);
+        } catch (error) {
+          capturedError = error;
+        }
+        deps.events.emit(rejection);
+        return 'swallowed';
+      });
+    } catch (error) {
+      rejectionFromPhase = error;
+    }
+
+    expect(rejectionFromPhase).toBe(capturedError);
+    expect(capturedError).toMatchObject({ reason: 'missing-pending-ai-call' });
+    expect(fixture.recording.emitted()).not.toContainEqual(rejection);
+  });
+
+  it('keeps the first caught protocol violation when a later violation throws its own reason', async () => {
+    const fixture = createBudget();
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      const executor = await deps.resolveAiExecutor();
+      try {
+        await executor.execute(request);
+      } catch {
+        // The first violation is deliberately swallowed to exercise the phase latch.
+      }
+      deps.events.emit({ type: 'ai-call' });
+      let secondViolation: unknown;
+      try {
+        deps.events.emit({ type: 'ai-call' });
+      } catch (error) {
+        secondViolation = error;
+      }
+      expect(secondViolation).toMatchObject({ reason: 'duplicate-pending-ai-call' });
+      await executor.execute(request);
+      return 'consumed';
+    })).rejects.toMatchObject({ reason: 'missing-pending-ai-call' });
+  });
+
+  it('gives a caught protocol violation precedence over integrity failure and denial', async () => {
+    const fixture = createBudget({ maxDispatches: 1 });
+    const violation = new IntegrityViolationError('A later replay observation escaped containment.');
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      const executor = await deps.resolveAiExecutor();
+      try {
+        await executor.execute(request);
+      } catch {
+        // run() may absorb the phase-local protocol error before returning.
+      }
+      await dispatchOnce(deps);
+      await expect(dispatchOnce(deps)).rejects.toThrow();
+      throw violation;
+    })).rejects.toMatchObject({ reason: 'missing-pending-ai-call' });
+  });
+
+  it('recovers after a caught and swallowed protocol violation', async () => {
+    const fixture = createBudget();
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      const executor = await deps.resolveAiExecutor();
+      try {
+        await executor.execute(request);
+      } catch {
+        // This mirrors a downstream catch that returns normally.
+      }
+      return 'swallowed';
+    })).rejects.toMatchObject({ reason: 'missing-pending-ai-call' });
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      await dispatchOnce(deps);
+      return 'recovered';
+    })).resolves.toEqual({ status: 'completed', result: { ok: true, value: 'recovered' } });
+  });
+
   it.each([
     {
       label: 'attempt-limit',
