@@ -58,6 +58,19 @@ async function withCaller(
 }
 
 describe('scanIntegrityViolationInventory()', () => {
+  test('rejects a run module without the repairable-navigation export', async () => {
+    await withProgram({
+      'src/core/errors/integrity-violation-error.ts': integritySource,
+      'src/usecases/run.ts': 'export const unrelated = true;',
+    }, (program, names) => {
+      const integrity = names['src/core/errors/integrity-violation-error.ts'];
+      const run = names['src/usecases/run.ts'];
+      if (integrity === undefined || run === undefined) throw new Error('Synthetic integrity modules are missing.');
+      expect(() => scanIntegrityViolationInventory(program, integrity, run))
+        .toThrow('isRepairableNavigationFailure must have a function declaration.');
+    });
+  });
+
   test('projects an exact direct repairable-navigation call into the allowlist only', async () => {
     await withCaller([
       "import { isRepairableNavigationFailure } from './run.js';",

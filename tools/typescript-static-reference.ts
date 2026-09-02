@@ -87,6 +87,23 @@ export interface StaticReferenceResolver {
   resolvePropertyKey(keyExpression: ts.Expression): readonly string[] | undefined;
 
   /**
+   * Determines which index-signature kinds a property key can address.
+   *
+   * @remarks
+   * Publishing this rule once prevents property-selection callers from
+   * drifting into different index-signature boundaries. The implementation
+   * delegates to the same transparent-wrapper unwrapping and constraint-chain
+   * walk as `resolvePropertyKey`, so finite names and index applicability are
+   * derived from one view of the key expression.
+   *
+   * @param keyExpression - The element or computed-property key, if one is
+   * available.
+   * @returns `'string'` or `'number'` for an unambiguous key type, or
+   * `'both'` for mixed, unknown, unresolved, or unavailable key information.
+   */
+  indexApplicabilityForKey(keyExpression: ts.Expression | undefined): 'string' | 'number' | 'both';
+
+  /**
    * Determines whether a finite or dynamic key set can select one target name.
    *
    * A dynamic key conservatively answers `true`: default-deny consumers must
@@ -123,18 +140,15 @@ export interface StaticReferenceResolver {
    *
    * @remarks
    * Candidate strings do not preserve whether a literal key was originally
-   * string- or number-typed. Callers therefore determine index applicability
-   * once from the key expression before resolving its names. A string-literal
-   * key expression or an identifier/string-literal property name uses the
-   * string index kind, while a numeric-literal key expression or property
-   * name uses the number kind. For a non-literal computed
-   * key or name, callers resolve its expression type through the same
-   * constraint chain as `resolvePropertyKey`: `StringLike`-only is
-   * `'string'`, `NumberLike`-only is `'number'`, and a mixed type, `any`,
-   * `unknown`, or unresolved type is `'both'`. A fully dynamic key without an
-   * available key expression also uses `'both'`. This avoids the tempting but
-   * imprecise alternative of always consulting both signatures while retaining
-   * default-deny behavior for mixed, unknown, and dynamically typed keys.
+   * string- or number-typed, so applicability must be derived once from the
+   * key expression before resolving its names. Callers obtain the
+   * `indexApplicability` argument through
+   * `indexApplicabilityForKey(keyExpression)`. A string-literal key expression
+   * or an identifier/string-literal property name uses the string index kind,
+   * while a numeric-literal key expression or property name uses the number
+   * kind. The published method owns the remaining type and constraint
+   * handling so callers share one derivation boundary instead of duplicating
+   * its mechanics.
    *
    * When `keyCandidates` is `undefined`, the resolver handles one conceptual
    * dynamic candidate. It returns `potential` when either a declared property
@@ -333,6 +347,9 @@ export function createStaticReferenceResolver(checker: ts.TypeChecker): StaticRe
       const name = literalTypeName(resolvedType);
       return name === undefined ? undefined : [name];
     },
+    indexApplicabilityForKey(keyExpression) {
+      return indexApplicabilityForKeyExpression(keyExpression);
+    },
     /**
      * Applies the shared default-deny rule that a dynamic key may select the
      * consumer's target.
@@ -404,7 +421,7 @@ export function createStaticReferenceResolver(checker: ts.TypeChecker): StaticRe
         return strongest(receiverTypes(reference.expression).map((receiverType) => this.resolvePropertySelection(
           receiverType,
           reference.argumentExpression === undefined ? undefined : this.resolvePropertyKey(reference.argumentExpression),
-          indexApplicabilityForKeyExpression(reference.argumentExpression),
+          this.indexApplicabilityForKey(reference.argumentExpression),
           isTarget,
           indexSignatureMaySelect,
         )));

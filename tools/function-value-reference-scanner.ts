@@ -197,17 +197,6 @@ export function scanFunctionValueReferences(
     }
     return ts.isFunctionDeclaration(parent) && parent === canonicalDeclaration && parent.name === node;
   };
-  const resolveConstraintChain = (type: ts.Type, active = new Set<ts.Type>()): ts.Type | undefined => {
-    if (!(type.flags & (ts.TypeFlags.TypeParameter | ts.TypeFlags.IndexedAccess))) return type;
-    if (active.has(type)) return undefined;
-    active.add(type);
-    try {
-      const constraint = checker.getBaseConstraintOfType(type);
-      return constraint === undefined ? undefined : resolveConstraintChain(constraint, active);
-    } finally {
-      active.delete(type);
-    }
-  };
   const keyCandidates = (keyNode: ts.PropertyName | ts.BindingName): PropertySelectionCandidates => {
     if (ts.isIdentifier(keyNode) || ts.isStringLiteral(keyNode)) {
       return { names: [keyNode.text], applicability: 'string' };
@@ -215,19 +204,9 @@ export function scanFunctionValueReferences(
     if (ts.isNumericLiteral(keyNode)) return { names: [keyNode.text], applicability: 'number' };
     if (!ts.isComputedPropertyName(keyNode)) return { names: undefined, applicability: 'both' };
 
-    const type = checker.getTypeAtLocation(unwrapExpression(keyNode.expression));
-    const resolvedType = type.flags & (ts.TypeFlags.TypeParameter | ts.TypeFlags.IndexedAccess)
-      ? resolveConstraintChain(type)
-      : type;
-    if (resolvedType === undefined || resolvedType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) {
-      return { names: resolver.resolvePropertyKey(keyNode.expression), applicability: 'both' };
-    }
-    const members = resolvedType.isUnion() ? resolvedType.types : [resolvedType];
-    const stringOnly = members.every((member) => Boolean(member.flags & ts.TypeFlags.StringLike));
-    const numberOnly = members.every((member) => Boolean(member.flags & ts.TypeFlags.NumberLike));
     return {
       names: resolver.resolvePropertyKey(keyNode.expression),
-      applicability: stringOnly ? 'string' : numberOnly ? 'number' : 'both',
+      applicability: resolver.indexApplicabilityForKey(keyNode.expression),
     };
   };
   const indexTypes = (sourceType: ts.Type, applicability: PropertySelectionCandidates['applicability']): ts.Type[] => [
