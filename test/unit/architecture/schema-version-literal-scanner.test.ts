@@ -164,6 +164,14 @@ describe('scanSchemaVersionLiteralViolations()', () => {
     ['multi-hop barrel authority', "import { PLAN_SCHEMA_VERSION } from '../core/ir/two.js'; const value = { schemaVersion: PLAN_SCHEMA_VERSION };", { 'src/core/ir/one.ts': "export { PLAN_SCHEMA_VERSION } from './schema.js';", 'src/core/ir/two.ts': "export { PLAN_SCHEMA_VERSION } from './one.js';" }],
   ])('allows %s', async (_name, source, extra) => { expect(await scan(source, authority, extra)).toEqual([]); });
 
+  test('allows a genuine authority constant through a transparent cast', async () => {
+    const source = [
+      "import { PLAN_SCHEMA_VERSION } from '../core/ir/schema.js';",
+      'const value = { schemaVersion: (PLAN_SCHEMA_VERSION as typeof PLAN_SCHEMA_VERSION) };',
+    ].join('\n');
+    expect(await scan(source)).toEqual([]);
+  });
+
   test('allows direct authorities and schemaVersion propagation in every sink form', async () => {
     const source = [
       "import { PLAN_SCHEMA_VERSION } from '../core/ir/schema.js';",
@@ -247,6 +255,27 @@ describe('scanSchemaVersionLiteralViolations()', () => {
       expectOne(result, { line: 1, column: source.indexOf('schemaVersion') + 1 });
     } else {
       expect(result).toEqual([]);
+    }
+  });
+
+  test.each([
+    ['a number-like source', 'number', true],
+    ['a string-only source', 'string', false],
+  ])('keeps a potential finite-union computed propagation subject to the source gate for %s', async (_name, sourceType, rejected) => {
+    const source = [
+      "declare const key: 'schemaVersion' | 'other';",
+      `declare const source: { schemaVersion: ${sourceType}; other: ${sourceType} };`,
+      'const result = { schemaVersion: source[key] };',
+    ].join('\n');
+    const result = await scanWithCaller(source);
+    if (rejected) {
+      expect(result.violations).toEqual([{
+        fileName: result.callerFileName,
+        line: 3,
+        column: 18,
+      }]);
+    } else {
+      expect(result.violations).toEqual([]);
     }
   });
 

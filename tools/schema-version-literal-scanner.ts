@@ -35,9 +35,33 @@
  * unknown rather than terminating as safe. Authority sources require an
  * `exact` resolver classification, so an ambiguous computed key remains denied
  * even when one candidate is canonical.
+ *
+ * SCANNER-ASSURANCE: The scanner's SA-1 guarantee is checker-backed
+ * declaration identity, default-deny handling, and sink recognition for
+ * object/class/shorthand properties, ordinary and compound assignments,
+ * comparisons, and direct destructuring defaults. Property and element
+ * accesses are sinks only when their resolver kind is not `none`; authority
+ * exemptions require exact declaration identity, while direct propagation
+ * uses the deliberate name-based resolver classification and requires its
+ * kind to be `exact`; neither admits a potential selection. schemaVersion
+ * sinks require finite keys. The recursive
+ * `NumberLike`/`any`/`unknown` type gate covers
+ * union/intersection members plus type-parameter and indexed-access
+ * constraints. Architecture checks invoke it only with a diagnostics-free
+ * `ts.Program` created from this project's compiler options. SA-2 excludes
+ * runtime reflection, compiler transforms, non-production source,
+ * checker-invisible mutation, unclassified syntax, and checker or scanner
+ * defects. Reads from `any`/`unknown` index slots, dynamic keys on
+ * name-identified sinks, and aggregates reachable only through an
+ * externally-typed value's signature are outside the guarantee; none is an
+ * allow-path, so a schema authority reached through one
+ * requires scanner extension or explicit review.
  */
 import * as ts from 'typescript';
-import { createStaticReferenceResolver } from './typescript-static-reference.js';
+import {
+  createStaticReferenceResolver,
+  type PropertyReferenceResolution,
+} from './typescript-static-reference.js';
 
 /**
  * Identifies a source location that encodes a schema version without a
@@ -73,15 +97,17 @@ export interface SchemaVersionLiteralViolation {
  *
  * A source is allowed when its resolved declaration is one of the canonical
  * constants, including renamed, namespace, and multi-hop barrel bindings, or
- * when it is itself a `.schemaVersion`/`['schemaVersion']` propagation.
- * Renamed assignment-pattern defaults are an exception: they are rejected
- * because their source is the compound assignment expression rather than the
- * canonical symbol directly, unlike equivalent renamed variable-declaration
- * binding defaults. Every other source is tested recursively for number-like, `any`, or `unknown`
- * constituents, so arithmetic, calls, conditionals, mixed unions, and
- * untrusted values cannot introduce a literal version through an indirect
- * binding. Declaration-only properties without an initializer have no source
- * to evaluate and are therefore not sinks.
+ * when a `.schemaVersion`/`['schemaVersion']` propagation is proven exact.
+ * A potential computed propagation is not an exemption and instead reaches
+ * the existing type gate. Renamed assignment-pattern defaults are an
+ * exception: they are rejected because their source is the compound assignment
+ * expression rather than the canonical symbol directly, unlike equivalent
+ * renamed variable-declaration binding defaults. Every other source is tested
+ * recursively for number-like, `any`, or `unknown` constituents, so
+ * arithmetic, calls, conditionals, mixed unions, and untrusted values cannot
+ * introduce a literal version through an indirect binding. Declaration-only
+ * properties without an initializer have no source to evaluate and are
+ * therefore not sinks.
  *
  * The type gate preserves assertion nodes while unwrapping only for key
  * resolution and source-identity recognition. Its constraint traversal treats
@@ -178,17 +204,43 @@ export function scanSchemaVersionLiteralViolations(
       && resolver.propertyKeyMaySelect(resolver.resolvePropertyKey(name.expression), 'schemaVersion');
   };
   /**
+   * Classifies a property or element access as a schema-version selection,
+   * while preserving the proof strength needed by distinct callers.
+   *
+   * The helper unwraps transparent wrappers and returns `undefined`
+   * for a non-access expression, keeping a local identifier named
+   * `schemaVersion` outside sink recognition. Element accesses whose keys
+   * cannot resolve to a finite set containing `schemaVersion` are also kept
+   * outside sink recognition. Remaining accesses return the shared resolver
+   * kind so sink recognition can retain its `exact`-or-`potential` threshold
+   * while source exemption can demand exact provenance.
+   */
+  const schemaVersionAccessResolutionKind = (
+    node: ts.Expression,
+  ): PropertyReferenceResolution['kind'] | undefined => {
+    const access = unwrapExpression(node);
+    if (!ts.isPropertyAccessExpression(access) && !ts.isElementAccessExpression(access)) return undefined;
+    if (ts.isPropertyAccessExpression(access) && access.name.text !== 'schemaVersion') return undefined;
+    if (ts.isElementAccessExpression(access)) {
+      const names = access.argumentExpression === undefined
+        ? undefined
+        : resolver.resolvePropertyKey(access.argumentExpression);
+      if (names === undefined || !names.includes('schemaVersion')) return undefined;
+    }
+    return resolver.resolvePropertyReference(access, (symbol) => symbol.name === 'schemaVersion').kind;
+  };
+  /**
    * Determines whether an expression is a schema-version property access.
    *
-   * The predicate unwraps transparent wrappers, then requires a property or
-   * element access before consulting the resolver. This explicit shape guard
-   * prevents an unrelated local identifier named `schemaVersion` from becoming
-   * a sink merely because the generic resolver can classify identifiers.
+   * The sink-recognition wrapper delegates shape handling to
+   * `schemaVersionAccessResolutionKind` and accepts every result except
+   * `undefined` and `none`. That preserves detection of a potential sink
+   * without treating the same uncertain access as proof that its value came
+   * from an approved source.
    */
   const isSchemaVersionAccess = (node: ts.Expression): boolean => {
-    const access = unwrapExpression(node);
-    if (!ts.isPropertyAccessExpression(access) && !ts.isElementAccessExpression(access)) return false;
-    return resolver.resolvePropertyReference(access, (symbol) => symbol.name === 'schemaVersion').kind !== 'none';
+    const kind = schemaVersionAccessResolutionKind(node);
+    return kind !== undefined && kind !== 'none';
   };
   /**
    * Tests whether a symbol identifies either canonical authority declaration.
@@ -313,15 +365,16 @@ export function scanSchemaVersionLiteralViolations(
    * Determines whether a sink source is a proven canonical authority or a
    * direct schema-version propagation.
    *
-   * An expression authority source is allowed only when its resolver
-   * classification is `exact`. A `potential` result is intentionally not
-   * enough: an ambiguous or dynamic key may select an authority, but it does
-   * not prove that the current value came from one.
+   * The direct-propagation exemption requires
+   * `schemaVersionAccessResolutionKind` to be `exact`. A `potential` access
+   * is neither exempted nor reported immediately: it falls through to the
+   * existing recursive type gate so a number-like, `any`, or `unknown` source
+   * is denied while a string-only source keeps its established contract.
    */
   const isAllowedSource = (sink: Sink): boolean => {
     if (sink.sourceSymbol !== undefined) return resolvesToAuthority(sink.sourceSymbol);
     if (sink.sourceExpression === undefined) return true;
-    if (isSchemaVersionAccess(sink.sourceExpression)) return true;
+    if (schemaVersionAccessResolutionKind(sink.sourceExpression) === 'exact') return true;
     return resolver.resolvePropertyReference(sink.sourceExpression, resolvesToAuthorityTarget).kind === 'exact';
   };
   /**

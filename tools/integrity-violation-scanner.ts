@@ -6,11 +6,34 @@
  * The scan resolves direct imports, re-exports, local aliases, and wrapped
  * expressions through TypeScript rather than matching text. It inventories
  * every declared integrity subclass separately from construction sites; more
- * dynamic references that TypeScript cannot resolve to a declaration remain
+ * dynamic checker-visible selections remain unsafe references rather than an
+ * allow-path. Only the runtime or checker-invisible forms listed in SA-2 stay
  * outside this static inventory. Function names are retained as stable
  * structural context while source lines remain free to move.
+ *
+ * SCANNER-ASSURANCE: The scanner's SA-1 guarantee is checker-backed
+ * declaration identity, default-deny handling, and coverage of integrity
+ * subclass construction sites and same-origin navigation checkpoints. Its
+ * repairable-navigation inventory delegates direct calls,
+ * identifier/property/element reads, declaration and assignment
+ * destructuring, value re-exports, and potential selections to
+ * `scanFunctionValueReferences`, projecting exact direct calls into the
+ * allowlist and every other covered reference into `unsafeReferences`. For
+ * index-signature selections, function-value targets require H3a-1 type
+ * evidence, H3a-2 independently reports aggregate escapes, H1a-2/H1a-3 keep
+ * transparent casts visible, and `any` receivers remain default-deny.
+ * Architecture checks invoke it only with a diagnostics-free `ts.Program`
+ * created from this project's compiler options. SA-2 excludes runtime
+ * reflection, compiler transforms, non-production source, checker-invisible
+ * mutation, unclassified syntax, and checker or scanner defects. Reads from
+ * `any`/`unknown` index slots, dynamic keys on name-identified sinks, and
+ * aggregates reachable only through an externally-typed value's signature are
+ * outside the guarantee; none is an
+ * allow-path, so a protected authority reached through one requires scanner
+ * extension or explicit review.
  */
 import * as ts from 'typescript';
+import { scanFunctionValueReferences } from './function-value-reference-scanner.js';
 
 export type IntegrityViolationConstructionSite = {
   readonly fileName: string;
@@ -24,7 +47,8 @@ export type SameOriginNavigationCheckpoint = {
 };
 
 /**
- * Identifies one reviewed caller of run.ts's repairable-navigation allowlist.
+ * Identifies one direct or unsafe reference location for run.ts's
+ * repairable-navigation authority.
  *
  * `fileName` locates the caller's source file, while `functionName` retains
  * stable structural context as source lines move.
@@ -39,6 +63,36 @@ export type IntegrityViolationSubclassDeclaration = {
   readonly className: string;
 };
 
+/**
+ * Inventories integrity-error construction, navigation, and repairable
+ * navigation authority usage in a TypeScript program.
+ *
+ * The implementation resolves the integrity and run-module
+ * declarations with the TypeScript checker. Its repairable-navigation portion
+ * delegates whole-program function-value classification to
+ * `scanFunctionValueReferences`: exact direct calls project into the reviewed
+ * allowlist, while every extraction or potential selection projects into
+ * `unsafeReferences`. The two arrays deliberately share a structural shape so
+ * callers can inspect stable file and enclosing-function context without the
+ * shared walker acquiring integrity-specific reporting policy.
+ *
+ * @param program - The TypeScript program whose non-declaration source files
+ * are inspected.
+ * @param integrityViolationModuleFileName - The module exporting
+ * `IntegrityViolationError`.
+ * @param runModuleFileName - The module exporting
+ * `isRepairableNavigationFailure` and navigation checkpoints.
+ * @returns Construction, checkpoint, direct-call, unsafe-reference, and
+ * subclass-declaration inventories.
+ * @throws {Error} If either required module or the
+ * `IntegrityViolationError` or `isRepairableNavigationFailure` declaration
+ * is unavailable to the program.
+ * @example
+ * ```ts
+ * const inventory = scanIntegrityViolationInventory(program, integrityFile, runFile);
+ * expect(inventory.unsafeReferences).toEqual([]);
+ * ```
+ */
 export function scanIntegrityViolationInventory(
   program: ts.Program,
   integrityViolationModuleFileName: string,
@@ -47,28 +101,35 @@ export function scanIntegrityViolationInventory(
   readonly constructions: readonly IntegrityViolationConstructionSite[];
   readonly checkpoints: readonly SameOriginNavigationCheckpoint[];
   /**
-   * Every call expression whose callee resolves to run.ts's exported
+   * Every exact direct call whose callee resolves to run.ts's exported
    * `isRepairableNavigationFailure`.
    *
-   * The scan walks every non-declaration source file in the program and uses
-   * `functionDeclarationFor` to resolve each call expression's callee,
-   * matching it to the `isRepairableNavigationFailure` declaration in `run.ts`
-   * rather than applying the `runModule` gate used by `checkpoints`. The
-   * exact-match assertion in `test/architecture.test.ts` enumerates every
-   * caller precisely. Any new caller anywhere in the program changes this
-   * inventory and requires that assertion, and a conscious review of the new
-   * call site, to be updated.
+   * Entries are resolved by the shared `scanFunctionValueReferences` scanner
+   * and projected into this field's `{ fileName, functionName }` shape.
+   * Renamed imports and namespace-qualified invocations remain exact direct
+   * calls; indirect extractions and potential selections are represented in
+   * `unsafeReferences` instead.
    *
-   * As a documented boundary, call-expression callees resolve with the same
-   * coverage as `checkpoints`: renamed imports, namespace-qualified calls,
-   * and local re-binds are handled. The scan does not additionally resolve a
-   * destructuring alias of the function or an indirect `.call()`/`.apply()`
-   * invocation. A full default-deny value-reference walk, such as the ones in
-   * `tools/digest-scanner.ts` and `tools/schema-version-literal-scanner.ts`
-   * for different symbols, is out of proportion to this tripwire; unhandled
-   * forms are outside its resolution contract.
+   * Entries preserve the AST-visitation order produced by
+   * `scanFunctionValueReferences` (source-file iteration, then position).
+   * This projection deliberately does not apply a canonicalized-path, line,
+   * or column sort.
    */
   readonly allowlistCallSites: readonly RepairableNavigationAllowlistCallSite[];
+  /**
+   * Every repairable-navigation function value reference that is not an exact
+   * direct call.
+   *
+   * The projection uses the same source-file and enclosing-function
+   * context as `allowlistCallSites`. Keeping unsafe forms in a separate,
+   * exact inventory makes indirect authority use visible without silently
+   * widening the set of reviewed callers.
+   *
+   * Entries preserve the same AST-visitation order produced by
+   * `scanFunctionValueReferences` (source-file iteration, then position),
+   * without a canonicalized-path, line, or column sort.
+   */
+  readonly unsafeReferences: readonly RepairableNavigationAllowlistCallSite[];
   readonly declarations: readonly IntegrityViolationSubclassDeclaration[];
 } {
   const checker = program.getTypeChecker();
@@ -83,6 +144,14 @@ export function scanIntegrityViolationInventory(
     : checker.getExportsOfModule(moduleSymbol).find((symbol) => symbol.name === 'IntegrityViolationError');
   const integrityDeclaration = integritySymbol?.declarations?.find(ts.isClassDeclaration);
   if (integrityDeclaration === undefined) throw new Error('IntegrityViolationError must have a class declaration.');
+  const runModuleSymbol = checker.getSymbolAtLocation(runModule);
+  const repairableNavigationFailureSymbol = runModuleSymbol === undefined
+    ? undefined
+    : checker.getExportsOfModule(runModuleSymbol).find((symbol) => symbol.name === 'isRepairableNavigationFailure');
+  const repairableNavigationFailureDeclaration = repairableNavigationFailureSymbol?.declarations?.find(ts.isFunctionDeclaration);
+  if (repairableNavigationFailureDeclaration === undefined) {
+    throw new Error('isRepairableNavigationFailure must have a function declaration.');
+  }
 
   const unwrapExpression = (expression: ts.Expression): ts.Expression => {
     let current = expression;
@@ -148,6 +217,7 @@ export function scanIntegrityViolationInventory(
   const constructions: IntegrityViolationConstructionSite[] = [];
   const checkpoints: SameOriginNavigationCheckpoint[] = [];
   const allowlistCallSites: RepairableNavigationAllowlistCallSite[] = [];
+  const unsafeReferences: RepairableNavigationAllowlistCallSite[] = [];
   const declarations: IntegrityViolationSubclassDeclaration[] = [];
   const visit = (sourceFile: ts.SourceFile, node: ts.Node): void => {
     if (ts.isClassDeclaration(node) && node.name !== undefined) {
@@ -171,17 +241,22 @@ export function scanIntegrityViolationInventory(
           && property.initializer.kind === ts.SyntaxKind.TrueKeyword);
       checkpoints.push({ functionName: enclosingFunctionName(node), planStepNavigation });
     }
-    if (ts.isCallExpression(node)) {
-      const declaration = functionDeclarationFor(node.expression);
-      if (declaration?.name?.text === 'isRepairableNavigationFailure' && declaration.getSourceFile() === runModule) {
-        allowlistCallSites.push({ fileName: sourceFile.fileName, functionName: enclosingFunctionName(node) });
-      }
-    }
     ts.forEachChild(node, (child) => visit(sourceFile, child));
   };
 
   for (const sourceFile of program.getSourceFiles()) {
     if (!sourceFile.isDeclarationFile) visit(sourceFile, sourceFile);
   }
-  return { constructions, checkpoints, allowlistCallSites, declarations };
+  const referenceScan = scanFunctionValueReferences(
+    program,
+    repairableNavigationFailureDeclaration,
+    (symbol) => symbol.declarations?.includes(repairableNavigationFailureDeclaration) ?? false,
+  );
+  for (const { call } of referenceScan.directCalls) {
+    allowlistCallSites.push({ fileName: call.getSourceFile().fileName, functionName: enclosingFunctionName(call) });
+  }
+  for (const { node } of referenceScan.unsafeReferences) {
+    unsafeReferences.push({ fileName: node.getSourceFile().fileName, functionName: enclosingFunctionName(node) });
+  }
+  return { constructions, checkpoints, allowlistCallSites, unsafeReferences, declarations };
 }

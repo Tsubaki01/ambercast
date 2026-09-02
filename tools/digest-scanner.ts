@@ -24,11 +24,29 @@
  * Call classification distinguishes an exact canonical selection from a
  * potential one. Exact calls remain inventory entries and receive the
  * existing location and argument checks; potential calls instead become an
- * immediate value-reference finding. Both outcomes mark their callee in
- * `classifiedCallees`, preventing later traversal of a callee's children from
- * reporting the same uncertain reference a second time.
+ * immediate value-reference finding. Both outcomes locally classify their
+ * callee selection while continuing through its receiver and computed-key
+ * subtrees, so nested storage remains visible without reporting the same
+ * selection twice.
+ *
+ * SCANNER-ASSURANCE: The scanner's SA-1 guarantee is checker-backed
+ * declaration identity, default-deny handling, and coverage of calls,
+ * identifier/property/element reads, destructuring, and value re-exports.
+ * For index-signature selections, function-value targets require H3a-1 type
+ * evidence, H3a-2 independently reports aggregate escapes, H1a-2/H1a-3 keep
+ * transparent casts visible, and `any` receivers remain default-deny.
+ * Architecture checks invoke it only with a diagnostics-free `ts.Program`
+ * created from this project's compiler options. SA-2 excludes runtime
+ * reflection, compiler transforms, non-production source, checker-invisible
+ * mutation, unclassified syntax, and checker or scanner defects. Reads from
+ * `any`/`unknown` index slots, dynamic keys on name-identified sinks, and
+ * aggregates reachable only through an externally-typed value's signature are
+ * outside the guarantee; none is an
+ * allow-path, so a protected authority reached through one requires scanner
+ * extension or explicit review.
  */
 import * as ts from 'typescript';
+import { scanFunctionValueReferences } from './function-value-reference-scanner.js';
 import { createStaticReferenceResolver } from './typescript-static-reference.js';
 
 /**
@@ -96,19 +114,23 @@ export interface DigestValueReferenceViolation {
  * one transparent-wrapper-normalized inline object literal without a spread.
  *
  * All other value references to the same declaration are findings. The
- * checker-backed walk follows aliases in one call, handles identifier and
- * non-identifier value-bearing syntax, and ignores declaration-introduction
- * positions plus erased type positions. A callee expression is exempted only
- * when that exact AST node was classified as a resolved call; extracting,
- * passing, returning, storing, or re-exporting the function remains outside
- * the authority contract.
+ * shared walk delegates reference classification to
+ * `scanFunctionValueReferences`, retaining this scanner's authority-location
+ * and argument-shape policy here. That shared walk follows aliases, handles
+ * identifier and non-identifier value-bearing syntax, and excludes
+ * declaration-introduction plus erased type positions. A callee expression
+ * is exempted only when that exact AST node is a resolved direct call;
+ * extracting, passing, returning, storing, or re-exporting the function
+ * remains outside the authority contract.
  *
- * The resolver makes the classification explicit: only an exact
- * canonical selection is a call-site inventory entry, while a potential
- * selection is reported immediately as an unsafe value reference. The
- * same resolver supplies ordinary value and element-access recognition,
- * and destructuring uses its finite key candidates for identifier,
- * quoted, and computed property names at both direct and nested positions.
+ * The shared walk classifies an exact canonical callee as a call-site
+ * inventory entry and a potential callee as an unsafe value reference. Its
+ * destructuring contract accepts `BindingElement`, `PropertyAssignment`, and
+ * `ShorthandPropertyAssignment` leaves. Root declarations and assignments
+ * supply their initializer or right-hand-side type; nested leaves recursively
+ * derive source types from both declared and innermost transparent-wrapper
+ * types, through explicit properties or H3a-1-evidenced applicable index
+ * types, then report both exact and potential canonical selections.
  *
  * @param program - The TypeScript program whose non-declaration source files
  * are inspected.
@@ -165,17 +187,6 @@ export function scanComputeInputsDigestAuthority(
   const calls: DigestCallSite[] = [];
   const violations: DigestValueReferenceViolation[] = [];
 
-  /**
-   * Tests whether a symbol identifies the canonical function declaration.
-   *
-   * One-hop alias normalization belongs to
-   * the shared resolver, leaving this predicate responsible only for the
-   * digest scanner's declaration-specific policy boundary.
-   */
-  const resolvesToCanonical = (symbol: ts.Symbol | undefined): boolean => {
-    const resolved = resolver.resolveAliasedSymbol(symbol);
-    return resolved?.declarations?.includes(canonicalDeclaration) ?? false;
-  };
   const isCanonicalSymbol = (symbol: ts.Symbol): boolean => (
     symbol.declarations?.includes(canonicalDeclaration) ?? false
   );
@@ -191,24 +202,6 @@ export function scanComputeInputsDigestAuthority(
       unwrapped = unwrapped.expression;
     }
     return unwrapped;
-  };
-  const isWithinTypeNode = (node: ts.Node): boolean => {
-    for (let current: ts.Node | undefined = node.parent; current !== undefined; current = current.parent) {
-      if (ts.isTypeNode(current)) return true;
-    }
-    return false;
-  };
-  const isDeclarationIntroduction = (node: ts.Identifier): boolean => {
-    const parent = node.parent;
-    if (ts.isImportSpecifier(parent) || ts.isImportClause(parent) || ts.isNamespaceImport(parent)) return true;
-    if (ts.isExportSpecifier(parent)) {
-      const exportDeclaration = ts.isNamedExports(parent.parent) && ts.isExportDeclaration(parent.parent.parent)
-        ? parent.parent.parent
-        : undefined;
-      if (parent.isTypeOnly || exportDeclaration?.isTypeOnly) return true;
-      return parent.propertyName !== undefined && parent.name === node;
-    }
-    return ts.isFunctionDeclaration(parent) && parent === canonicalDeclaration && parent.name === node;
   };
   const sourceLocation = (sourceFile: ts.SourceFile, node: ts.Node) => {
     const position = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
@@ -229,196 +222,23 @@ export function scanComputeInputsDigestAuthority(
     visit(node);
     return found;
   };
-  const propertyResolvesToCanonical = (sourceType: ts.Type, name: string): boolean => (
-    resolvesToCanonical(checker.getPropertyOfType(sourceType, name))
-  );
-  /**
-   * Finds the type from which a destructuring binding obtains its value.
-   *
-   * The nested walk keeps every plausible source type when an outer binding
-   * key is dynamic or has multiple finite candidates, because an unprovable
-   * selection must not hide a canonical value reference. A single resolved
-   * key retains the existing exact property walk, while ambiguous keys expand
-   * through their declared properties and index types so the leaf continues
-   * through the same resolver-backed canonical-property check.
-   */
-  const destructuringSourceTypes = (node: ts.BindingElement): readonly ts.Type[] | undefined => {
-    const pattern = node.parent;
-    const container = pattern.parent;
-    if (ts.isVariableDeclaration(container) && container.initializer !== undefined) {
-      return [checker.getTypeAtLocation(container.initializer)];
+  const references = scanFunctionValueReferences(program, canonicalDeclaration, isCanonicalSymbol);
+  for (const { call } of references.directCalls) {
+    const sourceFile = call.getSourceFile();
+    calls.push(sourceLocation(sourceFile, call));
+    if (ts.sys.resolvePath(sourceFile.fileName) !== canonicalAuthorityFileName) {
+      recordViolation(sourceFile, call, 'call-site-outside-authority');
     }
-    if (ts.isParameter(container)) {
-      return [checker.getTypeAtLocation(container.initializer ?? container)];
+    const argument = call.arguments[0];
+    const unwrappedArgument = argument === undefined ? undefined : unwrapExpression(argument);
+    if (call.arguments.length !== 1 || unwrappedArgument === undefined || !ts.isObjectLiteralExpression(unwrappedArgument)) {
+      recordViolation(sourceFile, call, 'argument-must-be-inline-object-literal');
+    } else if (hasSpread(unwrappedArgument)) {
+      recordViolation(sourceFile, call, 'argument-must-not-contain-spread');
     }
-    if (ts.isBindingElement(container)) {
-      const outerSourceTypes = destructuringSourceTypes(container);
-      const outerPropertyName = container.propertyName ?? container.name;
-      const outerNames = bindingElementPropertyCandidateNames(outerPropertyName);
-      if (outerSourceTypes === undefined) return undefined;
-      if (outerNames?.length === 1) {
-        const [outerName] = outerNames;
-        if (outerName !== undefined) {
-          const sourceTypes = outerSourceTypes.flatMap((outerSourceType) => {
-            const outerProperty = checker.getPropertyOfType(outerSourceType, outerName);
-            return outerProperty === undefined
-              ? []
-              : [checker.getTypeOfSymbolAtLocation(outerProperty, outerPropertyName)];
-          });
-          return sourceTypes.length === 0 ? undefined : sourceTypes;
-        }
-      }
-      const sourceTypes = outerSourceTypes.flatMap((outerSourceType) => {
-        const properties = outerNames === undefined
-          ? checker.getPropertiesOfType(outerSourceType)
-          : outerNames.flatMap((outerName) => {
-            const outerProperty = checker.getPropertyOfType(outerSourceType, outerName);
-            return outerProperty === undefined ? [] : [outerProperty];
-          });
-        const indexTypes = outerNames === undefined
-          ? [
-            checker.getIndexTypeOfType(outerSourceType, ts.IndexKind.String),
-            checker.getIndexTypeOfType(outerSourceType, ts.IndexKind.Number),
-          ].filter((indexType): indexType is ts.Type => indexType !== undefined)
-          : [];
-        return [
-          ...properties.map((property) => checker.getTypeOfSymbolAtLocation(property, outerPropertyName)),
-          ...indexTypes,
-        ];
-      });
-      return sourceTypes.length === 0 ? undefined : sourceTypes;
-    }
-    return undefined;
-  };
-  const assignmentDestructuringTarget = (
-    node: ts.ShorthandPropertyAssignment | ts.PropertyAssignment,
-  ): ts.Expression | undefined => {
-    const objectLiteral = node.parent;
-    if (!ts.isObjectLiteralExpression(objectLiteral)) return undefined;
-    const assignment = objectLiteral.parent;
-    return ts.isBinaryExpression(assignment)
-      && assignment.left === objectLiteral
-      && assignment.operatorToken.kind === ts.SyntaxKind.EqualsToken
-      ? assignment.right
-      : undefined;
-  };
-  /**
-   * Records callee expressions whose reference classification already owns
-   * their descendant traversal.
-   *
-   * The potential-call path enters this set as well as the exact
-   * call path, because a later visit to an element key or property name would
-   * otherwise turn one uncertain selection into duplicate value findings.
-   */
-  const classifiedCallees = new Set<ts.Node>();
-  const destructuringBindingSymbols = new Set<ts.Symbol>();
-  /**
-   * Resolves destructuring property names with the same finite-key rule as
-   * element access, so quoted and computed keys cannot bypass identity checks.
-   */
-  const bindingElementPropertyCandidateNames = (
-    keyNode: ts.PropertyName | ts.BindingName,
-  ): readonly string[] | undefined => {
-    if (ts.isIdentifier(keyNode) || ts.isStringLiteral(keyNode) || ts.isNumericLiteral(keyNode)) {
-      return [keyNode.text];
-    }
-    return ts.isComputedPropertyName(keyNode)
-      ? resolver.resolvePropertyKey(keyNode.expression)
-      : undefined;
-  };
-  const bindingElementResolvesToCanonical = (
-    sourceType: ts.Type,
-    keyNode: ts.PropertyName | ts.BindingName,
-  ): boolean => {
-    const names = bindingElementPropertyCandidateNames(keyNode);
-    return names === undefined
-      ? propertyResolvesToCanonical(sourceType, 'computeInputsDigest')
-      : names.some((name) => propertyResolvesToCanonical(sourceType, name));
-  };
-
-  const visit = (sourceFile: ts.SourceFile, node: ts.Node): void => {
-    if (ts.isCallExpression(node)) {
-      const resolution = resolver.resolvePropertyReference(node.expression, isCanonicalSymbol);
-      if (resolution.kind === 'exact') {
-        classifiedCallees.add(node.expression);
-        calls.push(sourceLocation(sourceFile, node));
-        if (ts.sys.resolvePath(sourceFile.fileName) !== canonicalAuthorityFileName) {
-          recordViolation(sourceFile, node, 'call-site-outside-authority');
-        }
-        const argument = node.arguments[0];
-        const unwrappedArgument = argument === undefined ? undefined : unwrapExpression(argument);
-        if (node.arguments.length !== 1 || unwrappedArgument === undefined || !ts.isObjectLiteralExpression(unwrappedArgument)) {
-          recordViolation(sourceFile, node, 'argument-must-be-inline-object-literal');
-        } else if (hasSpread(unwrappedArgument)) {
-          recordViolation(sourceFile, node, 'argument-must-not-contain-spread');
-        }
-      } else if (resolution.kind === 'potential') {
-        classifiedCallees.add(node.expression);
-        recordViolation(sourceFile, node.expression, 'value-reference-outside-authority-call');
-      }
-    } else if (ts.isIdentifier(node)) {
-      const symbol = checker.getSymbolAtLocation(node);
-      const isDestructuringBinding = symbol !== undefined && destructuringBindingSymbols.has(symbol);
-      const reference = ts.isPropertyAccessExpression(node.parent) && node.parent.name === node
-        ? node.parent
-        : node;
-      if (
-        !isDestructuringBinding
-        && !isDeclarationIntroduction(node)
-        && !isWithinTypeNode(node)
-        && resolver.resolvePropertyReference(reference, isCanonicalSymbol).kind !== 'none'
-      ) {
-        recordViolation(sourceFile, node, 'value-reference-outside-authority-call');
-      }
-    } else if (ts.isBindingElement(node)) {
-      const sourceTypes = destructuringSourceTypes(node);
-      const propertyName = node.propertyName ?? node.name;
-      if (
-        sourceTypes?.some((sourceType) => bindingElementResolvesToCanonical(sourceType, propertyName))
-      ) {
-        if (ts.isIdentifier(node.name)) {
-          const bindingSymbol = checker.getSymbolAtLocation(node.name);
-          if (bindingSymbol !== undefined) destructuringBindingSymbols.add(bindingSymbol);
-        }
-        recordViolation(sourceFile, node.name, 'value-reference-outside-authority-call');
-        return;
-      }
-    } else if (ts.isShorthandPropertyAssignment(node)) {
-      const target = assignmentDestructuringTarget(node);
-      if (target !== undefined && propertyResolvesToCanonical(checker.getTypeAtLocation(target), node.name.text)) {
-        recordViolation(sourceFile, node.name, 'value-reference-outside-authority-call');
-      } else if (node.objectAssignmentInitializer === undefined && resolvesToCanonical(checker.getShorthandAssignmentValueSymbol(node))) {
-        recordViolation(sourceFile, node.name, 'value-reference-outside-authority-call');
-      }
-    } else if (ts.isPropertyAssignment(node)) {
-      const target = assignmentDestructuringTarget(node);
-      if (target !== undefined && ts.isIdentifier(node.name) && propertyResolvesToCanonical(checker.getTypeAtLocation(target), node.name.text)) {
-        recordViolation(sourceFile, node.name, 'value-reference-outside-authority-call');
-      }
-    } else if (
-      ts.isElementAccessExpression(node)
-      && resolver.resolvePropertyReference(node, isCanonicalSymbol).kind !== 'none'
-    ) {
-      recordViolation(sourceFile, node, 'value-reference-outside-authority-call');
-    } else if (
-      ts.isExportDeclaration(node)
-      && !node.isTypeOnly
-      && node.moduleSpecifier !== undefined
-      && (node.exportClause === undefined || ts.isNamespaceExport(node.exportClause))
-    ) {
-      const module = checker.getSymbolAtLocation(node.moduleSpecifier);
-      if (module !== undefined && checker.getExportsOfModule(module).some((symbol) => resolvesToCanonical(symbol))) {
-        recordViolation(sourceFile, node, 'value-reference-outside-authority-call');
-      }
-    }
-
-    ts.forEachChild(node, (child) => {
-      if (!classifiedCallees.has(child)) visit(sourceFile, child);
-    });
-  };
-
-  for (const sourceFile of program.getSourceFiles()) {
-    if (!sourceFile.isDeclarationFile) visit(sourceFile, sourceFile);
+  }
+  for (const { node } of references.unsafeReferences) {
+    recordViolation(node.getSourceFile(), node, 'value-reference-outside-authority-call');
   }
 
   const compareLocation = <T extends { readonly fileName: string; readonly line: number; readonly column: number }>(left: T, right: T): number => (

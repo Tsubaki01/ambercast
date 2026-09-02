@@ -33,6 +33,62 @@ const INTEGRITY_VIOLATION_MODULE_FILE = fileURLToPath(new URL('../src/core/error
 const PROMPT_ENVELOPE_SPECIFIER = '#core/ai/prompt-envelope.js';
 const IR_SCHEMA_SPECIFIER = '#core/ir/schema.js';
 const SCHEMA_VERSION_AUTHORITIES = ['GROUNDING_SCHEMA_VERSION', 'PLAN_SCHEMA_VERSION'] as const;
+const VIRTUAL_DIGEST_FILE = '/virtual/src/core/ir/digest.ts';
+const VIRTUAL_DIGEST_AUTHORITY_FILE = '/virtual/src/core/ai/plan-input-provenance.ts';
+const VIRTUAL_DIGEST_PLANTED_FILE = '/virtual/src/usecases/planted-h1d-h3c.ts';
+
+function scanVirtualDigestCorpus(source: string, extraOptions: ts.CompilerOptions = {}): {
+  readonly program: ts.Program;
+  readonly scan: ReturnType<typeof scanComputeInputsDigestAuthority>;
+} {
+  const compilerOptions: ts.CompilerOptions = {
+    noEmit: true,
+    strict: true,
+    target: ts.ScriptTarget.ES2023,
+    ...extraOptions,
+  };
+  const files = [
+    ts.createSourceFile(
+      VIRTUAL_DIGEST_FILE,
+      "export function computeInputsDigest(_input: object): string { return 'digest'; }",
+      ts.ScriptTarget.ES2023,
+      true,
+    ),
+    ts.createSourceFile(VIRTUAL_DIGEST_AUTHORITY_FILE, 'export {};', ts.ScriptTarget.ES2023, true),
+    ts.createSourceFile(VIRTUAL_DIGEST_PLANTED_FILE, source, ts.ScriptTarget.ES2023, true),
+  ];
+  const sources = new Map(files.map((file) => [file.fileName, file]));
+  const host = ts.createCompilerHost(compilerOptions);
+  const originalGetSourceFile = host.getSourceFile.bind(host);
+  const originalFileExists = host.fileExists.bind(host);
+  const originalReadFile = host.readFile.bind(host);
+  host.getSourceFile = (fileName, languageVersion) => sources.get(fileName) ?? originalGetSourceFile(fileName, languageVersion);
+  host.fileExists = (fileName) => sources.has(fileName) || originalFileExists(fileName);
+  host.readFile = (fileName) => sources.get(fileName)?.text ?? originalReadFile(fileName);
+  host.resolveModuleNames = (moduleNames) => moduleNames.map((moduleName) => (
+    moduleName.endsWith('/digest.js')
+      ? { resolvedFileName: VIRTUAL_DIGEST_FILE, extension: ts.Extension.Ts }
+      : undefined
+  ));
+  const program = ts.createProgram({ rootNames: [...sources.keys()], options: compilerOptions, host });
+  return {
+    program,
+    scan: scanComputeInputsDigestAuthority(program, VIRTUAL_DIGEST_FILE, VIRTUAL_DIGEST_AUTHORITY_FILE),
+  };
+}
+
+function plantedDigestViolation(source: string, line: number, marker: string): {
+  readonly fileName: string;
+  readonly line: number;
+  readonly column: number;
+  readonly kind: 'value-reference-outside-authority-call';
+} {
+  const lineText = source.split('\n')[line - 1];
+  if (lineText === undefined) throw new Error(`Missing planted line ${line}.`);
+  const column = lineText.lastIndexOf(marker);
+  if (column < 0) throw new Error(`Missing planted marker ${marker} on line ${line}.`);
+  return { fileName: VIRTUAL_DIGEST_PLANTED_FILE, line, column: column + 1, kind: 'value-reference-outside-authority-call' };
+}
 
 interface GeneratorExecutePromptSite {
   readonly line: number;
@@ -373,6 +429,8 @@ describe('architecture guardrails', () => {
     if (configFile.error !== undefined) throw new Error(`The architecture test could not read ${tsconfigFileName}.`);
     const parsedConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, dirname(tsconfigFileName));
     const program = ts.createProgram({ rootNames: sourceFiles, options: { ...parsedConfig.options, noEmit: true } });
+    expect(program.getSyntacticDiagnostics()).toEqual([]);
+    expect(program.getSemanticDiagnostics()).toEqual([]);
     const inventory = scanIntegrityViolationInventory(program, INTEGRITY_VIOLATION_MODULE_FILE, RUN_MODULE_FILE);
     const portableConstructions = inventory.constructions.map((construction) => ({
       ...construction,
@@ -586,6 +644,7 @@ describe('architecture guardrails', () => {
     expect(portableAllowlistCallSites).toEqual([
       { fileName: 'usecases/heal.ts', functionName: 'measureReplay' },
     ]);
+    expect(inventory.unsafeReferences).toEqual([]);
     expect(inventory.checkpoints).toEqual([
       { functionName: 'materializeStep', planStepNavigation: true },
       { functionName: 'materializeTraceAction', planStepNavigation: false },
@@ -1005,9 +1064,170 @@ describe('architecture guardrails', () => {
     });
   });
 
+  test('detects planted computed-key and any nested destructuring bypasses through the architecture scan path', () => {
+    const authority = ts.createSourceFile(
+      '/virtual/src/core/ai/plan-input-provenance.ts',
+      "import { computeInputsDigest } from '../ir/digest.js';",
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    const planted = ts.createSourceFile(
+      '/virtual/src/usecases/planted-assignment-destructuring.ts',
+      [
+        "import * as digest from '../core/ir/digest.js';",
+        'declare const source: { outer: typeof digest };',
+        'declare const anySource: any;',
+        'let root: unknown;',
+        'let nested: unknown;',
+        'let assignmentAlias: unknown;',
+        "({ ['computeInputsDigest']: root } = digest);",
+        "({ outer: { ['computeInputsDigest']: nested } } = source);",
+        'const { outer: { computeInputsDigest: declarationAlias } } = anySource;',
+        '({ outer: { computeInputsDigest: assignmentAlias } } = anySource);',
+      ].join('\n'),
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    const digest = ts.createSourceFile(
+      '/virtual/src/core/ir/digest.ts',
+      "export function computeInputsDigest(_input: object): string { return 'digest'; }",
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    const sources = new Map([[authority.fileName, authority], [planted.fileName, planted], [digest.fileName, digest]]);
+    const host = ts.createCompilerHost({ noEmit: true, target: ts.ScriptTarget.ES2023 });
+    const originalGetSourceFile = host.getSourceFile.bind(host);
+    const originalFileExists = host.fileExists.bind(host);
+    const originalReadFile = host.readFile.bind(host);
+    host.getSourceFile = (fileName, languageVersion) => sources.get(fileName) ?? originalGetSourceFile(fileName, languageVersion);
+    host.fileExists = (fileName) => sources.has(fileName) || originalFileExists(fileName);
+    host.readFile = (fileName) => sources.get(fileName)?.text ?? originalReadFile(fileName);
+    host.resolveModuleNames = (moduleNames) => moduleNames.map((moduleName) => (
+      moduleName.endsWith('/digest.js')
+        ? { resolvedFileName: digest.fileName, extension: ts.Extension.Ts }
+        : undefined
+    ));
+    const program = ts.createProgram({ rootNames: [...sources.keys()], options: { noEmit: true, target: ts.ScriptTarget.ES2023 }, host });
+
+    expect(scanComputeInputsDigestAuthority(program, digest.fileName, authority.fileName)).toEqual({
+      calls: [],
+      violations: [
+        { fileName: planted.fileName, line: 7, column: 4, kind: 'value-reference-outside-authority-call' },
+        { fileName: planted.fileName, line: 8, column: 13, kind: 'value-reference-outside-authority-call' },
+        { fileName: planted.fileName, line: 9, column: 39, kind: 'value-reference-outside-authority-call' },
+        { fileName: planted.fileName, line: 10, column: 34, kind: 'value-reference-outside-authority-call' },
+      ],
+    });
+  });
+
+  test('detects the planted H1d and H3c function-value bypass families at owning-node coordinates', () => {
+    const source = [
+      "import * as digest from '../core/ir/digest.js';",
+      'void (digest as unknown as { computeInputsDigest: string }).computeInputsDigest;',
+      "void (digest as unknown as { computeInputsDigest: string })['computeInputsDigest'];",
+      'void ((digest as unknown) as { computeInputsDigest: string }).computeInputsDigest;',
+      'declare const optionalValues: Record<string, typeof digest.computeInputsDigest | undefined>;',
+      "void optionalValues['missing'];",
+      'declare const unionValues: Record<string, typeof digest.computeInputsDigest | string>;',
+      "void unionValues['missing'];",
+      'declare const compatibleValues: Record<string, (input: object) => string>;',
+      "void compatibleValues['missing'];",
+      'const ns = digest;',
+      'declare function consume(value: unknown): void;',
+      'consume(ns);',
+      'let ns2: unknown;',
+      'ns2 = ns;',
+      'const spread = { ...ns };',
+      'Object.assign({}, ns);',
+      'const cast = ns as typeof ns;',
+      'const { ...declRest } = ns;',
+      'let assignmentRest: unknown;',
+      '({ ...assignmentRest } = ns);',
+      'const { ...castRest } = (ns as typeof ns);',
+      "async function load(): Promise<void> { const loaded = await import('../core/ir/digest.js'); void loaded; }",
+      'interface A { child?: C; }',
+      'interface C { previous?: A; api: typeof digest; }',
+      'declare const recursive: A;',
+      'void recursive;',
+      'const slot: { value?: typeof digest.computeInputsDigest } = {};',
+      'slot.value = digest.computeInputsDigest;',
+      'void slot.value;',
+      'declare const compatibleAggregate: { fn: (input: object) => string };',
+      'consume(compatibleAggregate);',
+      'async function interleaved(): Promise<void> { void ((await (digest as unknown)) as unknown); }',
+      "declare function digestKey(value: unknown): 'computeInputsDigest';",
+      'const { [digestKey(digest)]: computedAlias } = digest;',
+      'function bind({ computeInputsDigest: parameterAlias }: { computeInputsDigest: string } = (digest as unknown as { computeInputsDigest: string })): void {}',
+      'declare const oneWayAggregate: { fn: (input: object) => unknown };',
+      'consume(oneWayAggregate);',
+      'declare const nestedRestSource: { outer: typeof digest };',
+      'const { outer: { ...nestedDeclarationRest } } = nestedRestSource;',
+      'let nestedAssignmentRest: unknown;',
+      '({ outer: { ...nestedAssignmentRest } } = nestedRestSource);',
+      'function inspectTypeParameter<T extends { api: typeof digest }>(): void {}',
+    ].join('\n');
+    const { program, scan } = scanVirtualDigestCorpus(source, { noUncheckedIndexedAccess: true });
+    expect(program.getSyntacticDiagnostics()).toEqual([]);
+    expect(program.getSemanticDiagnostics()).toEqual([]);
+    expect(scan.calls).toEqual([]);
+    expect(scan.violations).toEqual([
+      plantedDigestViolation(source, 2, 'computeInputsDigest;'),
+      plantedDigestViolation(source, 3, '(digest'),
+      plantedDigestViolation(source, 4, 'computeInputsDigest;'),
+      plantedDigestViolation(source, 6, "optionalValues['missing']"),
+      plantedDigestViolation(source, 8, "unionValues['missing']"),
+      plantedDigestViolation(source, 10, "compatibleValues['missing']"),
+      plantedDigestViolation(source, 11, 'digest;'),
+      plantedDigestViolation(source, 13, 'ns);'),
+      plantedDigestViolation(source, 15, 'ns;'),
+      plantedDigestViolation(source, 16, 'ns };'),
+      plantedDigestViolation(source, 17, 'Object.assign'),
+      plantedDigestViolation(source, 17, 'ns);'),
+      plantedDigestViolation(source, 18, 'ns as'),
+      plantedDigestViolation(source, 19, 'declRest'),
+      plantedDigestViolation(source, 21, 'assignmentRest'),
+      plantedDigestViolation(source, 22, 'castRest'),
+      plantedDigestViolation(source, 23, 'await import'),
+      plantedDigestViolation(source, 23, 'loaded;'),
+      plantedDigestViolation(source, 27, 'recursive;'),
+      plantedDigestViolation(source, 29, 'computeInputsDigest;'),
+      plantedDigestViolation(source, 32, 'compatibleAggregate'),
+      plantedDigestViolation(source, 33, '((await'),
+      plantedDigestViolation(source, 35, 'digest)'),
+      plantedDigestViolation(source, 35, 'computedAlias'),
+      plantedDigestViolation(source, 36, 'parameterAlias'),
+      plantedDigestViolation(source, 38, 'oneWayAggregate'),
+      plantedDigestViolation(source, 40, 'nestedDeclarationRest'),
+      plantedDigestViolation(source, 42, 'nestedAssignmentRest'),
+    ]);
+    for (const line of [2, 3, 4, 6, 8, 10, 11, 13, 15, 16, 17, 18, 19, 21, 22, 23, 27, 29, 32, 33, 35, 36, 38, 40, 42]) {
+      expect(scan.violations.some((violation) => violation.line === line)).toBe(true);
+    }
+  });
+
+  test('keeps planted unknown and narrowed-array H1d controls outside the violation inventory', () => {
+    const source = [
+      "import * as digest from '../core/ir/digest.js';",
+      'declare const unknownValues: Record<string, unknown>;',
+      'declare const anyValues: any[];',
+      'declare const numericValues: number[];',
+      "void unknownValues['computeInputsDigest'];",
+      'if (Array.isArray(anyValues)) void anyValues[0];',
+      'void numericValues[0];',
+      'interface NamespaceShape { digest: typeof digest; }',
+      'type NamespaceAlias = typeof digest;',
+    ].join('\n');
+    const { program, scan } = scanVirtualDigestCorpus(source);
+    expect(program.getSyntacticDiagnostics()).toEqual([]);
+    expect(program.getSemanticDiagnostics()).toEqual([]);
+    expect(scan).toEqual({ calls: [], violations: [] });
+  });
+
   test('scans every production source file without schemaVersion literal violations', async () => {
     const sourceFiles = await findTypeScriptFiles(SOURCE_ROOT);
     const program = ts.createProgram({ rootNames: sourceFiles, options: { module: ts.ModuleKind.NodeNext, moduleResolution: ts.ModuleResolutionKind.NodeNext, noEmit: true, strict: true, target: ts.ScriptTarget.ES2023, types: ['node'] } });
+    expect(program.getSyntacticDiagnostics()).toEqual([]);
+    expect(program.getSemanticDiagnostics()).toEqual([]);
     expect(scanSchemaVersionLiteralViolations(program, IR_SCHEMA_MODULE_FILE)).toEqual([]);
   });
 
@@ -1046,6 +1266,89 @@ describe('architecture guardrails', () => {
     expect(scanSchemaVersionLiteralViolations(program, IR_SCHEMA_MODULE_FILE)).toEqual([
       { fileName: source.fileName, line: 1, column: source.text.indexOf('schemaVersion') + 1 },
     ]);
+  });
+
+  test('keeps finite-union and any computed schemaVersion propagations subject to the source gate', () => {
+    const source = ts.createSourceFile(
+      '/virtual/src/usecases/planted-potential-schema-propagation.ts',
+      [
+        "declare const key: 'schemaVersion' | 'other';",
+        'declare const numeric: { schemaVersion: number; other: number };',
+        'declare const stringOnly: { schemaVersion: string; other: string };',
+        'declare const anyReceiver: any;',
+        'declare const dynamicKey: string;',
+        'const finiteUnion = { schemaVersion: numeric[key] };',
+        'const safeString = { schemaVersion: stringOnly[key] };',
+        'const anySelection = { schemaVersion: anyReceiver[dynamicKey] };',
+      ].join('\n'),
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    const schema = ts.createSourceFile(
+      IR_SCHEMA_MODULE_FILE,
+      'export const PLAN_SCHEMA_VERSION = 2 as const; export const GROUNDING_SCHEMA_VERSION = 1 as const;',
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    const sources = new Map([[source.fileName, source], [schema.fileName, schema]]);
+    const host = ts.createCompilerHost({ noEmit: true, target: ts.ScriptTarget.ES2023 });
+    const originalGetSourceFile = host.getSourceFile.bind(host);
+    host.getSourceFile = (fileName, languageVersion) => sources.get(fileName) ?? originalGetSourceFile(fileName, languageVersion);
+    const program = ts.createProgram({ rootNames: [...sources.keys()], options: { noEmit: true, target: ts.ScriptTarget.ES2023 }, host });
+
+    expect(scanSchemaVersionLiteralViolations(program, IR_SCHEMA_MODULE_FILE)).toEqual([
+      { fileName: source.fileName, line: 6, column: 23 },
+      { fileName: source.fileName, line: 8, column: 24 },
+    ]);
+  });
+
+  test('keeps planted indirect repairable-navigation references out of the allowlist', () => {
+    const integrity = ts.createSourceFile(
+      '/virtual/src/core/errors/integrity-violation-error.ts',
+      'export class IntegrityViolationError extends Error {}',
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    const run = ts.createSourceFile(
+      '/virtual/src/usecases/run.ts',
+      'export function isRepairableNavigationFailure(_error: unknown): boolean { return false; }',
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    const planted = ts.createSourceFile(
+      '/virtual/src/usecases/planted-indirect-repairable.ts',
+      [
+        "import * as run from './run.js';",
+        'function viaDestructuring(): void { const { isRepairableNavigationFailure: alias } = run; void alias; }',
+        'function viaCall(): void { run.isRepairableNavigationFailure.call(undefined, undefined); }',
+        'function viaApply(): void { run.isRepairableNavigationFailure.apply(undefined, [undefined]); }',
+      ].join('\n'),
+      ts.ScriptTarget.ES2023,
+      true,
+    );
+    const sources = new Map([[integrity.fileName, integrity], [run.fileName, run], [planted.fileName, planted]]);
+    const host = ts.createCompilerHost({ noEmit: true, target: ts.ScriptTarget.ES2023 });
+    const originalGetSourceFile = host.getSourceFile.bind(host);
+    const originalFileExists = host.fileExists.bind(host);
+    const originalReadFile = host.readFile.bind(host);
+    host.getSourceFile = (fileName, languageVersion) => sources.get(fileName) ?? originalGetSourceFile(fileName, languageVersion);
+    host.fileExists = (fileName) => sources.has(fileName) || originalFileExists(fileName);
+    host.readFile = (fileName) => sources.get(fileName)?.text ?? originalReadFile(fileName);
+    host.resolveModuleNames = (moduleNames) => moduleNames.map((moduleName) => (
+      moduleName.endsWith('/run.js')
+        ? { resolvedFileName: run.fileName, extension: ts.Extension.Ts }
+        : undefined
+    ));
+    const program = ts.createProgram({ rootNames: [...sources.keys()], options: { noEmit: true, target: ts.ScriptTarget.ES2023 }, host });
+
+    expect(scanIntegrityViolationInventory(program, integrity.fileName, run.fileName)).toMatchObject({
+      allowlistCallSites: [],
+      unsafeReferences: [
+        { fileName: planted.fileName, functionName: 'viaDestructuring' },
+        { fileName: planted.fileName, functionName: 'viaCall' },
+        { fileName: planted.fileName, functionName: 'viaApply' },
+      ],
+    });
   });
 
   test('resolves the core subpath alias to the relative digest module', () => {
