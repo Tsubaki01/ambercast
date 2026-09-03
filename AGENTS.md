@@ -10,11 +10,11 @@ Test cases are written as natural-language Markdown prompts; the prompt is the s
 
 ## Status
 
-Pre-implementation. The current package is a 0.0.1 placeholder that reserves the npm name; `bin/ambercast.js` only prints a banner. Implementation starts from this state.
+0.1.0. `generate`, `run`, `check`, and `heal` are implemented and exercised by the test suite. Chromium only, local execution only; the results viewer, `init`, and an MCP server are not implemented yet.
 
 ## Repository layout
 
-- `bin/` — CLI entry point (placeholder), a thin shim to the built `dist/`
+- `bin/` — the published CLI entry point: a thin shim (`bin/ambercast.js`) that imports and calls `main()` from the built `dist/cli.js`
 - `src/` — TypeScript sources, compiled by `tsdown` to `dist/` (gitignored, built on demand)
 - `package.json` — `files: ["bin", "dist"]` limits what gets published; keep agent/config files and sources out of the tarball
 - `AGENTS.md` / `CLAUDE.md` — agent guidance (this file is canonical)
