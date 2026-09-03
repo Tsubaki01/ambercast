@@ -767,8 +767,7 @@ describe('generate', () => {
   it('resolves once and reuses the same executor instance across a multi-file batch', async () => {
     const dispatchedBy: object[] = [];
     const trackedExecutor = () => {
-      let instance!: ReturnType<typeof createFakeAiExecutor>;
-      instance = createFakeAiExecutor({
+      const instance: ReturnType<typeof createFakeAiExecutor> = createFakeAiExecutor({
         execute: async () => {
           dispatchedBy.push(instance);
           return { data: RESPONSE, raw: JSON.stringify(RESPONSE) };
