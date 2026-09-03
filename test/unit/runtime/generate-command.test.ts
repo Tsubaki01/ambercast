@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => ({
   codexFactory: vi.fn(),
   createNoopEventSink: vi.fn(),
   createSystemClock: vi.fn(),
+  readCommandEnvironment: vi.fn(),
   finalizeReportEnvelope: vi.fn(),
   isEmergencyFinalizedEnvelope: vi.fn(),
 }));
@@ -33,6 +34,9 @@ vi.mock('#adapters/ai/registry.js', () => ({
 }));
 vi.mock('#adapters/system/noop-event-sink.js', () => ({ createNoopEventSink: mocks.createNoopEventSink }));
 vi.mock('#adapters/system/system-clock.js', () => ({ createSystemClock: mocks.createSystemClock }));
+vi.mock('#adapters/system/process-command-environment.js', () => ({
+  readCommandEnvironment: mocks.readCommandEnvironment,
+}));
 vi.mock('#usecases/report-finalization.js', () => ({
   finalizeReportEnvelope: mocks.finalizeReportEnvelope,
   isEmergencyFinalizedEnvelope: mocks.isEmergencyFinalizedEnvelope,
@@ -106,13 +110,30 @@ function arrangeSuccessfulCommand(
   }
   mocks.createNoopEventSink.mockReturnValue(events.sink);
   mocks.createAmbercast.mockReturnValue({
-    aiExecutor: selected,
     clock: { now: () => new Date('2026-08-08T00:00:00Z'), monotonicMs: () => 10 },
   });
   mocks.generate.mockResolvedValue({ results: [], noTestsFound: false });
   const output = reportOutput(0);
   mocks.buildGenerateReport.mockReturnValue(output);
   return { selected, events, output };
+}
+
+function arrangeGenerateToResolveExecutorOnce(): void {
+  mocks.generate.mockImplementation(async (deps: {
+    readonly resolveAiExecutor: (signal?: AbortSignal) => Promise<unknown>;
+    readonly signal?: AbortSignal;
+  }) => {
+    await deps.resolveAiExecutor(deps.signal);
+    return { results: [], noTestsFound: false };
+  });
+}
+
+function generateDeps(): Record<string, unknown> {
+  const deps = mocks.generate.mock.calls[0]?.[0];
+  if (deps === undefined || typeof deps !== 'object' || deps === null) {
+    throw new Error('Expected generate to receive its dependency object.');
+  }
+  return deps as Record<string, unknown>;
 }
 
 afterEach(() => {
@@ -201,11 +222,14 @@ describe('runGenerateCommand', () => {
 
   it('loads config, lets an explicit provider override win, composes, and generates', async () => {
     const { events, selected, output } = arrangeSuccessfulCommand('auto', 'codex');
+    arrangeGenerateToResolveExecutorOnce();
 
     await expect(runGenerateCommand(input({ aiProviderOverride: 'codex' }))).resolves.toEqual(output);
     expect(mocks.loadConfig).toHaveBeenCalledWith(expect.objectContaining({ cwd: '/workspace' }));
-    expect(mocks.createAmbercast).toHaveBeenCalledWith(expect.objectContaining({ aiProvider: 'codex', events: events.sink }));
+    expect(mocks.createAmbercast).toHaveBeenCalledWith(expect.objectContaining({ events: events.sink }));
+    expect(mocks.createAmbercast.mock.calls[0]?.[0]).not.toHaveProperty('aiProvider');
     expect(mocks.generate).toHaveBeenCalledWith(expect.objectContaining({ events: events.sink }), expect.objectContaining({ files: [] }));
+    expect(mocks.codexFactory).toHaveBeenCalledExactlyOnceWith({ run: expect.any(Function) });
     expect(selected.isAvailable).not.toHaveBeenCalled();
     expect(mocks.claudeFactory).not.toHaveBeenCalled();
   });
@@ -237,10 +261,12 @@ describe('runGenerateCommand', () => {
 
   it.each(['claude', 'codex'] as const)('passes configured %s through without auto probing', async (provider) => {
     const { selected } = arrangeSuccessfulCommand(provider, provider);
+    arrangeGenerateToResolveExecutorOnce();
 
     await runGenerateCommand(input());
 
-    expect(mocks.createAmbercast).toHaveBeenCalledWith(expect.objectContaining({ aiProvider: provider }));
+    expect(mocks.createAmbercast.mock.calls[0]?.[0]).not.toHaveProperty('aiProvider');
+    expect(provider === 'claude' ? mocks.claudeFactory : mocks.codexFactory).toHaveBeenCalledExactlyOnceWith({ run: expect.any(Function) });
     expect(selected.isAvailable).not.toHaveBeenCalled();
     expect(provider === 'claude' ? mocks.codexFactory : mocks.claudeFactory).not.toHaveBeenCalled();
   });
@@ -253,16 +279,17 @@ describe('runGenerateCommand', () => {
       return true;
     });
     arrangeSuccessfulCommand('auto', 'claude');
+    arrangeGenerateToResolveExecutorOnce();
     mocks.claudeFactory.mockImplementation(() => {
       calls.push('claude factory');
       return claude;
     });
-    mocks.createAmbercast.mockReturnValue({ aiExecutor: claude, clock: { now: () => new Date(), monotonicMs: () => 0 } });
+    mocks.createAmbercast.mockReturnValue({ clock: { now: () => new Date(), monotonicMs: () => 0 } });
 
     await runGenerateCommand(input());
 
-    expect(calls).toEqual(['claude factory', 'claude available']);
-    expect(mocks.claudeFactory).toHaveBeenCalledExactlyOnceWith({ run: expect.any(Function) });
+    expect(calls).toEqual(['claude factory', 'claude available', 'claude factory']);
+    expect(mocks.claudeFactory).toHaveBeenCalledTimes(2);
     expect(mocks.codexFactory).not.toHaveBeenCalled();
   });
 
@@ -279,6 +306,7 @@ describe('runGenerateCommand', () => {
       return true;
     });
     arrangeSuccessfulCommand('auto', 'codex');
+    arrangeGenerateToResolveExecutorOnce();
     mocks.claudeFactory.mockImplementation(() => {
       calls.push('claude factory');
       return claude;
@@ -287,21 +315,23 @@ describe('runGenerateCommand', () => {
       calls.push('codex factory');
       return codex;
     });
-    mocks.createAmbercast.mockReturnValue({ aiExecutor: codex, clock: { now: () => new Date(), monotonicMs: () => 0 } });
+    mocks.createAmbercast.mockReturnValue({ clock: { now: () => new Date(), monotonicMs: () => 0 } });
 
     await runGenerateCommand(input());
 
-    expect(calls).toEqual(['claude factory', 'claude available', 'codex factory', 'codex available']);
+    expect(calls).toEqual(['claude factory', 'claude available', 'codex factory', 'codex available', 'codex factory']);
   });
 
   it('returns an exit-3 run-scoped unavailable-provider report when auto probing finds no provider', async () => {
     mocks.loadConfig.mockResolvedValue(CONFIG);
     mocks.claudeFactory.mockReturnValue(executor('claude', false));
     mocks.codexFactory.mockReturnValue(executor('codex', false));
+    mocks.createAmbercast.mockReturnValue({ clock: { now: () => new Date(), monotonicMs: () => 0 } });
     const output = reportOutput(3, [{
       scope: 'run', kind: 'environment', code: 'AI_EXECUTOR_UNAVAILABLE', message: 'No AI provider is available.',
     }]);
     mocks.buildGenerateReport.mockReturnValue(output);
+    arrangeGenerateToResolveExecutorOnce();
 
     await expect(runGenerateCommand(input())).resolves.toEqual(output);
     expect(mocks.buildGenerateReport).toHaveBeenCalledWith(expect.objectContaining({
@@ -323,10 +353,12 @@ describe('runGenerateCommand', () => {
     });
     mocks.loadConfig.mockResolvedValue(CONFIG);
     mocks.claudeFactory.mockReturnValue({ name: 'claude-code-cli', isAvailable });
+    mocks.createAmbercast.mockReturnValue({ clock: { now: () => new Date(), monotonicMs: () => 0 } });
     const output = reportOutput(3, [{
       scope: 'run', kind: 'environment', code: 'UNEXPECTED_CRASH', message: 'The generate command crashed unexpectedly.',
     }]);
     mocks.buildGenerateReport.mockReturnValue(output);
+    arrangeGenerateToResolveExecutorOnce();
 
     try {
       await expect(runGenerateCommand(input({ signal: controller.signal }))).resolves.toEqual(output);
@@ -340,6 +372,80 @@ describe('runGenerateCommand', () => {
     } finally {
       timeoutSpy.mockRestore();
     }
+  });
+
+  it('keeps list composition AI-free while exposing only a resolver dependency', async () => {
+    const { output } = arrangeSuccessfulCommand('auto', 'claude');
+
+    await expect(runGenerateCommand(input({ list: true }))).resolves.toEqual(output);
+
+    expect(generateDeps()).toHaveProperty('resolveAiExecutor', expect.any(Function));
+    expect(generateDeps()).not.toHaveProperty('aiExecutor');
+    expect(mocks.claudeFactory).not.toHaveBeenCalled();
+    expect(mocks.codexFactory).not.toHaveBeenCalled();
+    expect(mocks.readCommandEnvironment).not.toHaveBeenCalled();
+  });
+
+  it('keeps --list with an explicit codex override composition AI-free and exits zero', async () => {
+    const { output } = arrangeSuccessfulCommand('auto', 'claude');
+
+    await expect(runGenerateCommand(input({ list: true, aiProviderOverride: 'codex' }))).resolves.toEqual(output);
+
+    expect(generateDeps()).toHaveProperty('resolveAiExecutor', expect.any(Function));
+    expect(generateDeps()).not.toHaveProperty('aiExecutor');
+    expect(mocks.claudeFactory).not.toHaveBeenCalled();
+    expect(mocks.codexFactory).not.toHaveBeenCalled();
+    expect(mocks.readCommandEnvironment).not.toHaveBeenCalled();
+  });
+
+  it('keeps no-tests composition AI-free while exposing only a resolver dependency', async () => {
+    const { output } = arrangeSuccessfulCommand('auto', 'claude');
+    mocks.generate.mockResolvedValue({ results: [], noTestsFound: true });
+
+    await expect(runGenerateCommand(input())).resolves.toEqual(output);
+
+    expect(generateDeps()).toHaveProperty('resolveAiExecutor', expect.any(Function));
+    expect(generateDeps()).not.toHaveProperty('aiExecutor');
+    expect(mocks.claudeFactory).not.toHaveBeenCalled();
+    expect(mocks.codexFactory).not.toHaveBeenCalled();
+    expect(mocks.readCommandEnvironment).not.toHaveBeenCalled();
+  });
+
+  it('keeps all-fresh composition AI-free while exposing only a resolver dependency', async () => {
+    const { output } = arrangeSuccessfulCommand('auto', 'claude');
+    mocks.generate.mockResolvedValue({
+      results: [{ file: '/workspace/tests/login.test.md', status: 'skipped-fresh' }],
+      noTestsFound: false,
+    });
+
+    await expect(runGenerateCommand(input())).resolves.toEqual(output);
+
+    expect(generateDeps()).toHaveProperty('resolveAiExecutor', expect.any(Function));
+    expect(generateDeps()).not.toHaveProperty('aiExecutor');
+    expect(mocks.claudeFactory).not.toHaveBeenCalled();
+    expect(mocks.codexFactory).not.toHaveBeenCalled();
+    expect(mocks.readCommandEnvironment).not.toHaveBeenCalled();
+  });
+
+  it('starts provider construction and probing only when generate invokes the resolver once', async () => {
+    const { selected, output } = arrangeSuccessfulCommand('auto', 'claude');
+    mocks.generate.mockImplementation(async (deps: {
+      readonly resolveAiExecutor: (signal?: AbortSignal) => Promise<unknown>;
+      readonly signal?: AbortSignal;
+    }) => {
+      expect(mocks.claudeFactory).not.toHaveBeenCalled();
+      expect(mocks.codexFactory).not.toHaveBeenCalled();
+      expect(mocks.readCommandEnvironment).not.toHaveBeenCalled();
+      await deps.resolveAiExecutor(deps.signal);
+      return { results: [], noTestsFound: false };
+    });
+
+    await expect(runGenerateCommand(input())).resolves.toEqual(output);
+
+    expect(mocks.claudeFactory).toHaveBeenCalledTimes(2);
+    expect(selected.isAvailable).toHaveBeenCalledOnce();
+    expect(mocks.codexFactory).not.toHaveBeenCalled();
+    expect(mocks.readCommandEnvironment).toHaveBeenCalledTimes(2);
   });
 
   it('measures a successful command from before configuration loading through report construction', async () => {

@@ -661,7 +661,7 @@ describe('run', () => {
     const generateDeps: GenerateDeps = {
       storage: recordingStorage.storage,
       layout: deps.layout,
-      aiExecutor: createFakeAiExecutor({
+      resolveAiExecutor: async () => createFakeAiExecutor({
         execute: async () => ({ data: response, raw: JSON.stringify(response) }),
       }),
       events: deps.events,

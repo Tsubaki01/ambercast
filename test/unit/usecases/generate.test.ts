@@ -215,7 +215,7 @@ function createScenario(overrides: Partial<GenerateDeps> = {}) {
   const deps: GenerateDeps = {
     storage: recordingStorage.storage,
     layout: createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR }),
-    aiExecutor: createFakeAiExecutor({ execute }),
+    resolveAiExecutor: async () => createFakeAiExecutor({ execute }),
     events: events.sink,
     discoverTestFiles: vi.fn(async () => ['login.test.md']),
     config: {
@@ -362,7 +362,7 @@ describe('generate', () => {
     async (_mode, options, status, expectedWrites) => {
       const raw = JSON.stringify(coveredResponse);
       const { deps, recordingStorage } = createScenario({
-        aiExecutor: createFakeAiExecutor({
+        resolveAiExecutor: async () => createFakeAiExecutor({
           execute: async () => ({ data: coveredResponse, raw }),
         }),
       });
@@ -417,7 +417,7 @@ describe('generate', () => {
       } as unknown as GeneratedPlanResponse;
       const raw = `RAW:${JSON.stringify(response)}`;
       const { deps, recordingStorage } = createScenario({
-        aiExecutor: createFakeAiExecutor({
+        resolveAiExecutor: async () => createFakeAiExecutor({
           execute: async () => ({ data: response, raw }),
         }),
       });
@@ -465,7 +465,7 @@ describe('generate', () => {
     } as unknown as GeneratedPlanResponse;
     const raw = `RAW:${JSON.stringify(response)}`;
     const { deps, recordingStorage } = createScenario({
-      aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: response, raw }) }),
+      resolveAiExecutor: async () => createFakeAiExecutor({ execute: async () => ({ data: response, raw }) }),
     });
     await writePrompt(recordingStorage.storage);
     recordingStorage.reset();
@@ -495,7 +495,7 @@ describe('generate', () => {
     } as unknown as GeneratedPlanResponse;
     const raw = `RAW:${JSON.stringify(response)}`;
     const { deps, recordingStorage } = createScenario({
-      aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: response, raw }) }),
+      resolveAiExecutor: async () => createFakeAiExecutor({ execute: async () => ({ data: response, raw }) }),
     });
     await writePrompt(recordingStorage.storage);
     recordingStorage.reset();
@@ -527,7 +527,7 @@ describe('generate', () => {
     } as unknown as GeneratedPlanResponse;
     const raw = `RAW:${JSON.stringify(response)}`;
     const { deps, recordingStorage } = createScenario({
-      aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: response, raw }) }),
+      resolveAiExecutor: async () => createFakeAiExecutor({ execute: async () => ({ data: response, raw }) }),
     });
     await writePrompt(recordingStorage.storage, 'login.test.md', prompt);
     recordingStorage.reset();
@@ -561,7 +561,7 @@ describe('generate', () => {
       } as unknown as GeneratedPlanResponse;
       const raw = `RAW:${JSON.stringify(response)}`;
       const { deps, recordingStorage } = createScenario({
-        aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: response, raw }) }),
+        resolveAiExecutor: async () => createFakeAiExecutor({ execute: async () => ({ data: response, raw }) }),
       });
       await writePrompt(recordingStorage.storage, 'login.test.md', '# Emoji\n\n😀 Ready\n');
       recordingStorage.reset();
@@ -595,7 +595,7 @@ describe('generate', () => {
       }],
     } as unknown as GeneratedPlanResponse;
     const { deps, recordingStorage } = createScenario({
-      aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: response, raw: JSON.stringify(response) }) }),
+      resolveAiExecutor: async () => createFakeAiExecutor({ execute: async () => ({ data: response, raw: JSON.stringify(response) }) }),
     });
     await writePrompt(recordingStorage.storage);
 
@@ -607,7 +607,7 @@ describe('generate', () => {
   it('prefixes the deterministic generation task with the exact exported generator policy', async () => {
     let request: AiExecuteRequest<unknown> | undefined;
     const { deps, recordingStorage } = createScenario({
-      aiExecutor: createFakeAiExecutor({
+      resolveAiExecutor: async () => createFakeAiExecutor({
         execute: async (nextRequest) => {
           request = nextRequest;
           return { data: coveredResponse, raw: JSON.stringify(coveredResponse) };
@@ -704,6 +704,271 @@ describe('generate', () => {
     expect(events.emitted()).toEqual([]);
     expect(recordingStorage.reads).toEqual([]);
     expect(recordingStorage.writes).toEqual([]);
+  });
+
+  it('never resolves AI for list mode with an already-aborted signal', async () => {
+    const controller = new AbortController();
+    controller.abort(new Error('list remains atomic'));
+    const resolveAiExecutor = vi.fn(async () => createFakeAiExecutor());
+    const { deps } = createScenario({
+      signal: controller.signal,
+      discoverTestFiles: async () => ['login.test.md'],
+      resolveAiExecutor,
+    });
+
+    await expect(generate(deps, { ...DEFAULT_OPTIONS, list: true })).resolves.toEqual({
+      results: [{ file: `${TEST_DIR}/login.test.md`, status: 'listed' }],
+      noTestsFound: false,
+      interrupted: false,
+    });
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+  });
+
+  it('never resolves AI when discovery finds no tests outside list mode', async () => {
+    const resolveAiExecutor = vi.fn(async () => createFakeAiExecutor());
+    const { deps } = createScenario({ discoverTestFiles: async () => [], resolveAiExecutor });
+
+    await expect(generate(deps, DEFAULT_OPTIONS)).resolves.toEqual({
+      results: [],
+      noTestsFound: true,
+      interrupted: false,
+    });
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+  });
+
+  it('never resolves AI for an all-fresh batch while repairing stale grounding', async () => {
+    const resolveAiExecutor = vi.fn(async () => createFakeAiExecutor());
+    const { deps, recordingStorage } = createScenario({
+      discoverTestFiles: async () => ['first.test.md', 'second.test.md'],
+      resolveAiExecutor,
+    });
+    const first = await writePrompt(recordingStorage.storage, 'first.test.md', 'first');
+    const second = await writePrompt(recordingStorage.storage, 'second.test.md', 'second');
+    const firstPlan = await createFreshPlan(recordingStorage.storage, first);
+    await seedFreshArtifacts(recordingStorage.storage, second);
+    recordingStorage.reset();
+
+    await expect(generate(deps, DEFAULT_OPTIONS)).resolves.toEqual({
+      results: [
+        { file: first, status: 'skipped-fresh', planFile: `${TEST_DIR}/first.ambercast.plan.json` },
+        { file: second, status: 'skipped-fresh', planFile: `${TEST_DIR}/second.ambercast.plan.json` },
+      ],
+      noTestsFound: false,
+      interrupted: false,
+    });
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+    expect(JSON.parse(await recordingStorage.storage.readText(`${TEST_DIR}/first.ambercast.grounding.json`))).toEqual({
+      schemaVersion: 1,
+      planDigest: computePlanDigest(firstPlan),
+      entries: {},
+    });
+  });
+
+  it('resolves once and reuses the same executor instance across a multi-file batch', async () => {
+    const dispatchedBy: object[] = [];
+    const trackedExecutor = () => {
+      const instance: ReturnType<typeof createFakeAiExecutor> = createFakeAiExecutor({
+        execute: async () => {
+          dispatchedBy.push(instance);
+          return { data: RESPONSE, raw: JSON.stringify(RESPONSE) };
+        },
+      });
+      return instance;
+    };
+    const executors = [trackedExecutor(), trackedExecutor(), trackedExecutor()];
+    let nextExecutor = 0;
+    const resolveAiExecutor = vi.fn(async () => {
+      const executor = executors[nextExecutor];
+      nextExecutor += 1;
+      if (executor === undefined) {
+        throw new Error('The resolver was called more times than this batch allows.');
+      }
+      return executor;
+    });
+    const { deps, recordingStorage } = createScenario({
+      discoverTestFiles: async () => ['first.test.md', 'second.test.md', 'third.test.md'],
+      resolveAiExecutor,
+    });
+    await writePrompt(recordingStorage.storage, 'first.test.md', 'first');
+    await writePrompt(recordingStorage.storage, 'second.test.md', 'second');
+    await writePrompt(recordingStorage.storage, 'third.test.md', 'third');
+    recordingStorage.reset();
+
+    await expect(generate(deps, DEFAULT_OPTIONS)).resolves.toMatchObject({
+      results: [
+        { file: `${TEST_DIR}/first.test.md`, status: 'generated' },
+        { file: `${TEST_DIR}/second.test.md`, status: 'generated' },
+        { file: `${TEST_DIR}/third.test.md`, status: 'generated' },
+      ],
+    });
+    expect(resolveAiExecutor).toHaveBeenCalledTimes(1);
+    expect(dispatchedBy).toEqual([executors[0], executors[0], executors[0]]);
+  });
+
+  it('does not resolve AI for a dry-run containing only fresh non-forced prompts', async () => {
+    const resolveAiExecutor = vi.fn(async () => createFakeAiExecutor());
+    const { deps, recordingStorage } = createScenario({ resolveAiExecutor });
+    const testPath = await writePrompt(recordingStorage.storage);
+    await seedFreshArtifacts(recordingStorage.storage, testPath);
+    recordingStorage.reset();
+
+    await expect(generate(deps, { ...DEFAULT_OPTIONS, dryRun: true })).resolves.toMatchObject({
+      results: [{ file: testPath, status: 'skipped-fresh' }],
+    });
+    expect(resolveAiExecutor).not.toHaveBeenCalled();
+  });
+
+  it('resolves AI for a dry-run containing a stale prompt', async () => {
+    const execute = vi.fn(async () => ({ data: RESPONSE, raw: JSON.stringify(RESPONSE) }));
+    const resolveAiExecutor = vi.fn(async () => createFakeAiExecutor({ execute }));
+    const { deps, recordingStorage } = createScenario({ resolveAiExecutor });
+    const testPath = await writePrompt(recordingStorage.storage);
+    recordingStorage.reset();
+
+    await expect(generate(deps, { ...DEFAULT_OPTIONS, dryRun: true })).resolves.toMatchObject({
+      results: [{ file: testPath, status: 'would-generate' }],
+    });
+    expect(resolveAiExecutor).toHaveBeenCalledOnce();
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it('constructs the deadline and emits ai-call only after a pending resolver fulfills', async () => {
+    const order: string[] = [];
+    const timeoutController = new AbortController();
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockImplementation(() => {
+      order.push('deadline');
+      return timeoutController.signal;
+    });
+    const events = { emit: vi.fn((event: { readonly type: string }) => { order.push(event.type); }) };
+    const executor = createFakeAiExecutor({
+      execute: async () => {
+        order.push('execute');
+        return { data: RESPONSE, raw: JSON.stringify(RESPONSE) };
+      },
+    });
+    let releaseResolver!: (executor: ReturnType<typeof createFakeAiExecutor>) => void;
+    let markResolverStarted!: () => void;
+    const resolverStarted = new Promise<void>((resolve) => { markResolverStarted = resolve; });
+    const resolveAiExecutor = vi.fn(() => new Promise<ReturnType<typeof createFakeAiExecutor>>((resolve) => {
+      releaseResolver = resolve;
+      markResolverStarted();
+    }));
+    const { deps, recordingStorage } = createScenario({ events, resolveAiExecutor });
+    await writePrompt(recordingStorage.storage);
+    recordingStorage.reset();
+
+    try {
+      const running = generate(deps, DEFAULT_OPTIONS);
+      await resolverStarted;
+      expect(timeoutSpy).not.toHaveBeenCalled();
+      expect(events.emit).not.toHaveBeenCalled();
+
+      releaseResolver(executor);
+      await expect(running).resolves.toMatchObject({ results: [{ status: 'generated' }] });
+
+      expect(order).toEqual(['deadline', 'ai-call', 'execute']);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+
+  it('emits neither a deadline nor ai-call when a pending resolver rejects', async () => {
+    const rejection = new Error('provider resolution failed');
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout');
+    const events = createRecordingEventSink();
+    let rejectResolver!: (error: Error) => void;
+    let markResolverStarted!: () => void;
+    const resolverStarted = new Promise<void>((resolve) => { markResolverStarted = resolve; });
+    const resolveAiExecutor = vi.fn(() => new Promise<never>((_resolve, reject) => {
+      rejectResolver = reject;
+      markResolverStarted();
+    }));
+    const { deps, recordingStorage } = createScenario({ events: events.sink, resolveAiExecutor });
+    await writePrompt(recordingStorage.storage);
+    recordingStorage.reset();
+
+    try {
+      const running = generate(deps, DEFAULT_OPTIONS);
+      await resolverStarted;
+      rejectResolver(rejection);
+
+      await expect(running).rejects.toBe(rejection);
+      expect(timeoutSpy).not.toHaveBeenCalled();
+      expect(events.emitted()).toEqual([]);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+
+  it('propagates a plain resolver rejection unchanged without producing file results', async () => {
+    const rejection = new Error('plain provider resolution rejection');
+    const resolveAiExecutor = vi.fn(async () => { throw rejection; });
+    const { deps, events, execute, recordingStorage } = createScenario({ resolveAiExecutor });
+    await writePrompt(recordingStorage.storage);
+
+    await expect(generate(deps, DEFAULT_OPTIONS)).rejects.toBe(rejection);
+    expect(execute).not.toHaveBeenCalled();
+    expect(events.emitted()).toEqual([]);
+  });
+
+  it('propagates an Ambercast resolver rejection unchanged without producing file results', async () => {
+    const rejection = new AiExecutorUnavailableError('classified provider resolution rejection');
+    const resolveAiExecutor = vi.fn(async () => { throw rejection; });
+    const { deps, events, execute, recordingStorage } = createScenario({ resolveAiExecutor });
+    await writePrompt(recordingStorage.storage);
+
+    await expect(generate(deps, DEFAULT_OPTIONS)).rejects.toBe(rejection);
+    expect(execute).not.toHaveBeenCalled();
+    expect(events.emitted()).toEqual([]);
+  });
+
+  it('retains an earlier fresh grounding repair when later resolver resolution rejects', async () => {
+    const rejection = new Error('second file needs an unavailable provider');
+    const resolveAiExecutor = vi.fn(async () => { throw rejection; });
+    const { deps, recordingStorage } = createScenario({
+      discoverTestFiles: async () => ['fresh.test.md', 'stale.test.md', 'unused.test.md'],
+      resolveAiExecutor,
+    });
+    const fresh = await writePrompt(recordingStorage.storage, 'fresh.test.md', 'fresh');
+    await writePrompt(recordingStorage.storage, 'stale.test.md', 'stale');
+    await writePrompt(recordingStorage.storage, 'unused.test.md', 'unused');
+    const freshPlan = await createFreshPlan(recordingStorage.storage, fresh);
+    recordingStorage.reset();
+
+    await expect(generate(deps, DEFAULT_OPTIONS)).rejects.toBe(rejection);
+    expect(resolveAiExecutor).toHaveBeenCalledOnce();
+    expect(JSON.parse(await recordingStorage.storage.readText(`${TEST_DIR}/fresh.ambercast.grounding.json`))).toEqual({
+      schemaVersion: 1,
+      planDigest: computePlanDigest(freshPlan),
+      entries: {},
+    });
+  });
+
+  it('propagates caller abort during resolver resolution with the exact supplied signal', async () => {
+    const controller = new AbortController();
+    const reason = new Error('abort pending provider resolution');
+    let markResolverStarted!: () => void;
+    const resolverStarted = new Promise<void>((resolve) => { markResolverStarted = resolve; });
+    const resolveAiExecutor = vi.fn((signal?: AbortSignal) => new Promise<never>((_resolve, reject) => {
+      if (signal === undefined) {
+        throw new Error('generate must pass its caller signal to the resolver.');
+      }
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      markResolverStarted();
+    }));
+    const { deps, events, recordingStorage } = createScenario({
+      signal: controller.signal,
+      resolveAiExecutor,
+    });
+    await writePrompt(recordingStorage.storage);
+
+    const running = generate(deps, DEFAULT_OPTIONS);
+    await resolverStarted;
+    controller.abort(reason);
+
+    await expect(running).rejects.toBe(reason);
+    expect(resolveAiExecutor).toHaveBeenCalledExactlyOnceWith(controller.signal);
+    expect(events.emitted()).toEqual([]);
   });
 
   it('skips a valid canonical fresh plan without calling AI or rewriting artifacts', async () => {
@@ -817,7 +1082,7 @@ describe('generate', () => {
     };
     const execute = vi.fn(async () => ({ data: regeneratedResponse, raw: JSON.stringify(regeneratedResponse) }));
     const { deps, recordingStorage } = createScenario({
-      aiExecutor: createFakeAiExecutor({ execute }),
+      resolveAiExecutor: async () => createFakeAiExecutor({ execute }),
     });
     const testPath = await writePrompt(recordingStorage.storage, 'login.test.md', `@ambercast-secret ${secretRef}\n`);
     await seedFreshArtifacts(recordingStorage.storage, testPath);
@@ -1226,7 +1491,7 @@ describe('generate', () => {
     ['invalid response rejection', new AiResponseInvalidError('invalid response'), 'ai-response-invalid'],
   ] as const)('keeps %s as a failed file and continues to later files', async (_description, error, kind) => {
     const { deps, events, recordingStorage } = createScenario({
-      aiExecutor: createFakeAiExecutor({
+      resolveAiExecutor: async () => createFakeAiExecutor({
         execute: async (request) => {
           if (request.context !== null && typeof request.context === 'object' && 'testMd' in request.context && String(request.context.testMd).includes('first')) {
             throw error;
@@ -1269,7 +1534,7 @@ describe('generate', () => {
     const { deps, recordingStorage } = createScenario({
       signal: caller.signal,
       config: { testDir: TEST_DIR, testMatch: ['**/*.test.md'], testIgnore: [], targets: RESOLVED_TARGETS, defaultTarget: 'web', ai: sequentialTimeoutConfig([101, 102]) },
-      aiExecutor: createFakeAiExecutor({
+      resolveAiExecutor: async () => createFakeAiExecutor({
         execute: (request) => {
           if (request.context !== null && typeof request.context === 'object' && 'testMd' in request.context && request.context.testMd === 'first') {
             observedSignal = request.signal;
@@ -1330,7 +1595,7 @@ describe('generate', () => {
     });
     const { deps, recordingStorage } = createScenario({
       signal: caller.signal,
-      aiExecutor: createFakeAiExecutor({ execute }),
+      resolveAiExecutor: async () => createFakeAiExecutor({ execute }),
       discoverTestFiles: async () => ['first.test.md', 'second.test.md'],
     });
     await writePrompt(recordingStorage.storage, 'first.test.md', 'first');
@@ -1357,7 +1622,7 @@ describe('generate', () => {
     const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeoutController.signal);
     const providerError = new DOMException('provider returned a timeout-shaped failure', 'TimeoutError');
     const { deps, recordingStorage } = createScenario({
-      aiExecutor: createFakeAiExecutor({
+      resolveAiExecutor: async () => createFakeAiExecutor({
         execute: async (request) => {
           if (request.context !== null && typeof request.context === 'object' && 'testMd' in request.context && request.context.testMd === 'first') {
             throw providerError;
@@ -1385,7 +1650,7 @@ describe('generate', () => {
 
   it('classifies a non-abort adapter failure as unavailable without claiming that the call timed out', async () => {
     const { deps, recordingStorage } = createScenario({
-      aiExecutor: createFakeAiExecutor({
+      resolveAiExecutor: async () => createFakeAiExecutor({
         execute: async (request) => {
           if (request.context !== null && typeof request.context === 'object' && 'testMd' in request.context && request.context.testMd === 'first') {
             throw new Error('temporary schema write failed');
@@ -1444,7 +1709,7 @@ describe('generate', () => {
     const recordingStorage = createRecordingStorage();
     const { deps } = createScenario({
       signal: controller.signal,
-      aiExecutor: createFakeAiExecutor({ execute }),
+      resolveAiExecutor: async () => createFakeAiExecutor({ execute }),
       storage: recordingStorage.storage,
       discoverTestFiles: async () => ['first.test.md', 'second.test.md'],
     });
@@ -1567,7 +1832,7 @@ describe('generate', () => {
 
   it('preserves provider ambiguities for generated and previewed plans regardless of strict policy', async () => {
     const { deps, recordingStorage } = createScenario({
-      aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: { steps: [], ambiguities: ['unclear target'] }, raw: '{...}' }) }),
+      resolveAiExecutor: async () => createFakeAiExecutor({ execute: async () => ({ data: { steps: [], ambiguities: ['unclear target'] }, raw: '{...}' }) }),
     });
     await writePrompt(recordingStorage.storage);
 
@@ -1585,7 +1850,7 @@ describe('generate', () => {
   ] as const)('rejects a literal secret in %s response ambiguities before exposing or writing it', async (_mode, options) => {
     const secret = 'sk-live-secret-in-ambiguity';
     const { deps, recordingStorage } = createScenario({
-      aiExecutor: createFakeAiExecutor({
+      resolveAiExecutor: async () => createFakeAiExecutor({
         execute: async () => ({ data: { steps: [], ambiguities: [secret] }, raw: '{...}' }),
       }),
     });
@@ -1600,7 +1865,7 @@ describe('generate', () => {
 
   it('rejects literal secrets before either artifact write and continues with the next file', async () => {
     const { deps, recordingStorage } = createScenario({
-      aiExecutor: createFakeAiExecutor({
+      resolveAiExecutor: async () => createFakeAiExecutor({
         execute: async (request) => request.context !== null && typeof request.context === 'object' && 'testMd' in request.context && request.context.testMd === 'unsafe'
           ? { data: { steps: [], ambiguities: [], generatorMeta: { token: 'sk-live-secret-value' } }, raw: '{...}' }
           : { data: RESPONSE, raw: '{...}' },
@@ -1644,7 +1909,7 @@ describe('generate', () => {
       return { data: response, raw: JSON.stringify(response) };
     });
     const { deps, recordingStorage } = createScenario({
-      aiExecutor: createFakeAiExecutor({ execute }),
+      resolveAiExecutor: async () => createFakeAiExecutor({ execute }),
       discoverTestFiles: async () => ['unattributable.test.md', 'valid.test.md'],
     });
     await writePrompt(recordingStorage.storage, 'unattributable.test.md', `@ambercast-secret ${FIRST_SECRET_REF}\n`);
@@ -1665,7 +1930,7 @@ describe('generate', () => {
     'rejects %s before writing generated artifacts',
     async (_description, response, testMd, reason) => {
       const { deps, recordingStorage } = createScenario({
-        aiExecutor: createFakeAiExecutor({
+        resolveAiExecutor: async () => createFakeAiExecutor({
           execute: async () => ({ data: response, raw: JSON.stringify(response) }),
         }),
       });
@@ -1685,7 +1950,7 @@ describe('generate', () => {
     'rejects %s through the --dry-run path without writing artifacts',
     async (_description, response, testMd, reason) => {
       const { deps, recordingStorage } = createScenario({
-        aiExecutor: createFakeAiExecutor({
+        resolveAiExecutor: async () => createFakeAiExecutor({
           execute: async () => ({ data: response, raw: JSON.stringify(response) }),
         }),
       });
@@ -1736,7 +2001,7 @@ describe('generate', () => {
       ambiguities: [],
     } as unknown as GeneratedPlanResponse;
     const { deps, recordingStorage } = createScenario({
-      aiExecutor: createFakeAiExecutor({
+      resolveAiExecutor: async () => createFakeAiExecutor({
         execute: async () => ({ data: response, raw: JSON.stringify(response) }),
       }),
     });
@@ -1762,7 +2027,7 @@ describe('generate', () => {
       ambiguities: [],
     };
     const { deps, recordingStorage } = createScenario({
-      aiExecutor: createFakeAiExecutor({
+      resolveAiExecutor: async () => createFakeAiExecutor({
         execute: async () => ({ data: duplicateResponse, raw: JSON.stringify(duplicateResponse) }),
       }),
     });
@@ -1789,7 +2054,7 @@ describe('generate', () => {
       ambiguities: [],
     };
     const { deps, recordingStorage } = createScenario({
-      aiExecutor: createFakeAiExecutor({
+      resolveAiExecutor: async () => createFakeAiExecutor({
         execute: async () => ({ data: response, raw: JSON.stringify(response) }),
       }),
     });
@@ -1817,7 +2082,7 @@ describe('generate', () => {
     ['overrides a provider-supplied producer bundle', { planProducerBundle: { fingerprint: 'provider-value', providerOwnedField: 'must-not-survive' } }, () => ({ planProducerBundle: producerBundleMeta() })],
   ] as const)('%s', async (_name, generatorMeta, expectedGeneratorMeta) => {
     const response = { ...RESPONSE, ...(generatorMeta === undefined ? {} : { generatorMeta }) } as GeneratedPlanResponse;
-    const { deps, recordingStorage } = createScenario({ aiExecutor: createFakeAiExecutor({ execute: async () => ({ data: response, raw: JSON.stringify(response) }) }) });
+    const { deps, recordingStorage } = createScenario({ resolveAiExecutor: async () => createFakeAiExecutor({ execute: async () => ({ data: response, raw: JSON.stringify(response) }) }) });
     const testPath = await writePrompt(recordingStorage.storage);
 
     await expect(generate(deps, DEFAULT_OPTIONS)).resolves.toMatchObject({ results: [{ status: 'generated' }] });
@@ -1954,7 +2219,7 @@ describe('generate interruption contract', () => {
     }));
     const { deps, recordingStorage } = createScenario({
       signal: controller.signal,
-      aiExecutor: createFakeAiExecutor({ execute }),
+      resolveAiExecutor: async () => createFakeAiExecutor({ execute }),
       discoverTestFiles: vi.fn(async () => ['first.test.md', 'second.test.md', 'third.test.md']),
     });
     const first = await writePrompt(recordingStorage.storage, 'first.test.md');
@@ -2020,7 +2285,7 @@ describe('generate interruption contract', () => {
     }));
     const { deps, recordingStorage } = createScenario({
       signal: controller.signal,
-      aiExecutor: createFakeAiExecutor({ execute }),
+      resolveAiExecutor: async () => createFakeAiExecutor({ execute }),
       discoverTestFiles: vi.fn(async () => ['first.test.md', 'second.test.md']),
     });
     const first = await writePrompt(recordingStorage.storage, 'first.test.md');

@@ -98,7 +98,7 @@ describe('fake vertical slice', () => {
     const generateDeps: GenerateDeps = {
       storage,
       layout,
-      aiExecutor: createFakeAiExecutor({
+      resolveAiExecutor: async () => createFakeAiExecutor({
         execute: async () => ({ data: GENERATED_RESPONSE, raw: JSON.stringify(GENERATED_RESPONSE) }),
       }),
       events: createRecordingEventSink().sink,
@@ -140,7 +140,7 @@ describe('fake vertical slice', () => {
     const generateDeps: GenerateDeps = {
       storage,
       layout,
-      aiExecutor: createFakeAiExecutor({
+      resolveAiExecutor: async () => createFakeAiExecutor({
         execute: async () => ({ data: generatedResponse, raw: JSON.stringify(generatedResponse) }),
       }),
       events: createRecordingEventSink().sink,
@@ -220,7 +220,7 @@ describe('fake vertical slice', () => {
     await generate({
       storage,
       layout,
-      aiExecutor: createFakeAiExecutor({
+      resolveAiExecutor: async () => createFakeAiExecutor({
         execute: async () => ({ data: generatedResponse, raw: JSON.stringify(generatedResponse) }),
       }),
       events: createRecordingEventSink().sink,
@@ -315,7 +315,7 @@ describe('fake vertical slice', () => {
     await generate({
       storage,
       layout,
-      aiExecutor: createFakeAiExecutor({
+      resolveAiExecutor: async () => createFakeAiExecutor({
         execute: async () => ({ data: generatedResponse, raw: JSON.stringify(generatedResponse) }),
       }),
       events: createRecordingEventSink().sink,
@@ -397,7 +397,7 @@ describe('fake vertical slice', () => {
     const generateDeps: GenerateDeps = {
       storage,
       layout,
-      aiExecutor: createFakeAiExecutor({ execute }),
+      resolveAiExecutor: async () => createFakeAiExecutor({ execute }),
       events: generateEvents.sink,
       discoverTestFiles: async () => [],
       config: {
@@ -514,7 +514,7 @@ describe('fake vertical slice', () => {
     const generateDeps: GenerateDeps = {
       storage,
       layout,
-      aiExecutor: createFakeAiExecutor({ execute }),
+      resolveAiExecutor: async () => createFakeAiExecutor({ execute }),
       events: createRecordingEventSink().sink,
       discoverTestFiles: async () => [],
       config: {
@@ -626,7 +626,7 @@ describe('fake vertical slice', () => {
     const generateDeps: GenerateDeps = {
       storage,
       layout,
-      aiExecutor: createFakeAiExecutor({
+      resolveAiExecutor: async () => createFakeAiExecutor({
         execute: async () => ({ data: generatedResponse, raw: JSON.stringify(generatedResponse) }),
       }),
       events: createRecordingEventSink().sink,

@@ -48,7 +48,7 @@ registerUsecaseEmitsEventsContract([
       await generate({
         storage,
         layout: createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR }),
-        aiExecutor: createFakeAiExecutor({
+        resolveAiExecutor: async () => createFakeAiExecutor({
           execute: async () => ({ data: GENERATED_RESPONSE, raw: JSON.stringify(GENERATED_RESPONSE) }),
         }),
         events: events.sink,
