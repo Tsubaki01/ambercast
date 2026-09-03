@@ -22,7 +22,16 @@
  * unclassified syntax, and checker or scanner defects. Reads from
  * `any`/`unknown` index slots, dynamic keys on name-identified sinks, and
  * aggregates reachable only through an externally-typed value's signature are
- * outside the guarantee; none is an allow-path,
+ * outside the guarantee. Two further shapes stay outside the guarantee rather
+ * than being closed: a union that includes the protected type as a slot type
+ * on an externally declared value — a `declare`, an external type definition,
+ * or a cast — can escape aggregate detection, and a direct call reached by
+ * narrowing that value afterward is not reported (an in-program value reaches
+ * the same slot type through its own construction site instead, which is
+ * already reported there); and a structurally compatible call-signature
+ * match's `void`-return gate is enforced only on the aggregate-escape path —
+ * the index-signature path reports on assignability alone, without that gate,
+ * so the two paths disagree on a `void`-returning structural match. None is an allow-path,
  * so a protected authority reached through one requires scanner extension or
  * explicit review.
  */
@@ -90,7 +99,7 @@ export interface FunctionValueReferenceScan {
  * the protected declaration's own type; ordinary exact or potential resolver
  * results are reported without that gate, and aggregate escapes are an
  * independent additional path. Destructuring preserves `any` and `unknown`
- * sources as potential. It will cover local rebinds, declaration and assignment
+ * sources as potential. It covers local rebinds, declaration and assignment
  * destructuring, property/element extraction,
  * `.bind`/`.call`/`.apply`, argument passing, returns, storage, and value
  * re-exports, while excluding declaration-introduction and erased type
@@ -237,9 +246,32 @@ export function scanFunctionValueReferences(
         : [checker.getTypeOfSymbolAtLocation(property, location)];
     });
   };
+  /**
+   * Retains the syntactic key for non-positional destructuring leaves. Array
+   * bindings derive their positional numeric key through the companion
+   * candidate helper, so a local alias never becomes a spurious property name.
+   */
   const leafKey = (node: DestructuringLeaf): ts.PropertyName | ts.BindingName => (
     ts.isBindingElement(node) ? node.propertyName ?? node.name : node.name
   );
+  /**
+   * `node` is always an element of `pattern.elements` here, because this
+   * helper is only ever called with `node.parent === pattern`, so `indexOf`
+   * never returns `-1` in practice -- a `String(-1)` would otherwise become
+   * a bogus key candidate silently, so this invariant matters for
+   * `leafKeyCandidates`'s correctness, not merely as an optimization note.
+   */
+  const arrayBindingElementIndex = (node: ts.BindingElement): string | undefined => {
+    const pattern = node.parent;
+    return ts.isArrayBindingPattern(pattern) ? String(pattern.elements.indexOf(node)) : undefined;
+  };
+  const leafKeyCandidates = (node: DestructuringLeaf): PropertySelectionCandidates => {
+    if (ts.isBindingElement(node) && node.propertyName === undefined) {
+      const index = arrayBindingElementIndex(node);
+      if (index !== undefined) return { names: [index], applicability: 'number' };
+    }
+    return keyCandidates(leafKey(node));
+  };
   const outerDestructuringLeaf = (node: DestructuringSource): DestructuringLeaf | undefined => {
     if (ts.isBindingElement(node)) {
       const container = node.parent.parent;
@@ -263,11 +295,30 @@ export function scanFunctionValueReferences(
     const innermost = checker.getTypeAtLocation(unwrapExpression(parameter.initializer, true));
     return declared === innermost ? [declared] : [declared, innermost];
   };
+  const isForOfBinding = (declaration: ts.VariableDeclaration): boolean => {
+    const list = declaration.parent;
+    return ts.isVariableDeclarationList(list)
+      && ts.isForOfStatement(list.parent)
+      && list.parent.initializer === list;
+  };
+  const isCatchClauseBinding = (declaration: ts.VariableDeclaration): boolean => (
+    ts.isCatchClause(declaration.parent) && declaration.parent.variableDeclaration === declaration
+  );
+  /**
+   * Resolves the root type that feeds a destructuring chain. Initializers and
+   * parameters preserve their wrapper-aware treatment, while for-of and catch
+   * bindings use the pattern's own checker type because their source expression
+   * is represented outside the declaration.
+   */
   const rootDestructuringSourceTypes = (node: DestructuringSource): readonly ts.Type[] | undefined => {
     if (ts.isBindingElement(node)) {
       const container = node.parent.parent;
-      if (ts.isVariableDeclaration(container) && container.initializer !== undefined) {
-        return sourceTypesThroughWrappers(container.initializer);
+      if (ts.isVariableDeclaration(container)) {
+        if (container.initializer !== undefined) return sourceTypesThroughWrappers(container.initializer);
+        if (isForOfBinding(container) || isCatchClauseBinding(container)) {
+          return [checker.getTypeAtLocation(container.name)];
+        }
+        return undefined;
       }
       if (ts.isParameter(container)) return parameterSourceTypes(container);
       return undefined;
@@ -279,6 +330,12 @@ export function scanFunctionValueReferences(
       || assignment.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return undefined;
     return sourceTypesThroughWrappers(assignment.right);
   };
+  /**
+   * Walks from a nested leaf to the root source while applying the key contract
+   * at every enclosing property or tuple position. This shares uncertainty and
+   * type evidence across declaration and assignment destructuring instead of
+   * re-deriving source types at each leaf.
+   */
   const destructuringElementSourceTypes = (node: DestructuringSource): readonly ts.Type[] | undefined => {
     const rootTypes = rootDestructuringSourceTypes(node);
     if (rootTypes !== undefined) return rootTypes;
@@ -287,23 +344,76 @@ export function scanFunctionValueReferences(
     if (outer === undefined) return undefined;
     const outerSourceTypes = destructuringElementSourceTypes(outer);
     if (outerSourceTypes === undefined) return undefined;
-    const candidates = keyCandidates(leafKey(outer));
+    const candidates = leafKeyCandidates(outer);
     const sourceTypes = outerSourceTypes.flatMap((outerSourceType) => {
       if (outerSourceType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return [outerSourceType];
       return selectedPropertyTypes(outerSourceType, candidates, leafKey(outer));
     });
     return sourceTypes.length === 0 ? undefined : sourceTypes;
   };
+  /**
+   * Resolves the checker type(s) of the array literal that is directly the
+   * value of an assignment-destructuring object property, by reusing the same
+   * containing-property source-type walk `destructuringElementSourceTypes`
+   * already performs for `PropertyAssignment` leaves. Array literal elements
+   * have no declaration-name AST shape the way binding-pattern elements do, so
+   * this narrow helper substitutes for that walk at exactly one position: the
+   * array literal must be a property's own initializer. Object nesting above
+   * that containing property is unbounded, because the shared walk it defers
+   * to already generalizes across arbitrary depth for the declaration form;
+   * this helper does not extend that generalization to an array literal
+   * nested inside another array literal or reached through any other shape.
+   */
+  const containingArrayLiteralTypes = (
+    arrayLiteral: ts.ArrayLiteralExpression,
+  ): readonly ts.Type[] | undefined => {
+    const outer = arrayLiteral.parent;
+    if (!ts.isPropertyAssignment(outer) || outer.initializer !== arrayLiteral) return undefined;
+    const outerSourceTypes = destructuringElementSourceTypes(outer);
+    if (outerSourceTypes === undefined) return undefined;
+    const candidates = leafKeyCandidates(outer);
+    const types = outerSourceTypes.flatMap((type) => (
+      type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)
+        ? [type]
+        : selectedPropertyTypes(type, candidates, outer)
+    ));
+    return types.length === 0 ? undefined : types;
+  };
+  const recordArrayLiteralAssignmentElement = (identifier: ts.Identifier): boolean => {
+    const arrayLiteral = identifier.parent;
+    if (!ts.isArrayLiteralExpression(arrayLiteral)) return false;
+    const index = arrayLiteral.elements.indexOf(identifier);
+    if (index === -1) return false;
+    const arrayTypes = containingArrayLiteralTypes(arrayLiteral);
+    if (arrayTypes === undefined) return false;
+    const resolutions = arrayTypes.map((type) => (
+      resolver.resolvePropertySelection(
+        type,
+        [String(index)],
+        'number',
+        isTarget,
+        indexSignatureMaySelect,
+      ).kind
+    ));
+    if (resolutions.every((kind) => kind === 'none')) return false;
+    recordUnsafe(identifier);
+    return true;
+  };
   const reportNodeForDestructuringLeaf = (node: DestructuringLeaf): ts.Node => {
     if (ts.isBindingElement(node) || ts.isShorthandPropertyAssignment(node)) return node.name;
     return ts.isComputedPropertyName(node.name) ? node.name : node.initializer ?? node.name;
   };
+  /**
+   * Records a leaf only when its source selection is exact or potential. Tuple
+   * leaves retain a numeric candidate so declarationless positional symbols can
+   * use the resolver's precise type evidence rather than an alias name.
+   */
   const recordDestructuringReference = (node: DestructuringLeaf): boolean => {
     if (ts.isBindingElement(node) && !ts.isIdentifier(node.name)) return false;
     if (ts.isPropertyAssignment(node) && ts.isObjectLiteralExpression(node.initializer)) return false;
     const sourceTypes = destructuringElementSourceTypes(node);
     if (sourceTypes === undefined) return false;
-    const candidates = keyCandidates(leafKey(node));
+    const candidates = leafKeyCandidates(node);
     const resolutions = sourceTypes.map((sourceType) => (
       resolver.resolvePropertySelection(sourceType, candidates.names, candidates.applicability, isTarget, indexSignatureMaySelect).kind
     ));
@@ -460,6 +570,12 @@ export function scanFunctionValueReferences(
       if (reference.argumentExpression !== undefined) visit(reference.argumentExpression);
     }
   };
+  /**
+   * Visits value-bearing syntax while preserving the first authoritative
+   * classification for each reference. Assignment-array elements receive a
+   * source-aware fallback only after ordinary identity resolution finds no
+   * target, which confines that extra path to destructuring writes.
+   */
   const visit = (node: ts.Node): void => {
     if (ts.isCallExpression(node)) {
       const resolution = resolver.resolvePropertyReference(node.expression, isTarget, indexSignatureMaySelect);
@@ -498,6 +614,8 @@ export function scanFunctionValueReferences(
         && resolution.kind !== 'none'
       ) {
         recordUnsafe(node);
+      } else if (ts.isArrayLiteralExpression(node.parent)) {
+        recordArrayLiteralAssignmentElement(node);
       }
     } else if (ts.isElementAccessExpression(node)) {
       const resolution = resolver.resolvePropertyReference(node, isTarget, indexSignatureMaySelect);
