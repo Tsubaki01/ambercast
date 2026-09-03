@@ -165,7 +165,7 @@ const digestInputRestrictions = [
 ];
 
 export default [
-  { ignores: ['dist/**', 'test/fixtures/architecture/**'] },
+  { ignores: ['dist/**', 'test/fixtures/architecture/**', 'website/**'] },
   ...tseslint.configs.recommended,
   {
     files: ['**/*.ts'],
