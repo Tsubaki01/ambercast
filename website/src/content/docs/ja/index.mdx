@@ -1,0 +1,35 @@
+---
+title: ambercast
+description: プロンプトネイティブな E2E テスト — テストを Markdown プロンプトとして書き、AI 呼び出しゼロでリプレイする。
+template: splash
+hero:
+  tagline: プロンプトネイティブな E2E テスト。
+  actions:
+    - text: はじめる
+      link: /ambercast/ja/guides/getting-started/
+      icon: right-arrow
+      variant: primary
+    - text: GitHub
+      link: https://github.com/Tsubaki01/ambercast
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+琥珀（amber）に閉じ込められた虫のように、テストの意図は一度だけ鋳込まれ、表面がどれだけ変化してもそのまま保たれる。
+
+<CardGrid stagger>
+	<Card title="リプレイ時は AI 呼び出しゼロ" icon="approve-check">
+		一度生成すれば、あとは永遠にリプレイできる。`ambercast run` はコミット済みのプランを決定的にリプレイする — ステップのキャッシュ済みグラウンディングが失われない限り、AI 呼び出しは発生しない。
+	</Card>
+	<Card title="ロックファイルのようなプラン" icon="document">
+		`generate` はプランとグラウンディングキャッシュを、プレーンな git-diffable JSON として書き出す。ロックファイルと同様にコミットしてレビューできる。
+	</Card>
+	<Card title="自己修復" icon="rocket">
+		UI がドリフトした場合、`ambercast heal` が影響を受けたプランのステップを再解決・修復・再生成し、書き込み前に確認を求める。
+	</Card>
+	<Card title="AI プロバイダは自前で用意" icon="setting">
+		認証情報の管理は行わない。ambercast は、自分でインストール・認証済みの Claude Code CLI または Codex CLI を利用する。
+	</Card>
+</CardGrid>
