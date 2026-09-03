@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { createFsReadStorage } from '../../../../src/adapters/storage/fs-read-storage.js';
+import { createFsStorage } from '../../../../src/adapters/storage/fs-storage.js';
 
 async function withIsolatedStorage(
   assertion: (storage: ReturnType<typeof createFsReadStorage>) => Promise<void>,
@@ -26,6 +27,13 @@ function isSymbolicLinkPermissionError(error: unknown): error is { readonly code
 
   return error.code === 'EACCES' || error.code === 'EPERM';
 }
+
+// Issue #193 derives this set from the storage adapter so coverage follows future method additions or renames.
+const readOnlyMethodNames = ['readText', 'exists'] as const;
+const allStorageMethodNames = Object.keys(createFsStorage());
+const nonReadStorageMethodNames = allStorageMethodNames.filter(
+  (name) => !(readOnlyMethodNames as readonly string[]).includes(name),
+);
 
 describe('createFsReadStorage()', () => {
   it('reads the exact UTF-8 content of an existing file', async () => {
@@ -92,5 +100,23 @@ describe('createFsReadStorage()', () => {
 
   it('exposes exactly the two read-only operations as own properties', () => {
     expect([...Reflect.ownKeys(createFsReadStorage())].sort()).toEqual(['exists', 'readText']);
+  });
+
+  it('derives the excluded method list from createFsStorage() and matches the fixed named set', () => {
+    expect([...nonReadStorageMethodNames].sort()).toEqual(
+      ['ensureDir', 'listFiles', 'readBinary', 'readTextSnapshot', 'writeBinary', 'writeText'].sort(),
+    );
+  });
+
+  it.each(nonReadStorageMethodNames)('does not expose %s via the `in` operator or Reflect.has', (name) => {
+    expect(name in createFsReadStorage()).toBe(false);
+    expect(Reflect.has(createFsReadStorage(), name)).toBe(false);
+  });
+
+  it('has the ordinary Object.prototype as its prototype, terminating at null', () => {
+    const adapterPrototype = Object.getPrototypeOf(createFsReadStorage());
+
+    expect(adapterPrototype).toBe(Object.prototype);
+    expect(Object.getPrototypeOf(adapterPrototype)).toBe(null);
   });
 });
