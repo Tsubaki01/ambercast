@@ -215,6 +215,7 @@ describe('createStaticReferenceResolver()', () => {
     ['a number key without an explicit property on a number-index receiver', 'numberIndexed', ['1'], 'number', 'potential'],
     ['a missing property on a receiver with no applicable index signature', 'closed', ['missing'], 'string', 'none'],
     ['a string-only key on a receiver with only a number index signature', 'numberIndexed', ['target'], 'string', 'none'],
+    ['a declarationless numeric property alongside a non-matching explicit property on a mixed-key receiver', 'tupleIntersection', ['0', 'other'], 'both', 'potential'],
   ] as const)('classifies %s through resolvePropertySelection()', async (_name, receiver, candidates, applicability, kind) => {
     await withProgram({
       'src/target.ts': 'export const target = (): void => undefined;',
@@ -224,6 +225,7 @@ describe('createStaticReferenceResolver()', () => {
         'const explicit = { target, other };',
         'declare const stringIndexed: Record<string, typeof target>;',
         'declare const numberIndexed: { [key: number]: typeof target };',
+        'declare const tupleIntersection: [typeof target] & { other: typeof other };',
         'declare const closed: { other: typeof other };',
       ].join('\n'),
     }, (program, names) => {

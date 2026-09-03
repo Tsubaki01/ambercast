@@ -400,7 +400,7 @@ export function createStaticReferenceResolver(checker: ts.TypeChecker): StaticRe
       const candidateKinds = keyCandidates.map((key) => {
         const property = checker.getPropertyOfType(receiverType, key);
         const declarationless = property !== undefined && (property.declarations?.length ?? 0) === 0;
-        if (indexApplicability === 'number' && declarationless) {
+        if ((indexApplicability === 'number' || indexApplicability === 'both') && declarationless) {
           return indexSignatureMaySelect(
             'number',
             checker.getTypeOfSymbol(property as ts.Symbol),
