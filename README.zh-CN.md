@@ -27,7 +27,7 @@ sign-in.test.md
 sign-in.ambercast.plan.json  +  sign-in.ambercast.grounding.json
       │  两者一并提交到 git
       ▼
-ambercast run（重放——零 AI 调用）
+ambercast run（重放——定位缓存命中时零 AI 调用）
       │
       ├─ grounding 命中 → 确定性重放
       ├─ grounding 未命中 → 实时 AI 辅助执行该步骤，并更新缓存（可用 git diff 查看）
@@ -168,7 +168,7 @@ npx ambercast <command>
 | `--allow-empty` | 零匹配的选择视为成功，而不是以退出码 5 结束 |
 | `--list` | 只报告解析出的提示词路径，不执行修复 |
 
-在 CI 中，除非设置了 `ci.heal: true`，否则 `heal` 会拒绝运行（退出码 2）——参见 [CI 使用](#ci-使用)。
+在 CI 中，除非设置了 `ci.heal: true`，否则 `heal` 会拒绝执行修复（退出码 2）；`heal --list` 仍可使用——参见 [CI 使用](#ci-使用)。
 
 有两个配置项用于控制增量修复；它们的完整约定参见 [`docs/configuration.md`](docs/configuration.md)：
 
@@ -220,7 +220,7 @@ npx ambercast check
 npx ambercast run
 ```
 
-- `heal` 不会在任何地方自动运行，并且除非在 `ambercast.config.json` 中显式设置 `ci.heal: true` 选择加入，否则它在 CI 中会完全拒绝运行。
+- `heal` 不会在任何地方自动运行，并且除非在 `ambercast.config.json` 中显式设置 `ci.heal: true` 选择加入，否则它在 CI 中会拒绝执行修复（未设置时仅允许只读的 `heal --list`）。
 - 除非为该次调用传入 `--update-cache`，或设置 `ci.updateGroundingCache: true`，否则 `run` 产生的定位缓存改动不会在 CI 中被持久化。
 - 请以进程退出码作为流水线的判定依据（参见[退出码](#退出码)）；其中 `4` 尤其意味着已提交的执行计划/定位缓存已不再匹配提示词，需要执行 `generate` 或 `heal`，而不是简单地重新运行。
 

@@ -27,7 +27,7 @@ sign-in.test.md
 sign-in.ambercast.plan.json  +  sign-in.ambercast.grounding.json
       │  両方を git にコミット
       ▼
-ambercast run（リプレイ — AI 呼び出しはゼロ）
+ambercast run（リプレイ — グラウンディングヒット時は AI 呼び出しゼロ）
       │
       ├─ グラウンディング ヒット → 決定的なリプレイ
       ├─ グラウンディング ミス → そのステップだけライブの AI 支援ステップを実行し、キャッシュを更新（git で diff 可能）
@@ -168,7 +168,7 @@ npx ambercast <command>
 | `--allow-empty` | 0 件マッチでも exit 5 で終了せず成功にする |
 | `--list` | 修復せずに解決済みのプロンプトパスを報告する |
 
-CI では、`ci.heal: true` が設定されていない限り `heal` は実行を拒否する（exit 2）— [CI での利用](#ci-での利用) を参照。
+CI では、`ci.heal: true` が設定されていない限り `heal` は修復を拒否する（exit 2）。`heal --list` は引き続き使える — [CI での利用](#ci-での利用) を参照。
 
 インクリメンタルな修復を制御する設定キーが 2 つある。完全な仕様は [`docs/configuration.md`](docs/configuration.md) を参照:
 
@@ -220,7 +220,7 @@ npx ambercast check
 npx ambercast run
 ```
 
-- `heal` はどこでも自動実行されることはなく、`ambercast.config.json` で `ci.heal: true` を明示的に指定しない限り CI では実行を拒否する。
+- `heal` はどこでも自動実行されることはなく、`ambercast.config.json` で `ci.heal: true` を明示的に指定しない限り CI では修復を拒否する（読み取り専用の `heal --list` のみ指定なしで使える）。
 - `run` によるグラウンディングキャッシュの変更は、その呼び出しで `--update-cache` を渡すか `ci.updateGroundingCache: true` を設定しない限り、CI では永続化されない。
 - パイプラインはプロセスの終了コードをゲートに使うこと（[終了コード](#終了コード) を参照）。特に `4` は、コミット済みのプラン/グラウンディングがもうプロンプトと一致していないことを意味し、必要なのは再実行ではなく `generate` または `heal` である。
 

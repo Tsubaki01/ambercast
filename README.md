@@ -27,7 +27,7 @@ sign-in.test.md
 sign-in.ambercast.plan.json  +  sign-in.ambercast.grounding.json
       │  commit both to git
       ▼
-ambercast run (replayed — zero AI calls)
+ambercast run (replayed — zero AI calls on a grounding hit)
       │
       ├─ grounding hit  → deterministic replay
       ├─ grounding miss → live AI-assisted step, cache updated (git-diffable)
@@ -168,7 +168,7 @@ Repairs a plan whose grounding no longer matches the live UI: step re-resolution
 | `--allow-empty` | A zero-match selection succeeds instead of exiting 5 |
 | `--list` | Reports resolved prompt paths without healing |
 
-In CI, `heal` refuses to run (exit 2) unless `ci.heal: true` is set — see [CI usage](#ci-usage).
+In CI, `heal` refuses to repair anything (exit 2) unless `ci.heal: true` is set; `heal --list` still works — see [CI usage](#ci-usage).
 
 Two configuration keys shape incremental repair; see [`docs/configuration.md`](docs/configuration.md) for their full contract:
 
@@ -220,7 +220,7 @@ npx ambercast check
 npx ambercast run
 ```
 
-- `heal` does not run automatically anywhere, and it refuses to run in CI at all unless you opt in with `ci.heal: true` in `ambercast.config.json`.
+- `heal` does not run automatically anywhere, and in CI it refuses to make repairs unless you opt in with `ci.heal: true` in `ambercast.config.json` (only the read-only `heal --list` is allowed without it).
 - Grounding-cache changes from `run` are not persisted in CI unless you pass `--update-cache` for that invocation or set `ci.updateGroundingCache: true`.
 - Gate your pipeline on the process exit code (see [Exit codes](#exit-codes)); `4` in particular means the committed plan/grounding no longer matches the prompt and needs `generate` or `heal`, not a re-run.
 
