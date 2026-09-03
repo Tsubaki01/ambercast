@@ -215,6 +215,7 @@ describe('createStaticReferenceResolver()', () => {
     ['a number key without an explicit property on a number-index receiver', 'numberIndexed', ['1'], 'number', 'potential'],
     ['a missing property on a receiver with no applicable index signature', 'closed', ['missing'], 'string', 'none'],
     ['a string-only key on a receiver with only a number index signature', 'numberIndexed', ['target'], 'string', 'none'],
+    ['a declarationless numeric property alongside a non-matching explicit property on a mixed-key receiver', 'tupleIntersection', ['0', 'other'], 'both', 'potential'],
   ] as const)('classifies %s through resolvePropertySelection()', async (_name, receiver, candidates, applicability, kind) => {
     await withProgram({
       'src/target.ts': 'export const target = (): void => undefined;',
@@ -224,6 +225,7 @@ describe('createStaticReferenceResolver()', () => {
         'const explicit = { target, other };',
         'declare const stringIndexed: Record<string, typeof target>;',
         'declare const numberIndexed: { [key: number]: typeof target };',
+        'declare const tupleIntersection: [typeof target] & { other: typeof other };',
         'declare const closed: { other: typeof other };',
       ].join('\n'),
     }, (program, names) => {
@@ -239,6 +241,43 @@ describe('createStaticReferenceResolver()', () => {
         applicability,
         (symbol) => symbol.declarations?.includes(target) ?? false,
       )).toEqual({ kind });
+    });
+  });
+
+  test('classifies a two-declaration union property as exact, potential, or none per declaration', async () => {
+    await withProgram({
+      'src/target.ts': 'export function target(): void {}',
+      'src/synthetic.ts': [
+        "import * as api from './target.js';",
+        'declare const receiver: typeof api | { target(): void };',
+      ].join('\n'),
+    }, (program, names) => {
+      const checker = program.getTypeChecker();
+      const target = exportedDeclaration(checker, sourceFile(program, names['src/target.ts'] ?? ''), 'target');
+      const resolver = createStaticReferenceResolver(checker);
+      const receiver = variableIdentifier(sourceFile(program, names['src/synthetic.ts'] ?? ''), 'receiver');
+      const receiverType = checker.getTypeAtLocation(receiver);
+      const property = checker.getPropertyOfType(receiverType, 'target');
+
+      expect(property?.declarations).toHaveLength(2);
+      expect(resolver.resolvePropertySelection(
+        receiverType,
+        ['target'],
+        'string',
+        (symbol) => symbol.name === 'target',
+      )).toEqual({ kind: 'exact' });
+      expect(resolver.resolvePropertySelection(
+        receiverType,
+        ['target'],
+        'string',
+        (symbol) => symbol.declarations?.includes(target) ?? false,
+      )).toEqual({ kind: 'potential' });
+      expect(resolver.resolvePropertySelection(
+        receiverType,
+        ['target'],
+        'string',
+        () => false,
+      )).toEqual({ kind: 'none' });
     });
   });
 
