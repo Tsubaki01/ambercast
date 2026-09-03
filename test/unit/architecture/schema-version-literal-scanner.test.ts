@@ -279,6 +279,16 @@ describe('scanSchemaVersionLiteralViolations()', () => {
     }
   });
 
+  test('keeps a potential any-receiver computed propagation subject to the source gate', async () => {
+    const source = [
+      'declare const anyReceiver: any;',
+      'declare const dynamicKey: string;',
+      'const result = { schemaVersion: anyReceiver[dynamicKey] };',
+    ].join('\n');
+    const result = await scanWithCaller(source);
+    expect(result.violations).toEqual([{ fileName: result.callerFileName, line: 3, column: 18 }]);
+  });
+
   test.each([
     ['a const-bound key', "const key = 'schemaVersion' as const; const value = { [key]: 2 };"],
     ['a finite-union key', "declare const key: 'schemaVersion' | 'other'; const value = { [key]: 2 };"],

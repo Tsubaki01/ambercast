@@ -186,6 +186,75 @@ describe('scanFunctionValueReferences()', () => {
     });
   });
 
+  test.each([
+    [
+      'a for-of binding',
+      [
+        "import { target } from './target.js';",
+        'declare const items: any[];',
+        'for (const { target: alias } of items) void alias;',
+      ].join('\n'),
+      3,
+    ],
+    [
+      'a catch-clause binding',
+      [
+        "import { target } from './target.js';",
+        'try { throw undefined; } catch ({ target: alias }: any) { void alias; }',
+      ].join('\n'),
+      2,
+    ],
+  ] as const)('propagates an any source through %s', async (_name, source, line) => {
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[line, 'alias']]);
+    });
+  });
+
+  test.each([
+    [
+      'declaration destructuring',
+      [
+        "import { target } from './target.js';",
+        'declare const source: { x: [typeof target] };',
+        'const { x: [alias] } = source;',
+      ].join('\n'),
+      3,
+    ],
+    [
+      'assignment destructuring',
+      [
+        "import { target } from './target.js';",
+        'declare const source: { x: [typeof target] };',
+        'let alias: unknown;',
+        '({ x: [alias] } = source);',
+      ].join('\n'),
+      4,
+    ],
+    [
+      'parameter destructuring',
+      [
+        "import { target } from './target.js';",
+        'function bind({ x: [alias] }: { x: [typeof target] }): void { alias(); }',
+      ].join('\n'),
+      2,
+    ],
+  ] as const)('propagates a nested array element through %s', async (_name, source, line) => {
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[line, 'alias']]);
+    });
+  });
+
+  test('uses the precise heterogeneous tuple element type for nested array destructuring', async () => {
+    const source = [
+      "import { target } from './target.js';",
+      'declare const source: { x: [string, typeof target] };',
+      'const { x: [safe, alias] } = source;',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[3, 'alias']]);
+    });
+  });
+
   test('excludes declaration-introduction positions from both inventories', async () => {
     const source = "import { target } from './target.js';";
     await withCaller(source, (scan, names) => {
