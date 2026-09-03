@@ -242,6 +242,43 @@ describe('createStaticReferenceResolver()', () => {
     });
   });
 
+  test('classifies a two-declaration union property as exact, potential, or none per declaration', async () => {
+    await withProgram({
+      'src/target.ts': 'export function target(): void {}',
+      'src/synthetic.ts': [
+        "import * as api from './target.js';",
+        'declare const receiver: typeof api | { target(): void };',
+      ].join('\n'),
+    }, (program, names) => {
+      const checker = program.getTypeChecker();
+      const target = exportedDeclaration(checker, sourceFile(program, names['src/target.ts'] ?? ''), 'target');
+      const resolver = createStaticReferenceResolver(checker);
+      const receiver = variableIdentifier(sourceFile(program, names['src/synthetic.ts'] ?? ''), 'receiver');
+      const receiverType = checker.getTypeAtLocation(receiver);
+      const property = checker.getPropertyOfType(receiverType, 'target');
+
+      expect(property?.declarations).toHaveLength(2);
+      expect(resolver.resolvePropertySelection(
+        receiverType,
+        ['target'],
+        'string',
+        (symbol) => symbol.name === 'target',
+      )).toEqual({ kind: 'exact' });
+      expect(resolver.resolvePropertySelection(
+        receiverType,
+        ['target'],
+        'string',
+        (symbol) => symbol.declarations?.includes(target) ?? false,
+      )).toEqual({ kind: 'potential' });
+      expect(resolver.resolvePropertySelection(
+        receiverType,
+        ['target'],
+        'string',
+        () => false,
+      )).toEqual({ kind: 'none' });
+    });
+  });
+
   test.each([
     ['an any-typed property receiver', 'anyProperty'],
     ['an any-typed element receiver', 'anyElement'],

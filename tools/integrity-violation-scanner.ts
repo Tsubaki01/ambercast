@@ -28,7 +28,16 @@
  * mutation, unclassified syntax, and checker or scanner defects. Reads from
  * `any`/`unknown` index slots, dynamic keys on name-identified sinks, and
  * aggregates reachable only through an externally-typed value's signature are
- * outside the guarantee; none is an
+ * outside the guarantee. Two further shapes stay outside the guarantee rather
+ * than being closed: a union that includes the protected type as a slot type
+ * on an externally declared value — a `declare`, an external type definition,
+ * or a cast — can escape aggregate detection, and a direct call reached by
+ * narrowing that value afterward is not reported (an in-program value reaches
+ * the same slot type through its own construction site instead, which is
+ * already reported there); and a structurally compatible call-signature
+ * match's `void`-return gate is enforced only on the aggregate-escape path —
+ * the index-signature path reports on assignability alone, without that gate,
+ * so the two paths disagree on a `void`-returning structural match. None is an
  * allow-path, so a protected authority reached through one requires scanner
  * extension or explicit review.
  */

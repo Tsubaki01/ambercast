@@ -537,6 +537,22 @@ describe('createHealAiDispatchBudget', () => {
     expect(fixture.recording.emitted()).toEqual([{ type: 'ai-call' }]);
   });
 
+  it('gives the first-latched protocol violation precedence over a separately unconsumed pending AI call', async () => {
+    const fixture = createBudget();
+
+    await expect(fixture.budget.runPhase('incremental', async (deps) => {
+      const executor = await deps.resolveAiExecutor();
+      try {
+        await executor.execute(request); // throws missing-pending-ai-call; latches phase.protocolViolation
+      } catch {
+        // Models a generic downstream catch (H2a): the record survives even though
+        // the throw itself is swallowed here.
+      }
+      deps.events.emit({ type: 'ai-call' }); // leaves phase.pendingAiCall set; never dispatched
+      return 'swallowed';
+    })).rejects.toMatchObject({ reason: 'missing-pending-ai-call' });
+  });
+
   it('gives an unconsumed pending AI call precedence over a latched denial', async () => {
     const fixture = createBudget({ maxDispatches: 1 });
 

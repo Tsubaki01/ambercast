@@ -128,7 +128,10 @@ export interface StaticReferenceResolver {
    * every finite candidate, an absent explicit property falls back to an
    * index signature permitted by `indexApplicability`: an applicable index is
    * `potential` only when `indexSignatureMaySelect` accepts its value type,
-   * kind, and candidate. The optional predicate defaults to `true`, preserving
+   * kind, and candidate. A declarationless numeric property uses its own
+   * precise checker type as that evidence, because a tuple index has no
+   * declaration identity while the tuple-wide number index would lose the
+   * selected position. The optional predicate defaults to `true`, preserving
    * the legacy unconditional fallback for consumers that do not need stronger
    * evidence; a supplied predicate can require consumer-specific type evidence.
    * The resolver returns `exact` only when every finite
@@ -152,7 +155,7 @@ export interface StaticReferenceResolver {
    *
    * When `keyCandidates` is `undefined`, the resolver handles one conceptual
    * dynamic candidate. It returns `potential` when either a declared property
-   * satisfying `isTarget` exists or an index signature permitted by
+   * with at least one matching declaration exists or an index signature permitted by
    * `indexApplicability` exists; it returns `none` otherwise. This preserves
    * uncertainty without treating a dynamic key as proof that every declared
    * property can be selected.
@@ -203,7 +206,10 @@ export interface StaticReferenceResolver {
    * consumers never turn missing static proof into proof of absence. A
    * `PropertyAccessExpression` or `ElementAccessExpression` target match also
    * follows a shorthand property assignment's own value symbol when its direct
-   * property symbol does not match.
+   * property symbol does not match. A synthesized union property is exact only
+   * when every contributing declaration identifies the target; a mixed set
+   * remains potential so a representative declaration cannot grant authority
+   * to an unrelated member.
    * Property and element accesses judge both the receiver's declared type and
    * its innermost transparent-wrapper type, retaining the strongest result.
    * A non-matching explicit property therefore does not prevent the innermost
@@ -279,14 +285,31 @@ export function createStaticReferenceResolver(checker: ts.TypeChecker): StaticRe
       : symbol;
     return resolved !== undefined && isTarget(resolved);
   };
-  const propertyMatches = (symbol: ts.Symbol | undefined, isTarget: (candidate: ts.Symbol) => boolean): boolean => (
-    matches(symbol, isTarget)
-    || symbol?.declarations?.some((declaration) => (
-      ts.isShorthandPropertyAssignment(declaration)
-      && matches(checker.getShorthandAssignmentValueSymbol(declaration), isTarget)
-    ))
-    || false
-  );
+  /**
+   * Preserves the uncertainty of synthesized properties that merge several
+   * declarations, rather than letting one matching representative authorize
+   * every union member. Each declaration is resolved at its own name before
+   * identity comparison; shorthand declarations retain their value-symbol
+   * exception. Declarationless checker symbols keep the ordinary direct-symbol
+   * behavior because no per-declaration evidence exists to divide.
+   */
+  const propertyMatches = (
+    symbol: ts.Symbol | undefined,
+    isTarget: (candidate: ts.Symbol) => boolean,
+  ): 'exact' | 'potential' | 'none' => {
+    if (symbol === undefined) return 'none';
+    const declarations = symbol.declarations ?? [];
+    if (declarations.length === 0) return matches(symbol, isTarget) ? 'exact' : 'none';
+    const matchingDeclarations = declarations.filter((declaration) => {
+      const name = ts.getNameOfDeclaration(declaration);
+      const localSymbol = name === undefined ? undefined : checker.getSymbolAtLocation(name);
+      return matches(localSymbol, isTarget)
+        || (ts.isShorthandPropertyAssignment(declaration)
+          && matches(checker.getShorthandAssignmentValueSymbol(declaration), isTarget));
+    });
+    if (matchingDeclarations.length === declarations.length) return 'exact';
+    return matchingDeclarations.length === 0 ? 'none' : 'potential';
+  };
   const hasApplicableIndexSignature = (
     receiverType: ts.Type,
     indexApplicability: 'string' | 'number' | 'both',
@@ -368,7 +391,7 @@ export function createStaticReferenceResolver(checker: ts.TypeChecker): StaticRe
       if (keyCandidates !== undefined && keyCandidates.length === 0) return { kind: 'none' };
 
       if (keyCandidates === undefined) {
-        return checker.getPropertiesOfType(receiverType).some((symbol) => propertyMatches(symbol, isTarget))
+        return checker.getPropertiesOfType(receiverType).some((symbol) => propertyMatches(symbol, isTarget) !== 'none')
           || hasApplicableIndexSignature(receiverType, indexApplicability, indexSignatureMaySelect, undefined)
           ? { kind: 'potential' }
           : { kind: 'none' };
@@ -376,7 +399,15 @@ export function createStaticReferenceResolver(checker: ts.TypeChecker): StaticRe
 
       const candidateKinds = keyCandidates.map((key) => {
         const property = checker.getPropertyOfType(receiverType, key);
-        if (property !== undefined) return propertyMatches(property, isTarget) ? 'exact' : 'none';
+        const declarationless = property !== undefined && (property.declarations?.length ?? 0) === 0;
+        if (indexApplicability === 'number' && declarationless) {
+          return indexSignatureMaySelect(
+            'number',
+            checker.getTypeOfSymbol(property as ts.Symbol),
+            key,
+          ) ? 'potential' : 'none';
+        }
+        if (property !== undefined) return propertyMatches(property, isTarget);
         return hasApplicableIndexSignature(receiverType, indexApplicability, indexSignatureMaySelect, key) ? 'potential' : 'none';
       });
       if (candidateKinds.every((kind) => kind === 'exact')) return { kind: 'exact' };
@@ -407,7 +438,7 @@ export function createStaticReferenceResolver(checker: ts.TypeChecker): StaticRe
 
       if (ts.isPropertyAccessExpression(reference)) {
         const symbol = checker.getSymbolAtLocation(reference);
-        if (symbol !== undefined && propertyMatches(symbol, isTarget)) return { kind: 'exact' };
+        if (symbol !== undefined && propertyMatches(symbol, isTarget) === 'exact') return { kind: 'exact' };
         return strongest(receiverTypes(reference.expression).map((receiverType) => this.resolvePropertySelection(
           receiverType,
           [reference.name.text],
