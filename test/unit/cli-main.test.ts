@@ -788,9 +788,11 @@ describe('main()', () => {
     });
 
     it.each([
+      ['the lower C0 boundary', '\u0000', '\\u0000'],
       ['the upper C0 boundary', '\u001f', '\\u001f'],
       ['space immediately above C0', ' ', ' '],
       ['DEL', '\u007f', '\\u007f'],
+      ['the lower C1 boundary', '\u0080', '\\u0080'],
       ['the upper C1 boundary', '\u009f', '\\u009f'],
       ['the character immediately above C1', '\u00a0', '\u00a0'],
     ])('renders %s with the exact expected file text', (_name, character, expected) => {
