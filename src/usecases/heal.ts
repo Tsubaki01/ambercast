@@ -889,7 +889,9 @@ async function tryFullPlanRepair(
     const generated = await generate({
       storage: overlay.storage,
       layout: deps.layout,
-      aiExecutor,
+      // Stage 3 resolves once before `generate` runs; this wrapper only adapts
+      // that resolved executor to its dependency shape, not a second lazy point.
+      resolveAiExecutor: async () => aiExecutor,
       events: deps.events,
       discoverTestFiles: deps.discoverTestFiles,
       config: deps.config,

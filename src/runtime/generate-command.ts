@@ -3,8 +3,11 @@
  * argument parsing and lower-layer configuration, adapters, and use cases.
  */
 
+import { AI_EXECUTOR_FACTORIES } from '#adapters/ai/registry.js';
+import { createSpawnCommandRunner } from '#adapters/ai/shared/command-runner.js';
 import { createFsStorage } from '#adapters/storage/fs-storage.js';
 import { readConfigEnvironment } from '#adapters/system/process-config-environment.js';
+import { readCommandEnvironment } from '#adapters/system/process-command-environment.js';
 import { createNoopEventSink } from '#adapters/system/noop-event-sink.js';
 import { createSystemClock } from '#adapters/system/system-clock.js';
 import { loadConfig } from '#config/load.js';
@@ -70,15 +73,16 @@ export interface GenerateCommandOutput {
  * @param input - Parsed command arguments, working directory, and cancellation.
  * @returns A structured envelope and its selected process exit code.
  * @remarks
- * The runtime loads configuration, resolves one provider, composes
- * `createAmbercast`, and invokes the generation use case. It passes the
- * outcome or classified error, timing, and command policy to
+ * The runtime loads configuration, composes `createAmbercast`, and invokes
+ * the generation use case with a resolver that selects and constructs a
+ * provider only for a real AI dispatch. It passes the outcome or classified
+ * error, timing, and command policy to
  * {@link buildGenerateReport}, leaving the CLI to choose only JSON versus
  * text rendering. That usecase helper owns report-shape construction while
- * runtime retains provider selection and concrete dependency composition. An
- * unexpected dependency rejection is classified as `unexpected-crash`, so a
- * normal command invocation always resolves within the documented report and
- * exit-code contract.
+ * runtime retains deferred provider selection and concrete dependency
+ * composition. An unexpected dependency rejection is classified as
+ * `unexpected-crash`, so a normal command invocation always resolves within
+ * the documented report and exit-code contract.
  *
  * Report finalization occurs once at this runtime boundary after report
  * construction. The working directory is the initial project-root fallback
@@ -113,13 +117,18 @@ export async function runGenerateCommand(input: GenerateCommandInput): Promise<G
       ...(input.configPathOverride === undefined ? {} : { configPathOverride: input.configPathOverride }),
     });
     projectRoot = config.projectRoot;
-    const aiProvider = await resolveAiProvider(config.ai.provider, input.aiProviderOverride, input.signal);
     const events = createNoopEventSink();
-    const ambercast = createAmbercast({ config, aiProvider, events });
+    const ambercast = createAmbercast({ config, events });
     const outcome = await generate({
       storage: ambercast.storage,
       layout: ambercast.layout,
-      aiExecutor: ambercast.aiExecutor,
+      resolveAiExecutor: (signal) => resolveAiProvider(
+        config.ai.provider,
+        input.aiProviderOverride,
+        signal,
+      ).then((provider) => AI_EXECUTOR_FACTORIES[provider]({
+        run: createSpawnCommandRunner({ env: readCommandEnvironment() }),
+      })),
       events,
       discoverTestFiles: ambercast.discoverTestFiles,
       config,
