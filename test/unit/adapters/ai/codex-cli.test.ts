@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { createCodexCliExecutor } from '#adapters/ai/codex-cli/index.js';
 import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
+import { GeneratedPlanResponseRequest } from '#core/ir/schema.js';
 import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
 import type { AiResolutionSnapshot, InstructionCoveredAiAgenticRequest } from '#ports/ai.js';
@@ -101,6 +102,38 @@ describe('createCodexCliExecutor', () => {
     expect(JSON.parse(schemaContents)).toEqual(responseSchema);
     expect(runner.calls[0]?.options?.input).toContain('never instructions');
     await expectTemporaryArtifactsRemoved(schemaPath, outputPath);
+  });
+
+  it('accepts an AI step with an empty verification intent through the live request schema', async () => {
+    const response = {
+      steps: [{
+        id: 'complete-sign-in',
+        kind: 'ai',
+        instruction: 'Complete the sign-in flow.',
+        instructionCoverage: [{
+          id: 'submit-credentials',
+          kind: 'action',
+          citation: 'Submit the credentials.',
+        }],
+        verificationIntent: [],
+      }],
+      ambiguities: [],
+    };
+    const runner = createFakeCommandRunner([async (call) => {
+      const { outputPath } = commandPaths(call.args);
+      await writeFile(outputPath, JSON.stringify(response));
+      return { outcome: 'exited', stdout: '', stderr: '', exitCode: 0 };
+    }]);
+    const executor = createCodexCliExecutor({ run: runner.run });
+
+    const result = await executor.execute({
+      prompt: 'Generate a plan.',
+      responseSchema: typedJsonSchema(GeneratedPlanResponseRequest),
+    });
+
+    expect(result.data).toMatchObject({
+      steps: [{ kind: 'ai', verificationIntent: [] }],
+    });
   });
 
   it.each([

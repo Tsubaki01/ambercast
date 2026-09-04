@@ -1308,10 +1308,33 @@ export type GeneratedInstructionCoveredStep =
   | GeneratedInstructionCoveredAiStep;
 
 /**
- * Provider response shape used to construct Plan v2.
+ * Provider response shape whose AI steps carry complete instruction-coverage
+ * citations and transient verification intents, prior to local attribution.
  *
- * {@link GeneratedPlanResponse} validates the covered step union before
- * generation policy examines citations or intent.
+ * This type is never a parse target on its own — no schema `.safeParse`s it
+ * directly. It names the shape a generated response takes between three
+ * separate runtime boundaries a response crosses in order. First, each
+ * adapter's AJV check validates the raw provider payload against
+ * {@link GeneratedPlanResponseRequest}'s compiled JSON Schema, the strict
+ * transport contract; it admits an empty `verificationIntent` array (without
+ * loosening `instructionCoverage` or the retained intent-element shape) so a
+ * genuinely action-only AI step, which has no success criterion to attach an
+ * intent to, is not rejected before it can reach a more specific local
+ * diagnosis. Second, {@link GeneratedPlanResponseForPolicy}'s `.safeParse` is
+ * the local generation-policy boundary. It also admits the empty array —
+ * every response reaching it already passed the transport boundary above —
+ * and it independently widens each intent's `assertion` to `JsonValue`
+ * rather than reusing that boundary's stricter element shape, keeping this
+ * contract self-sufficient instead of assuming an AJV pass already happened.
+ * The specific `success-criterion-missing` and `intent-id-missing`
+ * diagnostics for an admitted empty array are reported afterward, by
+ * {@link prepareInstructionCoveredSteps}'s instruction-coverage validation,
+ * not by this `.safeParse` step itself. Third, {@link PlanDocument}'s
+ * `.safeParse` is the committed-plan authority, reached only once local
+ * attribution replaces this type's provider-facing citations and transient
+ * intents with committed `sourceSpan` provenance —
+ * {@link GeneratedInstructionCoveredStep} is therefore a pre-attribution,
+ * provider-facing shape, not the committed one.
  */
 export type GeneratedInstructionCoveredPlanResponse = Omit<
   GeneratedPlanResponse,
