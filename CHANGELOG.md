@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.0](https://github.com/Tsubaki01/ambercast/compare/v0.1.0...v0.2.0) (2026-09-04)
+
+
+### ⚠ BREAKING CHANGES
+
+* **generate:** the AI provider request schema (`GENERATED_PLAN_RESPONSE_SCHEMA` / `generatedPlanResponseSchema`) changed, which changes `producerBundleFingerprint` and therefore `inputsDigest` for every prompt. A plan generated under 0.1.0 must be regenerated: `ambercast check` will report existing committed plans as stale (exit 4), and `ambercast generate` (or `--force`) must be re-run to produce a fresh plan under the new fingerprint. This is an owner-approved, intentional user impact (spec: SPEC-J4 J4-4, フェーズ2検収follow-up小粒バッチ実装仕様書.md).
+
+### Bug Fixes
+
+* **architecture:** close union-receiver, for-of/catch and nested-array destructuring bypasses and document SA-2 limits (SPEC-I1/I2/SA-2) ([#264](https://github.com/Tsubaki01/ambercast/issues/264)) ([b1bd7ef](https://github.com/Tsubaki01/ambercast/commit/b1bd7ef8a1633f4ccc17c97d9a6a49c8b5b1f235))
+* **generate:** admit empty verificationIntent in the AI provider request schema ([#266](https://github.com/Tsubaki01/ambercast/issues/266)) ([b5672dc](https://github.com/Tsubaki01/ambercast/commit/b5672dca71d5e94b412b48b18c30e8802a54512d))
+* **generate:** lazy-resolve AI provider for --list ([#191](https://github.com/Tsubaki01/ambercast/issues/191)) ([#263](https://github.com/Tsubaki01/ambercast/issues/263)) ([ac0d1ce](https://github.com/Tsubaki01/ambercast/commit/ac0d1cebc014995c2b59f3fad5cde92561f8ec49))
+* **report:** sanitize control sequences in human renderer output ([#192](https://github.com/Tsubaki01/ambercast/issues/192)) ([#262](https://github.com/Tsubaki01/ambercast/issues/262)) ([3b13ede](https://github.com/Tsubaki01/ambercast/commit/3b13edeecd077ed5a1626aae0c14c801e947100e))
+
 ## [0.1.0](https://github.com/Tsubaki01/ambercast/compare/v0.0.1...v0.1.0) (2026-09-03)
 
 

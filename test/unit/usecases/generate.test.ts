@@ -397,20 +397,20 @@ describe('generate', () => {
   );
 
   it.each([
-    ['missing success intent', [], ['verificationIntent', 'dashboard-reached']],
-    ['unknown success intent', [{ criterionId: 'unknown', assertion: { type: 'assert', check: 'text-visible', text: 'Dashboard' } }], ['verificationIntent', 0, 'criterionId']],
+    ['missing success intent', [], ['verificationIntent', 'dashboard-reached'], 'intent-id-missing'],
+    ['unknown success intent', [{ criterionId: 'unknown', assertion: { type: 'assert', check: 'text-visible', text: 'Dashboard' } }], ['verificationIntent', 0, 'criterionId'], 'intent-id-unknown'],
     ['duplicate success intent', [
       { criterionId: 'dashboard-reached', assertion: { type: 'assert', check: 'text-visible', text: 'Dashboard' } },
       { criterionId: 'dashboard-reached', assertion: { type: 'assert', check: 'text-visible', text: 'Dashboard' } },
-    ], ['verificationIntent', 1, 'criterionId']],
+    ], ['verificationIntent', 1, 'criterionId'], 'intent-id-duplicate'],
     ['unsupported assertion shape', [{
       criterionId: 'dashboard-reached',
       assertion: { type: 'assert', check: 'element-count', target: PASSWORD_TARGET, min: 0 },
-    }], ['verificationIntent', 0, 'assertion']],
-    ['terminal url intent', [{ criterionId: 'dashboard-reached', assertion: { type: 'assert', check: 'url-matches', pattern: '/dashboard$' } }], ['verificationIntent', 0, 'assertion']],
+    }], ['verificationIntent', 0, 'assertion'], 'intent-assertion-unsupported'],
+    ['terminal url intent', [{ criterionId: 'dashboard-reached', assertion: { type: 'assert', check: 'url-matches', pattern: '/dashboard$' } }], ['verificationIntent', 0, 'assertion'], 'terminal-url-matches-forbidden'],
   ] as const)(
     'preserves raw response and a path for %s without writing either artifact',
-    async (_name, verificationIntent, expectedPath) => {
+    async (_name, verificationIntent, expectedPath, expectedCode) => {
       const response = {
         ...coveredResponse,
         steps: [{ ...coveredResponse.steps[0], verificationIntent }],
@@ -432,7 +432,7 @@ describe('generate', () => {
       expect(error).toMatchObject({
         details: {
           raw,
-          issues: expect.arrayContaining([expect.objectContaining({ path: expectedPath })]),
+          issues: expect.arrayContaining([expect.objectContaining({ path: expectedPath, code: expectedCode })]),
         },
       });
       expect(recordingStorage.writes).toEqual([]);
@@ -507,6 +507,7 @@ describe('generate', () => {
       details: {
         raw,
         issues: expect.arrayContaining([expect.objectContaining({
+          code: 'success-criterion-missing',
           path: ['instructionCoverage'],
         })]),
       },

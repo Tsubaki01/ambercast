@@ -1,6 +1,6 @@
 {
   "name": "ambercast",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Prompt-native E2E testing: AI generates a deterministic, lockfile-like execution plan from natural-language test prompts, replayed with zero AI calls. Under active development.",
   "keywords": [
     "e2e",
