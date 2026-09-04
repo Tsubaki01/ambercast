@@ -23,7 +23,7 @@ import { toCanonicalArtifactText } from '#core/ir/canonical-json.js';
 import { computePlanDigest } from '#core/ir/digest.js';
 import { normalizeTestMd, type NormalizedTestMd } from '#core/ir/normalize.js';
 import {
-  GeneratedPlanResponse,
+  GeneratedPlanResponseRequest,
   GeneratedPlanResponseForPolicy,
   GROUNDING_SCHEMA_VERSION,
   GroundingDocument,
@@ -55,7 +55,7 @@ import {
 } from './instruction-coverage-policy.js';
 import { BatchInterruptionTracker } from './batch-interruption.js';
 
-const GENERATED_PLAN_RESPONSE_SCHEMA = typedJsonSchema(GeneratedPlanResponse);
+const GENERATED_PLAN_RESPONSE_SCHEMA = typedJsonSchema(GeneratedPlanResponseRequest);
 
 type GeneratedPlanResponseForPolicyType = Omit<
   GeneratedInstructionCoveredPlanResponse,

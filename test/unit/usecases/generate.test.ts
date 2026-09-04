@@ -632,6 +632,47 @@ describe('generate', () => {
         ambiguities: expect.objectContaining({ type: 'array' }),
       },
     });
+
+    const responseSchema = request?.responseSchema as Record<string, unknown>;
+    const properties = responseSchema.properties as Record<string, unknown>;
+    const steps = properties.steps as Record<string, unknown>;
+    const items = steps.items;
+
+    function findAiSchemas(node: unknown): Record<string, unknown>[] {
+      if (typeof node !== 'object' || node === null || Array.isArray(node)) {
+        return [];
+      }
+
+      const schemaNode = node as Record<string, unknown>;
+      const matches: Record<string, unknown>[] = [];
+      const nodeProperties = schemaNode.properties;
+      if (
+        typeof nodeProperties === 'object'
+        && nodeProperties !== null
+        && !Array.isArray(nodeProperties)
+        && Object.hasOwn(nodeProperties, 'verificationIntent')
+      ) {
+        matches.push(schemaNode);
+      }
+
+      for (const keyword of ['anyOf', 'oneOf', 'allOf']) {
+        const alternatives = schemaNode[keyword];
+        if (Array.isArray(alternatives)) {
+          for (const alternative of alternatives) {
+            matches.push(...findAiSchemas(alternative));
+          }
+        }
+      }
+
+      return matches;
+    }
+
+    const aiSchemas = findAiSchemas(items);
+
+    expect(aiSchemas).toHaveLength(1);
+    const aiProperties = (aiSchemas[0] as Record<string, unknown>).properties as Record<string, unknown>;
+    const verificationIntent = aiProperties.verificationIntent as Record<string, unknown>;
+    expect(verificationIntent.minItems).toBeUndefined();
   });
 
   it('uses configured discovery when files are absent and reports deterministic discovered paths', async () => {
