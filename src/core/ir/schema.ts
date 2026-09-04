@@ -1284,7 +1284,7 @@ export const GeneratedPlanResponseForPolicy = GeneratedPlanResponse.extend({
  * acceptance contract.
  */
 export const GeneratedPlanResponseRequest = GeneratedPlanResponse.extend({
-  steps: z.array(z.union([
+  steps: z.array(z.discriminatedUnion('kind', [
     GeneratedActionStep,
     AssertStep,
     CaptureStep,
