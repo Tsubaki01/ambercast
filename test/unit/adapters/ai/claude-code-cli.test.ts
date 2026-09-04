@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { createClaudeCodeCliExecutor } from '#adapters/ai/claude-code-cli/index.js';
 import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
+import { GeneratedPlanResponseRequest } from '#core/ir/schema.js';
 import { AiExecutorUnavailableError } from '#core/errors/ai-executor-unavailable-error.js';
 import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
 import type { AiResolutionSnapshot, InstructionCoveredAiAgenticRequest } from '#ports/ai.js';
@@ -81,6 +82,39 @@ describe('createClaudeCodeCliExecutor', () => {
 
     expect(JSON.parse(serializedSchema)).not.toHaveProperty('$schema');
     expect(responseSchema).toHaveProperty('$schema', 'https://json-schema.org/draft/2020-12/schema');
+  });
+
+  it('accepts an AI step with an empty verification intent through the live request schema', async () => {
+    const response = {
+      steps: [{
+        id: 'complete-sign-in',
+        kind: 'ai',
+        instruction: 'Complete the sign-in flow.',
+        instructionCoverage: [{
+          id: 'submit-credentials',
+          kind: 'action',
+          citation: 'Submit the credentials.',
+        }],
+        verificationIntent: [],
+      }],
+      ambiguities: [],
+    };
+    const runner = createFakeCommandRunner([{
+      outcome: 'exited',
+      stdout: JSON.stringify({ result: JSON.stringify(response) }),
+      stderr: '',
+      exitCode: 0,
+    }]);
+    const executor = createClaudeCodeCliExecutor({ run: runner.run });
+
+    const result = await executor.execute({
+      prompt: 'Generate a plan.',
+      responseSchema: typedJsonSchema(GeneratedPlanResponseRequest),
+    });
+
+    expect(result.data).toMatchObject({
+      steps: [{ kind: 'ai', verificationIntent: [] }],
+    });
   });
 
   it.each([
