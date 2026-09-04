@@ -68,11 +68,29 @@ describe('createAmbercast', () => {
   ] as const)('composes the narrow generation service set for %s', (provider, executorName) => {
     const ambercast = createAmbercast({ config: CONFIG, aiProvider: provider, events: createRecordingEventSink().sink });
 
-    expect(ambercast.aiExecutor.name).toBe(executorName);
+    // This fixture always supplies aiProvider, so the optional field is present.
+    expect(ambercast.aiExecutor!.name).toBe(executorName);
     expect(typeof ambercast.storage.readText).toBe('function');
     expect(typeof ambercast.layout.planPathFor).toBe('function');
     expect(typeof ambercast.clock.now).toBe('function');
     expect(typeof ambercast.discoverTestFiles).toBe('function');
+  });
+
+  it('omits aiExecutor entirely without constructing an AI factory or reading command environment', () => {
+    const ambercast = createAmbercast({ config: CONFIG, events: createRecordingEventSink().sink });
+
+    expect(ambercast).not.toHaveProperty('aiExecutor');
+    expect(mocks.claudeFactory).not.toHaveBeenCalled();
+    expect(mocks.codexFactory).not.toHaveBeenCalled();
+    expect(mocks.readCommandEnvironment).not.toHaveBeenCalled();
+  });
+
+  it('keeps supplied aiProvider composition behavior unchanged', () => {
+    const ambercast = createAmbercast({ config: CONFIG, aiProvider: 'codex', events: createRecordingEventSink().sink });
+
+    expect(ambercast.aiExecutor).toBe(mocks.codexFactory.mock.results[0]?.value);
+    expect(mocks.codexFactory).toHaveBeenCalledExactlyOnceWith({ run: expect.any(Function) });
+    expect(mocks.readCommandEnvironment).toHaveBeenCalledExactlyOnceWith();
   });
 
   it.each([
@@ -154,7 +172,8 @@ describe('createAmbercast', () => {
       events: events.sink,
     });
 
-    expect(ambercast.aiExecutor.name).toBe('claude-code-cli');
+    // This fixture always supplies aiProvider, so the optional field is present.
+    expect(ambercast.aiExecutor!.name).toBe('claude-code-cli');
     expect(ambercast.browserDriver).toBe(browserDriver);
     expect(ambercast.secrets).toBe(secrets);
     expect(ambercast.events).toBe(events.sink);

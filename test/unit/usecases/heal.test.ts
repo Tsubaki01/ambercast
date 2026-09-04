@@ -53,6 +53,7 @@ const replayRunObserver = vi.hoisted(() => ({
 
 const generateRunObserver = vi.hoisted(() => ({
   rejectWith: undefined as Error | undefined,
+  beforeGenerate: undefined as undefined | (() => void | Promise<void>),
   afterGenerate: undefined as undefined | ((outcome: Awaited<ReturnType<typeof import('#usecases/generate.js').generate>>) => void | Promise<void>),
 }));
 
@@ -88,6 +89,7 @@ vi.mock('#usecases/generate.js', async (importOriginal) => {
   return {
     ...actual,
     generate: async (...args: Parameters<typeof actual.generate>) => {
+      await generateRunObserver.beforeGenerate?.();
       if (generateRunObserver.rejectWith !== undefined) throw generateRunObserver.rejectWith;
       const outcome = await actual.generate(...args);
       await generateRunObserver.afterGenerate?.(outcome);
@@ -101,6 +103,7 @@ afterEach(() => {
   replayRunObserver.dropFirstLiveAiCall = false;
   replayRunObserver.droppedCount = 0;
   generateRunObserver.rejectWith = undefined;
+  generateRunObserver.beforeGenerate = undefined;
   generateRunObserver.afterGenerate = undefined;
 });
 
@@ -1624,6 +1627,27 @@ describe('heal state-machine contract', () => {
 
     expect(result.outcome.results[0]).toMatchObject({ repairOutcome: 'healed' });
     expect(resolveAiExecutor).toHaveBeenCalledTimes(1);
+  });
+
+  it('settles Stage-3 resolution before invoking nested generation', async () => {
+    const order: string[] = [];
+    const executor = createFakeAiExecutor({
+      execute: async () => {
+        order.push('generate-execute');
+        return { data: { steps: [], ambiguities: [] }, raw: '{}' };
+      },
+    });
+    const resolveAiExecutor = vi.fn(async () => {
+      order.push('stage3-resolved');
+      return executor;
+    });
+    generateRunObserver.beforeGenerate = () => { order.push('generate-invoked'); };
+    const scenario = await createScenario({ launchFailure: true });
+
+    await heal({ ...scenario.deps, resolveAiExecutor }, OPTIONS);
+
+    expect(resolveAiExecutor).toHaveBeenCalledOnce();
+    expect(order).toEqual(['stage3-resolved', 'generate-invoked', 'generate-execute']);
   });
 
   it('propagates an unclassified Stage-2 resolver failure as a case-scoped unexpected crash without Stage 3', async () => {

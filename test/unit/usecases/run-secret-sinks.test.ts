@@ -300,7 +300,7 @@ function createGenerateScenario(
     deps: {
       storage: recordingStorage.storage,
       layout: createLayoutResolver({ testDir: TEST_DIR, runsDir: RUNS_DIR }),
-      aiExecutor,
+      resolveAiExecutor: async () => aiExecutor,
       events: createRecordingEventSink().sink,
       discoverTestFiles: async () => ['login.test.md'],
       config: {

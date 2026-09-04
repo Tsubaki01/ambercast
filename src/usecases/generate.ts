@@ -249,8 +249,14 @@ export interface GenerateDeps {
   /** Deterministic companion-path arithmetic for discovered prompt paths. */
   readonly layout: LayoutResolver;
 
-  /** The already-selected structured-response provider. */
-  readonly aiExecutor: AiExecutor;
+  /**
+   * Defers provider resolution until this batch reaches its first AI dispatch.
+   *
+   * `generate()` memoizes this resolver for the whole batch rather than once
+   * per file: unlike `run`, generation has one shared provider-resolution
+   * budget. List, zero-match, and all-fresh batches never invoke it.
+   */
+  readonly resolveAiExecutor: (signal?: AbortSignal) => Promise<AiExecutor>;
 
   /**
    * Receives lifecycle accounting for structured provider invocations.
@@ -280,10 +286,12 @@ export interface GenerateDeps {
   >;
 
   /**
-   * Caller cancellation observed at the sequential scheduling boundary.
+   * Caller cancellation observed at the sequential per-file scheduling boundary.
    *
    * Cancellation retains terminal outcomes and turns every discovered but
-   * nonterminal identity into an evidence-free skipped row.
+   * nonterminal identity into an evidence-free skipped row. Cancellation while
+   * the batch AI-provider resolver is pending instead rejects `generate()` at
+   * the top level without producing a skipped row.
    */
   readonly signal?: AbortSignal;
 }
@@ -338,7 +346,7 @@ export interface GenerateOutcome {
 /**
  * Generates or previews deterministic plan artifacts for resolved prompt files.
  *
- * @param deps - I/O, layout, provider, event delivery, discovery,
+ * @param deps - I/O, layout, deferred provider resolution, event delivery, discovery,
  * configuration, and optional cancellation dependencies.
  * @param options - Batch selection and generation policy.
  * @returns Ordered file outcomes, the zero-match fact, and whether cancellation
@@ -351,9 +359,16 @@ export interface GenerateOutcome {
  * List mode is an atomic boundary after selection: it returns every listed row
  * and `GenerateOutcome.interrupted` is false even when its caller signal is
  * already aborted. It does not read prompt files, invoke AI, emit lifecycle
- * events, or write artifacts. Every attempted
- * provider invocation emits one `ai-call` event; paths that avoid the
- * provider emit none. Other files run sequentially, so a caller cancellation
+ * events, or write artifacts. The deadline is constructed only after provider
+ * resolution succeeds and before executor dispatch, so availability probing
+ * does not consume the AI request budget. Every attempted
+ * `aiExecutor.execute` dispatch emits one `ai-call`; resolution and paths
+ * avoiding dispatch emit none. A resolver rejection emits no `ai-call`, never
+ * becomes a file-level `failed` row, and propagates as a top-level rejection,
+ * leaving grounding repairs already written for earlier fresh files intact
+ * because the batch is non-transactional. Cancellation while resolution is pending
+ * follows that rejection path rather than the tracker's per-file skipped rows.
+ * Other files run sequentially, so a caller cancellation
  * prevents new work without discarding earlier terminal outcomes, while an
  * individual file failure does not block later files.
  *
@@ -377,8 +392,10 @@ export interface GenerateOutcome {
  * independently of whether completion creates a public row. Cancellation
  * leaves every still-pending public identity as an ordered, deduplicated,
  * identity-only skipped row and latches even when in-flight work later
- * completes; the listener is disposed in `finally` on success or rejection. A
- * timeout instead fails only the current file as an unavailable executor. Plan
+ * completes; the listener is disposed in `finally` on success or rejection.
+ * This skipped-row behavior applies after resolution succeeds; cancellation
+ * while resolution is pending rejects `generate()` at the top level. A timeout
+ * instead fails only the current file as an unavailable executor. Plan
  * text precedes grounding text so a grounding write failure leaves a
  * repairable fresh plan rather than a partial plan. Cross-process generation
  * against the same prompt is undefined behavior.
@@ -406,6 +423,7 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
     };
   }
 
+  let aiExecutorPromise: Promise<AiExecutor> | undefined;
   for (const [index, file] of discovered.entries()) tracker.addDiscovered(`generate:${index}:${file}`, file);
   const results: GenerateFileOutcome[] = [];
   for (const [index, file] of discovered.entries()) {
@@ -464,11 +482,13 @@ export async function generate(deps: GenerateDeps, options: GenerateOptions): Pr
       continue;
     }
 
+    aiExecutorPromise ??= deps.resolveAiExecutor(deps.signal);
+    const aiExecutor = await aiExecutorPromise;
     const deadline = composeAiDeadline(deps.signal, deps.config.ai.timeoutMs);
     let response;
     try {
       deps.events.emit({ type: 'ai-call' });
-      response = await deps.aiExecutor.execute({
+      response = await aiExecutor.execute({
         prompt: buildGeneratorTask(GENERATE_PLAN_TASK_INSTRUCTION),
         responseSchema: GENERATED_PLAN_RESPONSE_SCHEMA,
         context: { testMd: normalizedTestMd, targets: resolvedTargets } as unknown as JsonValueT,
