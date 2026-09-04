@@ -90,6 +90,18 @@ const H1D_H3C_CORPUS_SOURCE = [
   'declare const nestedArrayAssignmentSource: { outer: { value: [typeof digest.computeInputsDigest] } };',
   'let nestedAssignmentArrayAlias: unknown;',
   '({ outer: { value: [nestedAssignmentArrayAlias] } } = nestedArrayAssignmentSource);',
+  'declare const nestedPropertyAccessArraySource: { x: [typeof digest.computeInputsDigest] };',
+  'declare const nestedPropertyAccessSink: { alias: unknown };',
+  '({ x: [nestedPropertyAccessSink.alias] } = nestedPropertyAccessArraySource);',
+  'declare const nestedElementAccessArraySource: { x: [typeof digest.computeInputsDigest] };',
+  'declare const nestedElementAccessSink: { alias: unknown };',
+  "({ x: [nestedElementAccessSink['alias']] } = nestedElementAccessArraySource);",
+  'declare const nestedObjectArraySource: { x: [typeof digest] };',
+  'let nestedObjectArrayAlias: unknown;',
+  '({ x: [{ computeInputsDigest: nestedObjectArrayAlias }] } = nestedObjectArraySource);',
+  'declare const nestedArrayInArraySource: { x: [[typeof digest.computeInputsDigest]] };',
+  'let nestedArrayInArrayAlias: unknown;',
+  '({ x: [[nestedArrayInArrayAlias]] } = nestedArrayInArraySource);',
 ].join('\n');
 const H1D_H3C_CORPUS_OPTIONS: ts.CompilerOptions = { noUncheckedIndexedAccess: true };
 
@@ -1215,10 +1227,14 @@ describe('architecture guardrails', () => {
       plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 48, 'catchAlias'),
       plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 50, 'nestedDeclarationArrayAlias'),
       plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 53, 'nestedAssignmentArrayAlias'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 56, 'nestedPropertyAccessSink.alias'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 59, "nestedElementAccessSink['alias']"),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 62, 'nestedObjectArrayAlias'),
     ]);
-    for (const line of [2, 3, 4, 6, 8, 10, 11, 13, 15, 16, 17, 18, 19, 21, 22, 23, 27, 29, 32, 33, 35, 36, 38, 40, 42, 45, 47, 48, 50, 53]) {
+    for (const line of [2, 3, 4, 6, 8, 10, 11, 13, 15, 16, 17, 18, 19, 21, 22, 23, 27, 29, 32, 33, 35, 36, 38, 40, 42, 45, 47, 48, 50, 53, 56, 59, 62]) {
       expect(scan.violations.some((violation) => violation.line === line)).toBe(true);
     }
+    expect(scan.violations.some((violation) => violation.line === 65)).toBe(false);
   });
 
   test('confirms the H1d Record<string, typeof target> fixture depends on noUncheckedIndexedAccess for its undefined union', () => {

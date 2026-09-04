@@ -33,7 +33,13 @@
  * the index-signature path reports on assignability alone, without that gate,
  * so the two paths disagree on a `void`-returning structural match. None is an allow-path,
  * so a protected authority reached through one requires scanner extension or
- * explicit review.
+ * explicit review. SA-2 also excludes an array literal nested directly in
+ * another array literal, both a direct array-literal spread element
+ * (`ts.SpreadElement`, such as `[...rest]`) and an object-rest spread nested
+ * inside an array-literal element (`ts.SpreadAssignment`, such as
+ * `[{ ...rest }]`), and a defaulted array element such as `[value = fallback]`;
+ * those shapes need distinct source-position handling and remain
+ * intentionally outside this scanner's guarantee.
  */
 import * as ts from 'typescript';
 import { createStaticReferenceResolver } from './typescript-static-reference.js';
@@ -341,15 +347,17 @@ export function scanFunctionValueReferences(
     if (rootTypes !== undefined) return rootTypes;
 
     const outer = outerDestructuringLeaf(node);
-    if (outer === undefined) return undefined;
-    const outerSourceTypes = destructuringElementSourceTypes(outer);
-    if (outerSourceTypes === undefined) return undefined;
-    const candidates = leafKeyCandidates(outer);
-    const sourceTypes = outerSourceTypes.flatMap((outerSourceType) => {
-      if (outerSourceType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return [outerSourceType];
-      return selectedPropertyTypes(outerSourceType, candidates, leafKey(outer));
-    });
-    return sourceTypes.length === 0 ? undefined : sourceTypes;
+    if (outer !== undefined) {
+      const outerSourceTypes = destructuringElementSourceTypes(outer);
+      if (outerSourceTypes === undefined) return undefined;
+      const candidates = leafKeyCandidates(outer);
+      const sourceTypes = outerSourceTypes.flatMap((outerSourceType) => {
+        if (outerSourceType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return [outerSourceType];
+        return selectedPropertyTypes(outerSourceType, candidates, leafKey(outer));
+      });
+      return sourceTypes.length === 0 ? undefined : sourceTypes;
+    }
+    return ts.isObjectLiteralExpression(node.parent) ? arrayLiteralElementSourceTypes(node.parent) : undefined;
   };
   /**
    * Resolves the checker type(s) of the array literal that is directly the
@@ -379,10 +387,48 @@ export function scanFunctionValueReferences(
     ));
     return types.length === 0 ? undefined : types;
   };
-  const recordArrayLiteralAssignmentElement = (identifier: ts.Identifier): boolean => {
-    const arrayLiteral = identifier.parent;
+  /**
+   * Supplies the positional source type when an assignment-destructuring leaf
+   * is inside an object literal that is itself a direct array-literal element.
+   * `outerDestructuringLeaf` deliberately walks an alternating
+   * PropertyAssignment/ObjectLiteral chain so each enclosing property can
+   * apply its own selection key; that walk stops when an object literal's
+   * immediate parent is an array literal rather than a property assignment.
+   * This helper first reuses `containingArrayLiteralTypes` to
+   * recover the candidate array source types, then derives this direct
+   * object's numeric element position and selects that slot from each type.
+   * It preserves `any` and `unknown` candidates, while a non-direct
+   * element, absent position, or missing slot selection remains unresolved.
+   * This preserves the destructuring-only boundary instead of introducing a
+   * second source walk or generalizing to nested array literals.
+   */
+  const arrayLiteralElementSourceTypes = (
+    containerLiteral: ts.ObjectLiteralExpression,
+  ): readonly ts.Type[] | undefined => {
+    const arrayLiteral = containerLiteral.parent;
+    if (!ts.isArrayLiteralExpression(arrayLiteral)) return undefined;
+    const index = arrayLiteral.elements.indexOf(containerLiteral);
+    if (index === -1) return undefined;
+    const arrayTypes = containingArrayLiteralTypes(arrayLiteral);
+    if (arrayTypes === undefined) return undefined;
+    const candidates: PropertySelectionCandidates = { names: [String(index)], applicability: 'number' };
+    const types = arrayTypes.flatMap((type) => (
+      type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)
+        ? [type]
+        : selectedPropertyTypes(type, candidates, containerLiteral)
+    ));
+    return types.length === 0 ? undefined : types;
+  };
+  /**
+   * Bare identifiers and direct property- or element-access write targets
+   * share this array-slot resolution, so the helper accepts their common
+   * expression contract. Its callers retain the AST-shape boundary that
+   * excludes defaulted and spread array elements.
+   */
+  const recordArrayLiteralAssignmentElement = (element: ts.Expression): boolean => {
+    const arrayLiteral = element.parent;
     if (!ts.isArrayLiteralExpression(arrayLiteral)) return false;
-    const index = arrayLiteral.elements.indexOf(identifier);
+    const index = arrayLiteral.elements.indexOf(element);
     if (index === -1) return false;
     const arrayTypes = containingArrayLiteralTypes(arrayLiteral);
     if (arrayTypes === undefined) return false;
@@ -396,7 +442,7 @@ export function scanFunctionValueReferences(
       ).kind
     ));
     if (resolutions.every((kind) => kind === 'none')) return false;
-    recordUnsafe(identifier);
+    recordUnsafe(element);
     return true;
   };
   const reportNodeForDestructuringLeaf = (node: DestructuringLeaf): ts.Node => {
@@ -574,7 +620,10 @@ export function scanFunctionValueReferences(
    * Visits value-bearing syntax while preserving the first authoritative
    * classification for each reference. Assignment-array elements receive a
    * source-aware fallback only after ordinary identity resolution finds no
-   * target, which confines that extra path to destructuring writes.
+   * target, which confines that extra path to destructuring writes. After a
+   * successful array-slot match, traversal selectively revisits
+   * the write target's receiver and, for element access, its computed key before
+   * returning so independent target references in those subtrees are retained.
    */
   const visit = (node: ts.Node): void => {
     if (ts.isCallExpression(node)) {
@@ -617,10 +666,19 @@ export function scanFunctionValueReferences(
       } else if (ts.isArrayLiteralExpression(node.parent)) {
         recordArrayLiteralAssignmentElement(node);
       }
-    } else if (ts.isElementAccessExpression(node)) {
-      const resolution = resolver.resolvePropertyReference(node, isTarget, indexSignatureMaySelect);
-      if (resolution.kind !== 'none') {
-        recordUnsafe(node);
+    } else if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      let handledByOrdinaryResolution = false;
+      if (ts.isElementAccessExpression(node)) {
+        const resolution = resolver.resolvePropertyReference(node, isTarget, indexSignatureMaySelect);
+        if (resolution.kind !== 'none') {
+          recordUnsafe(node);
+          handledByOrdinaryResolution = true;
+        }
+      }
+      if (!handledByOrdinaryResolution && ts.isArrayLiteralExpression(node.parent) && recordArrayLiteralAssignmentElement(node)) {
+        visit(node.expression);
+        if (ts.isElementAccessExpression(node)) visit(node.argumentExpression);
+        return;
       }
     } else if (ts.isExportDeclaration(node)
       && !node.isTypeOnly

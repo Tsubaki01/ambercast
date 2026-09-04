@@ -255,6 +255,211 @@ describe('scanFunctionValueReferences()', () => {
     });
   });
 
+  test.each([
+    [
+      'a property-access target',
+      [
+        "import { target } from './target.js';",
+        'declare const source: { x: [typeof target] };',
+        'declare const sink: { alias: unknown };',
+        '({ x: [sink.alias] } = source);',
+      ].join('\n'),
+      [[4, 'sink.alias']],
+    ],
+    [
+      'an element-access target',
+      [
+        "import { target } from './target.js';",
+        'declare const source: { x: [typeof target] };',
+        'declare const sink: { alias: unknown };',
+        "({ x: [sink['alias']] } = source);",
+      ].join('\n'),
+      [[4, "sink['alias']"]],
+    ],
+  ] as const)('propagates a nested array element to %s', async (_name, source, unsafeReferences) => {
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], unsafeReferences);
+    });
+  });
+
+  test.each([
+    [
+      'a renamed nested-object target',
+      [
+        "import * as api from './target.js';",
+        'declare const source: { x: [typeof api] };',
+        'let alias: unknown;',
+        '({ x: [{ target: alias }] } = source);',
+      ].join('\n'),
+      [[4, 'alias']],
+    ],
+    [
+      'a shorthand nested-object target',
+      [
+        "import * as api from './target.js';",
+        'declare const source: { x: [typeof api] };',
+        'let target: unknown;',
+        '({ x: [{ target }] } = source);',
+      ].join('\n'),
+      [[4, 'target }']],
+    ],
+  ] as const)('propagates a nested array element through %s', async (_name, source, unsafeReferences) => {
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], unsafeReferences);
+    });
+  });
+
+  test('selects only the matching key in a nested array-element object target', async () => {
+    const source = [
+      "import * as api from './target.js';",
+      'declare const source: { x: [typeof api & { other: string }] };',
+      'let alias: unknown;',
+      'let safe: unknown;',
+      '({ x: [{ target: alias, other: safe }] } = source);',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[5, 'alias']]);
+    });
+  });
+
+  test('uses the precise heterogeneous tuple element type through the nested array-object fallback', async () => {
+    const source = [
+      "import * as api from './target.js';",
+      'declare const source: { x: [typeof api, { target: string }] };',
+      'let matching: unknown;',
+      'let safe: unknown;',
+      '({ x: [{ target: matching }, { target: safe }] } = source);',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[5, 'matching']]);
+    });
+  });
+
+  test('preserves a target-identifying property-access receiver beside its array-slot finding', async () => {
+    const source = [
+      "import { target as dyn } from './target.js';",
+      'declare const source: { x: [typeof dyn] };',
+      '({ x: [(dyn as typeof dyn & { alias: unknown }).alias] } = source);',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [
+        [3, '(dyn as'],
+        [3, 'dyn as'],
+      ]);
+    });
+  });
+
+  test('preserves a target-identifying element-access computed key beside its array-slot finding', async () => {
+    const source = [
+      "import * as api from './target.js';",
+      'declare const source: { x: [typeof api.target] };',
+      'declare const sink: { [key: string]: unknown };',
+      '({ x: [sink[api.target.name]] } = source);',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [
+        [4, 'sink[api.target.name]'],
+        [4, 'target.name'],
+      ]);
+    });
+  });
+
+  test('propagates a computed property name through the nested array-object fallback', async () => {
+    const source = [
+      "import * as api from './target.js';",
+      "declare const key: 'target';",
+      'declare const source: { x: [typeof api] };',
+      'let alias: unknown;',
+      '({ x: [{ [key]: alias }] } = source);',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[5, '[key]']]);
+    });
+  });
+
+  test('propagates an any array element through the nested array-object fallback', async () => {
+    const source = [
+      "import * as api from './target.js';",
+      'declare const source: { x: any[] };',
+      'let alias: unknown;',
+      '({ x: [{ target: alias }] } = source);',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[4, 'alias']]);
+    });
+  });
+
+  test.each([
+    [
+      'an array nested inside another array literal',
+      [
+        "import { target } from './target.js';",
+        'declare const source: { x: [[typeof target]] };',
+        'let alias: unknown;',
+        '({ x: [[alias]] } = source);',
+      ].join('\n'),
+    ],
+    [
+      'a direct array-literal spread element',
+      [
+        "import { target } from './target.js';",
+        'declare const source: { x: typeof target[] };',
+        'let rest: unknown[];',
+        '({ x: [...rest] } = source);',
+      ].join('\n'),
+    ],
+    [
+      'a nested object-rest target inside an array-literal element',
+      [
+        "import * as api from './target.js';",
+        'declare const source: { x: [typeof api] };',
+        'let rest: unknown;',
+        '({ x: [{ ...rest }] } = source);',
+      ].join('\n'),
+    ],
+    [
+      'a defaulted bare array element',
+      [
+        "import { target } from './target.js';",
+        'declare const source: { x: [typeof target] };',
+        'declare const sink: { alias: unknown };',
+        '({ x: [sink.alias = undefined] } = source);',
+      ].join('\n'),
+    ],
+    [
+      'a defaulted nested-object array element',
+      [
+        "import * as api from './target.js';",
+        'declare const source: { x: [typeof api] };',
+        'let alias: unknown;',
+        'declare const fallback: { target: unknown };',
+        '({ x: [{ target: alias } = fallback] } = source);',
+      ].join('\n'),
+    ],
+    [
+      'a plain array property-access read',
+      [
+        "import { target } from './target.js';",
+        'declare const sink: { alias: unknown };',
+        'const values: unknown[] = [sink.alias];',
+        'void values;',
+      ].join('\n'),
+    ],
+    [
+      'a plain array element-access read outside the H3a-1 index-signature path',
+      [
+        "import { target } from './target.js';",
+        'declare const numericValues: number[];',
+        'const values: unknown[] = [numericValues[0]];',
+        'void values;',
+      ].join('\n'),
+    ],
+  ] as const)('keeps %s outside both inventories', async (_name, source) => {
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], []);
+    });
+  });
+
   test('excludes declaration-introduction positions from both inventories', async () => {
     const source = "import { target } from './target.js';";
     await withCaller(source, (scan, names) => {
