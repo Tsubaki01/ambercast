@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { validateAiResponse } from '#adapters/ai/shared/response-validator.js';
 import {
   computePlanProducerBundleFingerprint,
   liveProducerBundleInputs,
@@ -8,6 +9,9 @@ import {
   planProducerBundleManifest,
   type PlanProducerBundleInputs,
 } from '#core/ai/plan-producer-bundle.js';
+import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
+import { AiResponseInvalidError } from '#core/errors/ai-response-invalid-error.js';
+import { GeneratedPlanResponseRequest } from '#core/ir/schema.js';
 
 function createInputs(overrides: Partial<PlanProducerBundleInputs> = {}): PlanProducerBundleInputs {
   return {
@@ -53,6 +57,126 @@ describe('plan producer bundle', () => {
   it('assembles the live fingerprint from a cold module load', () => {
     expect(planProducerBundleFingerprint()).toMatch(/^[0-9a-f]{64}$/);
     expect(liveProducerBundleInputs()).toBeDefined();
+    expect(liveProducerBundleInputs().generatedPlanResponseSchema).toEqual(
+      typedJsonSchema(GeneratedPlanResponseRequest),
+    );
+  });
+
+  it('accepts an AI step with an empty verification intent through AJV', () => {
+    const response = {
+      steps: [{
+        id: 'complete-sign-in',
+        kind: 'ai',
+        instruction: 'Complete the sign-in flow.',
+        instructionCoverage: [{
+          id: 'submit-credentials',
+          kind: 'action',
+          citation: 'Submit the credentials.',
+        }],
+        verificationIntent: [],
+      }],
+      ambiguities: [],
+    };
+
+    const result = validateAiResponse(
+      JSON.stringify(response),
+      typedJsonSchema(GeneratedPlanResponseRequest),
+    );
+
+    expect(result.steps[0]?.kind).toBe('ai');
+    if (result.steps[0]?.kind !== 'ai') {
+      throw new Error('Expected the response to contain one AI step.');
+    }
+    expect(result.steps[0].verificationIntent).toEqual([]);
+  });
+
+  it('rejects an AI step with empty instruction coverage through AJV', () => {
+    const response = {
+      steps: [{
+        id: 'complete-sign-in',
+        kind: 'ai',
+        instruction: 'Complete the sign-in flow.',
+        instructionCoverage: [],
+        verificationIntent: [{
+          criterionId: 'dashboard-reached',
+          assertion: { type: 'assert', check: 'text-visible', text: 'Dashboard' },
+        }],
+      }],
+      ambiguities: [],
+    };
+
+    expect(() => validateAiResponse(
+      JSON.stringify(response),
+      typedJsonSchema(GeneratedPlanResponseRequest),
+    )).toThrow(AiResponseInvalidError);
+  });
+
+  it('rejects an invalid non-empty verification intent element through AJV', () => {
+    const response = {
+      steps: [{
+        id: 'complete-sign-in',
+        kind: 'ai',
+        instruction: 'Complete the sign-in flow.',
+        instructionCoverage: [{
+          id: 'some-id',
+          kind: 'action',
+          citation: 'Complete the sign-in flow.',
+        }],
+        verificationIntent: [{
+          criterionId: 'some-id',
+          assertion: { type: 'not-a-real-assertion' },
+        }],
+      }],
+      ambiguities: [],
+    };
+
+    expect(() => validateAiResponse(
+      JSON.stringify(response),
+      typedJsonSchema(GeneratedPlanResponseRequest),
+    )).toThrow(AiResponseInvalidError);
+  });
+
+  it('has exactly one AI-shaped request alternative without a verification intent minimum', () => {
+    const schema = typedJsonSchema(GeneratedPlanResponseRequest) as unknown as Record<string, unknown>;
+    const properties = schema.properties as Record<string, unknown>;
+    const steps = properties.steps as Record<string, unknown>;
+    const items = steps.items;
+
+    function findAiSchemas(node: unknown): Record<string, unknown>[] {
+      if (typeof node !== 'object' || node === null || Array.isArray(node)) {
+        return [];
+      }
+
+      const schemaNode = node as Record<string, unknown>;
+      const matches: Record<string, unknown>[] = [];
+      const nodeProperties = schemaNode.properties;
+      if (
+        typeof nodeProperties === 'object'
+        && nodeProperties !== null
+        && !Array.isArray(nodeProperties)
+        && Object.hasOwn(nodeProperties, 'verificationIntent')
+      ) {
+        matches.push(schemaNode);
+      }
+
+      for (const keyword of ['anyOf', 'oneOf', 'allOf']) {
+        const alternatives = schemaNode[keyword];
+        if (Array.isArray(alternatives)) {
+          for (const alternative of alternatives) {
+            matches.push(...findAiSchemas(alternative));
+          }
+        }
+      }
+
+      return matches;
+    }
+
+    const aiSchemas = findAiSchemas(items);
+
+    expect(aiSchemas).toHaveLength(1);
+    const aiProperties = (aiSchemas[0] as Record<string, unknown>).properties as Record<string, unknown>;
+    const verificationIntent = aiProperties.verificationIntent as Record<string, unknown>;
+    expect(verificationIntent.minItems).toBeUndefined();
   });
 
   it.each(Object.keys(createInputs()) as (keyof PlanProducerBundleInputs)[])('isolates diagnostics for %s', (field) => {

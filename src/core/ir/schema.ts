@@ -1260,6 +1260,43 @@ export const GeneratedPlanResponseForPolicy = GeneratedPlanResponse.extend({
 });
 
 /**
+ * Defines the provider request schema sent to {@link AiExecutor.execute}.
+ *
+ * Both adapters validate the structured response with this JSON Schema through
+ * AJV before {@link GeneratedPlanResponseForPolicy} or any local policy sees
+ * it. It must admit an empty transient intent for a genuinely action-only AI
+ * step; otherwise the generic transport boundary rejects that response before
+ * instruction coverage can report its specific missing-success-criterion
+ * diagnostic. This is deliberately distinct from
+ * {@link GeneratedPlanResponseForPolicy}, whose local acceptance boundary
+ * accepts strict and relaxed AI shapes for a separate purpose (Issue #214).
+ * The steps union reuses {@link GeneratedStep}'s own non-AI members alongside
+ * one relaxed AI branch, rather than embedding {@link GeneratedStep} itself
+ * (which still carries the strict AI branch): each `kind` maps to exactly one
+ * schema, so the compiled JSON Schema carries no competing AI alternatives.
+ * Only `verificationIntent`'s
+ * minimum length differs from {@link GeneratedAiStep};
+ * `instructionCoverage` keeps its minimum length, `secrets` and shared
+ * `AiStepFields` remain identical, and {@link VerificationIntent}'s element
+ * shape is unchanged. {@link GeneratedPlanResponse} remains the committed-plan
+ * provider-shape authority, while
+ * {@link GeneratedPlanResponseForPolicy} remains the separate local
+ * acceptance contract.
+ */
+export const GeneratedPlanResponseRequest = GeneratedPlanResponse.extend({
+  steps: z.array(z.discriminatedUnion('kind', [
+    GeneratedActionStep,
+    AssertStep,
+    CaptureStep,
+    GeneratedAiStep.extend({
+      verificationIntent: z.array(z.lazy(() => VerificationIntent)),
+    }),
+  ])),
+});
+/** Provider request-response shape used for `AiExecutor.execute()`'s `responseSchema` type parameter. */
+export type GeneratedPlanResponseRequest = z.infer<typeof GeneratedPlanResponseRequest>;
+
+/**
  * The validated, provider-authored portion from which a complete plan is
  * assembled locally.
  */
