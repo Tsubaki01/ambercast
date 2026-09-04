@@ -1,0 +1,19 @@
+---
+import LanguageSelect from '@astrojs/starlight/components/LanguageSelect.astro';
+import Search from '@astrojs/starlight/components/Search.astro';
+import SocialIcons from '@astrojs/starlight/components/SocialIcons.astro';
+import ThemeSelect from '@astrojs/starlight/components/ThemeSelect.astro';
+import SiteTitle from './SiteTitle.astro';
+---
+
+<!-- Search, social links, theme and language controls retain Starlight's own behavior; PageFrame continues to own the mobile-menu toggle. -->
+<div class="header ac-header">
+  <div class="title-wrapper"><SiteTitle /></div>
+  <div class="ac-header-search"><Search /></div>
+  <div class="ac-header-controls">
+    <span class="ac-version">v0.1.0</span>
+    <div class="social-icons"><SocialIcons /></div>
+    <ThemeSelect />
+    <LanguageSelect />
+  </div>
+</div>
