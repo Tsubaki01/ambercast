@@ -317,20 +317,21 @@ export function scanFunctionValueReferences(
    * Resolves the element type yielded by a for-of source without consulting
    * the assignment pattern itself: the checker exposes that pattern as a
    * destination-shaped type, which would lose the source's `any` evidence.
-   * Numeric index lookup remains the first path because it is the scanner's
-   * established exact treatment for array and tuple positions. Other valid
-   * iterables need the language's structural iterator protocol instead, so
-   * the fallback locates the compiler's escaped `Symbol.iterator` member,
-   * obtains its call result, and reads its first type argument: the yielded
-   * element type is always that first argument even when the iterator has more
-   * arguments (for example, `Iterator<T, TReturn, TNext>`), so `[0]` only
-   * ever needs that one. TypeScript has
-   * no public checker operation for this general iteration query; retaining
-   * the reference guard keeps `getTypeArguments` within its required contract
-   * and leaves incomplete iterator shapes unresolved rather than guessing.
+   * Numeric-index lookup is exact only for actual arrays and tuples: another
+   * type can have an incidental numeric index signature that disagrees with
+   * what its iterator yields. Other iterables use their escaped
+   * `Symbol.iterator` member. A generic
+   * type-reference result retains its first type argument, while a
+   * non-generic reference or structural iterator result reads `next().value`;
+   * merging those paths would widen ordinary `Iterator<T, ...>` and
+   * `Iterable<T>` to `any`, because their default `TReturn` is `any`. A custom
+   * generic iterator whose yielded value is not its first type parameter
+   * remains the deliberate boundary: deriving that mapping would reimplement
+   * generic instantiation.
    */
   const iterationElementType = (iterableType: ts.Type): ts.Type | undefined => {
-    const indexed = checker.getIndexTypeOfType(iterableType, ts.IndexKind.Number);
+    const isArrayLike = checker.isArrayType(iterableType) || checker.isTupleType(iterableType);
+    const indexed = isArrayLike ? checker.getIndexTypeOfType(iterableType, ts.IndexKind.Number) : undefined;
     if (indexed !== undefined) return indexed;
     const iteratorProperty = checker.getPropertiesOfType(iterableType).find((property) => (
       /^__@iterator@\d+$/.test(property.escapedName as string)
@@ -342,7 +343,18 @@ export function scanFunctionValueReferences(
     const iteratorReturnType = checker.getReturnTypeOfSignature(signature);
     const isTypeReference = Boolean(iteratorReturnType.flags & ts.TypeFlags.Object)
       && Boolean((iteratorReturnType as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference);
-    return isTypeReference ? checker.getTypeArguments(iteratorReturnType as ts.TypeReference)[0] : undefined;
+    const typeArgument = isTypeReference
+      ? checker.getTypeArguments(iteratorReturnType as ts.TypeReference)[0]
+      : undefined;
+    if (typeArgument !== undefined) return typeArgument;
+    const nextProperty = checker.getPropertyOfType(iteratorReturnType, 'next');
+    if (nextProperty === undefined) return undefined;
+    const nextMethodType = checker.getTypeOfSymbolAtLocation(nextProperty, canonicalDeclaration);
+    const nextSignature = checker.getSignaturesOfType(nextMethodType, ts.SignatureKind.Call)[0];
+    if (nextSignature === undefined) return undefined;
+    const iterationResultType = checker.getReturnTypeOfSignature(nextSignature);
+    const valueProperty = checker.getPropertyOfType(iterationResultType, 'value');
+    return valueProperty === undefined ? undefined : checker.getTypeOfSymbolAtLocation(valueProperty, canonicalDeclaration);
   };
   /**
    * Identifies the assignment-pattern form of a for-of head while preserving

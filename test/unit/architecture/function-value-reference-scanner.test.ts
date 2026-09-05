@@ -481,6 +481,17 @@ describe('scanFunctionValueReferences()', () => {
       [[5, 'sink.alias']],
     ],
     [
+      'a wrapped target through a Set iterable',
+      [
+        "import { target } from './target.js';",
+        'type SourceItem = { x: [typeof target] };',
+        'declare const sink: { alias: unknown };',
+        'declare const set: Set<SourceItem>;',
+        'for ({ x: [(sink.alias)] } of set) {}',
+      ].join('\n'),
+      [[5, 'sink.alias']],
+    ],
+    [
       'an Iterable<any> through the Symbol.iterator fallback',
       [
         "import { target } from './target.js';",
@@ -501,9 +512,74 @@ describe('scanFunctionValueReferences()', () => {
       ].join('\n'),
       [[5, 'sink.alias']],
     ],
+    [
+      'a structural iterator through its next().value fallback',
+      [
+        "import { target } from './target.js';",
+        'class NoArgIterator {',
+        '  [Symbol.iterator](): { next(): { value: unknown; done: boolean } } {',
+        '    return { next: () => ({ value: undefined as unknown, done: false }) };',
+        '  }',
+        '}',
+        'declare const sink: { alias: unknown };',
+        'declare const iterable: NoArgIterator;',
+        '// @ts-expect-error The structural iterator value is intentionally unknown.',
+        'for ({ x: [sink.alias] } of iterable) {}',
+      ].join('\n'),
+      [[10, 'sink.alias']],
+    ],
+    [
+      'a mismatched numeric index signature through its iterator',
+      [
+        "import { target } from './target.js';",
+        'type TargetShape = { x: [typeof target] };',
+        'class MismatchIndex {',
+        '  [n: number]: string;',
+        '  [Symbol.iterator](): Iterator<TargetShape> {',
+        '    return { next: (): IteratorResult<TargetShape> => { throw new Error(); } };',
+        '  }',
+        '}',
+        'declare const sink: { alias: unknown };',
+        'declare const iterable: MismatchIndex;',
+        'for ({ x: [sink.alias] } of iterable) {}',
+      ].join('\n'),
+      [[11, 'sink.alias']],
+    ],
+    [
+      'a non-generic named iterator class through its next().value fallback',
+      [
+        "import { target } from './target.js';",
+        'type TargetShape = { x: [typeof target] };',
+        'class ConcreteIterator {',
+        '  next(): { value: TargetShape; done: false } { throw new Error(); }',
+        '}',
+        'class Custom {',
+        '  [Symbol.iterator](): ConcreteIterator { return new ConcreteIterator(); }',
+        '}',
+        'declare const sink: { alias: unknown };',
+        'declare const iterable: Custom;',
+        'for ({ x: [sink.alias] } of iterable) {}',
+      ].join('\n'),
+      [[11, 'sink.alias']],
+    ],
   ] as const)('reports a for-of assignment head from %s', async (_name, source, unsafeReferences) => {
     await withCaller(source, (scan, names) => {
       expectScan(scan, names['src/caller.ts'] ?? '', source, [], unsafeReferences);
+      expectUnsafeReferenceNodes(scan, unsafeReferences.map(([, marker]) => (
+        [marker, ts.SyntaxKind.PropertyAccessExpression] as const
+      )));
+    });
+  });
+
+  test('propagates an any source through a plain assignment array-literal property', async () => {
+    const source = [
+      "import { target } from './target.js';",
+      'declare const source: any;',
+      'let alias: unknown;',
+      '({ x: [alias] } = source);',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[4, 'alias']]);
     });
   });
 
@@ -539,20 +615,6 @@ describe('scanFunctionValueReferences()', () => {
         'declare const sink: { alias: unknown };',
         'declare const unsafeItems: any[];',
         'for ({ x: [sink.alias] } of (unsafeItems as unknown as SafeItem[])) {}',
-      ].join('\n'),
-    ],
-    [
-      'a custom iterator whose non-reference return type has no type argument',
-      [
-        "import { target } from './target.js';",
-        'class NoArgIterator {',
-        '  [Symbol.iterator](): { next(): { value: { x: [string] }; done: boolean } } {',
-        "    return { next: () => ({ value: { x: ['safe'] }, done: false }) };",
-        '  }',
-        '}',
-        'declare const sink: { alias: unknown };',
-        'declare const iterable: NoArgIterator;',
-        'for ({ x: [sink.alias] } of iterable) {}',
       ].join('\n'),
     ],
   ] as const)('keeps a for-of assignment head from reporting when %s', async (_name, source) => {
