@@ -311,6 +311,49 @@ export function scanFunctionValueReferences(
     ts.isCatchClause(declaration.parent) && declaration.parent.variableDeclaration === declaration
   );
   /**
+   * Resolves the element type yielded by a for-of source without consulting
+   * the assignment pattern itself: the checker exposes that pattern as a
+   * destination-shaped type, which would lose the source's `any` evidence.
+   * Numeric index lookup remains the first path because it is the scanner's
+   * established exact treatment for array and tuple positions. Other valid
+   * iterables need the language's structural iterator protocol instead, so
+   * the fallback locates the compiler's escaped `Symbol.iterator` member,
+   * obtains its call result, and reads its first type argument: the yielded
+   * element type is always that first argument even when the iterator has more
+   * arguments (for example, `Iterator<T, TReturn, TNext>`), so `[0]` only
+   * ever needs that one. TypeScript has
+   * no public checker operation for this general iteration query; retaining
+   * the reference guard keeps `getTypeArguments` within its required contract
+   * and leaves incomplete iterator shapes unresolved rather than guessing.
+   */
+  const iterationElementType = (iterableType: ts.Type): ts.Type | undefined => {
+    const indexed = checker.getIndexTypeOfType(iterableType, ts.IndexKind.Number);
+    if (indexed !== undefined) return indexed;
+    const iteratorProperty = checker.getPropertiesOfType(iterableType).find((property) => (
+      /^__@iterator@\d+$/.test(property.escapedName as string)
+    ));
+    if (iteratorProperty === undefined) return undefined;
+    const iteratorMethodType = checker.getTypeOfSymbolAtLocation(iteratorProperty, canonicalDeclaration);
+    const signature = checker.getSignaturesOfType(iteratorMethodType, ts.SignatureKind.Call)[0];
+    if (signature === undefined) return undefined;
+    const iteratorReturnType = checker.getReturnTypeOfSignature(signature);
+    const isTypeReference = Boolean(iteratorReturnType.flags & ts.TypeFlags.Object)
+      && Boolean((iteratorReturnType as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference);
+    return isTypeReference ? checker.getTypeArguments(iteratorReturnType as ts.TypeReference)[0] : undefined;
+  };
+  /**
+   * Identifies the assignment-pattern form of a for-of head while preserving
+   * the narrowed statement for its eventual source-expression lookup. A
+   * same-shape predicate would only restate an already-known object literal
+   * and would not safely make the parent's `expression` available; returning
+   * the statement makes the ownership relation explicit and rejects nested
+   * or declaration-form patterns.
+   */
+  const forOfAssignmentHead = (literal: ts.ObjectLiteralExpression): ts.ForOfStatement | undefined => {
+    const parent = literal.parent;
+    return ts.isForOfStatement(parent) && parent.initializer === literal ? parent : undefined;
+  };
+  /**
    * Resolves the root type that feeds a destructuring chain. Initializers and
    * parameters preserve their wrapper-aware treatment, while for-of and catch
    * bindings use the pattern's own checker type because their source expression
@@ -472,6 +515,26 @@ export function scanFunctionValueReferences(
     ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isTypeAssertionExpression(node)
     || ts.isSatisfiesExpression(node) || ts.isNonNullExpression(node) || ts.isAwaitExpression(node)
   );
+  /**
+   * Finds an array-assignment slot from its inner write target by walking
+   * upward through the scanner's existing transparent wrappers. Descending
+   * with `unwrapExpression` would answer a different question and make the
+   * eventual reporting path lose the target that owns the finding; this walk
+   * instead preserves that original node while locating the enclosing slot.
+   * The returned index is accepted only when the climbed expression is an
+   * actual array element, so callers have one applicability boundary for both
+   * wrapped and unwrapped forms without broadening destructuring support.
+   */
+  const arrayLiteralAssignmentSlot = (
+    element: ts.Expression,
+  ): { arrayLiteral: ts.ArrayLiteralExpression; index: number } | undefined => {
+    let current: ts.Node = element;
+    while (isTransparentWrapper(current.parent)) current = current.parent;
+    const arrayLiteral = current.parent;
+    if (!ts.isArrayLiteralExpression(arrayLiteral)) return undefined;
+    const index = arrayLiteral.elements.indexOf(current as ts.Expression);
+    return index === -1 ? undefined : { arrayLiteral, index };
+  };
   const containsCache = new Map<ts.Type, true>();
   const topLevelContainsCache = new Map<ts.Type, boolean>();
   // H3a-2 follows data-bearing type edges but does not traverse arbitrary call

@@ -102,6 +102,8 @@ const H1D_H3C_CORPUS_SOURCE = [
   'declare const nestedArrayInArraySource: { x: [[typeof digest.computeInputsDigest]] };',
   'let nestedArrayInArrayAlias: unknown;',
   '({ x: [[nestedArrayInArrayAlias]] } = nestedArrayInArraySource);',
+  'declare const wrappedArraySource: { x: [typeof digest.computeInputsDigest] }; declare const wrappedArraySink: { alias: unknown }; ({ x: [(wrappedArraySink.alias)] } = wrappedArraySource);',
+  'declare const forOfAssignmentItems: any[]; declare const forOfAssignmentSink: { alias: unknown }; for ({ x: [forOfAssignmentSink.alias] } of forOfAssignmentItems) {}',
 ].join('\n');
 const H1D_H3C_CORPUS_OPTIONS: ts.CompilerOptions = { noUncheckedIndexedAccess: true };
 
@@ -1230,8 +1232,10 @@ describe('architecture guardrails', () => {
       plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 56, 'nestedPropertyAccessSink.alias'),
       plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 59, "nestedElementAccessSink['alias']"),
       plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 62, 'nestedObjectArrayAlias'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 66, 'wrappedArraySink.alias'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 67, 'forOfAssignmentSink.alias'),
     ]);
-    for (const line of [2, 3, 4, 6, 8, 10, 11, 13, 15, 16, 17, 18, 19, 21, 22, 23, 27, 29, 32, 33, 35, 36, 38, 40, 42, 45, 47, 48, 50, 53, 56, 59, 62]) {
+    for (const line of [2, 3, 4, 6, 8, 10, 11, 13, 15, 16, 17, 18, 19, 21, 22, 23, 27, 29, 32, 33, 35, 36, 38, 40, 42, 45, 47, 48, 50, 53, 56, 59, 62, 66, 67]) {
       expect(scan.violations.some((violation) => violation.line === line)).toBe(true);
     }
     expect(scan.violations.some((violation) => violation.line === 65)).toBe(false);
