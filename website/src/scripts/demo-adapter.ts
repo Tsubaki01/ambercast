@@ -1,4 +1,4 @@
-import { demoPlan } from '../data/demo-plan.ts';
+import { demoPlan, demoPrompt } from '../data/demo-plan.ts';
 import { dispatch, type DemoSnapshot } from './demo-state-machine.ts';
 
 const STRUCTURAL_LINE_DELAY_MS = 90;
@@ -118,15 +118,7 @@ function requiredButton(root: HTMLElement, selector: string): HTMLButtonElement 
 }
 
 function promptMarkup(): string {
-  const prompt = `# Login
-
-@ambercast-secret {{secrets.password}}
-
-Go to /login.
-Fill in the email "mika@example.com" and the password {{secrets.password}}.
-Click "Sign in".
-Expect to land on the dashboard and see a "Welcome" heading.`;
-  return `<header><span>login.test.md</span><span class="demo-pill">prompt</span></header><pre>${prompt}</pre><footer>plain markdown · committed to git</footer>`;
+  return `<header><span>login.test.md</span><span class="demo-pill">prompt</span></header><pre>${demoPrompt}</pre><footer>plain markdown · committed to git</footer>`;
 }
 
 function planMarkup(phase: DemoSnapshot['phase']): string {
@@ -134,7 +126,7 @@ function planMarkup(phase: DemoSnapshot['phase']): string {
     return '<header><span>login.ambercast.plan.json</span><span class="demo-pill">empty</span></header><div class="demo-plan-empty">plan appears here<br>after generate</div><footer>+ login.ambercast.grounding.json</footer>';
   }
 
-  const label = phase === 'gen' ? 'casting · 1 AI call' : 'cast · 6 steps';
+  const label = phase === 'gen' ? 'casting · 1 AI call' : `cast · ${demoPlan.steps.length} steps`;
   const pillClass = phase === 'gen' ? 'demo-pill-ai' : '';
   const lines = PLAN_LINES.map((line) => {
     const visible = phase === 'gen' ? '' : ' demo-plan-line-visible';
@@ -252,7 +244,7 @@ function statusText(snapshot: DemoSnapshot): string {
     case 'gen': return 'NO. 001 · LOGIN · GENERATE · 1 AI CALL';
     case 'cast': return 'NO. 001 · LOGIN · CAST · REVIEW THE DIFF, THEN RUN';
     case 'run': return 'NO. 001 · LOGIN · REPLAY · 0 AI CALLS · CACHE HIT';
-    case 'done': return 'NO. 001 · LOGIN · 6/6 STEPS · 2.4S · 0 AI CALLS · EXIT 0';
+    case 'done': return `NO. 001 · LOGIN · ${demoPlan.steps.length}/${demoPlan.steps.length} STEPS · 2.4S · 0 AI CALLS · EXIT 0`;
     default: return 'NO. 001 · LOGIN · IDLE';
   }
 }

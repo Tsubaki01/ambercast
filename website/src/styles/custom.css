@@ -1,9 +1,9 @@
 /* Noto Sans SC and M PLUS 1 Code provide CJK fallback coverage for the configured UI and code stacks. */
 /* The light CTA foreground uses resin-900 for contrast; --slate-on-dark preserves legibility on dark resin surfaces. */
-@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+JP:wght@400;700&family=Noto+Sans+SC:wght@400;700&family=M+PLUS+1+Code:wght@400;500;600&display=swap");
+@import "https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+JP:wght@400;700&family=Noto+Sans+SC:wght@400;700&family=M+PLUS+1+Code:wght@400;500;600&display=swap";
 
 /* Starlight tokens and global overrides. */
-:root{--sl-font:"Manrope","Noto Sans JP","Noto Sans SC","Avenir Next","Segoe UI",system-ui,sans-serif;--sl-font-mono:"JetBrains Mono","M PLUS 1 Code","Noto Sans JP","Noto Sans SC","SF Mono",Menlo,Consolas,monospace;
+:root{--sl-font:"Manrope","Noto Sans JP","Noto Sans SC","Avenir Next","Segoe UI",system-ui,sans-serif;--sl-font-mono:"JetBrains Mono","M PLUS 1 Code","Noto Sans JP","Noto Sans SC","SF Mono",menlo,consolas,monospace;
 --sl-text-xs:.6875rem;--sl-text-sm:.8125rem;--sl-text-base:1rem;--sl-text-lg:1.125rem;--sl-text-xl:1.25rem;--sl-text-2xl:1.625rem;--sl-text-3xl:2.25rem;--sl-text-4xl:2.75rem;--sl-text-5xl:3.25rem;
 --sl-text-h1:2.25rem;--sl-text-h2:1.625rem;--sl-text-h3:1.25rem;--sl-text-h4:1.0625rem;--sl-text-h5:1rem;--sl-text-body:1rem;--sl-text-body-sm:.8125rem;--sl-text-code:.875rem;--sl-text-code-sm:.8125rem;--sl-line-height:1.65;--sl-line-height-headings:1.15;
 --sl-content-width:45rem;--sl-sidebar-width:18.75rem;--sl-nav-height:4rem;--sl-nav-pad-x:1.5rem;--sl-nav-pad-y:.75rem;--sl-mobile-toc-height:3rem;--sl-sidebar-pad-x:1rem}
@@ -19,7 +19,7 @@
 /* Amber rule: only logo mark, one primary CTA, "AI is working" states (orange-*), focus ring. */
 :focus-visible{outline:2px solid var(--ac-focus);outline-offset:2px}
 .sl-markdown-content a{text-decoration:underline;text-decoration-color:var(--sl-color-gray-4);text-underline-offset:3px}
-.sl-markdown-content a:hover{text-decoration-color:currentColor}
+.sl-markdown-content a:hover{text-decoration-color:currentcolor}
 .ac-label{font:500 var(--sl-text-xs)/1.2 var(--sl-font-mono);letter-spacing:.12em;text-transform:uppercase;color:var(--sl-color-gray-3)}
 .sidebar-content a[aria-current="page"]{background:var(--sl-color-text-accent);color:var(--sl-color-text-invert);font-weight:700;border-radius:8px}
 .starlight-aside{border:1px solid var(--sl-color-hairline);border-radius:10px;border-inline-start-width:1px}

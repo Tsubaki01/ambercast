@@ -1,15 +1,7 @@
 ---
-import { demoPlan } from '../data/demo-plan.ts';
+import { demoPlan, demoPrompt } from '../data/demo-plan.ts';
 
 const planJson = JSON.stringify(demoPlan, null, 2);
-const demoPrompt = `# Login
-
-@ambercast-secret {{secrets.password}}
-
-Go to /login.
-Fill in the email "mika@example.com" and the password {{secrets.password}}.
-Click "Sign in".
-Expect to land on the dashboard and see a "Welcome" heading.`;
 ---
 
 <!-- The terminal fallback leaves the complete result legible if the client bundle cannot attach; a successful adapter replaces it with the idle state. -->
@@ -26,7 +18,7 @@ Expect to land on the dashboard and see a "Welcome" heading.`;
     </section>
     <button id="demo-generate" class="demo-action" type="button" disabled>Generate ›</button>
     <section id="demo-plan-panel" class="demo-panel">
-      <header><span>login.ambercast.plan.json</span><span class="demo-pill">cast · 6 steps</span></header>
+      <header><span>login.ambercast.plan.json</span><span class="demo-pill">cast · {demoPlan.steps.length} steps</span></header>
       <pre>{planJson}</pre>
       <footer>+ login.ambercast.grounding.json · 2 files written</footer>
     </section>

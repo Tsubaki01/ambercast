@@ -126,7 +126,7 @@ async function waitForPreview(preview) {
 async function stopPreview(preview) {
   const { child } = preview;
 
-  if (child.exitCode !== null) return;
+  if (child.exitCode !== null || child.signalCode !== null) return;
 
   const closed = once(child, 'close');
 
@@ -150,7 +150,7 @@ async function stopPreview(preview) {
     }
   }
 
-  if (child.exitCode === null) await closed;
+  if (child.exitCode === null) await Promise.race([closed, sleep(5_000)]);
 }
 
 function pageUrl(path) {
@@ -356,23 +356,23 @@ async function openDemoPage(browser) {
     viewport: { width: 1440, height: 1100 },
   });
   const page = await context.newPage();
-
-  await page.goto(pageUrl('/'), { waitUntil: 'networkidle' });
-  // Load CSS-declared faces before observing clicks so the request assertion measures the
-  // demo's behavior, including text that first becomes visible in later phases.
-  await page.evaluate(() => Promise.allSettled([...document.fonts].map((font) => font.load())));
-
-  return { context, page, ...demoControls(page) };
-}
-
-async function assertInteractiveBehavior(browser) {
-  const { context, page, demo, generate, run, reset, counter, status } = await openDemoPage(browser);
   const consoleErrors = [];
 
   page.on('console', (message) => {
     if (message.type() === 'error') consoleErrors.push(message.text());
   });
   page.on('pageerror', (error) => consoleErrors.push(error.message));
+
+  await page.goto(pageUrl('/'), { waitUntil: 'networkidle' });
+  // Load CSS-declared faces before observing clicks so the request assertion measures the
+  // demo's behavior, including text that first becomes visible in later phases.
+  await page.evaluate(() => Promise.allSettled([...document.fonts].map((font) => font.load())));
+
+  return { context, page, consoleErrors, ...demoControls(page) };
+}
+
+async function assertInteractiveBehavior(browser) {
+  const { context, page, demo, generate, run, reset, counter, status, consoleErrors } = await openDemoPage(browser);
 
   try {
     await assertBasePath(page);
@@ -562,9 +562,11 @@ async function assertReducedMotion(browser) {
     assert.equal(await demo.locator('[data-demo-email], [data-demo-password]').count(), 0, 'Reduced motion must render the terminal result without typing frames.');
 
     const blinkAnimation = await page.evaluate(() => {
+      const host = document.querySelector('#demo-plan-panel') ?? document.querySelector('#ambercast-demo');
+      if (!host) throw new Error('The demo container must exist for the blink probe.');
       const pill = document.createElement('span');
       pill.className = 'demo-pill demo-pill-ai';
-      document.body.append(pill);
+      host.append(pill);
       const animationName = getComputedStyle(pill, '::before').animationName;
       pill.remove();
       return animationName;
@@ -587,6 +589,7 @@ async function captureScreenshots(browser) {
 
     try {
       await page.goto(pageUrl(screenshot.path), { waitUntil: 'networkidle' });
+      await page.evaluate(() => Promise.allSettled([...document.fonts].map((font) => font.load())));
       await assertBasePath(page);
       await page.screenshot({
         path: resolve(SCREENSHOT_DIRECTORY, `${screenshot.name}.png`),
@@ -620,8 +623,11 @@ async function main() {
     await assertReducedMotion(browser);
     await captureScreenshots(browser);
   } finally {
-    await browser?.close();
-    await stopPreview(preview);
+    try {
+      await browser?.close();
+    } finally {
+      await stopPreview(preview);
+    }
   }
 }
 

@@ -1,5 +1,14 @@
 import type { PlanDocument } from '../../../src/core/ir/schema.ts';
 
+export const demoPrompt = `# Login
+
+@ambercast-secret {{secrets.password}}
+
+Go to /login.
+Fill in the email "mika@example.com" and the password {{secrets.password}}.
+Click "Sign in".
+Expect to land on the dashboard and see a "Welcome" heading.`;
+
 /** The schema-validated plan rendered by the landing-page demonstration. */
 export const demoPlan = {
   schemaVersion: 2,
