@@ -39,7 +39,10 @@
  * inside an array-literal element (`ts.SpreadAssignment`, such as
  * `[{ ...rest }]`), and a defaulted array element such as `[value = fallback]`;
  * those shapes need distinct source-position handling and remain
- * intentionally outside this scanner's guarantee.
+ * intentionally outside this scanner's guarantee. A bare top-level array
+ * assignment pattern such as `[value] = source` is also outside the guarantee
+ * because it uses a distinct source-position mechanism from this scanner's
+ * destructuring-leaf walk.
  */
 import * as ts from 'typescript';
 import { createStaticReferenceResolver } from './typescript-static-reference.js';
@@ -311,6 +314,63 @@ export function scanFunctionValueReferences(
     ts.isCatchClause(declaration.parent) && declaration.parent.variableDeclaration === declaration
   );
   /**
+   * Resolves the element type yielded by a for-of source without consulting
+   * the assignment pattern itself: the checker exposes that pattern as a
+   * destination-shaped type, which would lose the source's `any` evidence.
+   * Numeric-index lookup is exact only for actual arrays and tuples: another
+   * type can have an incidental numeric index signature that disagrees with
+   * what its iterator yields. Other iterables use their escaped
+   * `Symbol.iterator` member. A generic
+   * type-reference result retains its first type argument, while a
+   * non-generic reference or structural iterator result reads `next().value`;
+   * merging those paths would widen ordinary `Iterator<T, ...>` and
+   * `Iterable<T>` to `any`, because their default `TReturn` is `any`. A custom
+   * generic iterator whose yielded value is not its first type parameter
+   * remains the deliberate boundary: deriving that mapping would reimplement
+   * generic instantiation. Bare `any` or `unknown` propagates directly to
+   * preserve SA-1 default-deny parity with declaration heads.
+   */
+  const iterationElementType = (iterableType: ts.Type): ts.Type | undefined => {
+    if (iterableType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return iterableType;
+    const isArrayLike = checker.isArrayType(iterableType) || checker.isTupleType(iterableType);
+    const indexed = isArrayLike ? checker.getIndexTypeOfType(iterableType, ts.IndexKind.Number) : undefined;
+    if (indexed !== undefined) return indexed;
+    const iteratorProperty = checker.getPropertiesOfType(iterableType).find((property) => (
+      /^__@iterator@\d+$/.test(property.escapedName as string)
+    ));
+    if (iteratorProperty === undefined) return undefined;
+    const iteratorMethodType = checker.getTypeOfSymbolAtLocation(iteratorProperty, canonicalDeclaration);
+    const signature = checker.getSignaturesOfType(iteratorMethodType, ts.SignatureKind.Call)[0];
+    if (signature === undefined) return undefined;
+    const iteratorReturnType = checker.getReturnTypeOfSignature(signature);
+    const isTypeReference = Boolean(iteratorReturnType.flags & ts.TypeFlags.Object)
+      && Boolean((iteratorReturnType as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference);
+    const typeArgument = isTypeReference
+      ? checker.getTypeArguments(iteratorReturnType as ts.TypeReference)[0]
+      : undefined;
+    if (typeArgument !== undefined) return typeArgument;
+    const nextProperty = checker.getPropertyOfType(iteratorReturnType, 'next');
+    if (nextProperty === undefined) return undefined;
+    const nextMethodType = checker.getTypeOfSymbolAtLocation(nextProperty, canonicalDeclaration);
+    const nextSignature = checker.getSignaturesOfType(nextMethodType, ts.SignatureKind.Call)[0];
+    if (nextSignature === undefined) return undefined;
+    const iterationResultType = checker.getReturnTypeOfSignature(nextSignature);
+    const valueProperty = checker.getPropertyOfType(iterationResultType, 'value');
+    return valueProperty === undefined ? undefined : checker.getTypeOfSymbolAtLocation(valueProperty, canonicalDeclaration);
+  };
+  /**
+   * Identifies the assignment-pattern form of a for-of head while preserving
+   * the narrowed statement for its source-expression lookup. A
+   * same-shape predicate would only restate an already-known object literal
+   * and would not safely make the parent's `expression` available; returning
+   * the statement makes the ownership relation explicit and rejects nested
+   * or declaration-form patterns.
+   */
+  const forOfAssignmentHead = (literal: ts.ObjectLiteralExpression): ts.ForOfStatement | undefined => {
+    const parent = literal.parent;
+    return ts.isForOfStatement(parent) && parent.initializer === literal ? parent : undefined;
+  };
+  /**
    * Resolves the root type that feeds a destructuring chain. Initializers and
    * parameters preserve their wrapper-aware treatment, while for-of and catch
    * bindings use the pattern's own checker type because their source expression
@@ -330,6 +390,11 @@ export function scanFunctionValueReferences(
       return undefined;
     }
     const objectLiteral = node.parent;
+    const forOfHead = ts.isObjectLiteralExpression(objectLiteral) ? forOfAssignmentHead(objectLiteral) : undefined;
+    if (forOfHead !== undefined) {
+      const elementType = iterationElementType(checker.getTypeAtLocation(forOfHead.expression));
+      return elementType === undefined ? undefined : [elementType];
+    }
     const assignment = ts.isObjectLiteralExpression(objectLiteral) ? objectLiteral.parent : undefined;
     if (assignment === undefined || !ts.isBinaryExpression(assignment)
       || assignment.left !== objectLiteral
@@ -426,10 +491,9 @@ export function scanFunctionValueReferences(
    * excludes defaulted and spread array elements.
    */
   const recordArrayLiteralAssignmentElement = (element: ts.Expression): boolean => {
-    const arrayLiteral = element.parent;
-    if (!ts.isArrayLiteralExpression(arrayLiteral)) return false;
-    const index = arrayLiteral.elements.indexOf(element);
-    if (index === -1) return false;
+    const slot = arrayLiteralAssignmentSlot(element);
+    if (slot === undefined) return false;
+    const { arrayLiteral, index } = slot;
     const arrayTypes = containingArrayLiteralTypes(arrayLiteral);
     if (arrayTypes === undefined) return false;
     const resolutions = arrayTypes.map((type) => (
@@ -452,11 +516,15 @@ export function scanFunctionValueReferences(
   /**
    * Records a leaf only when its source selection is exact or potential. Tuple
    * leaves retain a numeric candidate so declarationless positional symbols can
-   * use the resolver's precise type evidence rather than an alias name.
+   * use the resolver's precise type evidence rather than an alias name. Object
+   * and array literal property values remain containers rather than leaves so
+   * traversal can resolve their nested write targets at their own positions
+   * instead of pre-empting that work by reporting the container itself.
    */
   const recordDestructuringReference = (node: DestructuringLeaf): boolean => {
     if (ts.isBindingElement(node) && !ts.isIdentifier(node.name)) return false;
-    if (ts.isPropertyAssignment(node) && ts.isObjectLiteralExpression(node.initializer)) return false;
+    if (ts.isPropertyAssignment(node)
+      && (ts.isObjectLiteralExpression(node.initializer) || ts.isArrayLiteralExpression(node.initializer))) return false;
     const sourceTypes = destructuringElementSourceTypes(node);
     if (sourceTypes === undefined) return false;
     const candidates = leafKeyCandidates(node);
@@ -472,6 +540,26 @@ export function scanFunctionValueReferences(
     ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isTypeAssertionExpression(node)
     || ts.isSatisfiesExpression(node) || ts.isNonNullExpression(node) || ts.isAwaitExpression(node)
   );
+  /**
+   * Finds an array-assignment slot from its inner write target by walking
+   * upward through the scanner's existing transparent wrappers. Descending
+   * with `unwrapExpression` would answer a different question and make the
+   * reporting path lose the target that owns the finding; this walk
+   * instead preserves that original node while locating the enclosing slot.
+   * The returned index is accepted only when the climbed expression is an
+   * actual array element, so callers have one applicability boundary for both
+   * wrapped and unwrapped forms without broadening destructuring support.
+   */
+  const arrayLiteralAssignmentSlot = (
+    element: ts.Expression,
+  ): { arrayLiteral: ts.ArrayLiteralExpression; index: number } | undefined => {
+    let current: ts.Node = element;
+    while (isTransparentWrapper(current.parent)) current = current.parent;
+    const arrayLiteral = current.parent;
+    if (!ts.isArrayLiteralExpression(arrayLiteral)) return undefined;
+    const index = arrayLiteral.elements.indexOf(current as ts.Expression);
+    return index === -1 ? undefined : { arrayLiteral, index };
+  };
   const containsCache = new Map<ts.Type, true>();
   const topLevelContainsCache = new Map<ts.Type, boolean>();
   // H3a-2 follows data-bearing type edges but does not traverse arbitrary call
@@ -537,10 +625,14 @@ export function scanFunctionValueReferences(
   ) || (
     ts.isBinaryExpression(node.parent) && node.parent.right === node
       && node.parent.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isObjectLiteralExpression(node.parent.left)
+  ) || (
+    ts.isForOfStatement(node.parent) && node.parent.expression === node
+      && ts.isObjectLiteralExpression(node.parent.initializer)
   );
   const isAssignmentDestructuringTarget = (literal: ts.ObjectLiteralExpression): boolean => {
     const parent = literal.parent;
     return (ts.isBinaryExpression(parent) && parent.left === literal && parent.operatorToken.kind === ts.SyntaxKind.EqualsToken)
+      || forOfAssignmentHead(literal) !== undefined
       || ((ts.isPropertyAssignment(parent) || ts.isShorthandPropertyAssignment(parent))
         && ts.isObjectLiteralExpression(parent.parent) && isAssignmentDestructuringTarget(parent.parent));
   };
@@ -663,7 +755,7 @@ export function scanFunctionValueReferences(
         && resolution.kind !== 'none'
       ) {
         recordUnsafe(node);
-      } else if (ts.isArrayLiteralExpression(node.parent)) {
+      } else {
         recordArrayLiteralAssignmentElement(node);
       }
     } else if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
@@ -675,7 +767,7 @@ export function scanFunctionValueReferences(
           handledByOrdinaryResolution = true;
         }
       }
-      if (!handledByOrdinaryResolution && ts.isArrayLiteralExpression(node.parent) && recordArrayLiteralAssignmentElement(node)) {
+      if (!handledByOrdinaryResolution && recordArrayLiteralAssignmentElement(node)) {
         visit(node.expression);
         if (ts.isElementAccessExpression(node)) visit(node.argumentExpression);
         return;
