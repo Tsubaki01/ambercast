@@ -40,9 +40,24 @@
  * `[{ ...rest }]`), and a defaulted array element such as `[value = fallback]`;
  * those shapes need distinct source-position handling and remain
  * intentionally outside this scanner's guarantee. A bare top-level array
- * assignment pattern such as `[value] = source` is also outside the guarantee
- * because it uses a distinct source-position mechanism from this scanner's
- * destructuring-leaf walk.
+ * assignment pattern such as `[value] = source`, or the equivalent
+ * for-of/for-await-of loop head `for ([value] of source)`, is also outside the
+ * guarantee because it uses a distinct source-position mechanism from this
+ * scanner's destructuring-leaf walk. An assignment-form for-of or for-await-of
+ * destructuring source (the declaration form resolves these correctly) has
+ * three further boundaries. A custom generic iterator type where the yielded
+ * value is not that type's first type parameter (for example a hand-rolled
+ * `MyIter<A, B>` that yields `B`, not `A`) resolves to the wrong type argument
+ * rather than the true yielded type, because deriving the correct mapping
+ * would require re-deriving the compiler's own generic-instantiation
+ * resolution for an unconventional shape. A structural (non-nominal) async
+ * iterator's `next()` result stays `Promise`-wrapped rather than being
+ * unwrapped, because that unwrap only happens for an already-resolved element
+ * type, not inside the structural fallback's own return-type reading. A
+ * mixed-protocol union source (constituents implementing different iteration
+ * protocols) is not decomposed constituent-by-constituent, matching this
+ * file's existing non-decomposition of heterogeneous union sources on the
+ * plain assignment path.
  */
 import * as ts from 'typescript';
 import { createStaticReferenceResolver } from './typescript-static-reference.js';
@@ -314,30 +329,53 @@ export function scanFunctionValueReferences(
     ts.isCatchClause(declaration.parent) && declaration.parent.variableDeclaration === declaration
   );
   /**
-   * Resolves the element type yielded by a for-of source without consulting
-   * the assignment pattern itself: the checker exposes that pattern as a
-   * destination-shaped type, which would lose the source's `any` evidence.
-   * Numeric-index lookup is exact only for actual arrays and tuples: another
-   * type can have an incidental numeric index signature that disagrees with
-   * what its iterator yields. Other iterables use their escaped
-   * `Symbol.iterator` member. A generic
-   * type-reference result retains its first type argument, while a
-   * non-generic reference or structural iterator result reads `next().value`;
-   * merging those paths would widen ordinary `Iterator<T, ...>` and
-   * `Iterable<T>` to `any`, because their default `TReturn` is `any`. A custom
-   * generic iterator whose yielded value is not its first type parameter
-   * remains the deliberate boundary: deriving that mapping would reimplement
-   * generic instantiation. Bare `any` or `unknown` propagates directly to
-   * preserve SA-1 default-deny parity with declaration heads.
+   * Reads the compiler's escaped name for a real well-known symbol from its
+   * lib declaration. A user-defined `unique symbol` can share a well-known
+   * symbol's text name and produce an escaped name with the same visible
+   * shape but a distinct compiler identity, so regex matching would select a
+   * declaration-order-dependent, unrelated member.
    */
-  const iterationElementType = (iterableType: ts.Type): ts.Type | undefined => {
-    if (iterableType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return iterableType;
-    const isArrayLike = checker.isArrayType(iterableType) || checker.isTupleType(iterableType);
-    const indexed = isArrayLike ? checker.getIndexTypeOfType(iterableType, ts.IndexKind.Number) : undefined;
-    if (indexed !== undefined) return indexed;
-    const iteratorProperty = checker.getPropertiesOfType(iterableType).find((property) => (
-      /^__@iterator@\d+$/.test(property.escapedName as string)
-    ));
+  const canonicalWellKnownSymbolEscapedName = (globalInterfaceName: string, pattern: RegExp): string | undefined => {
+    const interfaceSymbol = checker.resolveName(globalInterfaceName, canonicalDeclaration, ts.SymbolFlags.Type, false);
+    if (interfaceSymbol === undefined) return undefined;
+    const declaredType = checker.getDeclaredTypeOfSymbol(interfaceSymbol);
+    const property = checker.getPropertiesOfType(declaredType).find((candidate) => pattern.test(candidate.escapedName as string));
+    return property?.escapedName as string | undefined;
+  };
+  const canonicalIteratorEscapedName = canonicalWellKnownSymbolEscapedName('Iterable', /^__@iterator@\d+$/);
+  const canonicalAsyncIteratorEscapedName = canonicalWellKnownSymbolEscapedName('AsyncIterable', /^__@asyncIterator@\d+$/);
+  /**
+   * Locates a well-known symbol member by its canonical compiler identity.
+   * Resolving that identity once keeps protocol lookup exact at every call
+   * site and fails closed if an unusual library configuration lacks the
+   * corresponding global interface.
+   */
+  const wellKnownSymbolProperty = (type: ts.Type, canonicalEscapedName: string | undefined): ts.Symbol | undefined => (
+    canonicalEscapedName === undefined
+      ? undefined
+      : checker.getPropertiesOfType(type).find((property) => property.escapedName === canonicalEscapedName)
+  );
+  /**
+   * Uses numeric indexing only for arrays and tuples, whose indexed element
+   * type is the value their ordinary iteration yields. A structurally similar
+   * type can expose an unrelated numeric index signature, so it must instead
+   * continue through its iteration protocol.
+   */
+  const arrayLikeElementType = (type: ts.Type): ts.Type | undefined => {
+    const isArrayLike = checker.isArrayType(type) || checker.isTupleType(type);
+    return isArrayLike ? checker.getIndexTypeOfType(type, ts.IndexKind.Number) : undefined;
+  };
+  /**
+   * Derives an iterator member's yielded type from the member's own call
+   * signature. Nominal iterator references retain their first type argument;
+   * structural and non-generic results fall back to `next().value`. Combining
+   * those paths would widen ordinary `Iterator<T, ...>` and `Iterable<T>` to
+   * `any` through their default `TReturn`. A custom generic iterator whose
+   * yielded value is not its first type parameter remains a deliberate
+   * boundary because recovering that mapping would reimplement generic
+   * instantiation.
+   */
+  const iteratorMemberElementType = (iteratorProperty: ts.Symbol | undefined): ts.Type | undefined => {
     if (iteratorProperty === undefined) return undefined;
     const iteratorMethodType = checker.getTypeOfSymbolAtLocation(iteratorProperty, canonicalDeclaration);
     const signature = checker.getSignaturesOfType(iteratorMethodType, ts.SignatureKind.Call)[0];
@@ -357,6 +395,30 @@ export function scanFunctionValueReferences(
     const iterationResultType = checker.getReturnTypeOfSignature(nextSignature);
     const valueProperty = checker.getPropertyOfType(iterationResultType, 'value');
     return valueProperty === undefined ? undefined : checker.getTypeOfSymbolAtLocation(valueProperty, canonicalDeclaration);
+  };
+  /**
+   * Resolves the element type yielded by an assignment-form for-of source
+   * without consulting its pattern, whose checker type is destination-shaped
+   * and loses source `any` evidence. Awaited loops first honor a custom
+   * asynchronous iterator even on an array-shaped type; ordinary loops retain
+   * the established array-or-tuple fast path before their synchronous
+   * iterator. Awaited loops then unwrap the resolved element because a
+   * synchronous fallback can yield promises at runtime. Bare `any` and
+   * `unknown` propagate directly to preserve SA-1 default-deny parity with
+   * declaration heads.
+   */
+  const iterationElementType = (iterableType: ts.Type, isAwaited: boolean): ts.Type | undefined => {
+    if (iterableType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return iterableType;
+    const asyncIteratorProperty = isAwaited
+      ? wellKnownSymbolProperty(iterableType, canonicalAsyncIteratorEscapedName)
+      : undefined;
+    const elementType = asyncIteratorProperty !== undefined
+      ? iteratorMemberElementType(asyncIteratorProperty)
+      : arrayLikeElementType(iterableType) ?? iteratorMemberElementType(
+        wellKnownSymbolProperty(iterableType, canonicalIteratorEscapedName),
+      );
+    if (elementType === undefined) return undefined;
+    return isAwaited ? (checker.getAwaitedType(elementType) ?? elementType) : elementType;
   };
   /**
    * Identifies the assignment-pattern form of a for-of head while preserving
@@ -392,7 +454,10 @@ export function scanFunctionValueReferences(
     const objectLiteral = node.parent;
     const forOfHead = ts.isObjectLiteralExpression(objectLiteral) ? forOfAssignmentHead(objectLiteral) : undefined;
     if (forOfHead !== undefined) {
-      const elementType = iterationElementType(checker.getTypeAtLocation(forOfHead.expression));
+      const elementType = iterationElementType(
+        checker.getTypeAtLocation(forOfHead.expression),
+        forOfHead.awaitModifier !== undefined,
+      );
       return elementType === undefined ? undefined : [elementType];
     }
     const assignment = ts.isObjectLiteralExpression(objectLiteral) ? objectLiteral.parent : undefined;
