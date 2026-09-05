@@ -12,6 +12,19 @@ export interface DemoSnapshot {
 }
 
 /**
+ * Selects the exhibit lit by a renderable phase.
+ *
+ * @remarks Deriving lighting from the snapshot keeps resets and stale asynchronous completions
+ * aligned with the panel markup they render.
+ *
+ * @param phase - The state-machine phase being rendered.
+ * @returns The prompt, plan, or browser exhibit that receives the spotlight.
+ */
+export function litExhibit(phase: DemoPhase): 'prompt' | 'plan' | 'browser' {
+  return phase === 'idle' ? 'prompt' : phase === 'gen' || phase === 'cast' ? 'plan' : 'browser';
+}
+
+/**
  * Applies one event to a demo snapshot without scheduling work or consulting the DOM.
  *
  * Every non-matching event is a no-op that preserves the exact prior snapshot, so duplicate

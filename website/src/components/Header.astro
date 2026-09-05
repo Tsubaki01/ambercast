@@ -5,6 +5,15 @@ import SocialIcons from '@astrojs/starlight/components/SocialIcons.astro';
 import ThemeSelect from '@astrojs/starlight/components/ThemeSelect.astro';
 import SiteTitle from './SiteTitle.astro';
 import { npmVersion } from '../data/site-meta.ts';
+
+const locale = Astro.locals.starlightRoute.locale;
+const base = import.meta.env.BASE_URL.endsWith('/') ? import.meta.env.BASE_URL : `${import.meta.env.BASE_URL}/`;
+const docsByLocale = {
+  ja: { href: `${base}ja/guides/introduction/`, label: 'ドキュメント' },
+  'zh-cn': { href: `${base}zh-cn/guides/introduction/`, label: '文档' },
+  en: { href: `${base}guides/introduction/`, label: 'Docs' },
+};
+const docs = docsByLocale[locale ?? 'en'] ?? docsByLocale.en;
 ---
 
 <!-- Search, social links, theme and language controls retain Starlight's own behavior; PageFrame continues to own the mobile-menu toggle. -->
@@ -12,6 +21,8 @@ import { npmVersion } from '../data/site-meta.ts';
   <div class="title-wrapper"><SiteTitle /></div>
   <div class="ac-header-search"><Search /></div>
   <div class="ac-header-controls">
+    <!-- Landing routes have no sidebar, so this permanent header link keeps the documentation reachable in every locale. -->
+    <a class="ac-docs-link" href={docs.href} aria-label={docs.label}><span class="ac-docs-label">{docs.label}</span><span class="ac-docs-label-short" aria-hidden="true">Docs</span></a>
     <span class="ac-version">v{npmVersion}</span>
     <div class="social-icons"><SocialIcons /></div>
     <ThemeSelect />
