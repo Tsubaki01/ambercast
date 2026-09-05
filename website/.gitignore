@@ -2,3 +2,7 @@ node_modules
 dist
 .astro
 src/content/docs/reference/configuration.md
+
+# visual-and-behavior.mjs writes regenerable screenshots here on every run;
+# they are PR-attached evidence (like .runs/ elsewhere in this repo), not source.
+test/e2e/.artifacts

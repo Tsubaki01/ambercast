@@ -1,0 +1,71 @@
+---
+import { demoPlan, demoPrompt } from '../data/demo-plan.ts';
+import type { LandingCopy } from '../content/en-landing.ts';
+
+interface Props {
+  labels: LandingCopy['demo'];
+}
+
+const { labels } = Astro.props;
+const planJson = JSON.stringify(demoPlan, null, 2);
+---
+
+<!-- The terminal fallback leaves the complete result legible if the client bundle cannot attach; a successful adapter replaces it with the idle state. -->
+<section id="ambercast-demo" class="landing-demo" aria-label={labels.tryIt} data-run-label={labels.run} data-run-again-label={labels.runAgain}>
+  <header class="demo-header">
+    <span class="ac-label">FIG. 2 · TRY IT · NO INSTALL</span>
+    <div id="demo-counter">RUNS 1 · AI CALLS 1</div>
+  </header>
+  <div class="demo-stage">
+    <section id="demo-prompt-panel" class="demo-panel">
+      <header><span>login.test.md</span><span class="demo-pill">prompt</span></header>
+      <pre>{demoPrompt}</pre>
+      <footer>plain markdown · committed to git</footer>
+    </section>
+    <button id="demo-generate" class="demo-action" type="button" disabled>{labels.generate}</button>
+    <section id="demo-plan-panel" class="demo-panel">
+      <header><span>login.ambercast.plan.json</span><span class="demo-pill">cast · {demoPlan.steps.length} steps</span></header>
+      <pre>{planJson}</pre>
+      <footer>+ login.ambercast.grounding.json · 2 files written</footer>
+    </section>
+    <button id="demo-run" class="demo-action" type="button" disabled>{labels.runAgain}</button>
+    <section id="demo-browser-panel" class="demo-panel demo-browser-panel">
+      <header><span>chromium · headless</span><span class="demo-pill demo-pill-ok">passed · exit 0</span></header>
+      <div class="demo-browser">
+        <div class="demo-browser-url"><span class="demo-browser-dots"><i></i><i></i><i></i></span><span>localhost:3000/dashboard</span></div>
+        <div class="demo-browser-app demo-dashboard"><h3><span class="demo-check">Welcome, Mika</span></h3><i></i><i></i><i></i></div>
+      </div>
+      <footer>report.json → tests/ambercast/.runs/</footer>
+    </section>
+  </div>
+  <div class="demo-status-row">
+    <span id="demo-status" aria-live="polite">NO. 001 · LOGIN · 6/6 STEPS · 2.4S · 0 AI CALLS · EXIT 0</span>
+    <button id="demo-reset" type="button" disabled>{labels.reset}</button>
+  </div>
+</section>
+
+<script>
+  import { attach } from '../scripts/demo-adapter';
+
+  const root = document.getElementById('ambercast-demo');
+  if (root instanceof HTMLElement) {
+    try {
+      attach(root);
+    } catch {
+      // The server-rendered terminal state remains usable when client enhancement cannot start.
+    }
+  }
+</script>
+
+<style is:global>
+  .landing-demo{display:grid;gap:1rem;margin:0 auto;padding:1rem 0 4rem}
+  .demo-header,.demo-status-row{display:flex;align-items:center;justify-content:space-between;gap:1rem}.demo-header>div{font:500 var(--sl-text-sm)/1 var(--sl-font-mono);color:var(--sl-color-gray-3)}
+  .demo-stage{display:grid;grid-template-columns:minmax(0,.8fr) minmax(6rem,108px) minmax(0,1.55fr) minmax(6rem,108px) minmax(0,1fr);margin-top:.25rem;align-items:stretch}
+  .demo-panel{display:grid;grid-template-rows:auto minmax(0,1fr) auto;min-width:0;height:380px;border:1px solid var(--sl-color-hairline);border-radius:14px;background:var(--sl-color-gray-6);overflow:hidden}.demo-panel>header,.demo-panel>footer{display:flex;justify-content:space-between;gap:.75rem;padding:.7rem 1rem;font:500 var(--sl-text-xs)/1.2 var(--sl-font-mono);color:var(--sl-color-gray-3)}.demo-panel>header{align-items:center;border-bottom:1px solid var(--sl-color-hairline);color:var(--sl-color-gray-1)}.demo-panel>footer{border-top:1px solid var(--sl-color-hairline);overflow-wrap:anywhere}.demo-panel pre{min-height:0;margin:0;padding:1rem;white-space:pre-wrap;overflow:auto;overflow-wrap:anywhere;font:500 .72rem/1.7 var(--sl-font-mono);color:var(--sl-color-gray-2)}#demo-prompt-panel pre{font-size:.8125rem}.demo-plan-empty{display:grid;place-items:center;padding:1.5rem;color:var(--sl-color-gray-4);font:500 var(--sl-text-xs)/1.6 var(--sl-font-mono);letter-spacing:.12em;text-align:center;text-transform:uppercase}.demo-plan-line{display:grid;grid-template-columns:1rem minmax(0,1fr);gap:.375rem;opacity:0;transform:translateY(4px);transition:opacity .25s,transform .25s}.demo-plan-line-visible{opacity:1;transform:none}.demo-plan-marker{color:var(--sl-color-gray-4);font-style:normal;text-align:center}.demo-plan-marker-active{color:var(--sl-color-white)}.demo-plan-marker-ok{color:var(--sl-color-green-high)}
+  .demo-pill{display:inline-flex;align-items:center;flex:none;border-radius:999px;padding:.25rem .45rem;background:var(--sl-color-gray-5);font-size:.65rem;color:var(--sl-color-gray-2)}.demo-pill-ai{background:var(--sl-color-orange-low);color:var(--sl-color-orange-high)}.demo-pill-ai::before{width:.375rem;height:.375rem;margin-right:.35rem;border-radius:50%;background:currentColor;content:"";animation:demo-casting-blink 1s step-end infinite}.demo-pill-ok{background:var(--sl-color-green-low);color:var(--sl-color-green-high)}
+  .demo-action{align-self:center;min-height:44px;border:1px solid var(--sl-color-gray-4);border-bottom-width:3px;border-radius:10px;padding:.5rem .75rem;background:var(--sl-color-gray-6);color:var(--sl-color-white);font:700 .9rem/1 var(--sl-font);cursor:pointer}.demo-action-hint{animation:demo-action-hint-ring 1.4s infinite}.demo-action:not(:disabled):hover,.demo-status-row button:not(:disabled):hover{border-color:var(--sl-color-gray-3)}.demo-action:active,.demo-status-row button:active{border-bottom-width:1px;transform:translateY(2px)}.demo-action:disabled,.demo-status-row button:disabled{cursor:not-allowed;opacity:.55}
+  .demo-browser{position:relative;min-height:0;background:var(--ac-code-bg);overflow:hidden}.demo-browser-dim{opacity:.45}.demo-browser-url{display:flex;align-items:center;gap:.5rem;height:34px;padding:0 .75rem;border-bottom:1px solid var(--sl-color-hairline);font:500 .6875rem/1 var(--sl-font-mono);color:var(--sl-color-gray-3)}.demo-browser-url>span:last-child{min-width:0;flex:1;border-radius:6px;padding:.25rem .625rem;background:var(--sl-color-gray-6);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.demo-browser-dots{display:flex;gap:.25rem}.demo-browser-dots i{width:7px;height:7px;border-radius:50%;background:var(--sl-color-gray-5)}.demo-browser-app{padding:1.75rem 2rem}.demo-browser-app h3{margin:0 0 1rem;color:var(--sl-color-white);font-size:1.125rem;letter-spacing:-.02em}.demo-field{display:grid;gap:.25rem;margin-bottom:.75rem;color:var(--sl-color-gray-3);font-size:.75rem}.demo-input{display:flex;align-items:center;height:36px;border:1px solid var(--sl-color-gray-5);border-radius:8px;padding:0 .625rem;background:var(--sl-color-black);color:var(--sl-color-gray-1);font-size:.8125rem}.demo-sign-in{display:inline-flex;align-items:center;height:36px;border-radius:8px;padding:0 1rem;background:var(--sl-color-gray-1);color:var(--sl-color-black);font-size:.8125rem;font-weight:700}.demo-run-browser .demo-input,.demo-run-browser .demo-sign-in{animation:demo-replay-pulse .45s ease both}.demo-check{border-radius:4px;padding:.125rem .375rem;background:var(--sl-color-green-low);color:var(--sl-color-green-high)}.demo-dashboard>i{display:block;width:70%;height:10px;margin-top:.5rem;border-radius:5px;background:var(--sl-color-gray-6)}.demo-dashboard>i:nth-of-type(2){width:50%}.demo-dashboard>i:nth-of-type(3){width:60%}@keyframes demo-replay-pulse{from{opacity:.45}to{opacity:1}}
+  .demo-sign-in-pressed{transform:scale(.96);background:var(--sl-color-gray-3)}@keyframes demo-action-hint-ring{from{outline:2px solid rgba(158,145,132,.8);outline-offset:2px}to{outline:2px solid transparent;outline-offset:12px}}@keyframes demo-casting-blink{0%,49%{opacity:1}50%,100%{opacity:0}}
+  .demo-status-row{font:500 var(--sl-text-xs)/1.35 var(--sl-font-mono);color:var(--sl-color-gray-3)}.demo-status-row button{min-height:44px;border:1px solid var(--sl-color-hairline);border-radius:8px;padding:.45rem .7rem;background:transparent;color:var(--sl-color-gray-1);font:inherit;cursor:pointer}
+  @media (prefers-reduced-motion:reduce){.demo-action-hint,.demo-pill-ai::before{animation:none}}@media (max-width:71.99rem){.demo-stage{grid-template-columns:1fr 1fr;gap:1rem}.demo-action{grid-column:1/-1;width:100%}.demo-browser-panel{grid-column:1/-1}}@media (max-width:49.99rem){.demo-stage{grid-template-columns:1fr;gap:.875rem}.demo-action,.demo-browser-panel{grid-column:auto}.landing-demo{padding:1rem 0 2.5rem}.demo-header,.demo-status-row{align-items:flex-start;flex-direction:column}}
+</style>
