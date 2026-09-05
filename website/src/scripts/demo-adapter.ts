@@ -1,5 +1,8 @@
-import { demoPlan, demoPrompt } from '../data/demo-plan.ts';
-import { dispatch, type DemoSnapshot } from './demo-state-machine.ts';
+import { demoPlan } from '../data/demo-plan.ts';
+import { dispatch, litExhibit, type DemoSnapshot } from './demo-state-machine.ts';
+import { PLAN_LINES, browserMarkup, planMarkup, promptMarkup } from './demo-markup.ts';
+// Shared builders give SSR and client rendering one panel contract, while the rendered snapshot
+// determines the spotlight attribute so asynchronous timing cannot desynchronize visual state.
 
 const STRUCTURAL_LINE_DELAY_MS = 90;
 const STEP_LINE_DELAY_MS = 230;
@@ -8,23 +11,8 @@ const RUN_DELAY_MS = 2_400;
 const EMAIL_TYPING_DELAY_MS = 22;
 const PASSWORD_TYPING_DELAY_MS = 28;
 
-export const PLAN_LINES = [
-  { text: '{' },
-  { text: `  "schemaVersion": ${demoPlan.schemaVersion},` },
-  { text: `  "source": ${JSON.stringify(demoPlan.source)},` },
-  { text: '  "steps": [' },
-  ...demoPlan.steps.map((step, index) => ({
-    text: `    ${JSON.stringify(step)}${index === demoPlan.steps.length - 1 ? '' : ','}`,
-    step: index,
-  })),
-  { text: '  ],' },
-  { text: `  "targets": ${JSON.stringify(demoPlan.targets)}` },
-  { text: '}' },
-] as const;
-
-const GENERATION_FRAME_DELAYS = PLAN_LINES.map((line) => (
-  'step' in line ? STEP_LINE_DELAY_MS : STRUCTURAL_LINE_DELAY_MS
-));
+// Tests read this timing seam to keep progressive-frame expectations aligned with the adapter.
+export const GENERATION_FRAME_DELAYS = PLAN_LINES.map((line) => ('step' in line ? STEP_LINE_DELAY_MS : STRUCTURAL_LINE_DELAY_MS));
 const GENERATION_DELAY_MS = GENERATION_FRAME_DELAYS.reduce((total, delay) => total + delay, CAST_SETTLE_DELAY_MS);
 
 /**
@@ -53,6 +41,7 @@ export function attach(root: HTMLElement): void {
 
   const render = () => {
     counter.textContent = `RUNS ${snapshot.runs} · AI CALLS ${snapshot.aiCalls}`;
+    root.dataset.demoLit = litExhibit(snapshot.phase);
     promptPanel.innerHTML = promptMarkup();
     planPanel.innerHTML = planMarkup(snapshot.phase);
     browserPanel.innerHTML = browserMarkup(snapshot.phase);
@@ -119,52 +108,6 @@ function requiredButton(root: HTMLElement, selector: string): HTMLButtonElement 
   return element;
 }
 
-function promptMarkup(): string {
-  return `<header><span>login.test.md</span><span class="demo-pill">prompt</span></header><pre>${demoPrompt}</pre><footer>plain markdown · committed to git</footer>`;
-}
-
-function planMarkup(phase: DemoSnapshot['phase']): string {
-  if (phase === 'idle') {
-    return '<header><span>login.ambercast.plan.json</span><span class="demo-pill">empty</span></header><div class="demo-plan-empty">plan appears here<br>after generate</div><footer>+ login.ambercast.grounding.json</footer>';
-  }
-
-  const label = phase === 'gen' ? 'casting · 1 AI call' : `cast · ${demoPlan.steps.length} steps`;
-  const pillClass = phase === 'gen' ? 'demo-pill-ai' : '';
-  const lines = PLAN_LINES.map((line) => {
-    const visible = phase === 'gen' ? '' : ' demo-plan-line-visible';
-    const step = 'step' in line ? ` data-plan-step="${line.step}"` : '';
-    const marker = 'step' in line ? phase === 'done' ? '✓' : phase === 'run' && line.step === 0 ? '›' : '·' : '';
-    const markerClass = phase === 'done' && 'step' in line ? ' demo-plan-marker-ok' : phase === 'run' && 'step' in line && line.step === 0 ? ' demo-plan-marker-active' : '';
-    return `<span class="demo-plan-line${visible}"${step}><i class="demo-plan-marker${markerClass}">${marker}</i><span>${escapeHtml(line.text)}</span></span>`;
-  }).join('');
-  return `<header><span>login.ambercast.plan.json</span><span class="demo-pill ${pillClass}">${label}</span></header><pre>${lines}</pre><footer>+ login.ambercast.grounding.json · 2 files written</footer>`;
-}
-
-function browserMarkup(phase: DemoSnapshot['phase'], runFrame = 0): string {
-  if (phase === 'done' || runFrame === 5) {
-    const label = phase === 'done' ? 'passed · exit 0' : 'replay · 0 AI calls';
-    return `<header><span>chromium · headless</span><span class="demo-pill demo-pill-ok">${label}</span></header>${dashboardMarkup()}<footer>${phase === 'done' ? 'report.json → tests/ambercast/.runs/' : 'replaying from cache'}</footer>`;
-  }
-
-  const active = phase === 'run';
-  const path = runFrame >= 1 ? '/login' : '';
-  const email = runFrame >= 3 ? 'mika@example.com' : '';
-  const password = runFrame >= 4 ? '••••••••••' : '';
-  const pressed = runFrame === 4 ? ' demo-sign-in-pressed' : '';
-  const label = active ? 'replay · 0 AI calls' : phase === 'cast' ? 'ready' : 'idle';
-  const pillClass = active ? 'demo-pill-ok' : '';
-  const dimClass = active ? ' demo-run-browser' : ' demo-browser-dim';
-
-  return `<header><span>chromium · headless</span><span class="demo-pill ${pillClass}">${label}</span></header><div class="demo-browser${dimClass}">${browserUrlMarkup(path)}<div class="demo-browser-app"><h3>Sign in</h3><span class="demo-field">Email<span class="demo-input" data-demo-email>${email}</span></span><span class="demo-field">Password<span class="demo-input" data-demo-password>${password}</span></span><span class="demo-sign-in${pressed}">Sign in</span></div></div><footer>${active ? 'replaying from cache' : phase === 'cast' ? 'plan ready' : 'waiting for a plan'}</footer>`;
-}
-
-function browserUrlMarkup(path: string): string {
-  return `<div class="demo-browser-url"><span class="demo-browser-dots"><i></i><i></i><i></i></span><span>localhost:3000${path}</span></div>`;
-}
-
-function dashboardMarkup(): string {
-  return `<div class="demo-browser">${browserUrlMarkup('/dashboard')}<div class="demo-browser-app demo-dashboard"><h3><span class="demo-check">Welcome, Mika</span></h3><i></i><i></i><i></i></div></div>`;
-}
 
 function scheduleGenerationFrames(panel: HTMLElement, isCurrent: () => boolean): void {
   const lines = panel.querySelectorAll<HTMLElement>('.demo-plan-line');
@@ -235,10 +178,6 @@ function updatePlanMarkers(panel: HTMLElement, completedSteps: number): void {
     marker.classList.toggle('demo-plan-marker-active', index === completedSteps);
     marker.textContent = index < completedSteps ? '✓' : index === completedSteps ? '›' : '·';
   }
-}
-
-function escapeHtml(value: string): string {
-  return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 }
 
 function statusText(snapshot: DemoSnapshot): string {
