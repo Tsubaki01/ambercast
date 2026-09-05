@@ -428,6 +428,7 @@ describe('scanFunctionValueReferences()', () => {
         '({ y: { x: [(sink.alias)] } } = source);',
       ].join('\n'),
       [[4, 'sink.alias']],
+      [['sink.alias', ts.SyntaxKind.PropertyAccessExpression]],
     ],
       [
       'a wrapped non-array assignment target at its current regression value',
@@ -439,9 +440,10 @@ describe('scanFunctionValueReferences()', () => {
       ].join('\n'),
       [],
     ],
-  ] as const)('handles %s', async (_name, source, unsafeReferences) => {
+  ] as const)('handles %s', async (_name, source, unsafeReferences, unsafeReferenceNodes?) => {
     await withCaller(source, (scan, names) => {
       expectScan(scan, names['src/caller.ts'] ?? '', source, [], unsafeReferences);
+      if (unsafeReferenceNodes !== undefined) expectUnsafeReferenceNodes(scan, unsafeReferenceNodes);
     });
   });
 
@@ -502,6 +504,19 @@ describe('scanFunctionValueReferences()', () => {
   ] as const)('reports a for-of assignment head from %s', async (_name, source, unsafeReferences) => {
     await withCaller(source, (scan, names) => {
       expectScan(scan, names['src/caller.ts'] ?? '', source, [], unsafeReferences);
+    });
+  });
+
+  test('composes a wrapped array element with an any[] for-of assignment head', async () => {
+    const source = [
+      "import { target } from './target.js';",
+      'declare const sink: { alias: unknown };',
+      'declare const arr: any[];',
+      'for ({ x: [(sink.alias)] } of arr) {}',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[4, 'sink.alias']]);
+      expectUnsafeReferenceNodes(scan, [['sink.alias', ts.SyntaxKind.PropertyAccessExpression]]);
     });
   });
 
@@ -652,6 +667,15 @@ describe('scanFunctionValueReferences()', () => {
         'declare const sink: { alias: unknown };',
         'const values: unknown[] = [sink.alias];',
         'void values;',
+      ].join('\n'),
+    ],
+    [
+      'a wrapped bare top-level array assignment target',
+      [
+        "import { target } from './target.js';",
+        'declare const source: [string];',
+        'declare const sink: { alias: unknown };',
+        '[(sink.alias)] = source;',
       ].join('\n'),
     ],
     [
