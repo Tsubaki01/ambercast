@@ -1,0 +1,32 @@
+---
+import DefaultPageTitle from '@astrojs/starlight/components/PageTitle.astro';
+
+const { entry } = Astro.locals.starlightRoute;
+const routeParts = entry.id.split('/');
+const localeOffset = routeParts[0] === 'ja' || routeParts[0] === 'zh-cn' ? 1 : 0;
+const sectionSlug = routeParts[localeOffset];
+const pageSlug = routeParts[localeOffset + 1];
+const section = sectionSlug === 'reference' ? 'REFERENCE' : 'GUIDES';
+const pageNumbers: Record<string, Record<string, string>> = {
+  guides: {
+    introduction: '01',
+    'getting-started': '02',
+    'writing-prompts': '03',
+    commands: '04',
+    'exit-codes': '05',
+    artifacts: '06',
+    secrets: '07',
+    ci: '08',
+  },
+  reference: { cli: '01', configuration: '02' },
+};
+const pageNumber = pageNumbers[sectionSlug]?.[pageSlug] ?? '01';
+const specimenTitle = pageSlug?.replaceAll('-', ' ') ?? entry.data.title;
+---
+
+<!-- The route's existing title and anchor remain Starlight-owned; the ASCII specimen index stays language-neutral in every locale. -->
+<div class="ac-page-title">
+  <p class="ac-label">{section} · NO. {pageNumber} · {specimenTitle}</p>
+  <DefaultPageTitle />
+  {entry.data.description && <p class="ac-page-lead">{entry.data.description}</p>}
+</div>
