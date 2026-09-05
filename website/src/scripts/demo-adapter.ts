@@ -45,6 +45,8 @@ export function attach(root: HTMLElement): void {
   const generate = requiredButton(root, '#demo-generate');
   const run = requiredButton(root, '#demo-run');
   const reset = requiredButton(root, '#demo-reset');
+  const runLabel = root.dataset.runLabel ?? 'Run ›';
+  const runAgainLabel = root.dataset.runAgainLabel ?? 'Run again ›';
   const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
   let snapshot: DemoSnapshot = { phase: 'idle', aiCalls: 0, runs: 0 };
   let generationToken = 0;
@@ -60,7 +62,7 @@ export function attach(root: HTMLElement): void {
     reset.disabled = false;
     generate.classList.toggle('demo-action-hint', !generate.disabled);
     run.classList.toggle('demo-action-hint', !run.disabled);
-    run.textContent = snapshot.phase === 'done' ? 'Run again ›' : 'Run ›';
+    run.textContent = snapshot.phase === 'done' ? runAgainLabel : runLabel;
   };
 
   const transition = (event: Parameters<typeof dispatch>[1]) => {

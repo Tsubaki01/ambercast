@@ -1,0 +1,12 @@
+---
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+import LandingPage from '../../components/LandingPage.astro';
+import { zhCnLanding } from '../../content/zh-cn-landing.ts';
+---
+
+<StarlightPage
+  hasSidebar={false}
+  frontmatter={{ title: 'ambercast', template: 'splash', tableOfContents: false }}
+>
+  <LandingPage copy={zhCnLanding} />
+</StarlightPage>

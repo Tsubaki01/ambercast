@@ -1,3 +1,5 @@
+import { npmVersion } from '../data/site-meta.ts';
+
 /**
  * Defines English landing-page copy separately from Astro markup so locale-specific data
  * reuses the same layout without forking its interaction contract.
@@ -48,6 +50,13 @@ export interface LandingCopy {
     license: string;
     specimen: string;
   };
+  demo: {
+    tryIt: string;
+    generate: string;
+    run: string;
+    runAgain: string;
+    reset: string;
+  };
 }
 
 export const enLanding = {
@@ -89,5 +98,12 @@ export const enLanding = {
       { term: 'Agent', description: 'claude or codex CLI, installed and authenticated. Default ai.provider: "auto" looks for claude, then codex.' },
     ],
   },
-  footer: { github: 'GitHub', npm: 'npm v0.1.0', changelog: 'Changelog', license: 'MIT', specimen: 'PRE-1.0 · CHROMIUM · LOCAL' },
+  footer: { github: 'GitHub', npm: `npm v${npmVersion}`, changelog: 'Changelog', license: 'MIT', specimen: 'PRE-1.0 · CHROMIUM · LOCAL' },
+  demo: {
+    tryIt: 'Try it',
+    generate: 'Generate ›',
+    run: 'Run ›',
+    runAgain: 'Run again ›',
+    reset: 'Reset',
+  },
 } satisfies LandingCopy;

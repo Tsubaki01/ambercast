@@ -1,11 +1,17 @@
 ---
 import { demoPlan, demoPrompt } from '../data/demo-plan.ts';
+import type { LandingCopy } from '../content/en-landing.ts';
 
+interface Props {
+  labels: LandingCopy['demo'];
+}
+
+const { labels } = Astro.props;
 const planJson = JSON.stringify(demoPlan, null, 2);
 ---
 
 <!-- The terminal fallback leaves the complete result legible if the client bundle cannot attach; a successful adapter replaces it with the idle state. -->
-<section id="ambercast-demo" class="landing-demo" aria-label="Try it">
+<section id="ambercast-demo" class="landing-demo" aria-label={labels.tryIt} data-run-label={labels.run} data-run-again-label={labels.runAgain}>
   <header class="demo-header">
     <span class="ac-label">FIG. 2 · TRY IT · NO INSTALL</span>
     <div id="demo-counter">RUNS 1 · AI CALLS 1</div>
@@ -16,13 +22,13 @@ const planJson = JSON.stringify(demoPlan, null, 2);
       <pre>{demoPrompt}</pre>
       <footer>plain markdown · committed to git</footer>
     </section>
-    <button id="demo-generate" class="demo-action" type="button" disabled>Generate ›</button>
+    <button id="demo-generate" class="demo-action" type="button" disabled>{labels.generate}</button>
     <section id="demo-plan-panel" class="demo-panel">
       <header><span>login.ambercast.plan.json</span><span class="demo-pill">cast · {demoPlan.steps.length} steps</span></header>
       <pre>{planJson}</pre>
       <footer>+ login.ambercast.grounding.json · 2 files written</footer>
     </section>
-    <button id="demo-run" class="demo-action" type="button" disabled>Run again ›</button>
+    <button id="demo-run" class="demo-action" type="button" disabled>{labels.runAgain}</button>
     <section id="demo-browser-panel" class="demo-panel demo-browser-panel">
       <header><span>chromium · headless</span><span class="demo-pill demo-pill-ok">passed · exit 0</span></header>
       <div class="demo-browser">
@@ -34,7 +40,7 @@ const planJson = JSON.stringify(demoPlan, null, 2);
   </div>
   <div class="demo-status-row">
     <span id="demo-status" aria-live="polite">NO. 001 · LOGIN · 6/6 STEPS · 2.4S · 0 AI CALLS · EXIT 0</span>
-    <button id="demo-reset" type="button" disabled>Reset</button>
+    <button id="demo-reset" type="button" disabled>{labels.reset}</button>
   </div>
 </section>
 

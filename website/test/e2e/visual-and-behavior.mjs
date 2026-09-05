@@ -26,6 +26,11 @@ const LOCALE_ROOTS = [
   { path: '/ja/', lang: 'ja' },
   { path: '/zh-cn/', lang: 'zh-CN' },
 ];
+const LOCALE_DEMO_LABELS = {
+  '/': { tryIt: 'Try it', generate: 'Generate ›', run: 'Run ›', runAgain: 'Run again ›', reset: 'Reset' },
+  '/ja/': { tryIt: '試してみる', generate: '生成 ›', run: '実行 ›', runAgain: 'もう一度実行 ›', reset: 'リセット' },
+  '/zh-cn/': { tryIt: '试一试', generate: '生成 ›', run: '运行 ›', runAgain: '再次运行 ›', reset: '重置' },
+};
 
 const APPROVED_EXTERNAL_SITE_URLS = [
   { origin: 'https://tsubaki01.github.io', pathnamePrefix: '/ambercast/' },
@@ -46,6 +51,12 @@ const SCREENSHOTS = [
   { name: 'landing-1440-dark', path: '/', viewport: { width: 1440, height: 1100 }, colorScheme: 'dark' },
   { name: 'landing-1440-light', path: '/', viewport: { width: 1440, height: 1100 }, colorScheme: 'light' },
   { name: 'landing-390-dark', path: '/', viewport: { width: 390, height: 844 }, colorScheme: 'dark' },
+  { name: 'landing-1440-dark-ja', path: '/ja/', viewport: { width: 1440, height: 1100 }, colorScheme: 'dark' },
+  { name: 'landing-1440-light-ja', path: '/ja/', viewport: { width: 1440, height: 1100 }, colorScheme: 'light' },
+  { name: 'landing-390-dark-ja', path: '/ja/', viewport: { width: 390, height: 844 }, colorScheme: 'dark' },
+  { name: 'landing-1440-dark-zh-cn', path: '/zh-cn/', viewport: { width: 1440, height: 1100 }, colorScheme: 'dark' },
+  { name: 'landing-1440-light-zh-cn', path: '/zh-cn/', viewport: { width: 1440, height: 1100 }, colorScheme: 'light' },
+  { name: 'landing-390-dark-zh-cn', path: '/zh-cn/', viewport: { width: 390, height: 844 }, colorScheme: 'dark' },
   { name: 'guide-dark', path: '/guides/getting-started/', viewport: { width: 1440, height: 1100 }, colorScheme: 'dark' },
   { name: 'guide-light', path: '/guides/getting-started/', viewport: { width: 1440, height: 1100 }, colorScheme: 'light' },
   { name: 'guide-ja', path: '/ja/guides/getting-started/', viewport: { width: 1440, height: 1100 }, colorScheme: 'dark' },
@@ -245,6 +256,17 @@ async function assertLocaleRoots(browser) {
       assert.ok(response?.ok(), `${locale.path} must render successfully.`);
       assert.equal(await page.locator('html').getAttribute('lang'), locale.lang);
       await assertBasePath(page);
+      const expectedLabels = LOCALE_DEMO_LABELS[locale.path];
+      const controls = demoControls(page);
+      assert.equal(await controls.demo.getAttribute('aria-label'), expectedLabels.tryIt, `${locale.path} demo aria-label must be localized.`);
+      assert.equal(await controls.generate.textContent(), expectedLabels.generate, `${locale.path} Generate button must be localized.`);
+      assert.equal(await controls.run.textContent(), expectedLabels.run, `${locale.path} Run button must be localized.`);
+      assert.equal(await controls.demo.getAttribute('data-run-again-label'), expectedLabels.runAgain, `${locale.path} data-run-again-label must be localized.`);
+      assert.equal(await controls.reset.textContent(), expectedLabels.reset, `${locale.path} Reset button must be localized.`);
+      const nodeWidths = await page.$$eval('.landing-node', (nodes) => nodes.map((n) => n.getBoundingClientRect().width));
+      for (const width of nodeWidths) {
+        assert.ok(width >= 60, `${locale.path} .landing-node width ${width}px is suspiciously narrow (CJK grid-column collapse regression?).`);
+      }
     }
   } finally {
     await context.close();
@@ -591,6 +613,10 @@ async function captureScreenshots(browser) {
       await page.goto(pageUrl(screenshot.path), { waitUntil: 'networkidle' });
       await page.evaluate(() => Promise.allSettled([...document.fonts].map((font) => font.load())));
       await assertBasePath(page);
+      const hasHorizontalOverflow = await page.evaluate(
+        () => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
+      );
+      assert.equal(hasHorizontalOverflow, false, `${screenshot.name} must not overflow horizontally.`);
       await page.screenshot({
         path: resolve(SCREENSHOT_DIRECTORY, `${screenshot.name}.png`),
         fullPage: true,

@@ -4,6 +4,7 @@ import Search from '@astrojs/starlight/components/Search.astro';
 import SocialIcons from '@astrojs/starlight/components/SocialIcons.astro';
 import ThemeSelect from '@astrojs/starlight/components/ThemeSelect.astro';
 import SiteTitle from './SiteTitle.astro';
+import { npmVersion } from '../data/site-meta.ts';
 ---
 
 <!-- Search, social links, theme and language controls retain Starlight's own behavior; PageFrame continues to own the mobile-menu toggle. -->
@@ -11,7 +12,7 @@ import SiteTitle from './SiteTitle.astro';
   <div class="title-wrapper"><SiteTitle /></div>
   <div class="ac-header-search"><Search /></div>
   <div class="ac-header-controls">
-    <span class="ac-version">v0.1.0</span>
+    <span class="ac-version">v{npmVersion}</span>
     <div class="social-icons"><SocialIcons /></div>
     <ThemeSelect />
     <LanguageSelect />
