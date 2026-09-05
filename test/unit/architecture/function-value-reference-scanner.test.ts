@@ -702,6 +702,19 @@ describe('scanFunctionValueReferences()', () => {
       [[6, 'sink.alias']],
     ],
     [
+      'a wrapped precise AsyncIterable source',
+      [
+        "import { target } from './target.js';",
+        'type SourceItem = { x: [typeof target] };',
+        'declare const sink: { alias: unknown };',
+        'declare const items: AsyncIterable<SourceItem>;',
+        'async function run(): Promise<void> {',
+        '  for await ({ x: [sink.alias as unknown] } of items) {}',
+        '}',
+      ].join('\n'),
+      [[6, 'sink.alias']],
+    ],
+    [
       'a sync-only Iterable<any> fallback',
       [
         "import { target } from './target.js';",
