@@ -3,7 +3,7 @@ import { toCanonicalArtifactText } from '../../src/core/ir/canonical-json.ts';
 import type { JsonValueT } from '../../src/core/ir/schema.ts';
 import { PlanDocument } from '../../src/core/ir/schema.ts';
 import { demoPlan } from '../src/data/demo-plan.ts';
-import { PLAN_LINES } from '../src/scripts/demo-adapter.ts';
+import { PLAN_LINES } from '../src/scripts/demo-markup.ts';
 
 describe('demoPlan', () => {
   it('parses the six-step login demonstration with the production IR validator', () => {

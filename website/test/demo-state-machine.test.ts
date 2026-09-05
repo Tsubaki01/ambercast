@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { dispatch, type DemoEvent, type DemoPhase, type DemoSnapshot } from '../src/scripts/demo-state-machine.ts';
+import { dispatch, litExhibit, type DemoEvent, type DemoPhase, type DemoSnapshot } from '../src/scripts/demo-state-machine.ts';
 
 const EVENTS: readonly DemoEvent[] = ['generate', 'generationComplete', 'run', 'runComplete', 'reset'];
 
@@ -96,5 +96,23 @@ describe('dispatch', () => {
     const reset = dispatch(SNAPSHOTS.done, 'reset');
 
     expect(dispatch(reset, 'reset')).toEqual(reset);
+  });
+});
+
+describe('litExhibit', () => {
+  it.each([
+    ['idle', 'prompt'], ['gen', 'plan'], ['cast', 'plan'], ['run', 'browser'], ['done', 'browser'],
+  ] as const)('maps %s to %s', (phase, exhibit) => {
+    expect(litExhibit(phase)).toBe(exhibit);
+  });
+
+  it('follows the legal path rather than the last clicked control', () => {
+    let snapshot = SNAPSHOTS.idle;
+    const events: DemoEvent[] = ['generate', 'generationComplete', 'run', 'runComplete', 'run', 'reset'];
+    const expected = ['plan', 'plan', 'browser', 'browser', 'browser', 'prompt'];
+    for (const [index, event] of events.entries()) {
+      snapshot = dispatch(snapshot, event);
+      expect(litExhibit(snapshot.phase)).toBe(expected[index]);
+    }
   });
 });
