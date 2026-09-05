@@ -39,6 +39,7 @@ describe('localized landing copy', () => {
       assert.equal(copy.footer.license, enLanding.footer.license);
       assert.equal(copy.footer.specimen, enLanding.footer.specimen);
 
+      assert.equal(copy.commands.rows.length, enLanding.commands.rows.length);
       for (const [index, row] of copy.commands.rows.entries()) {
         const englishRow = enLanding.commands.rows[index];
         assert.equal(row.number, englishRow.number);
