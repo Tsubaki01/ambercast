@@ -583,6 +583,23 @@ describe('scanFunctionValueReferences()', () => {
       ].join('\n'),
       [[11, 'sink.alias']],
     ],
+    [
+      'the real Symbol.iterator member after a same-named unique symbol member',
+      [
+        "import { target } from './target.js';",
+        'type SourceItem = { x: [typeof target] };',
+        'type Unrelated = { x: [string] };',
+        'declare const iterator: unique symbol;',
+        'class Custom {',
+        '  [iterator](): Iterator<Unrelated> { throw new Error(); }',
+        '  [Symbol.iterator](): Iterator<SourceItem> { throw new Error(); }',
+        '}',
+        'declare const sink: { alias: unknown };',
+        'declare const iterable: Custom;',
+        'for ({ x: [sink.alias] } of iterable) {}',
+      ].join('\n'),
+      [[11, 'sink.alias']],
+    ],
   ] as const)('reports a for-of assignment head from %s', async (_name, source, unsafeReferences) => {
     await withCaller(source, (scan, names) => {
       expectScan(scan, names['src/caller.ts'] ?? '', source, [], unsafeReferences);
@@ -749,6 +766,25 @@ describe('scanFunctionValueReferences()', () => {
         '}',
       ].join('\n'),
       [[8, 'sink.alias']],
+    ],
+    [
+      'the real Symbol.asyncIterator member after a same-named unique symbol member',
+      [
+        "import { target } from './target.js';",
+        'type SourceItem = { x: [typeof target] };',
+        'type Unrelated = { x: [string] };',
+        'declare const asyncIterator: unique symbol;',
+        'class Custom {',
+        '  [asyncIterator](): AsyncIterator<Unrelated> { throw new Error(); }',
+        '  [Symbol.asyncIterator](): AsyncIterator<SourceItem> { throw new Error(); }',
+        '}',
+        'declare const sink: { alias: unknown };',
+        'declare const iterable: Custom;',
+        'async function run(): Promise<void> {',
+        '  for await ({ x: [sink.alias] } of iterable) {}',
+        '}',
+      ].join('\n'),
+      [[12, 'sink.alias']],
     ],
   ] as const)('reports a for-await-of assignment head from %s', async (_name, source, unsafeReferences) => {
     await withCaller(source, (scan, names) => {
@@ -953,6 +989,26 @@ describe('scanFunctionValueReferences()', () => {
         'declare const source: unknown;',
         'declare const sink: { alias: unknown };',
         '[(sink.alias)] = (source as [typeof target]);',
+      ].join('\n'),
+    ],
+    [
+      'a bare top-level array for-of assignment target',
+      [
+        "import { target } from './target.js';",
+        'declare const items: unknown;',
+        'declare const sink: { alias: unknown };',
+        'for ([(sink.alias)] of (items as Iterable<[typeof target]>)) {}',
+      ].join('\n'),
+    ],
+    [
+      'a bare top-level array for-await-of assignment target',
+      [
+        "import { target } from './target.js';",
+        'declare const items: unknown;',
+        'declare const sink: { alias: unknown };',
+        'async function run(): Promise<void> {',
+        '  for await ([(sink.alias)] of (items as AsyncIterable<[typeof target]>)) {}',
+        '}',
       ].join('\n'),
     ],
     [

@@ -40,9 +40,10 @@
  * `[{ ...rest }]`), and a defaulted array element such as `[value = fallback]`;
  * those shapes need distinct source-position handling and remain
  * intentionally outside this scanner's guarantee. A bare top-level array
- * assignment pattern such as `[value] = source` is also outside the guarantee
- * because it uses a distinct source-position mechanism from this scanner's
- * destructuring-leaf walk. An assignment-form for-of or for-await-of
+ * assignment pattern such as `[value] = source`, or the equivalent
+ * for-of/for-await-of loop head `for ([value] of source)`, is also outside the
+ * guarantee because it uses a distinct source-position mechanism from this
+ * scanner's destructuring-leaf walk. An assignment-form for-of or for-await-of
  * destructuring source (the declaration form resolves these correctly) has
  * three further boundaries. A custom generic iterator type where the yielded
  * value is not that type's first type parameter (for example a hand-rolled
@@ -328,13 +329,31 @@ export function scanFunctionValueReferences(
     ts.isCatchClause(declaration.parent) && declaration.parent.variableDeclaration === declaration
   );
   /**
-   * Locates a well-known symbol member through TypeScript's escaped property
-   * names. Keeping the symbol-name convention at this boundary lets the
-   * iteration resolver select the synchronous or asynchronous protocol
-   * without constructing checker-internal names at each call site.
+   * Reads the compiler's escaped name for a real well-known symbol from its
+   * lib declaration. A user-defined `unique symbol` can share a well-known
+   * symbol's text name and produce an escaped name with the same visible
+   * shape but a distinct compiler identity, so regex matching would select a
+   * declaration-order-dependent, unrelated member.
    */
-  const wellKnownSymbolProperty = (type: ts.Type, pattern: RegExp): ts.Symbol | undefined => (
-    checker.getPropertiesOfType(type).find((property) => pattern.test(property.escapedName as string))
+  const canonicalWellKnownSymbolEscapedName = (globalInterfaceName: string, pattern: RegExp): string | undefined => {
+    const interfaceSymbol = checker.resolveName(globalInterfaceName, canonicalDeclaration, ts.SymbolFlags.Type, false);
+    if (interfaceSymbol === undefined) return undefined;
+    const declaredType = checker.getDeclaredTypeOfSymbol(interfaceSymbol);
+    const property = checker.getPropertiesOfType(declaredType).find((candidate) => pattern.test(candidate.escapedName as string));
+    return property?.escapedName as string | undefined;
+  };
+  const canonicalIteratorEscapedName = canonicalWellKnownSymbolEscapedName('Iterable', /^__@iterator@\d+$/);
+  const canonicalAsyncIteratorEscapedName = canonicalWellKnownSymbolEscapedName('AsyncIterable', /^__@asyncIterator@\d+$/);
+  /**
+   * Locates a well-known symbol member by its canonical compiler identity.
+   * Resolving that identity once keeps protocol lookup exact at every call
+   * site and fails closed if an unusual library configuration lacks the
+   * corresponding global interface.
+   */
+  const wellKnownSymbolProperty = (type: ts.Type, canonicalEscapedName: string | undefined): ts.Symbol | undefined => (
+    canonicalEscapedName === undefined
+      ? undefined
+      : checker.getPropertiesOfType(type).find((property) => property.escapedName === canonicalEscapedName)
   );
   /**
    * Uses numeric indexing only for arrays and tuples, whose indexed element
@@ -391,11 +410,13 @@ export function scanFunctionValueReferences(
   const iterationElementType = (iterableType: ts.Type, isAwaited: boolean): ts.Type | undefined => {
     if (iterableType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return iterableType;
     const asyncIteratorProperty = isAwaited
-      ? wellKnownSymbolProperty(iterableType, /^__@asyncIterator@\d+$/)
+      ? wellKnownSymbolProperty(iterableType, canonicalAsyncIteratorEscapedName)
       : undefined;
     const elementType = asyncIteratorProperty !== undefined
       ? iteratorMemberElementType(asyncIteratorProperty)
-      : arrayLikeElementType(iterableType) ?? iteratorMemberElementType(wellKnownSymbolProperty(iterableType, /^__@iterator@\d+$/));
+      : arrayLikeElementType(iterableType) ?? iteratorMemberElementType(
+        wellKnownSymbolProperty(iterableType, canonicalIteratorEscapedName),
+      );
     if (elementType === undefined) return undefined;
     return isAwaited ? (checker.getAwaitedType(elementType) ?? elementType) : elementType;
   };
