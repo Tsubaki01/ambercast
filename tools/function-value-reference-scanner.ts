@@ -39,7 +39,10 @@
  * inside an array-literal element (`ts.SpreadAssignment`, such as
  * `[{ ...rest }]`), and a defaulted array element such as `[value = fallback]`;
  * those shapes need distinct source-position handling and remain
- * intentionally outside this scanner's guarantee.
+ * intentionally outside this scanner's guarantee. A bare top-level array
+ * assignment pattern such as `[value] = source` is also outside the guarantee
+ * because it uses a distinct source-position mechanism from this scanner's
+ * destructuring-leaf walk.
  */
 import * as ts from 'typescript';
 import { createStaticReferenceResolver } from './typescript-static-reference.js';
@@ -343,7 +346,7 @@ export function scanFunctionValueReferences(
   };
   /**
    * Identifies the assignment-pattern form of a for-of head while preserving
-   * the narrowed statement for its eventual source-expression lookup. A
+   * the narrowed statement for its source-expression lookup. A
    * same-shape predicate would only restate an already-known object literal
    * and would not safely make the parent's `expression` available; returning
    * the statement makes the ownership relation explicit and rejects nested
@@ -373,6 +376,11 @@ export function scanFunctionValueReferences(
       return undefined;
     }
     const objectLiteral = node.parent;
+    const forOfHead = ts.isObjectLiteralExpression(objectLiteral) ? forOfAssignmentHead(objectLiteral) : undefined;
+    if (forOfHead !== undefined) {
+      const elementType = iterationElementType(checker.getTypeAtLocation(forOfHead.expression));
+      return elementType === undefined ? undefined : [elementType];
+    }
     const assignment = ts.isObjectLiteralExpression(objectLiteral) ? objectLiteral.parent : undefined;
     if (assignment === undefined || !ts.isBinaryExpression(assignment)
       || assignment.left !== objectLiteral
@@ -469,10 +477,9 @@ export function scanFunctionValueReferences(
    * excludes defaulted and spread array elements.
    */
   const recordArrayLiteralAssignmentElement = (element: ts.Expression): boolean => {
-    const arrayLiteral = element.parent;
-    if (!ts.isArrayLiteralExpression(arrayLiteral)) return false;
-    const index = arrayLiteral.elements.indexOf(element);
-    if (index === -1) return false;
+    const slot = arrayLiteralAssignmentSlot(element);
+    if (slot === undefined) return false;
+    const { arrayLiteral, index } = slot;
     const arrayTypes = containingArrayLiteralTypes(arrayLiteral);
     if (arrayTypes === undefined) return false;
     const resolutions = arrayTypes.map((type) => (
@@ -495,11 +502,15 @@ export function scanFunctionValueReferences(
   /**
    * Records a leaf only when its source selection is exact or potential. Tuple
    * leaves retain a numeric candidate so declarationless positional symbols can
-   * use the resolver's precise type evidence rather than an alias name.
+   * use the resolver's precise type evidence rather than an alias name. Object
+   * and array literal property values remain containers rather than leaves so
+   * traversal can resolve their nested write targets at their own positions
+   * instead of pre-empting that work by reporting the container itself.
    */
   const recordDestructuringReference = (node: DestructuringLeaf): boolean => {
     if (ts.isBindingElement(node) && !ts.isIdentifier(node.name)) return false;
-    if (ts.isPropertyAssignment(node) && ts.isObjectLiteralExpression(node.initializer)) return false;
+    if (ts.isPropertyAssignment(node)
+      && (ts.isObjectLiteralExpression(node.initializer) || ts.isArrayLiteralExpression(node.initializer))) return false;
     const sourceTypes = destructuringElementSourceTypes(node);
     if (sourceTypes === undefined) return false;
     const candidates = leafKeyCandidates(node);
@@ -519,7 +530,7 @@ export function scanFunctionValueReferences(
    * Finds an array-assignment slot from its inner write target by walking
    * upward through the scanner's existing transparent wrappers. Descending
    * with `unwrapExpression` would answer a different question and make the
-   * eventual reporting path lose the target that owns the finding; this walk
+   * reporting path lose the target that owns the finding; this walk
    * instead preserves that original node while locating the enclosing slot.
    * The returned index is accepted only when the climbed expression is an
    * actual array element, so callers have one applicability boundary for both
@@ -600,10 +611,14 @@ export function scanFunctionValueReferences(
   ) || (
     ts.isBinaryExpression(node.parent) && node.parent.right === node
       && node.parent.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isObjectLiteralExpression(node.parent.left)
+  ) || (
+    ts.isForOfStatement(node.parent) && node.parent.expression === node
+      && ts.isObjectLiteralExpression(node.parent.initializer)
   );
   const isAssignmentDestructuringTarget = (literal: ts.ObjectLiteralExpression): boolean => {
     const parent = literal.parent;
     return (ts.isBinaryExpression(parent) && parent.left === literal && parent.operatorToken.kind === ts.SyntaxKind.EqualsToken)
+      || forOfAssignmentHead(literal) !== undefined
       || ((ts.isPropertyAssignment(parent) || ts.isShorthandPropertyAssignment(parent))
         && ts.isObjectLiteralExpression(parent.parent) && isAssignmentDestructuringTarget(parent.parent));
   };
@@ -726,7 +741,7 @@ export function scanFunctionValueReferences(
         && resolution.kind !== 'none'
       ) {
         recordUnsafe(node);
-      } else if (ts.isArrayLiteralExpression(node.parent)) {
+      } else {
         recordArrayLiteralAssignmentElement(node);
       }
     } else if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
@@ -738,7 +753,7 @@ export function scanFunctionValueReferences(
           handledByOrdinaryResolution = true;
         }
       }
-      if (!handledByOrdinaryResolution && ts.isArrayLiteralExpression(node.parent) && recordArrayLiteralAssignmentElement(node)) {
+      if (!handledByOrdinaryResolution && recordArrayLiteralAssignmentElement(node)) {
         visit(node.expression);
         if (ts.isElementAccessExpression(node)) visit(node.argumentExpression);
         return;
