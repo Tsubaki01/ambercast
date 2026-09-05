@@ -327,9 +327,11 @@ export function scanFunctionValueReferences(
    * `Iterable<T>` to `any`, because their default `TReturn` is `any`. A custom
    * generic iterator whose yielded value is not its first type parameter
    * remains the deliberate boundary: deriving that mapping would reimplement
-   * generic instantiation.
+   * generic instantiation. Bare `any` or `unknown` propagates directly to
+   * preserve SA-1 default-deny parity with declaration heads.
    */
   const iterationElementType = (iterableType: ts.Type): ts.Type | undefined => {
+    if (iterableType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return iterableType;
     const isArrayLike = checker.isArrayType(iterableType) || checker.isTupleType(iterableType);
     const indexed = isArrayLike ? checker.getIndexTypeOfType(iterableType, ts.IndexKind.Number) : undefined;
     if (indexed !== undefined) return indexed;

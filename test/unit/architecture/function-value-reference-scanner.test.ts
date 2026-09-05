@@ -502,6 +502,27 @@ describe('scanFunctionValueReferences()', () => {
       [[4, 'sink.alias']],
     ],
     [
+      'a bare any iterable',
+      [
+        "import { target } from './target.js';",
+        'declare const sink: { alias: unknown };',
+        'declare const items: any;',
+        'for ({ x: [sink.alias] } of items) {}',
+      ].join('\n'),
+      [[4, 'sink.alias']],
+    ],
+    [
+      'a bare unknown iterable',
+      [
+        "import { target } from './target.js';",
+        'declare const sink: { alias: unknown };',
+        'declare const items: unknown;',
+        '// @ts-expect-error The bare iterable value is intentionally unknown.',
+        'for ({ x: [sink.alias] } of items) {}',
+      ].join('\n'),
+      [[5, 'sink.alias']],
+    ],
+    [
       'a tuple-shaped iterable',
       [
         "import { target } from './target.js';",
