@@ -1,5 +1,6 @@
 import starlight from '@astrojs/starlight';
 import { defineConfig } from 'astro/config';
+import { codeThemes } from './src/styles/code-themes';
 
 const site = 'https://tsubaki01.github.io';
 const base = '/ambercast';
@@ -39,9 +40,23 @@ export default defineConfig({
         Pagination: './src/components/Pagination.astro',
         Footer: './src/components/Footer.astro',
       },
-      // A monochrome pair leaves visible code colors to the design token overrides below.
+      // The monochrome pair owns token colors while Starlight keeps its UI surfaces in sync
+      // with site tokens. Contrast normalization stays disabled because it would mutate the approved
+      // low-emphasis token colors instead of preserving the explicit theme table.
       expressiveCode: {
-        themes: ['github-dark', 'github-light'],
+        themes: codeThemes,
+        useStarlightUiThemeColors: true,
+        minSyntaxHighlightingColorContrast: 0,
+        // Starlight's UI-color pass precedes this callback. It restores
+        // only frame backgrounds so code surfaces remain tied to the CSS token without replacing the
+        // generated marker and accessibility colors. Frame overrides are optional when the UI-color
+        // pass is disabled, so the callback creates that nested map before preserving this invariant.
+        customizeTheme(theme) {
+          theme.styleOverrides.frames ??= {};
+          theme.styleOverrides.frames.editorBackground = 'var(--ac-code-bg)';
+          theme.styleOverrides.frames.terminalBackground = 'var(--ac-code-bg)';
+          return theme;
+        },
         styleOverrides: {
           borderRadius: '10px',
           borderColor: 'var(--sl-color-hairline)',
@@ -76,12 +91,10 @@ export default defineConfig({
       sidebar: [
         {
           label: 'Guides',
-          translations: { ja: 'ガイド', 'zh-CN': '指南' },
           items: [{ autogenerate: { directory: 'guides' } }],
         },
         {
           label: 'Reference',
-          translations: { ja: 'リファレンス', 'zh-CN': '参考' },
           items: [{ autogenerate: { directory: 'reference' } }],
         },
       ],
