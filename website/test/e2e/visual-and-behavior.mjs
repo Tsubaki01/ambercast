@@ -34,7 +34,7 @@ const LOCALE_DEMO_LABELS = {
 const PACKAGE_VERSION = JSON.parse(readFileSync(new URL('../../../package.json', import.meta.url), 'utf8')).version;
 
 const APPROVED_EXTERNAL_SITE_URLS = [
-  { origin: 'https://tsubaki01.github.io', pathnamePrefix: '/ambercast/' },
+  { origin: 'https://kotarotsubaki.github.io', pathnamePrefix: '/ambercast/' },
 ];
 
 const APPROVED_EXTERNAL_ANCHOR_URLS = [
@@ -42,9 +42,9 @@ const APPROVED_EXTERNAL_ANCHOR_URLS = [
   { origin: 'https://playwright.dev', pathname: '/' },
   { origin: 'https://docs.claude.com', pathname: '/en/docs/claude-code' },
   { origin: 'https://github.com', pathname: '/openai/codex' },
-  { origin: 'https://github.com', pathname: '/Tsubaki01/ambercast' },
-  { origin: 'https://github.com', pathname: '/Tsubaki01/ambercast/blob/main/CHANGELOG.md' },
-  { origin: 'https://github.com', pathnamePrefix: '/Tsubaki01/ambercast/edit/main/website/' },
+  { origin: 'https://github.com', pathname: '/kotarotsubaki/ambercast' },
+  { origin: 'https://github.com', pathname: '/kotarotsubaki/ambercast/blob/main/CHANGELOG.md' },
+  { origin: 'https://github.com', pathnamePrefix: '/kotarotsubaki/ambercast/edit/main/website/' },
   { origin: 'https://www.npmjs.com', pathname: '/package/ambercast' },
 ];
 
