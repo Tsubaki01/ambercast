@@ -10,7 +10,7 @@ const outputPath = path.resolve(
 const frontmatter = `---
 title: Configuration
 description: Auto-generated from the repository's docs/configuration.md — configuration fields with a non-obvious contract.
-editUrl: https://github.com/Tsubaki01/ambercast/edit/main/docs/configuration.md
+editUrl: https://github.com/kotarotsubaki/ambercast/edit/main/docs/configuration.md
 sidebar:
   order: 2
 ---
