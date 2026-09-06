@@ -1,4 +1,5 @@
 import starlight from '@astrojs/starlight';
+import { ExpressiveCodeTheme } from '@astrojs/starlight/expressive-code';
 import { defineConfig } from 'astro/config';
 import { codeThemes } from './src/styles/code-themes';
 
@@ -44,7 +45,9 @@ export default defineConfig({
       // with site tokens. Contrast normalization stays disabled because it would mutate the approved
       // low-emphasis token colors instead of preserving the explicit theme table.
       expressiveCode: {
-        themes: codeThemes,
+        // Starlight forwards custom values unchanged, while Expressive Code operates on theme
+        // instances. Convert the dependency-free definitions only where that dependency exists.
+        themes: codeThemes.map((theme) => new ExpressiveCodeTheme(theme)),
         useStarlightUiThemeColors: true,
         minSyntaxHighlightingColorContrast: 0,
         // Starlight's UI-color pass precedes this callback. It restores

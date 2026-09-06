@@ -1,6 +1,14 @@
-import { ExpressiveCodeTheme } from '@astrojs/starlight/expressive-code';
-
 type ThemeType = 'dark' | 'light';
+
+type ThemeInput = {
+  name: string;
+  type: ThemeType;
+  colors: Record<string, string>;
+  tokenColors: {
+    scope: string[];
+    settings: { foreground: string; fontStyle: 'bold' | '' };
+  }[];
+};
 
 type ScopeRow = {
   scopes: string[];
@@ -14,8 +22,8 @@ type ScopeRow = {
  * remains reviewable. Explicit empty font styles are part of that contract: TextMate scopes can
  * inherit boldness, so a punctuation row must actively restore regular weight.
  *
- * Expressive Code accepts VS Code theme colors through `colors.editor.*`; its constructor derives
- * the public foreground and background fields from those keys, avoiding a second color mapping.
+ * Expressive Code accepts VS Code theme colors through `colors.editor.*`. Keeping those constructor
+ * inputs here lets the integration own instantiation without duplicating the color mapping.
  */
 const SCOPE_TABLE: ScopeRow[] = [
   {
@@ -56,9 +64,9 @@ const SCOPE_TABLE: ScopeRow[] = [
 /**
  * Keeps the VS Code theme input local so consumers cannot reorder scope precedence or mix variants.
  */
-function buildTheme(type: ThemeType): ExpressiveCodeTheme {
+function buildTheme(type: ThemeType): ThemeInput {
   const dark = type === 'dark';
-  return new ExpressiveCodeTheme({
+  return {
     name: dark ? 'ambercast-dark' : 'ambercast-light',
     type,
     colors: {
@@ -69,14 +77,14 @@ function buildTheme(type: ThemeType): ExpressiveCodeTheme {
       scope: row.scopes,
       settings: { foreground: row[type], fontStyle: row.fontStyle },
     })),
-  });
+  };
 }
 
 /**
  * Expressive Code themes consumed by the Starlight configuration.
  *
  * The two-element tuple is ordered dark first and light second, with theme names
- * `ambercast-dark` and `ambercast-light` respectively. Starlight consumes this stable export
- * directly from `astro.config.mjs`.
+ * `ambercast-dark` and `ambercast-light` respectively. Consumers instantiate these VS Code theme
+ * inputs at their integration boundary.
  */
 export const codeThemes = [buildTheme('dark'), buildTheme('light')] as const;

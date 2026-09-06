@@ -10,26 +10,30 @@ const EXPECTED_ROWS = [
 
 describe('codeThemes', () => {
   it('exports the dark and light monochrome themes in the required stable order', () => {
-    const themes = codeThemes as unknown as Array<{ type: string; name: string; bg: string; fg: string }>;
+    const themes = codeThemes as unknown as Array<{
+      type: string;
+      name: string;
+      colors: Record<string, string>;
+    }>;
     expect(themes).toHaveLength(2);
     const [dark, light] = themes;
     expect(dark.type).toBe('dark'); expect(light.type).toBe('light');
     expect(dark.name).toBe('ambercast-dark'); expect(light.name).toBe('ambercast-light');
-    expect(dark.bg.toLowerCase()).toBe('#100c09'); expect(light.bg.toLowerCase()).toBe('#f1ebe2');
-    expect(dark.fg.toLowerCase()).toBe('#e2d9cc'); expect(light.fg.toLowerCase()).toBe('#3b332c');
+    expect(dark.colors['editor.background'].toLowerCase()).toBe('#100c09'); expect(light.colors['editor.background'].toLowerCase()).toBe('#f1ebe2');
+    expect(dark.colors['editor.foreground'].toLowerCase()).toBe('#e2d9cc'); expect(light.colors['editor.foreground'].toLowerCase()).toBe('#3b332c');
   });
 
   it('preserves the complete ordered scope table without implicit regular-weight inheritance', () => {
-    const themes = codeThemes as unknown as Array<{ settings: Array<{ scope: string[]; settings: { foreground?: string; fontStyle?: string } }> }>;
+    const themes = codeThemes as unknown as Array<{ tokenColors: Array<{ scope: string[]; settings: { foreground?: string; fontStyle?: string } }> }>;
     const [dark, light] = themes;
-    const rows = (theme: (typeof themes)[number]) => theme.settings.map((entry) => ({
+    const rows = (theme: (typeof themes)[number]) => theme.tokenColors.map((entry) => ({
       scope: entry.scope,
       settings: { foreground: entry.settings.foreground?.toLowerCase(), fontStyle: entry.settings.fontStyle },
     }));
     expect(rows(dark)).toEqual(EXPECTED_ROWS.map(({ scope, settings }) => ({ scope, settings: { foreground: settings.dark, fontStyle: settings.fontStyle } })));
     expect(rows(light)).toEqual(EXPECTED_ROWS.map(({ scope, settings }) => ({ scope, settings: { foreground: settings.light, fontStyle: settings.fontStyle } })));
-    expect(dark.settings).toHaveLength(4); expect(light.settings).toHaveLength(4);
-    expect(dark.settings.map((entry) => entry.scope)).toEqual(light.settings.map((entry) => entry.scope));
-    for (const theme of themes) for (const row of theme.settings.filter((entry) => entry.settings.fontStyle !== 'bold')) expect(row.settings.fontStyle).toBe('');
+    expect(dark.tokenColors).toHaveLength(4); expect(light.tokenColors).toHaveLength(4);
+    expect(dark.tokenColors.map((entry) => entry.scope)).toEqual(light.tokenColors.map((entry) => entry.scope));
+    for (const theme of themes) for (const row of theme.tokenColors.filter((entry) => entry.settings.fontStyle !== 'bold')) expect(row.settings.fontStyle).toBe('');
   });
 });
