@@ -14,7 +14,7 @@ Write test cases as natural-language Markdown prompts — the prompt is the sing
 Like an insect preserved in amber, your test's intent is cast once and kept intact — no matter how the surface changes.
 
 > [!NOTE]
-> ambercast is pre-1.0 and under active development. See [Status](#status).
+> ambercast is pre-1.0 and under active development. [Status](#status) has the details.
 
 **Full documentation:** https://kotarotsubaki.github.io/ambercast/ (English / 日本語 / 简体中文)
 
@@ -30,11 +30,11 @@ Or run it without installing:
 npx ambercast <command>
 ```
 
-You need Node.js >= 22.14, a Chromium binary (`npx playwright-core install chromium`), and an already-authenticated AI provider CLI, either [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) or [Codex CLI](https://github.com/openai/codex) (ambercast does not manage credentials; bring your own key) — see the [Getting started guide](https://kotarotsubaki.github.io/ambercast/guides/getting-started/).
+You need Node.js >= 22.14, a Chromium binary (`npx playwright-core install chromium`), and an already-authenticated AI provider CLI, either [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) or [Codex CLI](https://github.com/openai/codex) (ambercast does not manage credentials; bring your own key) — take a look at the [Getting started guide](https://kotarotsubaki.github.io/ambercast/guides/getting-started/).
 
 ## Quick start
 
-There is no `init` command yet; a prompt file is all you need, and defaults assume your app is at `http://localhost:3000` (see [configuration](https://kotarotsubaki.github.io/ambercast/reference/configuration/)).
+There is no `init` command yet; a prompt file is all you need, and defaults assume your app is at `http://localhost:3000` ([configuration](https://kotarotsubaki.github.io/ambercast/reference/configuration/) has the details).
 
 1. Write a test prompt at `tests/ambercast/sign-in.test.md`:
 
@@ -51,7 +51,7 @@ There is no `init` command yet; a prompt file is all you need, and defaults assu
    npx ambercast run
    ```
 
-`generate` writes `sign-in.ambercast.plan.json` and `sign-in.ambercast.grounding.json` next to the prompt; commit all three files. Every later `run` replays the plan with zero AI calls — see the [Writing prompts](https://kotarotsubaki.github.io/ambercast/guides/writing-prompts/) guide.
+`generate` writes `sign-in.ambercast.plan.json` and `sign-in.ambercast.grounding.json` next to the prompt; be sure to commit all three files. Every later `run` replays the plan with zero AI calls — take a look at the [Writing prompts](https://kotarotsubaki.github.io/ambercast/guides/writing-prompts/) guide.
 
 ## Learn more
 
@@ -68,7 +68,7 @@ ambercast is pre-1.0 (0.x), and breaking changes can land in a minor release.
 
 - Chromium only (Firefox and WebKit are planned).
 - Local execution only — no hosted runner.
-- No `init` command yet — set up config and prompts by hand.
+- No `init` command yet — config and prompts are set up by hand.
 - No results viewer yet.
 - No MCP server yet.
 
@@ -78,4 +78,4 @@ Bug reports and PRs are welcome; start with [CONTRIBUTING.md](CONTRIBUTING.md), 
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — [LICENSE](LICENSE) has the details.
