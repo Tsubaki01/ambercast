@@ -600,6 +600,47 @@ describe('scanFunctionValueReferences()', () => {
       ].join('\n'),
       [[11, 'sink.alias']],
     ],
+    [
+      'a non-generic named iterator class whose next() returns a yield/return union',
+      [
+        "import { target } from './target.js';",
+        'type TargetShape = { x: [typeof target] };',
+        'class UnionIterator {',
+        '  next(): IteratorResult<TargetShape, string> { throw new Error(); }',
+        '}',
+        'class Custom {',
+        '  [Symbol.iterator](): UnionIterator { return new UnionIterator(); }',
+        '}',
+        'declare const sink: { alias: unknown };',
+        'declare const iterable: Custom;',
+        'for ({ x: [sink.alias] } of iterable) {}',
+      ].join('\n'),
+      [[11, 'sink.alias']],
+    ],
+    [
+      'an interface iterator whose next() returns a yield/return union',
+      [
+        "import { target } from './target.js';",
+        'type TargetShape = { x: [typeof target] };',
+        'interface UnionIterator { next(): IteratorResult<TargetShape, string>; }',
+        'declare const sink: { alias: unknown };',
+        'declare const iterable: { [Symbol.iterator](): UnionIterator };',
+        'for ({ x: [sink.alias] } of iterable) {}',
+      ].join('\n'),
+      [[6, 'sink.alias']],
+    ],
+    [
+      'a next() union where no branch is done: true (no canonical return branch)',
+      [
+        "import { target } from './target.js';",
+        'type TargetShape = { x: [typeof target] };',
+        'type Unrelated = { x: [string] };',
+        'declare const sink: { alias: unknown };',
+        'declare const iterable: { [Symbol.iterator](): { next(): { value: Unrelated; done: false } | { value: TargetShape; done: false } } };',
+        'for ({ x: [sink.alias] } of iterable) {}',
+      ].join('\n'),
+      [[6, 'sink.alias']],
+    ],
   ] as const)('reports a for-of assignment head from %s', async (_name, source, unsafeReferences) => {
     await withCaller(source, (scan, names) => {
       expectScan(scan, names['src/caller.ts'] ?? '', source, [], unsafeReferences);
@@ -653,6 +694,17 @@ describe('scanFunctionValueReferences()', () => {
         'declare const sink: { alias: unknown };',
         'declare const unsafeItems: any[];',
         'for ({ x: [sink.alias] } of (unsafeItems as unknown as SafeItem[])) {}',
+      ].join('\n'),
+    ],
+    [
+      'a next() yield/return union whose return branch — not the yield branch — carries the target',
+      [
+        "import { target } from './target.js';",
+        'type TargetShape = { x: [typeof target] };',
+        'type Unrelated = { x: [string] };',
+        'declare const sink: { alias: unknown };',
+        'declare const iterable: { [Symbol.iterator](): { next(): IteratorReturnResult<TargetShape> | IteratorYieldResult<Unrelated> } };',
+        'for ({ x: [sink.alias] } of iterable) {}',
       ].join('\n'),
     ],
   ] as const)('keeps a for-of assignment head from reporting when %s', async (_name, source) => {
@@ -881,7 +933,7 @@ describe('scanFunctionValueReferences()', () => {
         'for ({ x: [sink.alias] } of items) {}',
       ].join('\n'),
     ],
-  ] as const)('keeps a for-await-of assignment head from reporting for %s', async (_name, source) => {
+  ] as const)('keeps a for-of assignment head from reporting for %s', async (_name, source) => {
     await withCaller(source, (scan, names) => {
       expectScan(scan, names['src/caller.ts'] ?? '', source, [], []);
     });
