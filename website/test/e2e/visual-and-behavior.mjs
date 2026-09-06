@@ -66,6 +66,29 @@ const SCREENSHOTS = [
   { name: 'guide-ja', path: '/ja/guides/getting-started/', viewport: { width: 1440, height: 1100 }, colorScheme: 'dark' },
   { name: 'reference-dark', path: '/reference/cli/', viewport: { width: 1440, height: 1100 }, colorScheme: 'dark' },
   { name: 'reference-light', path: '/reference/cli/', viewport: { width: 1440, height: 1100 }, colorScheme: 'light' },
+  { name: 'guide-390-dark', path: '/guides/getting-started/', viewport: { width: 390, height: 844 }, colorScheme: 'dark' },
+  { name: 'guide-390-light', path: '/guides/getting-started/', viewport: { width: 390, height: 844 }, colorScheme: 'light' },
+  { name: 'guide-zh-cn-dark', path: '/zh-cn/guides/getting-started/', viewport: { width: 1440, height: 1100 }, colorScheme: 'dark' },
+  { name: 'reference-390-dark', path: '/reference/cli/', viewport: { width: 390, height: 844 }, colorScheme: 'dark' },
+  { name: 'introduction-ja-1440-dark', path: '/ja/guides/introduction/', viewport: { width: 1440, height: 1100 }, colorScheme: 'dark' },
+  { name: 'introduction-ja-2000-dark', path: '/ja/guides/introduction/', viewport: { width: 2000, height: 1100 }, colorScheme: 'dark' },
+  { name: 'guide-ja-1440-light', path: '/ja/guides/getting-started/', viewport: { width: 1440, height: 1100 }, colorScheme: 'light' },
+  { name: 'guide-ja-390-dark', path: '/ja/guides/getting-started/', viewport: { width: 390, height: 844 }, colorScheme: 'dark' },
+  { name: 'guide-ja-390-light', path: '/ja/guides/getting-started/', viewport: { width: 390, height: 844 }, colorScheme: 'light' },
+  { name: 'guide-zh-cn-1440-light', path: '/zh-cn/guides/getting-started/', viewport: { width: 1440, height: 1100 }, colorScheme: 'light' },
+  { name: 'guide-zh-cn-390-dark', path: '/zh-cn/guides/getting-started/', viewport: { width: 390, height: 844 }, colorScheme: 'dark' },
+  { name: 'guide-zh-cn-390-light', path: '/zh-cn/guides/getting-started/', viewport: { width: 390, height: 844 }, colorScheme: 'light' },
+  { name: 'reference-ja-1440-dark', path: '/ja/reference/cli/', viewport: { width: 1440, height: 1100 }, colorScheme: 'dark' },
+  { name: 'reference-ja-1440-light', path: '/ja/reference/cli/', viewport: { width: 1440, height: 1100 }, colorScheme: 'light' },
+  { name: 'reference-ja-390-dark', path: '/ja/reference/cli/', viewport: { width: 390, height: 844 }, colorScheme: 'dark' },
+  { name: 'reference-ja-390-light', path: '/ja/reference/cli/', viewport: { width: 390, height: 844 }, colorScheme: 'light' },
+  { name: 'reference-390-light', path: '/reference/cli/', viewport: { width: 390, height: 844 }, colorScheme: 'light' },
+  { name: 'introduction-en-1440-dark', path: '/guides/introduction/', viewport: { width: 1440, height: 1100 }, colorScheme: 'dark' },
+  { name: 'introduction-en-2000-dark', path: '/guides/introduction/', viewport: { width: 2000, height: 1100 }, colorScheme: 'dark' },
+  { name: 'introduction-en-1151-dark', path: '/guides/introduction/', viewport: { width: 1151, height: 1100 }, colorScheme: 'dark' },
+  { name: 'introduction-en-1152-dark', path: '/guides/introduction/', viewport: { width: 1152, height: 1100 }, colorScheme: 'dark' },
+  { name: 'introduction-ja-1151-dark', path: '/ja/guides/introduction/', viewport: { width: 1151, height: 1100 }, colorScheme: 'dark' },
+  { name: 'introduction-ja-1152-dark', path: '/ja/guides/introduction/', viewport: { width: 1152, height: 1100 }, colorScheme: 'dark' },
 ];
 
 function sleep(milliseconds) {
@@ -1126,6 +1149,202 @@ async function assertHeaderV13(browser) {
   }
 }
 
+/**
+ * Verifies that syntax highlighting stays inside the approved monochrome palette instead of
+ * accepting a theme-specific rendering accident. The oracle walks every rendered span so a
+ * newly introduced token category cannot escape a spot check, while its literals remain
+ * independent of the production theme table. JSON categories are mapped from each line's
+ * concatenated text back to leaf spans by character offsets: Shiki may serialize a quoted
+ * string as quote, body, and quote spans, so only spans inside the quote pair receive the
+ * string's semantic colour and weight; the quote spans themselves remain punctuation.
+ */
+async function assertCodeTokenPalette(browser) {
+  const themes = {
+    dark: { allowed: [[226, 217, 204], [118, 107, 96], [250, 246, 240], [241, 235, 226], [158, 145, 132]], keyword: [250, 246, 240], string: [241, 235, 226], punctuation: [158, 145, 132], background: [16, 12, 9] },
+    light: { allowed: [[59, 51, 44], [158, 145, 132], [24, 19, 16], [39, 33, 28], [118, 107, 96]], keyword: [24, 19, 16], string: [39, 33, 28], punctuation: [118, 107, 96], background: [241, 235, 226] },
+  };
+  for (const scenario of SCREENSHOTS.filter((entry) => entry.path === '/guides/getting-started/' && entry.viewport.width === 1440)) {
+    const { colorScheme, viewport } = scenario; const expected = themes[colorScheme];
+    const context = await browser.newContext({ colorScheme, viewport }); const page = await context.newPage();
+    try {
+      await page.goto(pageUrl('/guides/getting-started/'), { waitUntil: 'networkidle' }); await waitForFonts(page);
+      const tokens = await page.$$eval('.expressive-code pre span', (spans) => spans.map((span) => ({ text: span.textContent, color: getComputedStyle(span).color, weight: Number(getComputedStyle(span).fontWeight) })));
+      assert.ok(tokens.length > 0, `${colorScheme} guide must contain highlighted spans.`);
+      for (const token of tokens) assert.ok(expected.allowed.some((color) => color.join(',') === rgbChannels(token.color).join(',')), `${colorScheme} token ${JSON.stringify(token.text)} must use the approved palette.`);
+      for (const command of ['npx', 'npm']) {
+        const commandTokens = tokens.filter((token) => token.text?.trim() === command);
+        assert.ok(commandTokens.length > 0, `${colorScheme} guide must render ${command} tokens.`);
+        for (const token of commandTokens) { assert.deepEqual(rgbChannels(token.color), expected.keyword); assert.ok(token.weight >= 700); }
+      }
+      const json = await page.$$eval('.expressive-code pre', (pres) => pres.map((pre) => ({ text: pre.textContent, background: getComputedStyle(pre).backgroundColor })));
+      const jsonBlock = json.find((block) => block.text.includes('"') && block.text.includes(':')); assert.ok(jsonBlock, 'The guide must include a JSON code block.');
+      const jsonTokens = await page.evaluate(() => {
+        const pre = [...document.querySelectorAll('.expressive-code pre')].find((entry) => entry.textContent?.includes('"') && entry.textContent?.includes(':'));
+        if (!pre) throw new Error('The guide needs a JSON code block.');
+        const token = (span) => ({ text: span.textContent ?? '', color: getComputedStyle(span).color, weight: Number(getComputedStyle(span).fontWeight) });
+        const keys = []; const values = []; const punctuation = [];
+        for (const line of pre.querySelectorAll('.ec-line .code')) {
+          const leaves = [...line.querySelectorAll('span')].filter((span) => !span.querySelector('span'));
+          let offset = 0;
+          const spans = leaves.map((span) => {
+            const text = span.textContent ?? '';
+            const entry = { ...token(span), start: offset, end: offset + text.length };
+            offset = entry.end;
+            return entry;
+          });
+          const text = spans.map((span) => span.text).join('');
+          const strings = [...text.matchAll(/"(?:\\.|[^"\\])*"/g)].map((match) => {
+            const start = match.index ?? 0; const end = start + match[0].length;
+            const after = text.slice(end); const before = text.slice(0, start);
+            return { start, end, kind: /^\s*:/.test(after) ? 'key' : /:\s*$/.test(before) ? 'value' : null };
+          }).filter((entry) => entry.kind);
+          for (const span of spans) {
+            const category = strings.find((entry) => span.start < entry.end - 1 && entry.start + 1 < span.end)?.kind;
+            if (category === 'key') keys.push(span);
+            else if (category === 'value') values.push(span);
+            if (/^[,:{}"]+$/.test(span.text.replace(/\s/g, ''))) punctuation.push(span);
+          }
+        }
+        return { keys, values, punctuation };
+      });
+      assert.ok(jsonTokens.keys.length > 0, 'The JSON block must expose key string spans.');
+      assert.ok(jsonTokens.values.length > 0, 'The JSON block must expose value string spans.');
+      assert.ok(jsonTokens.punctuation.length > 0, 'The JSON block must expose punctuation spans.');
+      for (const token of jsonTokens.keys) { assert.deepEqual(rgbChannels(token.color), expected.keyword); assert.ok(token.weight >= 700); }
+      for (const token of jsonTokens.values) assert.deepEqual(rgbChannels(token.color), expected.string);
+      for (const token of jsonTokens.punctuation) { assert.deepEqual(rgbChannels(token.color), expected.punctuation); assert.ok(token.weight < 700); }
+      for (const block of json) assert.deepEqual(rgbChannels(block.background), expected.background);
+    } finally { await context.close(); }
+  }
+}
+
+/**
+ * Checks shared document surfaces over every rendered match, which makes the test sensitive to
+ * generated headings, table rows, and localized sidebar labels rather than only their first
+ * instance. The fallback heading is a temporary clone measured and removed in the page context,
+ * preserving the same non-persistent DOM contract as the frame variants.
+ */
+async function assertDocumentationSurfaces(browser) {
+  for (const scenario of SCREENSHOTS.filter((entry) => entry.path.endsWith('/guides/getting-started/'))) {
+    const { path, colorScheme, viewport } = scenario;
+    const context = await browser.newContext({ colorScheme, viewport }); const page = await context.newPage();
+    try {
+      await page.goto(pageUrl(path), { waitUntil: 'networkidle' }); await waitForFonts(page);
+      if (viewport.width === 390) { await openDocumentationMenu(page); assert.equal(await page.locator('.sidebar-pane').isVisible(), true, `${scenario.name} must open the documentation drawer.`); }
+      const values = await page.evaluate(() => { const probe = document.createElement('i'); probe.style.color = 'var(--sl-color-gray-3)'; document.body.append(probe); const gray3 = getComputedStyle(probe).color; probe.style.color = 'var(--sl-color-hairline)'; const hairline = getComputedStyle(probe).color; probe.remove(); const labels = [...document.querySelectorAll('.ac-sidebar summary .large')].map((element) => { const style = getComputedStyle(element); return { text: element.textContent, size: style.fontSize, weight: style.fontWeight, family: style.fontFamily, spacing: parseFloat(style.letterSpacing), transform: style.textTransform, color: style.color }; }); const headings = [...document.querySelectorAll('.sl-heading-wrapper.level-h2')].map((element) => { const style = getComputedStyle(element); const h2 = element.querySelector(':scope > h2'); const h2Style = h2 && getComputedStyle(h2); return { width: element.getBoundingClientRect().width, articleWidth: element.closest('.sl-markdown-content')?.getBoundingClientRect().width, borderWidth: style.borderTopWidth, borderStyle: style.borderTopStyle, borderColor: style.borderTopColor, padding: style.paddingTop, margin: style.marginTop, h2: h2Style && { border: h2Style.borderTopWidth, padding: h2Style.paddingTop, margin: h2Style.marginTop } }; }); return { gray3, hairline, labels, headings }; });
+      assert.ok(values.labels.length >= 2); for (const label of values.labels) { assert.equal(label.size, '11px'); assert.equal(label.weight, '500'); assert.match(label.family, /mono/i); assertWithinTolerance(label.spacing, 1.32, 0.05, 'Sidebar label letter spacing'); assert.equal(label.transform, 'uppercase'); assert.deepEqual(rgbChannels(label.color), rgbChannels(values.gray3)); }
+      assert.deepEqual(values.labels.map((label) => label.text), ['Guides', 'Reference']);
+      if (!path.startsWith('/zh-cn/')) { assert.ok(values.headings.length > 0); for (const heading of values.headings) { assert.equal(heading.borderWidth, '1px'); assert.equal(heading.borderStyle, 'solid'); assert.deepEqual(rgbChannels(heading.borderColor), rgbChannels(values.hairline)); assert.equal(heading.padding, '28px'); assert.equal(heading.margin, '40px'); assertWithinTolerance(heading.width, heading.articleWidth, 1, 'Heading wrapper width'); assert.deepEqual(heading.h2, { border: '0px', padding: '0px', margin: '0px' }); } const fallback = await page.evaluate(() => { const article = document.querySelector('.sl-markdown-content'); const source = article?.querySelector('h2'); if (!article || !source) throw new Error('A fallback heading requires a markdown article h2.'); const clone = source.cloneNode(true); article.append(clone); const style = getComputedStyle(clone); const result = { border: style.borderTopWidth, style: style.borderTopStyle, color: style.borderTopColor, padding: style.paddingTop, margin: style.marginTop }; clone.remove(); return result; }); assert.deepEqual({ border: fallback.border, style: fallback.style, padding: fallback.padding, margin: fallback.margin }, { border: '1px', style: 'solid', padding: '28px', margin: '40px' }); assert.deepEqual(rgbChannels(fallback.color), rgbChannels(values.hairline)); }
+    } finally { await context.close(); }
+  }
+  for (const scenario of SCREENSHOTS.filter((entry) => entry.path.endsWith('/reference/cli/'))) { const { path, colorScheme, viewport } = scenario; const context = await browser.newContext({ colorScheme, viewport }); const page = await context.newPage(); try { await page.goto(pageUrl(path), { waitUntil: 'networkidle' }); const table = await page.evaluate(() => { const probe = (property) => { const element = document.createElement('i'); element.style.color = `var(${property})`; document.body.append(element); const color = getComputedStyle(element).color; element.remove(); return color; }; const padding = (style) => ({ top: style.paddingTop, right: style.paddingRight, bottom: style.paddingBottom, left: style.paddingLeft }); return [...document.querySelectorAll('.sl-markdown-content table')].map((entry) => ({ fontSize: getComputedStyle(entry).fontSize, gray3: probe('--sl-color-gray-3'), gray4: probe('--sl-color-gray-4'), hairline: probe('--sl-color-hairline'), white: probe('--sl-color-white'), headers: [...entry.querySelectorAll('th')].map((cell) => { const style = getComputedStyle(cell); return { size: style.fontSize, weight: style.fontWeight, family: style.fontFamily, spacing: parseFloat(style.letterSpacing), transform: style.textTransform, padding: padding(style), borderWidth: style.borderBottomWidth, borderStyle: style.borderBottomStyle, borderColor: style.borderBottomColor, first: cell.matches(':first-child'), last: cell.matches(':last-child'), color: style.color }; }), cells: [...entry.querySelectorAll('td')].map((cell) => { const style = getComputedStyle(cell); const codes = [...cell.querySelectorAll('code')].map((code) => ({ color: getComputedStyle(code).color, whiteSpace: getComputedStyle(code).whiteSpace })); return { padding: padding(style), lineHeight: style.lineHeight, verticalAlign: style.verticalAlign, borderWidth: style.borderBottomWidth, borderStyle: style.borderBottomStyle, borderColor: style.borderBottomColor, first: cell.matches(':first-child'), last: cell.matches(':last-child'), color: style.color, codes }; }) })); }); assert.ok(table.length > 0); for (const entry of table) { assert.equal(entry.fontSize, '13px'); for (const header of entry.headers) { assert.equal(header.size, '11px'); assert.equal(header.weight, '500'); assert.match(header.family, /mono/i); assertWithinTolerance(header.spacing, 1.32, 0.05, 'Table heading letter spacing'); assert.equal(header.transform, 'uppercase'); assert.deepEqual(header.padding, { top: '9.6px', right: header.last ? '0px' : '12px', bottom: '9.6px', left: header.first ? '0px' : '12px' }); assert.equal(header.borderWidth, '1px'); assert.equal(header.borderStyle, 'solid'); assert.deepEqual(rgbChannels(header.borderColor), rgbChannels(entry.gray4)); assert.deepEqual(rgbChannels(header.color), rgbChannels(entry.gray3)); } for (const cell of entry.cells) { assert.deepEqual(cell.padding, { top: '11.2px', right: cell.last ? '0px' : '12px', bottom: '11.2px', left: cell.first ? '0px' : '12px' }); assert.equal(cell.lineHeight, '19.5px'); assert.equal(cell.verticalAlign, 'top'); assert.equal(cell.borderWidth, '1px'); assert.equal(cell.borderStyle, 'solid'); assert.deepEqual(rgbChannels(cell.borderColor), rgbChannels(entry.hairline)); if (cell.first) { assert.deepEqual(rgbChannels(cell.color), rgbChannels(entry.white)); for (const code of cell.codes) assert.deepEqual(rgbChannels(code.color), rgbChannels(entry.white)); } for (const code of cell.codes) assert.equal(code.whiteSpace, 'nowrap'); } } } finally { await context.close(); } }
+}
+
+/**
+ * Exercises all frame variants without changing documentation content. The two unavailable
+ * variants are cloned with their enclosing expressive-code wrapper, because frame styling relies
+ * on that ancestor; every temporary wrapper is removed after measurement. Geometry permits one
+ * pixel of browser rounding, while the COPY button must be wider than its height and remain
+ * compact rather than being mistaken for the plugin's square icon geometry; first-line clearance is
+ * guaranteed by inline-end padding at least eight pixels wider than the COPY button, with rect
+ * non-intersection additionally checked when the line fits within its pre. A line that overflows
+ * its pre can scroll underneath the floating button, so rectangle non-intersection cannot hold
+ * there and the padding-clearance contract is the only applicable assertion.
+ * The pseudo-element oracle reads generated TERMINAL and COPY labels from computed styles because
+ * their DOM nodes are intentionally absent. The TERMINAL label must retain its line-height-sized
+ * box rather than the plugin's fixed-size dot geometry, while its inset remains content-driven.
+ */
+async function assertCodeFrameVariants(browser) {
+  for (const scenario of SCREENSHOTS.filter((entry) => entry.path === '/guides/getting-started/' || entry.path === '/ja/guides/getting-started/')) {
+    const { colorScheme, viewport } = scenario; const context = await browser.newContext({ colorScheme, viewport }); const page = await context.newPage();
+    try {
+      await page.goto(pageUrl(scenario.path), { waitUntil: 'networkidle' }); await waitForFonts(page);
+      const ids = await page.evaluate(() => {
+        const source = document.querySelector('.expressive-code .frame'); if (!source) throw new Error('The guide needs a code frame.');
+        const targets = [...document.querySelectorAll('.expressive-code .frame')].map((frame) => ({ frame, cloned: false, terminal: frame.classList.contains('is-terminal'), titled: frame.classList.contains('has-title') }));
+        for (const variant of [{ terminal: true, title: true }, { terminal: false, title: true }]) {
+          if (targets.some((target) => target.terminal === variant.terminal && target.titled === variant.title)) continue;
+          const wrapper = source.closest('.expressive-code')?.cloneNode(true); const frame = wrapper?.querySelector('.frame'); if (!wrapper || !frame) throw new Error('Frame clones require an expressive-code wrapper.'); frame.classList.toggle('is-terminal', variant.terminal); frame.classList.toggle('has-title', variant.title);
+          let title = frame.querySelector('.header .title'); if (!title) { title = document.createElement('div'); title.className = 'title'; frame.querySelector('.header')?.append(title); }
+          title.textContent = 'example.txt'; wrapper.dataset.acTemporaryFrame = 'true'; document.body.append(wrapper); targets.push({ frame, cloned: true, wrapper, terminal: variant.terminal, titled: variant.title });
+        }
+        return targets.map((entry, index) => { entry.frame.dataset.acFrameCase = String(index); return String(index); });
+      });
+      const caseCounts = await page.evaluate(() => [...document.querySelectorAll('[data-ac-frame-case]')].reduce((counts, frame) => { const key = `${frame.classList.contains('is-terminal')}:${frame.classList.contains('has-title')}`; counts[key] = (counts[key] ?? 0) + 1; return counts; }, {}));
+      for (const key of ['true:false', 'true:true', 'false:true', 'false:false']) assert.ok(caseCounts[key] >= 1, `The frame oracle must exercise ${key}.`);
+      const copyDimensions = await page.evaluate(() => [...document.querySelectorAll('[data-ac-frame-case] .copy button')].map((button) => { const style = getComputedStyle(button); const rect = button.getBoundingClientRect(); return { width: rect.width, height: rect.height, computedWidth: style.width }; }));
+      for (const dimensions of copyDimensions) { assert.ok(dimensions.width > dimensions.height, 'COPY button must not be square'); assert.notEqual(dimensions.computedWidth, '28px'); assert.ok(dimensions.width < 120, 'COPY button width must remain compact'); }
+      for (const id of ids) {
+        const locator = page.locator(`[data-ac-frame-case="${id}"]`); const button = locator.locator('.copy button');
+        const normal = await page.evaluate((caseId) => { const frame = document.querySelector(`[data-ac-frame-case="${caseId}"]`); if (!frame) throw new Error('Frame case disappeared.'); const probe = document.createElement('i'); probe.style.color = 'var(--ac-code-bg)'; document.body.append(probe); const background = getComputedStyle(probe).color; probe.remove(); const header = frame.querySelector('.header'); const title = frame.querySelector('.header .title'); const button = frame.querySelector('.copy button'); const code = frame.querySelector('.ec-line .code'); const pre = frame.querySelector('pre'); if (!header || !button || !code || !pre) throw new Error('Frame case must have a header, COPY button, and first code line.'); const range = document.createRange(); range.selectNodeContents(code); const textRect = range.getBoundingClientRect(); const style = getComputedStyle(button); const headerStyle = getComputedStyle(header); const titleStyle = title && getComputedStyle(title); const titleRect = title?.getBoundingClientRect(); const rect = button.getBoundingClientRect(); const copy = button.closest('.copy'); return { terminal: frame.classList.contains('is-terminal'), titled: frame.classList.contains('has-title'), header: { display: headerStyle.display, height: header.getBoundingClientRect().height, before: getComputedStyle(header, '::before').content, after: getComputedStyle(header, '::after').content }, title: titleStyle && { display: titleStyle.display, size: titleStyle.fontSize, family: titleStyle.fontFamily, color: titleStyle.color, visible: titleRect !== undefined && titleStyle.display !== 'none' && titleRect.width > 0 && titleRect.height > 0 }, copy: { height: rect.height, width: rect.width, opacity: style.opacity, background: style.backgroundColor, border: style.borderColor, borderWidth: style.borderWidth, borderStyle: style.borderStyle, before: getComputedStyle(button, '::before').content, after: getComputedStyle(button, '::after').content, inner: button.querySelector('div') ? getComputedStyle(button.querySelector('div')).display : null, title: button.getAttribute('title'), copied: button.getAttribute('data-copied'), feedback: copy?.querySelector(':scope > [aria-live]')?.getAttribute('aria-live') ?? null, clearance: parseFloat(getComputedStyle(code).paddingInlineEnd), buttonWidth: rect.width, lineFits: pre.scrollWidth <= pre.clientWidth, intersects: rect.left < textRect.right && textRect.left < rect.right && rect.top < textRect.bottom && textRect.top < rect.bottom }, background }; }, id);
+        const pseudo = await page.evaluate((caseId) => { const frame = document.querySelector(`[data-ac-frame-case="${caseId}"]`); const header = frame?.querySelector('.header'); const button = frame?.querySelector('.copy button'); if (!header || !button) throw new Error('D4 pseudo-element targets disappeared.'); const read = (element, pseudo) => { const style = getComputedStyle(element, pseudo); return { content: style.content, family: style.fontFamily, size: style.fontSize, weight: style.fontWeight, lineHeight: style.lineHeight, spacing: parseFloat(style.letterSpacing), transform: style.textTransform, color: style.color, position: style.position, inset: style.inset, width: style.width, height: style.height, mask: style.mask, webkitMask: style.webkitMask, opacity: style.opacity, background: style.background, backgroundColor: style.backgroundColor, backgroundImage: style.backgroundImage, margin: style.margin }; }; const headerStyle = getComputedStyle(header); return { header: { display: headerStyle.display, align: headerStyle.alignItems, justify: headerStyle.justifyContent, before: read(header, '::before') }, copy: { after: read(button, '::after') } }; }, id);
+        const gray3 = await page.evaluate(() => { const probe = document.createElement('i'); probe.style.color = 'var(--sl-color-gray-3)'; document.body.append(probe); const value = getComputedStyle(probe).color; probe.remove(); return value; });
+        if (normal.terminal || normal.titled) { assert.equal(pseudo.header.display, 'flex'); assert.equal(pseudo.header.align, 'center'); assert.equal(pseudo.header.justify, 'flex-start'); }
+        if (normal.terminal && !normal.titled) { const label = pseudo.header.before; assert.equal(label.content, '"TERMINAL"'); assert.match(label.family, /mono/i); assert.equal(label.size, '11px'); assert.equal(label.weight, '500'); assert.equal(label.lineHeight, '13.2px'); assertWithinTolerance(label.spacing, 1.32, 0.05, 'TERMINAL letter spacing'); assert.equal(label.transform, 'uppercase'); assert.deepEqual(rgbChannels(label.color), rgbChannels(gray3)); assert.equal(label.position, 'static'); assert.equal(label.inset, 'auto'); assertWithinTolerance(parseFloat(label.height), 13.2, 1, 'TERMINAL label height'); assert.ok(parseFloat(label.width) > parseFloat(label.height), 'TERMINAL label must not use a fixed dot box'); assert.equal(label.mask, 'none'); assert.equal(label.webkitMask, 'none'); assert.equal(label.opacity, '1'); assert.equal(label.backgroundImage, 'none'); assert.equal(label.backgroundColor, 'rgba(0, 0, 0, 0)'); assert.equal(label.margin, '0px'); }
+        const copyLabel = pseudo.copy.after; assert.equal(copyLabel.content, '"COPY"'); assert.match(copyLabel.family, /mono/i); assert.equal(copyLabel.size, '11px'); assert.equal(copyLabel.weight, '500'); assert.equal(copyLabel.lineHeight, '11px'); assertWithinTolerance(copyLabel.spacing, 0.88, 0.05, 'COPY letter spacing'); assert.equal(copyLabel.transform, 'uppercase'); assert.deepEqual(rgbChannels(copyLabel.color), rgbChannels(gray3)); assert.equal(copyLabel.position, 'static'); assert.equal(copyLabel.inset, 'auto'); assert.equal(copyLabel.mask, 'none'); assert.equal(copyLabel.webkitMask, 'none'); assert.equal(copyLabel.opacity, '1', 'COPY pseudo-element must be fully opaque.'); assert.equal(copyLabel.backgroundImage, 'none'); assert.equal(copyLabel.backgroundColor, 'rgba(0, 0, 0, 0)'); assert.equal(copyLabel.margin, '0px');
+        await button.hover();
+        await page.waitForFunction((caseId) => { const button = document.querySelector(`[data-ac-frame-case="${caseId}"] .copy button`); if (!button) return false; const probe = document.createElement('i'); probe.style.color = 'var(--sl-color-gray-1)'; document.body.append(probe); const text = getComputedStyle(probe).color; probe.style.color = 'var(--sl-color-gray-4)'; const border = getComputedStyle(probe).color; probe.remove(); const style = getComputedStyle(button); return getComputedStyle(button, '::after').color === text && style.borderColor === border; }, id);
+        const hovered = await page.evaluate((caseId) => { const button = document.querySelector(`[data-ac-frame-case="${caseId}"] .copy button`); if (!button) throw new Error('COPY button disappeared.'); const style = getComputedStyle(button); return { text: getComputedStyle(button, '::after').color, border: style.borderColor, background: style.backgroundColor }; }, id);
+        assert.equal(normal.header.after, 'none'); assertWithinTolerance(normal.copy.height, 28, 1, 'Copy button height'); assert.ok(normal.copy.width > 0); assert.equal(normal.copy.opacity, '1'); assert.deepEqual(rgbChannels(normal.copy.background), rgbChannels(normal.background)); assert.deepEqual(rgbChannels(normal.copy.border), rgbChannels(await page.evaluate(() => { const probe = document.createElement('i'); probe.style.color = 'var(--sl-color-hairline)'; document.body.append(probe); const color = getComputedStyle(probe).color; probe.remove(); return color; }))); assert.equal(normal.copy.before, 'none'); assert.equal(normal.copy.after, '"COPY"'); assert.equal(normal.copy.inner, 'none'); assert.equal(normal.copy.borderWidth, '1px'); assert.equal(normal.copy.borderStyle, 'solid'); const expectedCopyLabels = scenario.path.startsWith('/ja/') ? { title: 'クリップボードにコピー', copied: 'コピーしました！' } : { title: 'Copy to clipboard', copied: 'Copied!' }; assert.equal(normal.copy.title, expectedCopyLabels.title); assert.equal(normal.copy.copied, expectedCopyLabels.copied); assert.equal(normal.copy.feedback, 'polite'); assert.ok(normal.copy.clearance >= normal.copy.buttonWidth + 8, 'first code line must clear the COPY button'); const { intersects } = normal.copy; if (normal.copy.lineFits) assert.equal(intersects, false, 'COPY button must not overlap a fitting first line'); assert.deepEqual(rgbChannels(hovered.background), rgbChannels(normal.background)); assert.deepEqual(rgbChannels(hovered.text), rgbChannels(await page.evaluate(() => { const probe = document.createElement('i'); probe.style.color = 'var(--sl-color-gray-1)'; document.body.append(probe); const color = getComputedStyle(probe).color; probe.remove(); return color; }))); assert.deepEqual(rgbChannels(hovered.border), rgbChannels(await page.evaluate(() => { const probe = document.createElement('i'); probe.style.color = 'var(--sl-color-gray-4)'; document.body.append(probe); const color = getComputedStyle(probe).color; probe.remove(); return color; })));
+        if (!normal.terminal && !normal.titled) { assert.equal(normal.header.display, 'none'); assert.equal(normal.header.height, 0); } else { assert.notEqual(normal.header.display, 'none'); assertWithinTolerance(normal.header.height, 36, 1, 'Visible code frame header height'); }
+        if (normal.terminal && !normal.titled) { assert.equal(normal.header.before, '"TERMINAL"'); assert.equal(normal.title?.display, 'none'); } else if (normal.terminal) assert.equal(normal.header.before, 'none');
+        if (!normal.terminal && normal.titled) { assert.notEqual(normal.title?.display, 'none'); assert.equal(normal.title?.visible, true); }
+        if (normal.terminal && normal.titled) { assert.notEqual(normal.title?.display, 'none'); assert.equal(normal.title?.size, '13px'); assert.match(normal.title?.family ?? '', /mono/i); assert.deepEqual(rgbChannels(normal.title?.color ?? ''), rgbChannels(await page.evaluate(() => { const probe = document.createElement('i'); probe.style.color = 'var(--sl-color-gray-1)'; document.body.append(probe); const color = getComputedStyle(probe).color; probe.remove(); return color; }))); }
+      }
+      await page.evaluate(() => { document.querySelectorAll('[data-ac-temporary-frame="true"]').forEach((entry) => entry.remove()); document.querySelectorAll('[data-ac-frame-case]').forEach((entry) => entry.removeAttribute('data-ac-frame-case')); });
+    } finally { await context.close(); }
+  }
+}
+
+/**
+ * Keeps document measurements tied to the approved layout contract rather than browser serialization details.
+ * A one-pixel allowance covers fractional-layout serialization, two pixels covers comparing two
+ * independently rounded gutters, and letter spacing accepts five hundredths of a pixel because
+ * font shaping exposes a fractional computed value.
+ */
+function assertWithinTolerance(actual, expected, tolerance, message) {
+  assert.ok(Math.abs(actual - expected) <= tolerance, `${message}: expected ${expected} ± ${tolerance}, received ${actual}`);
+}
+
+/**
+ * Confirms a narrow code block remains readable through its own scroll container instead of
+ * relying on clipping or page-level overflow. Assigning scrollLeft is a behavioral probe: it
+ * proves that the final portion of the command can be reached without mutating durable content.
+ */
+async function assertCodeBlockScroll(browser) {
+  for (const scenario of SCREENSHOTS.filter((entry) => entry.path === '/reference/cli/' && entry.colorScheme === 'dark')) {
+    const { viewport } = scenario; const context = await browser.newContext({ colorScheme: scenario.colorScheme, viewport }); const page = await context.newPage();
+    try { await page.goto(pageUrl('/reference/cli/'), { waitUntil: 'networkidle' }); const measure = await page.evaluate(() => { const pre = [...document.querySelectorAll('.expressive-code pre[data-language="text"]')].find((entry) => entry.textContent?.includes('Usage: ambercast')); if (!pre) throw new Error('The CLI reference needs its Usage: ambercast text code block.'); pre.scrollLeft = pre.scrollWidth; return { scrollWidth: pre.scrollWidth, clientWidth: pre.clientWidth, scrollLeft: pre.scrollLeft, overflow: getComputedStyle(pre).overflowX, pageWidth: document.documentElement.scrollWidth, clientPageWidth: document.documentElement.clientWidth }; }); if (viewport.width === 390) { assert.ok(measure.scrollWidth > measure.clientWidth); assert.ok(['auto', 'scroll'].includes(measure.overflow)); assertWithinTolerance(measure.scrollLeft, measure.scrollWidth - measure.clientWidth, 1, 'Code block final scroll position'); } assert.ok(measure.pageWidth <= measure.clientPageWidth + 1); } finally { await context.close(); }
+  }
+}
+
+/**
+ * Measures the wide document layout as a geometric symmetry contract. It compares the article's
+ * two free gutters, the fixed table-of-contents column, and the viewport edge so a compensating
+ * offset in one region cannot hide a layout regression in another. At the boundary widths, the
+ * main pane is 560px wide and cannot sustain a 3rem gap, so the minimum gap is checked only at
+ * the 1440px and 2000px acceptance widths.
+ */
+async function assertDocumentColumnSymmetry(browser) {
+  for (const scenario of SCREENSHOTS.filter((entry) => ['/guides/introduction/', '/ja/guides/introduction/'].includes(entry.path))) {
+    const { viewport } = scenario; const context = await browser.newContext({ colorScheme: scenario.colorScheme, viewport }); const page = await context.newPage();
+    try { await page.goto(pageUrl(scenario.path), { waitUntil: 'networkidle' }); const geometry = await page.evaluate(() => { const sidebar = document.querySelector('.sidebar-pane'); const contents = [...document.querySelectorAll('.main-pane .content-panel .sl-container')]; const toc = document.querySelector('.right-sidebar-container'); const inner = document.querySelector('.right-sidebar-panel .sl-container'); if (!sidebar || !toc || !inner || contents.length === 0) throw new Error('The three-column document layout is incomplete.'); return { sidebarRight: sidebar.getBoundingClientRect().right, content: contents.map((entry) => { const rect = entry.getBoundingClientRect(); return { left: rect.left, right: rect.right }; }), toc: toc.getBoundingClientRect().toJSON(), innerRight: inner.getBoundingClientRect().right, clientWidth: document.documentElement.clientWidth, scrollWidth: document.documentElement.scrollWidth }; }); assert.ok(geometry.scrollWidth <= geometry.clientWidth + 1); if (viewport.width >= 1152) { for (const content of geometry.content) { assertWithinTolerance(content.left, geometry.content[0].left, 1, 'All content columns share a left edge'); assertWithinTolerance(content.right, geometry.content[0].right, 1, 'All content columns share a right edge'); } const content = geometry.content[0]; assertWithinTolerance((content.left - geometry.sidebarRight) - (geometry.toc.left - content.right), 0, 2, 'Document gutters must be symmetric'); assertWithinTolerance(geometry.toc.right, geometry.clientWidth, 1, 'TOC right edge'); assertWithinTolerance(geometry.toc.width, 272, 1, 'TOC width'); assert.ok(geometry.innerRight <= geometry.clientWidth); if (viewport.width >= 1440) assert.ok(geometry.toc.left - content.right >= 48); } else assert.notEqual(Math.round(geometry.toc.width), 272); } finally { await context.close(); }
+  }
+}
+
+/**
+ * Opens the responsive documentation drawer only when the sidebar is otherwise unavailable.
+ * The helper keeps each viewport assertion focused on its visible navigation surface and does
+ * not assume a particular animation implementation.
+ */
+async function openDocumentationMenu(page) {
+  const menu = page.locator('button.sl-menu-button[popovertarget="starlight__sidebar"]').first();
+  assert.equal(await menu.count(), 1, 'A document page must render Starlight’s mobile menu control.');
+  if (!await page.locator('#starlight__sidebar:popover-open').count()) await menu.click();
+  await page.waitForFunction(() => document.querySelector('#starlight__sidebar')?.matches(':popover-open') === true);
+  await page.locator('.sidebar-pane').waitFor({ state: 'visible' });
+}
+
 async function captureScreenshots(browser) {
   await mkdir(SCREENSHOT_DIRECTORY, { recursive: true });
 
@@ -1182,6 +1401,11 @@ async function main() {
     await assertResponsiveAndDocumentationInvariants(browser);
     await assertApprovedCopyAndNoClipping(browser);
     await assertSsrClientBuilderEquality(browser);
+    await assertDocumentationSurfaces(browser);
+    await assertCodeTokenPalette(browser);
+    await assertCodeFrameVariants(browser);
+    await assertCodeBlockScroll(browser);
+    await assertDocumentColumnSymmetry(browser);
     await captureBoundaryAndPhaseScreenshots(browser);
     await captureScreenshots(browser);
   } finally {
