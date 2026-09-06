@@ -365,6 +365,40 @@ export function scanFunctionValueReferences(
     const isArrayLike = checker.isArrayType(type) || checker.isTupleType(type);
     return isArrayLike ? checker.getIndexTypeOfType(type, ts.IndexKind.Number) : undefined;
   };
+  const propertyType = (type: ts.Type, name: string): ts.Type | undefined => {
+    const property = checker.getPropertyOfType(type, name);
+    return property === undefined ? undefined : checker.getTypeOfSymbolAtLocation(property, canonicalDeclaration);
+  };
+
+  /**
+   * Narrows a `next()` return type to its yielded-value type when — and only
+   * when — that type is a two-branch union with exactly one `done: true`
+   * constituent: the shape `IteratorResult<T, TReturn>` always produces (as
+   * `IteratorYieldResult<T> | IteratorReturnResult<TReturn>`, regardless of
+   * `TReturn`). `checker.getPropertyOfType` resolves that union's own `value`
+   * property to the type merged across both branches; a nested-destructuring
+   * lookup against that broadened type fails whenever the return branch's
+   * value type lacks the looked-up property, so the merged read cannot see
+   * through to the yield branch's own shape. This helper isolates the yield
+   * branch's value type only for that exact shape; every other union (no
+   * `done: true` constituent, or more than one of either kind) resolves
+   * through the same whole-union `value` lookup, uniformly across every
+   * constituent.
+   */
+  const iteratorResultYieldType = (resultType: ts.Type): ts.Type | undefined => {
+    if (!resultType.isUnion()) return propertyType(resultType, 'value');
+    const isDoneTrueBranch = (branch: ts.Type): boolean => {
+      const doneType = propertyType(branch, 'done');
+      return doneType !== undefined
+        && Boolean(doneType.flags & ts.TypeFlags.BooleanLiteral)
+        && checker.isTypeAssignableTo(doneType, checker.getTrueType());
+    };
+    const returnBranches = resultType.types.filter(isDoneTrueBranch);
+    const yieldBranches = resultType.types.filter((branch) => !isDoneTrueBranch(branch));
+    return returnBranches.length === 1 && yieldBranches.length === 1
+      ? propertyType(yieldBranches[0]!, 'value')
+      : propertyType(resultType, 'value');
+  };
   /**
    * Derives an iterator member's yielded type from the member's own call
    * signature. Nominal iterator references retain their first type argument;
@@ -387,14 +421,12 @@ export function scanFunctionValueReferences(
       ? checker.getTypeArguments(iteratorReturnType as ts.TypeReference)[0]
       : undefined;
     if (typeArgument !== undefined) return typeArgument;
-    const nextProperty = checker.getPropertyOfType(iteratorReturnType, 'next');
-    if (nextProperty === undefined) return undefined;
-    const nextMethodType = checker.getTypeOfSymbolAtLocation(nextProperty, canonicalDeclaration);
+    const nextMethodType = propertyType(iteratorReturnType, 'next');
+    if (nextMethodType === undefined) return undefined;
     const nextSignature = checker.getSignaturesOfType(nextMethodType, ts.SignatureKind.Call)[0];
     if (nextSignature === undefined) return undefined;
     const iterationResultType = checker.getReturnTypeOfSignature(nextSignature);
-    const valueProperty = checker.getPropertyOfType(iterationResultType, 'value');
-    return valueProperty === undefined ? undefined : checker.getTypeOfSymbolAtLocation(valueProperty, canonicalDeclaration);
+    return iteratorResultYieldType(iterationResultType);
   };
   /**
    * Resolves the element type yielded by an assignment-form for-of source
