@@ -51,7 +51,7 @@ npx ambercast <command>
    npx ambercast run
    ```
 
-`generate` はプロンプトの隣に `sign-in.ambercast.plan.json` と `sign-in.ambercast.grounding.json` を書き出すため、3 ファイルすべてを git にコミットします。以降の `run` はプランをリプレイするだけで AI 呼び出しはゼロです（詳細は[プロンプトの書き方](https://kotarotsubaki.github.io/ambercast/ja/guides/writing-prompts/)を参照してください）。
+`generate` はプロンプトの隣に `sign-in.ambercast.plan.json` と `sign-in.ambercast.grounding.json` を書き出すため、3 ファイルすべてを git にコミットします。以降の `run` はキャッシュ済みの grounding が揃っている限りプランをリプレイするだけで AI 呼び出しはゼロです。grounding が欠けたステップは AI にフォールバックし、`--cache-only` を付けると代わりに失敗します（詳細は[プロンプトの書き方](https://kotarotsubaki.github.io/ambercast/ja/guides/writing-prompts/)を参照してください）。
 
 ## もっと知る
 

@@ -51,7 +51,7 @@ npx ambercast <command>
    npx ambercast run
    ```
 
-`generate` 会在提示词旁边生成 `sign-in.ambercast.plan.json` 和 `sign-in.ambercast.grounding.json`，请将这三个文件都提交到 git。此后每次 `run` 仅重放该计划且零 AI 调用；详情请参见[编写提示词](https://kotarotsubaki.github.io/ambercast/zh-cn/guides/writing-prompts/)指南。
+`generate` 会在提示词旁边生成 `sign-in.ambercast.plan.json` 和 `sign-in.ambercast.grounding.json`，请将这三个文件都提交到 git。此后每次 `run` 只要缓存的 grounding 完整，就仅重放该计划且零 AI 调用；缺失 grounding 的步骤会回退到 AI，加上 `--cache-only` 则会直接失败；详情请参见[编写提示词](https://kotarotsubaki.github.io/ambercast/zh-cn/guides/writing-prompts/)指南。
 
 ## 了解更多
 

@@ -51,7 +51,7 @@ There is no `init` command yet; a prompt file is all you need, and defaults assu
    npx ambercast run
    ```
 
-`generate` writes `sign-in.ambercast.plan.json` and `sign-in.ambercast.grounding.json` next to the prompt; be sure to commit all three files. Every later `run` replays the plan with zero AI calls — take a look at the [Writing prompts](https://kotarotsubaki.github.io/ambercast/guides/writing-prompts/) guide.
+`generate` writes `sign-in.ambercast.plan.json` and `sign-in.ambercast.grounding.json` next to the prompt; be sure to commit all three files. Every later `run` replays the plan with zero AI calls as long as the cached grounding is intact; a grounding miss falls back to AI for that step, and `--cache-only` makes it fail instead — take a look at the [Writing prompts](https://kotarotsubaki.github.io/ambercast/guides/writing-prompts/) guide.
 
 ## Learn more
 
