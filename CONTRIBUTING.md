@@ -4,10 +4,16 @@ Thanks for your interest in ambercast!
 
 ## Current state
 
-The package is a pre-implementation placeholder — the CLI is not functional
-yet, though the TypeScript/ESM build toolchain (`tsdown`, Vitest) is in
-place. Realistic contributions are still limited to docs, configuration, and
-toolchain work until the generator/runner land.
+ambercast is published on npm (0.x, pre-1.0). The CLI (`generate`, `run`, `check`, `heal`) is functional, but breaking changes can still land in a minor release. Contributions to code, tests, docs (README in three locales, the docs site under `website/`), and toolchain are all welcome. Please open an issue before large changes.
+
+## Development
+
+Requires Node.js >= 22.14, then run `npm ci`.
+
+- `npm run build` — compile `src/` to `dist/` (tsdown) and regenerate the config schema
+- `npm test` — build then run the Vitest suite
+- `npm run typecheck` / `npm run lint`
+- `cd website && npm ci && npm run build` — build the docs site (Astro/Starlight); `npm run dev` there for a local preview
 
 ## How to contribute
 

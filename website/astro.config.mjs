@@ -3,7 +3,7 @@ import { ExpressiveCodeTheme } from '@astrojs/starlight/expressive-code';
 import { defineConfig } from 'astro/config';
 import { codeThemes } from './src/styles/code-themes';
 
-const site = 'https://tsubaki01.github.io';
+const site = 'https://kotarotsubaki.github.io';
 const base = '/ambercast';
 const assetUrl = (asset) => new URL(`${base}/${asset}`, site).href;
 
@@ -19,9 +19,9 @@ export default defineConfig({
         ja: { label: '日本語', lang: 'ja' },
         'zh-cn': { label: '简体中文', lang: 'zh-CN' },
       },
-      social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/Tsubaki01/ambercast' }],
+      social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/kotarotsubaki/ambercast' }],
       editLink: {
-        baseUrl: 'https://github.com/Tsubaki01/ambercast/edit/main/website/',
+        baseUrl: 'https://github.com/kotarotsubaki/ambercast/edit/main/website/',
       },
       lastUpdated: false,
       favicon: assetUrl('favicon.svg'),
