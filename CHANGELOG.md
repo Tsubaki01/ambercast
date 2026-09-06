@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.0](https://github.com/kotarotsubaki/ambercast/compare/v0.2.0...v0.3.0) (2026-09-06)
+
+
+### Features
+
+* **website:** align the docs pages with the design handoff ([#285](https://github.com/kotarotsubaki/ambercast/issues/285)) ([a9e1d65](https://github.com/kotarotsubaki/ambercast/commit/a9e1d65bf1bf6bcd762b7ddfc2c73a366771e2ac))
+* **website:** apply the ambercast brand and design system to the Starlight docs site ([#273](https://github.com/kotarotsubaki/ambercast/issues/273)) ([66d72f1](https://github.com/kotarotsubaki/ambercast/commit/66d72f13315027d33b148b3e5aff89e33c80ca74))
+* **website:** apply the museum-lighting landing design and header fixes ([#280](https://github.com/kotarotsubaki/ambercast/issues/280)) ([8b2c8dc](https://github.com/kotarotsubaki/ambercast/commit/8b2c8dc0745a4df5418c81fd645e12457672c01d))
+
+
+### Bug Fixes
+
+* **architecture:** isolate the yield branch of an IteratorResult union for issue 276 round 3 ([#282](https://github.com/kotarotsubaki/ambercast/issues/282)) ([ef8c2d4](https://github.com/kotarotsubaki/ambercast/commit/ef8c2d4ffe816d2c9cdfa791786098a1bde25624))
+* **architecture:** resolve remaining assignment-form for-of gaps for issue 276 (round 2) ([#281](https://github.com/kotarotsubaki/ambercast/issues/281)) ([89d8995](https://github.com/kotarotsubaki/ambercast/commit/89d8995f5b01b602147f36a9c3ccc63b8510cff5))
+* **architecture:** track nested-array assignment destructuring whose element target is not a bare identifier ([#272](https://github.com/kotarotsubaki/ambercast/issues/272)) ([8dc4bae](https://github.com/kotarotsubaki/ambercast/commit/8dc4bae3a975189f9e257a34daec28087da7722e))
+* **architecture:** unwrap transparent wrappers and track for-of assignment heads in nested-array assignment destructuring ([#279](https://github.com/kotarotsubaki/ambercast/issues/279)) ([bca6bf2](https://github.com/kotarotsubaki/ambercast/commit/bca6bf2711325d9a91c93363d696b013eb58f03c))
+
 ## [0.2.0](https://github.com/Tsubaki01/ambercast/compare/v0.1.0...v0.2.0) (2026-09-04)
 
 
