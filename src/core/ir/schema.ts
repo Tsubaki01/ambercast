@@ -1260,6 +1260,43 @@ export const GeneratedPlanResponseForPolicy = GeneratedPlanResponse.extend({
 });
 
 /**
+ * Defines the provider request schema sent to {@link AiExecutor.execute}.
+ *
+ * Both adapters validate the structured response with this JSON Schema through
+ * AJV before {@link GeneratedPlanResponseForPolicy} or any local policy sees
+ * it. It must admit an empty transient intent for a genuinely action-only AI
+ * step; otherwise the generic transport boundary rejects that response before
+ * instruction coverage can report its specific missing-success-criterion
+ * diagnostic. This is deliberately distinct from
+ * {@link GeneratedPlanResponseForPolicy}, whose local acceptance boundary
+ * accepts strict and relaxed AI shapes for a separate purpose (Issue #214).
+ * The steps union reuses {@link GeneratedStep}'s own non-AI members alongside
+ * one relaxed AI branch, rather than embedding {@link GeneratedStep} itself
+ * (which still carries the strict AI branch): each `kind` maps to exactly one
+ * schema, so the compiled JSON Schema carries no competing AI alternatives.
+ * Only `verificationIntent`'s
+ * minimum length differs from {@link GeneratedAiStep};
+ * `instructionCoverage` keeps its minimum length, `secrets` and shared
+ * `AiStepFields` remain identical, and {@link VerificationIntent}'s element
+ * shape is unchanged. {@link GeneratedPlanResponse} remains the committed-plan
+ * provider-shape authority, while
+ * {@link GeneratedPlanResponseForPolicy} remains the separate local
+ * acceptance contract.
+ */
+export const GeneratedPlanResponseRequest = GeneratedPlanResponse.extend({
+  steps: z.array(z.discriminatedUnion('kind', [
+    GeneratedActionStep,
+    AssertStep,
+    CaptureStep,
+    GeneratedAiStep.extend({
+      verificationIntent: z.array(z.lazy(() => VerificationIntent)),
+    }),
+  ])),
+});
+/** Provider request-response shape used for `AiExecutor.execute()`'s `responseSchema` type parameter. */
+export type GeneratedPlanResponseRequest = z.infer<typeof GeneratedPlanResponseRequest>;
+
+/**
  * The validated, provider-authored portion from which a complete plan is
  * assembled locally.
  */
@@ -1271,10 +1308,33 @@ export type GeneratedInstructionCoveredStep =
   | GeneratedInstructionCoveredAiStep;
 
 /**
- * Provider response shape used to construct Plan v2.
+ * Provider response shape whose AI steps carry complete instruction-coverage
+ * citations and transient verification intents, prior to local attribution.
  *
- * {@link GeneratedPlanResponse} validates the covered step union before
- * generation policy examines citations or intent.
+ * This type is never a parse target on its own — no schema `.safeParse`s it
+ * directly. It names the shape a generated response takes between three
+ * separate runtime boundaries a response crosses in order. First, each
+ * adapter's AJV check validates the raw provider payload against
+ * {@link GeneratedPlanResponseRequest}'s compiled JSON Schema, the strict
+ * transport contract; it admits an empty `verificationIntent` array (without
+ * loosening `instructionCoverage` or the retained intent-element shape) so a
+ * genuinely action-only AI step, which has no success criterion to attach an
+ * intent to, is not rejected before it can reach a more specific local
+ * diagnosis. Second, {@link GeneratedPlanResponseForPolicy}'s `.safeParse` is
+ * the local generation-policy boundary. It also admits the empty array —
+ * every response reaching it already passed the transport boundary above —
+ * and it independently widens each intent's `assertion` to `JsonValue`
+ * rather than reusing that boundary's stricter element shape, keeping this
+ * contract self-sufficient instead of assuming an AJV pass already happened.
+ * The specific `success-criterion-missing` and `intent-id-missing`
+ * diagnostics for an admitted empty array are reported afterward, by
+ * {@link prepareInstructionCoveredSteps}'s instruction-coverage validation,
+ * not by this `.safeParse` step itself. Third, {@link PlanDocument}'s
+ * `.safeParse` is the committed-plan authority, reached only once local
+ * attribution replaces this type's provider-facing citations and transient
+ * intents with committed `sourceSpan` provenance —
+ * {@link GeneratedInstructionCoveredStep} is therefore a pre-attribution,
+ * provider-facing shape, not the committed one.
  */
 export type GeneratedInstructionCoveredPlanResponse = Omit<
   GeneratedPlanResponse,

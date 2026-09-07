@@ -148,6 +148,52 @@ function colorize(value: string, color: string, enabled: boolean): string {
 }
 
 /**
+ * Escapes C0 controls (0x00–0x1F), DEL (0x7F), and C1 controls (0x80–0x9F)
+ * into display-safe visible forms. Backspace, tab, newline, form feed, and
+ * carriage return use JSON's short escapes; every other affected value uses
+ * a backslash, the letter u, and four lowercase hexadecimal digits.
+ *
+ * A literal backslash remains unescaped to favor readability over round-trip
+ * safety. This display-time transform prevents untrusted filesystem-derived
+ * strings from injecting terminal control sequences and never applies to
+ * `--json` output.
+ *
+ * Only these three ranges change; everything else passes through byte-for-byte.
+ */
+function escapeControlChars(value: string): string {
+  let escaped = '';
+
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    switch (code) {
+      case 0x08:
+        escaped += '\\b';
+        break;
+      case 0x09:
+        escaped += '\\t';
+        break;
+      case 0x0a:
+        escaped += '\\n';
+        break;
+      case 0x0c:
+        escaped += '\\f';
+        break;
+      case 0x0d:
+        escaped += '\\r';
+        break;
+      default:
+        if (code <= 0x1f || code === 0x7f || (code >= 0x80 && code <= 0x9f)) {
+          escaped += '\\u' + code.toString(16).padStart(4, '0');
+        } else {
+          escaped += value[index]!;
+        }
+    }
+  }
+
+  return escaped;
+}
+
+/**
  * Renders a report-shaped value as compact terminal lines.
  *
  * @param envelope - The runtime report or an unexpected non-report value.
@@ -160,10 +206,16 @@ function colorize(value: string, color: string, enabled: boolean): string {
  * the repair outcome and settled application state. Partially healed and
  * unresolved rows remain unhealthy regardless of application; otherwise,
  * applied, preview-only, and no-artifact-change are healthy. The renderer appends a result's optional `reason`; check supplies only its fixed,
- * path-free reason. The displayed identity comes from `file`, never
- * `groundingFile` or `artifactFile`, so artifact evidence cannot be rendered as
- * an explanatory host path. A `skipped` row has no reason or artifact evidence
+ * path-free reason. The displayed identity comes from `file`, falling back to
+ * `id` when `file` is absent, and never from `groundingFile` or `artifactFile`,
+ * so artifact evidence cannot be rendered as an explanatory host path. A `skipped` row has no reason or artifact evidence
  * and retains the generic non-healthy styling.
+ *
+ * The `file`/`id`, `reason`, and error `message` values written to this output
+ * have C0, DEL, and C1 control characters replaced with a JSON-style
+ * visible-escape form because they may originate in untrusted filesystem paths
+ * or free text; literal backslashes are preserved unescaped. This does not
+ * affect the `status` column or the JSON output path.
  */
 export function renderHumanReport(
   envelope: Awaited<ReturnType<typeof runRunCommand>>['envelope'],
@@ -191,13 +243,13 @@ export function renderHumanReport(
         && healRepairOutcome !== 'unresolved'
         && (healApplication === 'applied' || healApplication === 'preview-only' || healApplication === 'no-artifact-change');
     const statusColor = healthy ? '32' : status === 'would-generate' ? '33' : '31';
-    const reason = typeof item.reason === 'string' ? `: ${item.reason}` : '';
-    return `${colorize(status, statusColor, color)} ${String(item.file ?? item.id ?? '')}${reason}`.trimEnd();
+    const reason = typeof item.reason === 'string' ? `: ${escapeControlChars(item.reason)}` : '';
+    return `${colorize(status, statusColor, color)} ${escapeControlChars(String(item.file ?? item.id ?? ''))}${reason}`.trimEnd();
   });
 
   for (const error of errors) {
     const item = error as Record<string, unknown>;
-    lines.push(`${colorize('error', '31', color)} ${String(item.message ?? 'Unknown error')}`);
+    lines.push(`${colorize('error', '31', color)} ${escapeControlChars(String(item.message ?? 'Unknown error'))}`);
   }
 
   return `${lines.join('\n')}${lines.length === 0 ? '' : '\n'}`;

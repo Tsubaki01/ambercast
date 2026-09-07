@@ -22,9 +22,42 @@
  * unclassified syntax, and checker or scanner defects. Reads from
  * `any`/`unknown` index slots, dynamic keys on name-identified sinks, and
  * aggregates reachable only through an externally-typed value's signature are
- * outside the guarantee; none is an allow-path,
+ * outside the guarantee. Two further shapes stay outside the guarantee rather
+ * than being closed: a union that includes the protected type as a slot type
+ * on an externally declared value — a `declare`, an external type definition,
+ * or a cast — can escape aggregate detection, and a direct call reached by
+ * narrowing that value afterward is not reported (an in-program value reaches
+ * the same slot type through its own construction site instead, which is
+ * already reported there); and a structurally compatible call-signature
+ * match's `void`-return gate is enforced only on the aggregate-escape path —
+ * the index-signature path reports on assignability alone, without that gate,
+ * so the two paths disagree on a `void`-returning structural match. None is an allow-path,
  * so a protected authority reached through one requires scanner extension or
- * explicit review.
+ * explicit review. SA-2 also excludes an array literal nested directly in
+ * another array literal, both a direct array-literal spread element
+ * (`ts.SpreadElement`, such as `[...rest]`) and an object-rest spread nested
+ * inside an array-literal element (`ts.SpreadAssignment`, such as
+ * `[{ ...rest }]`), and a defaulted array element such as `[value = fallback]`;
+ * those shapes need distinct source-position handling and remain
+ * intentionally outside this scanner's guarantee. A bare top-level array
+ * assignment pattern such as `[value] = source`, or the equivalent
+ * for-of/for-await-of loop head `for ([value] of source)`, is also outside the
+ * guarantee because it uses a distinct source-position mechanism from this
+ * scanner's destructuring-leaf walk. An assignment-form for-of or for-await-of
+ * destructuring source (the declaration form resolves these correctly) has
+ * three further boundaries. A custom generic iterator type where the yielded
+ * value is not that type's first type parameter (for example a hand-rolled
+ * `MyIter<A, B>` that yields `B`, not `A`) resolves to the wrong type argument
+ * rather than the true yielded type, because deriving the correct mapping
+ * would require re-deriving the compiler's own generic-instantiation
+ * resolution for an unconventional shape. A structural (non-nominal) async
+ * iterator's `next()` result stays `Promise`-wrapped rather than being
+ * unwrapped, because that unwrap only happens for an already-resolved element
+ * type, not inside the structural fallback's own return-type reading. A
+ * mixed-protocol union source (constituents implementing different iteration
+ * protocols) is not decomposed constituent-by-constituent, matching this
+ * file's existing non-decomposition of heterogeneous union sources on the
+ * plain assignment path.
  */
 import * as ts from 'typescript';
 import { createStaticReferenceResolver } from './typescript-static-reference.js';
@@ -90,7 +123,7 @@ export interface FunctionValueReferenceScan {
  * the protected declaration's own type; ordinary exact or potential resolver
  * results are reported without that gate, and aggregate escapes are an
  * independent additional path. Destructuring preserves `any` and `unknown`
- * sources as potential. It will cover local rebinds, declaration and assignment
+ * sources as potential. It covers local rebinds, declaration and assignment
  * destructuring, property/element extraction,
  * `.bind`/`.call`/`.apply`, argument passing, returns, storage, and value
  * re-exports, while excluding declaration-introduction and erased type
@@ -237,9 +270,32 @@ export function scanFunctionValueReferences(
         : [checker.getTypeOfSymbolAtLocation(property, location)];
     });
   };
+  /**
+   * Retains the syntactic key for non-positional destructuring leaves. Array
+   * bindings derive their positional numeric key through the companion
+   * candidate helper, so a local alias never becomes a spurious property name.
+   */
   const leafKey = (node: DestructuringLeaf): ts.PropertyName | ts.BindingName => (
     ts.isBindingElement(node) ? node.propertyName ?? node.name : node.name
   );
+  /**
+   * `node` is always an element of `pattern.elements` here, because this
+   * helper is only ever called with `node.parent === pattern`, so `indexOf`
+   * never returns `-1` in practice -- a `String(-1)` would otherwise become
+   * a bogus key candidate silently, so this invariant matters for
+   * `leafKeyCandidates`'s correctness, not merely as an optimization note.
+   */
+  const arrayBindingElementIndex = (node: ts.BindingElement): string | undefined => {
+    const pattern = node.parent;
+    return ts.isArrayBindingPattern(pattern) ? String(pattern.elements.indexOf(node)) : undefined;
+  };
+  const leafKeyCandidates = (node: DestructuringLeaf): PropertySelectionCandidates => {
+    if (ts.isBindingElement(node) && node.propertyName === undefined) {
+      const index = arrayBindingElementIndex(node);
+      if (index !== undefined) return { names: [index], applicability: 'number' };
+    }
+    return keyCandidates(leafKey(node));
+  };
   const outerDestructuringLeaf = (node: DestructuringSource): DestructuringLeaf | undefined => {
     if (ts.isBindingElement(node)) {
       const container = node.parent.parent;
@@ -263,47 +319,312 @@ export function scanFunctionValueReferences(
     const innermost = checker.getTypeAtLocation(unwrapExpression(parameter.initializer, true));
     return declared === innermost ? [declared] : [declared, innermost];
   };
+  const isForOfBinding = (declaration: ts.VariableDeclaration): boolean => {
+    const list = declaration.parent;
+    return ts.isVariableDeclarationList(list)
+      && ts.isForOfStatement(list.parent)
+      && list.parent.initializer === list;
+  };
+  const isCatchClauseBinding = (declaration: ts.VariableDeclaration): boolean => (
+    ts.isCatchClause(declaration.parent) && declaration.parent.variableDeclaration === declaration
+  );
+  /**
+   * Reads the compiler's escaped name for a real well-known symbol from its
+   * lib declaration. A user-defined `unique symbol` can share a well-known
+   * symbol's text name and produce an escaped name with the same visible
+   * shape but a distinct compiler identity, so regex matching would select a
+   * declaration-order-dependent, unrelated member.
+   */
+  const canonicalWellKnownSymbolEscapedName = (globalInterfaceName: string, pattern: RegExp): string | undefined => {
+    const interfaceSymbol = checker.resolveName(globalInterfaceName, canonicalDeclaration, ts.SymbolFlags.Type, false);
+    if (interfaceSymbol === undefined) return undefined;
+    const declaredType = checker.getDeclaredTypeOfSymbol(interfaceSymbol);
+    const property = checker.getPropertiesOfType(declaredType).find((candidate) => pattern.test(candidate.escapedName as string));
+    return property?.escapedName as string | undefined;
+  };
+  const canonicalIteratorEscapedName = canonicalWellKnownSymbolEscapedName('Iterable', /^__@iterator@\d+$/);
+  const canonicalAsyncIteratorEscapedName = canonicalWellKnownSymbolEscapedName('AsyncIterable', /^__@asyncIterator@\d+$/);
+  /**
+   * Locates a well-known symbol member by its canonical compiler identity.
+   * Resolving that identity once keeps protocol lookup exact at every call
+   * site and fails closed if an unusual library configuration lacks the
+   * corresponding global interface.
+   */
+  const wellKnownSymbolProperty = (type: ts.Type, canonicalEscapedName: string | undefined): ts.Symbol | undefined => (
+    canonicalEscapedName === undefined
+      ? undefined
+      : checker.getPropertiesOfType(type).find((property) => property.escapedName === canonicalEscapedName)
+  );
+  /**
+   * Uses numeric indexing only for arrays and tuples, whose indexed element
+   * type is the value their ordinary iteration yields. A structurally similar
+   * type can expose an unrelated numeric index signature, so it must instead
+   * continue through its iteration protocol.
+   */
+  const arrayLikeElementType = (type: ts.Type): ts.Type | undefined => {
+    const isArrayLike = checker.isArrayType(type) || checker.isTupleType(type);
+    return isArrayLike ? checker.getIndexTypeOfType(type, ts.IndexKind.Number) : undefined;
+  };
+  const propertyType = (type: ts.Type, name: string): ts.Type | undefined => {
+    const property = checker.getPropertyOfType(type, name);
+    return property === undefined ? undefined : checker.getTypeOfSymbolAtLocation(property, canonicalDeclaration);
+  };
+
+  /**
+   * Narrows a `next()` return type to its yielded-value type when — and only
+   * when — that type is a two-branch union with exactly one `done: true`
+   * constituent: the shape `IteratorResult<T, TReturn>` always produces (as
+   * `IteratorYieldResult<T> | IteratorReturnResult<TReturn>`, regardless of
+   * `TReturn`). `checker.getPropertyOfType` resolves that union's own `value`
+   * property to the type merged across both branches; a nested-destructuring
+   * lookup against that broadened type fails whenever the return branch's
+   * value type lacks the looked-up property, so the merged read cannot see
+   * through to the yield branch's own shape. This helper isolates the yield
+   * branch's value type only for that exact shape; every other union (no
+   * `done: true` constituent, or more than one of either kind) resolves
+   * through the same whole-union `value` lookup, uniformly across every
+   * constituent.
+   */
+  const iteratorResultYieldType = (resultType: ts.Type): ts.Type | undefined => {
+    if (!resultType.isUnion()) return propertyType(resultType, 'value');
+    const isDoneTrueBranch = (branch: ts.Type): boolean => {
+      const doneType = propertyType(branch, 'done');
+      return doneType !== undefined
+        && Boolean(doneType.flags & ts.TypeFlags.BooleanLiteral)
+        && checker.isTypeAssignableTo(doneType, checker.getTrueType());
+    };
+    const returnBranches = resultType.types.filter(isDoneTrueBranch);
+    const yieldBranches = resultType.types.filter((branch) => !isDoneTrueBranch(branch));
+    return returnBranches.length === 1 && yieldBranches.length === 1
+      ? propertyType(yieldBranches[0]!, 'value')
+      : propertyType(resultType, 'value');
+  };
+  /**
+   * Derives an iterator member's yielded type from the member's own call
+   * signature. Nominal iterator references retain their first type argument;
+   * structural and non-generic results fall back to `next().value`. Combining
+   * those paths would widen ordinary `Iterator<T, ...>` and `Iterable<T>` to
+   * `any` through their default `TReturn`. A custom generic iterator whose
+   * yielded value is not its first type parameter remains a deliberate
+   * boundary because recovering that mapping would reimplement generic
+   * instantiation.
+   */
+  const iteratorMemberElementType = (iteratorProperty: ts.Symbol | undefined): ts.Type | undefined => {
+    if (iteratorProperty === undefined) return undefined;
+    const iteratorMethodType = checker.getTypeOfSymbolAtLocation(iteratorProperty, canonicalDeclaration);
+    const signature = checker.getSignaturesOfType(iteratorMethodType, ts.SignatureKind.Call)[0];
+    if (signature === undefined) return undefined;
+    const iteratorReturnType = checker.getReturnTypeOfSignature(signature);
+    const isTypeReference = Boolean(iteratorReturnType.flags & ts.TypeFlags.Object)
+      && Boolean((iteratorReturnType as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference);
+    const typeArgument = isTypeReference
+      ? checker.getTypeArguments(iteratorReturnType as ts.TypeReference)[0]
+      : undefined;
+    if (typeArgument !== undefined) return typeArgument;
+    const nextMethodType = propertyType(iteratorReturnType, 'next');
+    if (nextMethodType === undefined) return undefined;
+    const nextSignature = checker.getSignaturesOfType(nextMethodType, ts.SignatureKind.Call)[0];
+    if (nextSignature === undefined) return undefined;
+    const iterationResultType = checker.getReturnTypeOfSignature(nextSignature);
+    return iteratorResultYieldType(iterationResultType);
+  };
+  /**
+   * Resolves the element type yielded by an assignment-form for-of source
+   * without consulting its pattern, whose checker type is destination-shaped
+   * and loses source `any` evidence. Awaited loops first honor a custom
+   * asynchronous iterator even on an array-shaped type; ordinary loops retain
+   * the established array-or-tuple fast path before their synchronous
+   * iterator. Awaited loops then unwrap the resolved element because a
+   * synchronous fallback can yield promises at runtime. Bare `any` and
+   * `unknown` propagate directly to preserve SA-1 default-deny parity with
+   * declaration heads.
+   */
+  const iterationElementType = (iterableType: ts.Type, isAwaited: boolean): ts.Type | undefined => {
+    if (iterableType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return iterableType;
+    const asyncIteratorProperty = isAwaited
+      ? wellKnownSymbolProperty(iterableType, canonicalAsyncIteratorEscapedName)
+      : undefined;
+    const elementType = asyncIteratorProperty !== undefined
+      ? iteratorMemberElementType(asyncIteratorProperty)
+      : arrayLikeElementType(iterableType) ?? iteratorMemberElementType(
+        wellKnownSymbolProperty(iterableType, canonicalIteratorEscapedName),
+      );
+    if (elementType === undefined) return undefined;
+    return isAwaited ? (checker.getAwaitedType(elementType) ?? elementType) : elementType;
+  };
+  /**
+   * Identifies the assignment-pattern form of a for-of head while preserving
+   * the narrowed statement for its source-expression lookup. A
+   * same-shape predicate would only restate an already-known object literal
+   * and would not safely make the parent's `expression` available; returning
+   * the statement makes the ownership relation explicit and rejects nested
+   * or declaration-form patterns.
+   */
+  const forOfAssignmentHead = (literal: ts.ObjectLiteralExpression): ts.ForOfStatement | undefined => {
+    const parent = literal.parent;
+    return ts.isForOfStatement(parent) && parent.initializer === literal ? parent : undefined;
+  };
+  /**
+   * Resolves the root type that feeds a destructuring chain. Initializers and
+   * parameters preserve their wrapper-aware treatment, while for-of and catch
+   * bindings use the pattern's own checker type because their source expression
+   * is represented outside the declaration.
+   */
   const rootDestructuringSourceTypes = (node: DestructuringSource): readonly ts.Type[] | undefined => {
     if (ts.isBindingElement(node)) {
       const container = node.parent.parent;
-      if (ts.isVariableDeclaration(container) && container.initializer !== undefined) {
-        return sourceTypesThroughWrappers(container.initializer);
+      if (ts.isVariableDeclaration(container)) {
+        if (container.initializer !== undefined) return sourceTypesThroughWrappers(container.initializer);
+        if (isForOfBinding(container) || isCatchClauseBinding(container)) {
+          return [checker.getTypeAtLocation(container.name)];
+        }
+        return undefined;
       }
       if (ts.isParameter(container)) return parameterSourceTypes(container);
       return undefined;
     }
     const objectLiteral = node.parent;
+    const forOfHead = ts.isObjectLiteralExpression(objectLiteral) ? forOfAssignmentHead(objectLiteral) : undefined;
+    if (forOfHead !== undefined) {
+      const elementType = iterationElementType(
+        checker.getTypeAtLocation(forOfHead.expression),
+        forOfHead.awaitModifier !== undefined,
+      );
+      return elementType === undefined ? undefined : [elementType];
+    }
     const assignment = ts.isObjectLiteralExpression(objectLiteral) ? objectLiteral.parent : undefined;
     if (assignment === undefined || !ts.isBinaryExpression(assignment)
       || assignment.left !== objectLiteral
       || assignment.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return undefined;
     return sourceTypesThroughWrappers(assignment.right);
   };
+  /**
+   * Walks from a nested leaf to the root source while applying the key contract
+   * at every enclosing property or tuple position. This shares uncertainty and
+   * type evidence across declaration and assignment destructuring instead of
+   * re-deriving source types at each leaf.
+   */
   const destructuringElementSourceTypes = (node: DestructuringSource): readonly ts.Type[] | undefined => {
     const rootTypes = rootDestructuringSourceTypes(node);
     if (rootTypes !== undefined) return rootTypes;
 
     const outer = outerDestructuringLeaf(node);
-    if (outer === undefined) return undefined;
+    if (outer !== undefined) {
+      const outerSourceTypes = destructuringElementSourceTypes(outer);
+      if (outerSourceTypes === undefined) return undefined;
+      const candidates = leafKeyCandidates(outer);
+      const sourceTypes = outerSourceTypes.flatMap((outerSourceType) => {
+        if (outerSourceType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return [outerSourceType];
+        return selectedPropertyTypes(outerSourceType, candidates, leafKey(outer));
+      });
+      return sourceTypes.length === 0 ? undefined : sourceTypes;
+    }
+    return ts.isObjectLiteralExpression(node.parent) ? arrayLiteralElementSourceTypes(node.parent) : undefined;
+  };
+  /**
+   * Resolves the checker type(s) of the array literal that is directly the
+   * value of an assignment-destructuring object property, by reusing the same
+   * containing-property source-type walk `destructuringElementSourceTypes`
+   * already performs for `PropertyAssignment` leaves. Array literal elements
+   * have no declaration-name AST shape the way binding-pattern elements do, so
+   * this narrow helper substitutes for that walk at exactly one position: the
+   * array literal must be a property's own initializer. Object nesting above
+   * that containing property is unbounded, because the shared walk it defers
+   * to already generalizes across arbitrary depth for the declaration form;
+   * this helper does not extend that generalization to an array literal
+   * nested inside another array literal or reached through any other shape.
+   */
+  const containingArrayLiteralTypes = (
+    arrayLiteral: ts.ArrayLiteralExpression,
+  ): readonly ts.Type[] | undefined => {
+    const outer = arrayLiteral.parent;
+    if (!ts.isPropertyAssignment(outer) || outer.initializer !== arrayLiteral) return undefined;
     const outerSourceTypes = destructuringElementSourceTypes(outer);
     if (outerSourceTypes === undefined) return undefined;
-    const candidates = keyCandidates(leafKey(outer));
-    const sourceTypes = outerSourceTypes.flatMap((outerSourceType) => {
-      if (outerSourceType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return [outerSourceType];
-      return selectedPropertyTypes(outerSourceType, candidates, leafKey(outer));
-    });
-    return sourceTypes.length === 0 ? undefined : sourceTypes;
+    const candidates = leafKeyCandidates(outer);
+    const types = outerSourceTypes.flatMap((type) => (
+      type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)
+        ? [type]
+        : selectedPropertyTypes(type, candidates, outer)
+    ));
+    return types.length === 0 ? undefined : types;
+  };
+  /**
+   * Supplies the positional source type when an assignment-destructuring leaf
+   * is inside an object literal that is itself a direct array-literal element.
+   * `outerDestructuringLeaf` deliberately walks an alternating
+   * PropertyAssignment/ObjectLiteral chain so each enclosing property can
+   * apply its own selection key; that walk stops when an object literal's
+   * immediate parent is an array literal rather than a property assignment.
+   * This helper first reuses `containingArrayLiteralTypes` to
+   * recover the candidate array source types, then derives this direct
+   * object's numeric element position and selects that slot from each type.
+   * It preserves `any` and `unknown` candidates, while a non-direct
+   * element, absent position, or missing slot selection remains unresolved.
+   * This preserves the destructuring-only boundary instead of introducing a
+   * second source walk or generalizing to nested array literals.
+   */
+  const arrayLiteralElementSourceTypes = (
+    containerLiteral: ts.ObjectLiteralExpression,
+  ): readonly ts.Type[] | undefined => {
+    const arrayLiteral = containerLiteral.parent;
+    if (!ts.isArrayLiteralExpression(arrayLiteral)) return undefined;
+    const index = arrayLiteral.elements.indexOf(containerLiteral);
+    if (index === -1) return undefined;
+    const arrayTypes = containingArrayLiteralTypes(arrayLiteral);
+    if (arrayTypes === undefined) return undefined;
+    const candidates: PropertySelectionCandidates = { names: [String(index)], applicability: 'number' };
+    const types = arrayTypes.flatMap((type) => (
+      type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)
+        ? [type]
+        : selectedPropertyTypes(type, candidates, containerLiteral)
+    ));
+    return types.length === 0 ? undefined : types;
+  };
+  /**
+   * Bare identifiers and direct property- or element-access write targets
+   * share this array-slot resolution, so the helper accepts their common
+   * expression contract. Its callers retain the AST-shape boundary that
+   * excludes defaulted and spread array elements.
+   */
+  const recordArrayLiteralAssignmentElement = (element: ts.Expression): boolean => {
+    const slot = arrayLiteralAssignmentSlot(element);
+    if (slot === undefined) return false;
+    const { arrayLiteral, index } = slot;
+    const arrayTypes = containingArrayLiteralTypes(arrayLiteral);
+    if (arrayTypes === undefined) return false;
+    const resolutions = arrayTypes.map((type) => (
+      resolver.resolvePropertySelection(
+        type,
+        [String(index)],
+        'number',
+        isTarget,
+        indexSignatureMaySelect,
+      ).kind
+    ));
+    if (resolutions.every((kind) => kind === 'none')) return false;
+    recordUnsafe(element);
+    return true;
   };
   const reportNodeForDestructuringLeaf = (node: DestructuringLeaf): ts.Node => {
     if (ts.isBindingElement(node) || ts.isShorthandPropertyAssignment(node)) return node.name;
     return ts.isComputedPropertyName(node.name) ? node.name : node.initializer ?? node.name;
   };
+  /**
+   * Records a leaf only when its source selection is exact or potential. Tuple
+   * leaves retain a numeric candidate so declarationless positional symbols can
+   * use the resolver's precise type evidence rather than an alias name. Object
+   * and array literal property values remain containers rather than leaves so
+   * traversal can resolve their nested write targets at their own positions
+   * instead of pre-empting that work by reporting the container itself.
+   */
   const recordDestructuringReference = (node: DestructuringLeaf): boolean => {
     if (ts.isBindingElement(node) && !ts.isIdentifier(node.name)) return false;
-    if (ts.isPropertyAssignment(node) && ts.isObjectLiteralExpression(node.initializer)) return false;
+    if (ts.isPropertyAssignment(node)
+      && (ts.isObjectLiteralExpression(node.initializer) || ts.isArrayLiteralExpression(node.initializer))) return false;
     const sourceTypes = destructuringElementSourceTypes(node);
     if (sourceTypes === undefined) return false;
-    const candidates = keyCandidates(leafKey(node));
+    const candidates = leafKeyCandidates(node);
     const resolutions = sourceTypes.map((sourceType) => (
       resolver.resolvePropertySelection(sourceType, candidates.names, candidates.applicability, isTarget, indexSignatureMaySelect).kind
     ));
@@ -316,6 +637,26 @@ export function scanFunctionValueReferences(
     ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isTypeAssertionExpression(node)
     || ts.isSatisfiesExpression(node) || ts.isNonNullExpression(node) || ts.isAwaitExpression(node)
   );
+  /**
+   * Finds an array-assignment slot from its inner write target by walking
+   * upward through the scanner's existing transparent wrappers. Descending
+   * with `unwrapExpression` would answer a different question and make the
+   * reporting path lose the target that owns the finding; this walk
+   * instead preserves that original node while locating the enclosing slot.
+   * The returned index is accepted only when the climbed expression is an
+   * actual array element, so callers have one applicability boundary for both
+   * wrapped and unwrapped forms without broadening destructuring support.
+   */
+  const arrayLiteralAssignmentSlot = (
+    element: ts.Expression,
+  ): { arrayLiteral: ts.ArrayLiteralExpression; index: number } | undefined => {
+    let current: ts.Node = element;
+    while (isTransparentWrapper(current.parent)) current = current.parent;
+    const arrayLiteral = current.parent;
+    if (!ts.isArrayLiteralExpression(arrayLiteral)) return undefined;
+    const index = arrayLiteral.elements.indexOf(current as ts.Expression);
+    return index === -1 ? undefined : { arrayLiteral, index };
+  };
   const containsCache = new Map<ts.Type, true>();
   const topLevelContainsCache = new Map<ts.Type, boolean>();
   // H3a-2 follows data-bearing type edges but does not traverse arbitrary call
@@ -381,10 +722,14 @@ export function scanFunctionValueReferences(
   ) || (
     ts.isBinaryExpression(node.parent) && node.parent.right === node
       && node.parent.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isObjectLiteralExpression(node.parent.left)
+  ) || (
+    ts.isForOfStatement(node.parent) && node.parent.expression === node
+      && ts.isObjectLiteralExpression(node.parent.initializer)
   );
   const isAssignmentDestructuringTarget = (literal: ts.ObjectLiteralExpression): boolean => {
     const parent = literal.parent;
     return (ts.isBinaryExpression(parent) && parent.left === literal && parent.operatorToken.kind === ts.SyntaxKind.EqualsToken)
+      || forOfAssignmentHead(literal) !== undefined
       || ((ts.isPropertyAssignment(parent) || ts.isShorthandPropertyAssignment(parent))
         && ts.isObjectLiteralExpression(parent.parent) && isAssignmentDestructuringTarget(parent.parent));
   };
@@ -460,6 +805,15 @@ export function scanFunctionValueReferences(
       if (reference.argumentExpression !== undefined) visit(reference.argumentExpression);
     }
   };
+  /**
+   * Visits value-bearing syntax while preserving the first authoritative
+   * classification for each reference. Assignment-array elements receive a
+   * source-aware fallback only after ordinary identity resolution finds no
+   * target, which confines that extra path to destructuring writes. After a
+   * successful array-slot match, traversal selectively revisits
+   * the write target's receiver and, for element access, its computed key before
+   * returning so independent target references in those subtrees are retained.
+   */
   const visit = (node: ts.Node): void => {
     if (ts.isCallExpression(node)) {
       const resolution = resolver.resolvePropertyReference(node.expression, isTarget, indexSignatureMaySelect);
@@ -498,11 +852,22 @@ export function scanFunctionValueReferences(
         && resolution.kind !== 'none'
       ) {
         recordUnsafe(node);
+      } else {
+        recordArrayLiteralAssignmentElement(node);
       }
-    } else if (ts.isElementAccessExpression(node)) {
-      const resolution = resolver.resolvePropertyReference(node, isTarget, indexSignatureMaySelect);
-      if (resolution.kind !== 'none') {
-        recordUnsafe(node);
+    } else if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      let handledByOrdinaryResolution = false;
+      if (ts.isElementAccessExpression(node)) {
+        const resolution = resolver.resolvePropertyReference(node, isTarget, indexSignatureMaySelect);
+        if (resolution.kind !== 'none') {
+          recordUnsafe(node);
+          handledByOrdinaryResolution = true;
+        }
+      }
+      if (!handledByOrdinaryResolution && recordArrayLiteralAssignmentElement(node)) {
+        visit(node.expression);
+        if (ts.isElementAccessExpression(node)) visit(node.argumentExpression);
+        return;
       }
     } else if (ts.isExportDeclaration(node)
       && !node.isTypeOnly

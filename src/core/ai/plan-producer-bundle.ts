@@ -14,7 +14,7 @@ import {
 import { typedJsonSchema } from '#core/ai/typed-json-schema.js';
 import { sha256HexOfCanonicalJson } from '#core/ir/digest.js';
 import {
-  GeneratedPlanResponse,
+  GeneratedPlanResponseRequest,
   GeneratedPlanResponseForPolicy,
   type JsonValueT,
 } from '#core/ir/schema.js';
@@ -133,7 +133,7 @@ export function liveProducerBundleInputs(): PlanProducerBundleInputs {
   return {
     generatorPromptTemplate: GENERATOR_PROMPT_TEMPLATE,
     generatorTaskInstruction: GENERATE_PLAN_TASK_INSTRUCTION,
-    generatedPlanResponseSchema: typedJsonSchema(GeneratedPlanResponse) as unknown as JsonValueT,
+    generatedPlanResponseSchema: typedJsonSchema(GeneratedPlanResponseRequest) as unknown as JsonValueT,
     generatedPlanResponseLocalContract: typedJsonSchema(GeneratedPlanResponseForPolicy) as unknown as JsonValueT,
     instructionCoveragePolicyRevision: PLAN_PRODUCER_SEMANTIC_REVISIONS.instructionCoveragePolicy,
     generatorSecretPolicyRevision: PLAN_PRODUCER_SEMANTIC_REVISIONS.generatorSecretPolicy,

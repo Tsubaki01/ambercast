@@ -36,6 +36,80 @@ const SCHEMA_VERSION_AUTHORITIES = ['GROUNDING_SCHEMA_VERSION', 'PLAN_SCHEMA_VER
 const VIRTUAL_DIGEST_FILE = '/virtual/src/core/ir/digest.ts';
 const VIRTUAL_DIGEST_AUTHORITY_FILE = '/virtual/src/core/ai/plan-input-provenance.ts';
 const VIRTUAL_DIGEST_PLANTED_FILE = '/virtual/src/usecases/planted-h1d-h3c.ts';
+const H1D_H3C_CORPUS_SOURCE = [
+  "import * as digest from '../core/ir/digest.js';",
+  'void (digest as unknown as { computeInputsDigest: string }).computeInputsDigest;',
+  "void (digest as unknown as { computeInputsDigest: string })['computeInputsDigest'];",
+  'void ((digest as unknown) as { computeInputsDigest: string }).computeInputsDigest;',
+  'declare const optionalValues: Record<string, typeof digest.computeInputsDigest>;',
+  "void optionalValues['missing'];",
+  'declare const unionValues: Record<string, typeof digest.computeInputsDigest | string>;',
+  "void unionValues['missing'];",
+  'declare const compatibleValues: Record<string, (input: object) => string>;',
+  "void compatibleValues['missing'];",
+  'const ns = digest;',
+  'declare function consume(value: unknown): void;',
+  'consume(ns);',
+  'let ns2: unknown;',
+  'ns2 = ns;',
+  'const spread = { ...ns };',
+  'Object.assign({}, ns);',
+  'const cast = ns as typeof ns;',
+  'const { ...declRest } = ns;',
+  'let assignmentRest: unknown;',
+  '({ ...assignmentRest } = ns);',
+  'const { ...castRest } = (ns as typeof ns);',
+  "async function load(): Promise<void> { const loaded = await import('../core/ir/digest.js'); void loaded; }",
+  'interface A { child?: C; }',
+  'interface C { previous?: A; api: typeof digest; }',
+  'declare const recursive: A;',
+  'void recursive;',
+  'const slot: { value?: typeof digest.computeInputsDigest } = {};',
+  'slot.value = digest.computeInputsDigest;',
+  'void slot.value;',
+  'declare const compatibleAggregate: { fn: (input: object) => string };',
+  'consume(compatibleAggregate);',
+  'async function interleaved(): Promise<void> { void ((await (digest as unknown)) as unknown); }',
+  "declare function digestKey(value: unknown): 'computeInputsDigest';",
+  'const { [digestKey(digest)]: computedAlias } = digest;',
+  'function bind({ computeInputsDigest: parameterAlias }: { computeInputsDigest: string } = (digest as unknown as { computeInputsDigest: string })): void {}',
+  'declare const oneWayAggregate: { fn: (input: object) => unknown };',
+  'consume(oneWayAggregate);',
+  'declare const nestedRestSource: { outer: typeof digest };',
+  'const { outer: { ...nestedDeclarationRest } } = nestedRestSource;',
+  'let nestedAssignmentRest: unknown;',
+  '({ outer: { ...nestedAssignmentRest } } = nestedRestSource);',
+  'function inspectTypeParameter<T extends { api: typeof digest }>(): void {}',
+  'declare const unionReceiver: typeof digest | { computeInputsDigest(input: object): string };',
+  'unionReceiver.computeInputsDigest({});',
+  'declare const forOfItems: any[];',
+  'for (const { computeInputsDigest: forOfAlias } of forOfItems) {}',
+  'try { throw undefined; } catch ({ computeInputsDigest: catchAlias }: any) {}',
+  'declare const nestedArrayDeclarationSource: { outer: { value: [typeof digest.computeInputsDigest] } };',
+  'const { outer: { value: [nestedDeclarationArrayAlias] } } = nestedArrayDeclarationSource;',
+  'declare const nestedArrayAssignmentSource: { outer: { value: [typeof digest.computeInputsDigest] } };',
+  'let nestedAssignmentArrayAlias: unknown;',
+  '({ outer: { value: [nestedAssignmentArrayAlias] } } = nestedArrayAssignmentSource);',
+  'declare const nestedPropertyAccessArraySource: { x: [typeof digest.computeInputsDigest] };',
+  'declare const nestedPropertyAccessSink: { alias: unknown };',
+  '({ x: [nestedPropertyAccessSink.alias] } = nestedPropertyAccessArraySource);',
+  'declare const nestedElementAccessArraySource: { x: [typeof digest.computeInputsDigest] };',
+  'declare const nestedElementAccessSink: { alias: unknown };',
+  "({ x: [nestedElementAccessSink['alias']] } = nestedElementAccessArraySource);",
+  'declare const nestedObjectArraySource: { x: [typeof digest] };',
+  'let nestedObjectArrayAlias: unknown;',
+  '({ x: [{ computeInputsDigest: nestedObjectArrayAlias }] } = nestedObjectArraySource);',
+  'declare const nestedArrayInArraySource: { x: [[typeof digest.computeInputsDigest]] };',
+  'let nestedArrayInArrayAlias: unknown;',
+  '({ x: [[nestedArrayInArrayAlias]] } = nestedArrayInArraySource);',
+  'declare const wrappedArraySource: { x: [typeof digest.computeInputsDigest] }; declare const wrappedArraySink: { alias: unknown }; ({ x: [(wrappedArraySink.alias)] } = wrappedArraySource);',
+  'declare const forOfAssignmentItems: any[]; declare const forOfAssignmentSink: { alias: unknown }; for ({ x: [forOfAssignmentSink.alias] } of forOfAssignmentItems) {}',
+  'declare const wrappedArrayAsSource: { x: [typeof digest.computeInputsDigest] }; declare const wrappedArrayAsSink: { alias: unknown }; ({ x: [(wrappedArrayAsSink.alias as unknown)] } = wrappedArrayAsSource);',
+  'declare const wrappedArrayNonNullSource: { x: [typeof digest.computeInputsDigest] }; declare const wrappedArrayNonNullSink: { alias: unknown }; ({ x: [wrappedArrayNonNullSink.alias!] } = wrappedArrayNonNullSource);',
+  'declare const forAwaitAssignmentItems: AsyncIterable<any>; declare const forAwaitAssignmentSink: { alias: unknown }; async function forAwaitAssignment(): Promise<void> { for await ({ x: [forAwaitAssignmentSink.alias] } of forAwaitAssignmentItems) {} }',
+  'declare const customGenericIteratorBoundarySink: { alias: unknown }; class CustomGenericIteratorBoundary<A, B> implements Iterator<B> { next(): IteratorResult<B> { throw new Error(); } } declare const customGenericIteratorBoundaryItems: { [Symbol.iterator](): CustomGenericIteratorBoundary<string, { x: [typeof digest.computeInputsDigest] }> }; for ({ x: [customGenericIteratorBoundarySink.alias] } of customGenericIteratorBoundaryItems) {}',
+].join('\n');
+const H1D_H3C_CORPUS_OPTIONS: ts.CompilerOptions = { noUncheckedIndexedAccess: true };
 
 function scanVirtualDigestCorpus(source: string, extraOptions: ts.CompilerOptions = {}): {
   readonly program: ts.Program;
@@ -1121,88 +1195,83 @@ describe('architecture guardrails', () => {
   });
 
   test('detects the planted H1d and H3c function-value bypass families at owning-node coordinates', () => {
-    const source = [
-      "import * as digest from '../core/ir/digest.js';",
-      'void (digest as unknown as { computeInputsDigest: string }).computeInputsDigest;',
-      "void (digest as unknown as { computeInputsDigest: string })['computeInputsDigest'];",
-      'void ((digest as unknown) as { computeInputsDigest: string }).computeInputsDigest;',
-      'declare const optionalValues: Record<string, typeof digest.computeInputsDigest | undefined>;',
-      "void optionalValues['missing'];",
-      'declare const unionValues: Record<string, typeof digest.computeInputsDigest | string>;',
-      "void unionValues['missing'];",
-      'declare const compatibleValues: Record<string, (input: object) => string>;',
-      "void compatibleValues['missing'];",
-      'const ns = digest;',
-      'declare function consume(value: unknown): void;',
-      'consume(ns);',
-      'let ns2: unknown;',
-      'ns2 = ns;',
-      'const spread = { ...ns };',
-      'Object.assign({}, ns);',
-      'const cast = ns as typeof ns;',
-      'const { ...declRest } = ns;',
-      'let assignmentRest: unknown;',
-      '({ ...assignmentRest } = ns);',
-      'const { ...castRest } = (ns as typeof ns);',
-      "async function load(): Promise<void> { const loaded = await import('../core/ir/digest.js'); void loaded; }",
-      'interface A { child?: C; }',
-      'interface C { previous?: A; api: typeof digest; }',
-      'declare const recursive: A;',
-      'void recursive;',
-      'const slot: { value?: typeof digest.computeInputsDigest } = {};',
-      'slot.value = digest.computeInputsDigest;',
-      'void slot.value;',
-      'declare const compatibleAggregate: { fn: (input: object) => string };',
-      'consume(compatibleAggregate);',
-      'async function interleaved(): Promise<void> { void ((await (digest as unknown)) as unknown); }',
-      "declare function digestKey(value: unknown): 'computeInputsDigest';",
-      'const { [digestKey(digest)]: computedAlias } = digest;',
-      'function bind({ computeInputsDigest: parameterAlias }: { computeInputsDigest: string } = (digest as unknown as { computeInputsDigest: string })): void {}',
-      'declare const oneWayAggregate: { fn: (input: object) => unknown };',
-      'consume(oneWayAggregate);',
-      'declare const nestedRestSource: { outer: typeof digest };',
-      'const { outer: { ...nestedDeclarationRest } } = nestedRestSource;',
-      'let nestedAssignmentRest: unknown;',
-      '({ outer: { ...nestedAssignmentRest } } = nestedRestSource);',
-      'function inspectTypeParameter<T extends { api: typeof digest }>(): void {}',
-    ].join('\n');
-    const { program, scan } = scanVirtualDigestCorpus(source, { noUncheckedIndexedAccess: true });
+    const { program, scan } = scanVirtualDigestCorpus(H1D_H3C_CORPUS_SOURCE, H1D_H3C_CORPUS_OPTIONS);
     expect(program.getSyntacticDiagnostics()).toEqual([]);
     expect(program.getSemanticDiagnostics()).toEqual([]);
     expect(scan.calls).toEqual([]);
     expect(scan.violations).toEqual([
-      plantedDigestViolation(source, 2, 'computeInputsDigest;'),
-      plantedDigestViolation(source, 3, '(digest'),
-      plantedDigestViolation(source, 4, 'computeInputsDigest;'),
-      plantedDigestViolation(source, 6, "optionalValues['missing']"),
-      plantedDigestViolation(source, 8, "unionValues['missing']"),
-      plantedDigestViolation(source, 10, "compatibleValues['missing']"),
-      plantedDigestViolation(source, 11, 'digest;'),
-      plantedDigestViolation(source, 13, 'ns);'),
-      plantedDigestViolation(source, 15, 'ns;'),
-      plantedDigestViolation(source, 16, 'ns };'),
-      plantedDigestViolation(source, 17, 'Object.assign'),
-      plantedDigestViolation(source, 17, 'ns);'),
-      plantedDigestViolation(source, 18, 'ns as'),
-      plantedDigestViolation(source, 19, 'declRest'),
-      plantedDigestViolation(source, 21, 'assignmentRest'),
-      plantedDigestViolation(source, 22, 'castRest'),
-      plantedDigestViolation(source, 23, 'await import'),
-      plantedDigestViolation(source, 23, 'loaded;'),
-      plantedDigestViolation(source, 27, 'recursive;'),
-      plantedDigestViolation(source, 29, 'computeInputsDigest;'),
-      plantedDigestViolation(source, 32, 'compatibleAggregate'),
-      plantedDigestViolation(source, 33, '((await'),
-      plantedDigestViolation(source, 35, 'digest)'),
-      plantedDigestViolation(source, 35, 'computedAlias'),
-      plantedDigestViolation(source, 36, 'parameterAlias'),
-      plantedDigestViolation(source, 38, 'oneWayAggregate'),
-      plantedDigestViolation(source, 40, 'nestedDeclarationRest'),
-      plantedDigestViolation(source, 42, 'nestedAssignmentRest'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 2, 'computeInputsDigest;'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 3, '(digest'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 4, 'computeInputsDigest;'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 6, "optionalValues['missing']"),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 8, "unionValues['missing']"),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 10, "compatibleValues['missing']"),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 11, 'digest;'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 13, 'ns);'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 15, 'ns;'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 16, 'ns };'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 17, 'Object.assign'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 17, 'ns);'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 18, 'ns as'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 19, 'declRest'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 21, 'assignmentRest'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 22, 'castRest'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 23, 'await import'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 23, 'loaded;'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 27, 'recursive;'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 29, 'computeInputsDigest;'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 32, 'compatibleAggregate'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 33, '((await'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 35, 'digest)'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 35, 'computedAlias'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 36, 'parameterAlias'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 38, 'oneWayAggregate'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 40, 'nestedDeclarationRest'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 42, 'nestedAssignmentRest'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 45, 'unionReceiver.computeInputsDigest'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 47, 'forOfAlias'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 48, 'catchAlias'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 50, 'nestedDeclarationArrayAlias'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 53, 'nestedAssignmentArrayAlias'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 56, 'nestedPropertyAccessSink.alias'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 59, "nestedElementAccessSink['alias']"),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 62, 'nestedObjectArrayAlias'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 66, 'wrappedArraySink.alias'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 67, 'forOfAssignmentSink.alias'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 68, 'wrappedArrayAsSink.alias'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 69, 'wrappedArrayNonNullSink.alias'),
+      plantedDigestViolation(H1D_H3C_CORPUS_SOURCE, 70, 'forAwaitAssignmentSink.alias'),
     ]);
-    for (const line of [2, 3, 4, 6, 8, 10, 11, 13, 15, 16, 17, 18, 19, 21, 22, 23, 27, 29, 32, 33, 35, 36, 38, 40, 42]) {
+    for (const line of [2, 3, 4, 6, 8, 10, 11, 13, 15, 16, 17, 18, 19, 21, 22, 23, 27, 29, 32, 33, 35, 36, 38, 40, 42, 45, 47, 48, 50, 53, 56, 59, 62, 66, 67, 68, 69]) {
       expect(scan.violations.some((violation) => violation.line === line)).toBe(true);
     }
+    expect(scan.violations.some((violation) => violation.line === 65)).toBe(false);
+  });
+
+  test('confirms the H1d Record<string, typeof target> fixture depends on noUncheckedIndexedAccess for its undefined union', () => {
+    const typeOfAccess = (compilerOptions: ts.CompilerOptions): string => {
+      const { program } = scanVirtualDigestCorpus(H1D_H3C_CORPUS_SOURCE, compilerOptions);
+      expect(program.getSyntacticDiagnostics()).toEqual([]);
+      expect(program.getSemanticDiagnostics()).toEqual([]);
+      const source = program.getSourceFile(VIRTUAL_DIGEST_PLANTED_FILE);
+      if (source === undefined) throw new Error('Missing planted source file.');
+      let access: ts.ElementAccessExpression | undefined;
+      const visit = (node: ts.Node): void => {
+        if (access !== undefined) return;
+        if (ts.isElementAccessExpression(node) && node.getText(source) === "optionalValues['missing']") {
+          access = node;
+          return;
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(source);
+      if (access === undefined) throw new Error('Missing probe element access.');
+      const checker = program.getTypeChecker();
+      return checker.typeToString(checker.getTypeAtLocation(access));
+    };
+
+    expect(typeOfAccess(H1D_H3C_CORPUS_OPTIONS)).toContain('undefined');
+    expect(typeOfAccess({})).not.toContain('undefined');
   });
 
   test('keeps planted unknown and narrowed-array H1d controls outside the violation inventory', () => {
@@ -1216,6 +1285,11 @@ describe('architecture guardrails', () => {
       'void numericValues[0];',
       'interface NamespaceShape { digest: typeof digest; }',
       'type NamespaceAlias = typeof digest;',
+      'declare const externalUnionSlot: { slot: typeof digest.computeInputsDigest | string };',
+      "if (typeof externalUnionSlot.slot !== 'string') externalUnionSlot.slot({});",
+      'declare const aggregateVoidGateContainer: { fn: (input: object) => void };',
+      'declare function consumeAggregate(value: unknown): void;',
+      'consumeAggregate(aggregateVoidGateContainer);',
     ].join('\n');
     const { program, scan } = scanVirtualDigestCorpus(source);
     expect(program.getSyntacticDiagnostics()).toEqual([]);

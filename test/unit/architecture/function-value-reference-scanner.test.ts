@@ -96,6 +96,15 @@ function expectScan(
   });
 }
 
+function expectUnsafeReferenceNodes(
+  scan: FunctionValueReferenceScan,
+  expected: readonly (readonly [string, ts.SyntaxKind])[],
+): void {
+  expect(scan.unsafeReferences.map(({ node }) => ({ text: node.getText(), kind: node.kind }))).toEqual(
+    expected.map(([text, kind]) => ({ text, kind })),
+  );
+}
+
 async function withCaller(
   source: string,
   assertion: (scan: FunctionValueReferenceScan, names: Readonly<Record<string, string>>) => void,
@@ -183,6 +192,902 @@ describe('scanFunctionValueReferences()', () => {
   ] as const)('propagates an any outer source through nested %s', async (_name, source, line) => {
     await withCaller(source, (scan, names) => {
       expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[line, 'alias']]);
+    });
+  });
+
+  test.each([
+    [
+      'a for-of binding',
+      [
+        "import { target } from './target.js';",
+        'declare const items: any[];',
+        'for (const { target: alias } of items) void alias;',
+      ].join('\n'),
+      3,
+    ],
+    [
+      'a catch-clause binding',
+      [
+        "import { target } from './target.js';",
+        'try { throw undefined; } catch ({ target: alias }: any) { void alias; }',
+      ].join('\n'),
+      2,
+    ],
+  ] as const)('propagates an any source through %s', async (_name, source, line) => {
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[line, 'alias']]);
+    });
+  });
+
+  test.each([
+    [
+      'declaration destructuring',
+      [
+        "import { target } from './target.js';",
+        'declare const source: { x: [typeof target] };',
+        'const { x: [alias] } = source;',
+      ].join('\n'),
+      3,
+    ],
+    [
+      'assignment destructuring',
+      [
+        "import { target } from './target.js';",
+        'declare const source: { x: [typeof target] };',
+        'let alias: unknown;',
+        '({ x: [alias] } = source);',
+      ].join('\n'),
+      4,
+    ],
+    [
+      'parameter destructuring',
+      [
+        "import { target } from './target.js';",
+        'function bind({ x: [alias] }: { x: [typeof target] }): void { alias(); }',
+      ].join('\n'),
+      2,
+    ],
+  ] as const)('propagates a nested array element through %s', async (_name, source, line) => {
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[line, 'alias']]);
+    });
+  });
+
+  test('uses the precise heterogeneous tuple element type for nested array destructuring', async () => {
+    const source = [
+      "import { target } from './target.js';",
+      'declare const source: { x: [string, typeof target] };',
+      'const { x: [safe, alias] } = source;',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[3, 'alias']]);
+    });
+  });
+
+  test.each([
+    [
+      'a property-access target',
+      [
+        "import { target } from './target.js';",
+        'declare const source: { x: [typeof target] };',
+        'declare const sink: { alias: unknown };',
+        '({ x: [sink.alias] } = source);',
+      ].join('\n'),
+      [[4, 'sink.alias']],
+    ],
+    [
+      'an element-access target',
+      [
+        "import { target } from './target.js';",
+        'declare const source: { x: [typeof target] };',
+        'declare const sink: { alias: unknown };',
+        "({ x: [sink['alias']] } = source);",
+      ].join('\n'),
+      [[4, "sink['alias']"]],
+    ],
+  ] as const)('propagates a nested array element to %s', async (_name, source, unsafeReferences) => {
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], unsafeReferences);
+    });
+  });
+
+  test.each([
+    [
+      'a renamed nested-object target',
+      [
+        "import * as api from './target.js';",
+        'declare const source: { x: [typeof api] };',
+        'let alias: unknown;',
+        '({ x: [{ target: alias }] } = source);',
+      ].join('\n'),
+      [[4, 'alias']],
+    ],
+    [
+      'a shorthand nested-object target',
+      [
+        "import * as api from './target.js';",
+        'declare const source: { x: [typeof api] };',
+        'let target: unknown;',
+        '({ x: [{ target }] } = source);',
+      ].join('\n'),
+      [[4, 'target }']],
+    ],
+  ] as const)('propagates a nested array element through %s', async (_name, source, unsafeReferences) => {
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], unsafeReferences);
+    });
+  });
+
+  test('selects only the matching key in a nested array-element object target', async () => {
+    const source = [
+      "import * as api from './target.js';",
+      'declare const source: { x: [typeof api & { other: string }] };',
+      'let alias: unknown;',
+      'let safe: unknown;',
+      '({ x: [{ target: alias, other: safe }] } = source);',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[5, 'alias']]);
+    });
+  });
+
+  test('uses the precise heterogeneous tuple element type through the nested array-object fallback', async () => {
+    const source = [
+      "import * as api from './target.js';",
+      'declare const source: { x: [typeof api, { target: string }] };',
+      'let matching: unknown;',
+      'let safe: unknown;',
+      '({ x: [{ target: matching }, { target: safe }] } = source);',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[5, 'matching']]);
+    });
+  });
+
+  test('preserves a target-identifying property-access receiver beside its array-slot finding', async () => {
+    const source = [
+      "import { target as dyn } from './target.js';",
+      'declare const source: { x: [typeof dyn] };',
+      '({ x: [(dyn as typeof dyn & { alias: unknown }).alias] } = source);',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [
+        [3, '(dyn as'],
+        [3, 'dyn as'],
+      ]);
+    });
+  });
+
+  test('preserves a target-identifying element-access computed key beside its array-slot finding', async () => {
+    const source = [
+      "import * as api from './target.js';",
+      'declare const source: { x: [typeof api.target] };',
+      'declare const sink: { [key: string]: unknown };',
+      '({ x: [sink[api.target.name]] } = source);',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [
+        [4, 'sink[api.target.name]'],
+        [4, 'target.name'],
+      ]);
+    });
+  });
+
+  test.each([
+    ['a parenthesized property-access target', '[(sink.alias)]', 'sink.alias', ts.SyntaxKind.PropertyAccessExpression],
+    ['an as-cast property-access target', '[sink.alias as unknown]', 'sink.alias', ts.SyntaxKind.PropertyAccessExpression],
+    ['a satisfies property-access target', '[sink.alias satisfies unknown]', 'sink.alias', ts.SyntaxKind.PropertyAccessExpression],
+    ['a non-null property-access target', '[sink.alias!]', 'sink.alias', ts.SyntaxKind.PropertyAccessExpression],
+    ['an angle-bracket-cast property-access target', '[<unknown>sink.alias]', 'sink.alias', ts.SyntaxKind.PropertyAccessExpression],
+    ['a double-parenthesized property-access target', '[((sink.alias))]', 'sink.alias', ts.SyntaxKind.PropertyAccessExpression],
+    ["a parenthesized element-access target", "[(sink['alias'])]", "sink['alias']", ts.SyntaxKind.ElementAccessExpression],
+  ] as const)('reports %s at its inner owning node', async (_name, element, text, kind) => {
+    const source = [
+      "import { target } from './target.js';",
+      'declare const source: { x: [typeof target] };',
+      'declare const sink: { alias: unknown };',
+      `({ x: ${element} } = source);`,
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[4, text]]);
+      expectUnsafeReferenceNodes(scan, [[text, kind]]);
+    });
+  });
+
+  test('reports a wrapped bare identifier at a non-zero tuple slot', async () => {
+    const source = [
+      "import { target } from './target.js';",
+      'declare const source: { x: [string, typeof target] };',
+      'let unrelated: string;',
+      'let alias: unknown;',
+      '({ x: [unrelated, (alias)] } = source);',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[5, 'alias']]);
+      expectUnsafeReferenceNodes(scan, [['alias', ts.SyntaxKind.Identifier]]);
+    });
+  });
+
+  test.each([
+    [
+      'a wrapped element whose source slot is unrelated',
+      [
+        "import { target } from './target.js';",
+        'declare const source: { x: [string] };',
+        'declare const other: { value: unknown };',
+        '({ x: [(other.value)] } = source);',
+      ].join('\n'),
+      [],
+    ],
+    [
+      'a wrapped element nested two object levels deep',
+      [
+        "import { target } from './target.js';",
+        'declare const source: { y: { x: [typeof target] } };',
+        'declare const sink: { alias: unknown };',
+        '({ y: { x: [(sink.alias)] } } = source);',
+      ].join('\n'),
+      [[4, 'sink.alias']],
+      [['sink.alias', ts.SyntaxKind.PropertyAccessExpression]],
+    ],
+      [
+      'a wrapped non-array assignment target at its current regression value',
+      [
+        "import { target } from './target.js';",
+        'declare const source: { x: typeof target };',
+        'declare const sink: { alias: unknown };',
+        '({ x: (sink.alias) } = source);',
+      ].join('\n'),
+      [],
+    ],
+  ] as const)('handles %s', async (_name, source, unsafeReferences, unsafeReferenceNodes?) => {
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], unsafeReferences);
+      if (unsafeReferenceNodes !== undefined) expectUnsafeReferenceNodes(scan, unsafeReferenceNodes);
+    });
+  });
+
+  test.each([
+    [
+      'an any[] iterable',
+      [
+        "import { target } from './target.js';",
+        'declare const sink: { alias: unknown };',
+        'declare const arr: any[];',
+        'for ({ x: [sink.alias] } of arr) {}',
+      ].join('\n'),
+      [[4, 'sink.alias']],
+    ],
+    [
+      'a concrete array iterable without reporting the iterable itself',
+      [
+        "import { target } from './target.js';",
+        'type SourceItem = { x: [typeof target] };',
+        'declare const sink: { alias: unknown };',
+        'declare const arr: SourceItem[];',
+        'for ({ x: [sink.alias] } of arr) {}',
+      ].join('\n'),
+      [[5, 'sink.alias']],
+    ],
+    [
+      'a Set iterable through the Symbol.iterator fallback',
+      [
+        "import { target } from './target.js';",
+        'type SourceItem = { x: [typeof target] };',
+        'declare const sink: { alias: unknown };',
+        'declare const set: Set<SourceItem>;',
+        'for ({ x: [sink.alias] } of set) {}',
+      ].join('\n'),
+      [[5, 'sink.alias']],
+    ],
+    [
+      'a wrapped target through a Set iterable',
+      [
+        "import { target } from './target.js';",
+        'type SourceItem = { x: [typeof target] };',
+        'declare const sink: { alias: unknown };',
+        'declare const set: Set<SourceItem>;',
+        'for ({ x: [(sink.alias)] } of set) {}',
+      ].join('\n'),
+      [[5, 'sink.alias']],
+    ],
+    [
+      'an Iterable<any> through the Symbol.iterator fallback',
+      [
+        "import { target } from './target.js';",
+        'declare const sink: { alias: unknown };',
+        'declare const iterable: Iterable<any>;',
+        'for ({ x: [sink.alias] } of iterable) {}',
+      ].join('\n'),
+      [[4, 'sink.alias']],
+    ],
+    [
+      'a bare any iterable',
+      [
+        "import { target } from './target.js';",
+        'declare const sink: { alias: unknown };',
+        'declare const items: any;',
+        'for ({ x: [sink.alias] } of items) {}',
+      ].join('\n'),
+      [[4, 'sink.alias']],
+    ],
+    [
+      'a bare unknown iterable',
+      [
+        "import { target } from './target.js';",
+        'declare const sink: { alias: unknown };',
+        'declare const items: unknown;',
+        '// @ts-expect-error The bare iterable value is intentionally unknown.',
+        'for ({ x: [sink.alias] } of items) {}',
+      ].join('\n'),
+      [[5, 'sink.alias']],
+    ],
+    [
+      'a tuple-shaped iterable',
+      [
+        "import { target } from './target.js';",
+        'type SourceItem = { x: [typeof target] };',
+        'declare const sink: { alias: unknown };',
+        'declare const arr: [SourceItem];',
+        'for ({ x: [sink.alias] } of arr) {}',
+      ].join('\n'),
+      [[5, 'sink.alias']],
+    ],
+    [
+      'a structural iterator through its next().value fallback',
+      [
+        "import { target } from './target.js';",
+        'class NoArgIterator {',
+        '  [Symbol.iterator](): { next(): { value: unknown; done: boolean } } {',
+        '    return { next: () => ({ value: undefined as unknown, done: false }) };',
+        '  }',
+        '}',
+        'declare const sink: { alias: unknown };',
+        'declare const iterable: NoArgIterator;',
+        '// @ts-expect-error The structural iterator value is intentionally unknown.',
+        'for ({ x: [sink.alias] } of iterable) {}',
+      ].join('\n'),
+      [[10, 'sink.alias']],
+    ],
+    [
+      'a mismatched numeric index signature through its iterator',
+      [
+        "import { target } from './target.js';",
+        'type TargetShape = { x: [typeof target] };',
+        'class MismatchIndex {',
+        '  [n: number]: string;',
+        '  [Symbol.iterator](): Iterator<TargetShape> {',
+        '    return { next: (): IteratorResult<TargetShape> => { throw new Error(); } };',
+        '  }',
+        '}',
+        'declare const sink: { alias: unknown };',
+        'declare const iterable: MismatchIndex;',
+        'for ({ x: [sink.alias] } of iterable) {}',
+      ].join('\n'),
+      [[11, 'sink.alias']],
+    ],
+    [
+      'a non-generic named iterator class through its next().value fallback',
+      [
+        "import { target } from './target.js';",
+        'type TargetShape = { x: [typeof target] };',
+        'class ConcreteIterator {',
+        '  next(): { value: TargetShape; done: false } { throw new Error(); }',
+        '}',
+        'class Custom {',
+        '  [Symbol.iterator](): ConcreteIterator { return new ConcreteIterator(); }',
+        '}',
+        'declare const sink: { alias: unknown };',
+        'declare const iterable: Custom;',
+        'for ({ x: [sink.alias] } of iterable) {}',
+      ].join('\n'),
+      [[11, 'sink.alias']],
+    ],
+    [
+      'the real Symbol.iterator member after a same-named unique symbol member',
+      [
+        "import { target } from './target.js';",
+        'type SourceItem = { x: [typeof target] };',
+        'type Unrelated = { x: [string] };',
+        'declare const iterator: unique symbol;',
+        'class Custom {',
+        '  [iterator](): Iterator<Unrelated> { throw new Error(); }',
+        '  [Symbol.iterator](): Iterator<SourceItem> { throw new Error(); }',
+        '}',
+        'declare const sink: { alias: unknown };',
+        'declare const iterable: Custom;',
+        'for ({ x: [sink.alias] } of iterable) {}',
+      ].join('\n'),
+      [[11, 'sink.alias']],
+    ],
+    [
+      'a non-generic named iterator class whose next() returns a yield/return union',
+      [
+        "import { target } from './target.js';",
+        'type TargetShape = { x: [typeof target] };',
+        'class UnionIterator {',
+        '  next(): IteratorResult<TargetShape, string> { throw new Error(); }',
+        '}',
+        'class Custom {',
+        '  [Symbol.iterator](): UnionIterator { return new UnionIterator(); }',
+        '}',
+        'declare const sink: { alias: unknown };',
+        'declare const iterable: Custom;',
+        'for ({ x: [sink.alias] } of iterable) {}',
+      ].join('\n'),
+      [[11, 'sink.alias']],
+    ],
+    [
+      'an interface iterator whose next() returns a yield/return union',
+      [
+        "import { target } from './target.js';",
+        'type TargetShape = { x: [typeof target] };',
+        'interface UnionIterator { next(): IteratorResult<TargetShape, string>; }',
+        'declare const sink: { alias: unknown };',
+        'declare const iterable: { [Symbol.iterator](): UnionIterator };',
+        'for ({ x: [sink.alias] } of iterable) {}',
+      ].join('\n'),
+      [[6, 'sink.alias']],
+    ],
+    [
+      'a next() union where no branch is done: true (no canonical return branch)',
+      [
+        "import { target } from './target.js';",
+        'type TargetShape = { x: [typeof target] };',
+        'type Unrelated = { x: [string] };',
+        'declare const sink: { alias: unknown };',
+        'declare const iterable: { [Symbol.iterator](): { next(): { value: Unrelated; done: false } | { value: TargetShape; done: false } } };',
+        'for ({ x: [sink.alias] } of iterable) {}',
+      ].join('\n'),
+      [[6, 'sink.alias']],
+    ],
+  ] as const)('reports a for-of assignment head from %s', async (_name, source, unsafeReferences) => {
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], unsafeReferences);
+      expectUnsafeReferenceNodes(scan, unsafeReferences.map(([, marker]) => (
+        [marker, ts.SyntaxKind.PropertyAccessExpression] as const
+      )));
+    });
+  });
+
+  test('propagates an any source through a plain assignment array-literal property', async () => {
+    const source = [
+      "import { target } from './target.js';",
+      'declare const source: any;',
+      'let alias: unknown;',
+      '({ x: [alias] } = source);',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[4, 'alias']]);
+    });
+  });
+
+  test('composes a wrapped array element with an any[] for-of assignment head', async () => {
+    const source = [
+      "import { target } from './target.js';",
+      'declare const sink: { alias: unknown };',
+      'declare const arr: any[];',
+      'for ({ x: [(sink.alias)] } of arr) {}',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[4, 'sink.alias']]);
+      expectUnsafeReferenceNodes(scan, [['sink.alias', ts.SyntaxKind.PropertyAccessExpression]]);
+    });
+  });
+
+  test.each([
+    [
+      'a concrete iterable whose slot is unrelated',
+      [
+        "import { target } from './target.js';",
+        'type SourceItem = { x: [string] };',
+        'declare const sink: { alias: unknown };',
+        'declare const arr: SourceItem[];',
+        'for ({ x: [sink.alias] } of arr) {}',
+      ].join('\n'),
+    ],
+    [
+      'an iterable cast to a safe outer type',
+      [
+        "import { target } from './target.js';",
+        'type SafeItem = { x: [string] };',
+        'declare const sink: { alias: unknown };',
+        'declare const unsafeItems: any[];',
+        'for ({ x: [sink.alias] } of (unsafeItems as unknown as SafeItem[])) {}',
+      ].join('\n'),
+    ],
+    [
+      'a next() yield/return union whose return branch — not the yield branch — carries the target',
+      [
+        "import { target } from './target.js';",
+        'type TargetShape = { x: [typeof target] };',
+        'type Unrelated = { x: [string] };',
+        'declare const sink: { alias: unknown };',
+        'declare const iterable: { [Symbol.iterator](): { next(): IteratorReturnResult<TargetShape> | IteratorYieldResult<Unrelated> } };',
+        'for ({ x: [sink.alias] } of iterable) {}',
+      ].join('\n'),
+    ],
+  ] as const)('keeps a for-of assignment head from reporting when %s', async (_name, source) => {
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], []);
+    });
+  });
+
+  test('retains the existing for-await-of declaration-head behavior for AsyncIterable<any>', async () => {
+    const source = [
+      "import { target } from './target.js';",
+      'declare const items: AsyncIterable<any>;',
+      'async function run(): Promise<void> {',
+      '  for await (const { x: [alias] } of items) { void alias; }',
+      '}',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[4, 'alias']]);
+      expectUnsafeReferenceNodes(scan, [['alias', ts.SyntaxKind.Identifier]]);
+    });
+  });
+
+  test.each([
+    [
+      'an AsyncIterable<any> assignment head',
+      [
+        "import { target } from './target.js';",
+        'declare const sink: { alias: unknown };',
+        'declare const items: AsyncIterable<any>;',
+        'async function run(): Promise<void> {',
+        '  for await ({ x: [sink.alias] } of items) {}',
+        '}',
+      ].join('\n'),
+      [[5, 'sink.alias']],
+    ],
+    [
+      'a precise AsyncIterable source',
+      [
+        "import { target } from './target.js';",
+        'type SourceItem = { x: [typeof target] };',
+        'declare const sink: { alias: unknown };',
+        'declare const items: AsyncIterable<SourceItem>;',
+        'async function run(): Promise<void> {',
+        '  for await ({ x: [sink.alias] } of items) {}',
+        '}',
+      ].join('\n'),
+      [[6, 'sink.alias']],
+    ],
+    [
+      'a wrapped precise AsyncIterable source',
+      [
+        "import { target } from './target.js';",
+        'type SourceItem = { x: [typeof target] };',
+        'declare const sink: { alias: unknown };',
+        'declare const items: AsyncIterable<SourceItem>;',
+        'async function run(): Promise<void> {',
+        '  for await ({ x: [sink.alias as unknown] } of items) {}',
+        '}',
+      ].join('\n'),
+      [[6, 'sink.alias']],
+    ],
+    [
+      'a sync-only Iterable<any> fallback',
+      [
+        "import { target } from './target.js';",
+        'declare const sink: { alias: unknown };',
+        'declare const items: Iterable<any>;',
+        'async function run(): Promise<void> {',
+        '  for await ({ x: [sink.alias] } of items) {}',
+        '}',
+      ].join('\n'),
+      [[5, 'sink.alias']],
+    ],
+    [
+      'a sync-only Set<SourceItem> fallback',
+      [
+        "import { target } from './target.js';",
+        'type SourceItem = { x: [typeof target] };',
+        'declare const sink: { alias: unknown };',
+        'declare const items: Set<SourceItem>;',
+        'async function run(): Promise<void> {',
+        '  for await ({ x: [sink.alias] } of items) {}',
+        '}',
+      ].join('\n'),
+      [[6, 'sink.alias']],
+    ],
+    [
+      'an array of target-bearing promises',
+      [
+        "import { target } from './target.js';",
+        'type SourceItem = { x: [typeof target] };',
+        'declare const sink: { alias: unknown };',
+        'declare const promises: Promise<SourceItem>[];',
+        'async function run(): Promise<void> {',
+        '  for await ({ x: [sink.alias] } of promises) {}',
+        '}',
+      ].join('\n'),
+      [[6, 'sink.alias']],
+    ],
+    [
+      'an Iterable of target-bearing promises',
+      [
+        "import { target } from './target.js';",
+        'type SourceItem = { x: [typeof target] };',
+        'declare const sink: { alias: unknown };',
+        'declare const promises: Iterable<Promise<SourceItem>>;',
+        'async function run(): Promise<void> {',
+        '  for await ({ x: [sink.alias] } of promises) {}',
+        '}',
+      ].join('\n'),
+      [[6, 'sink.alias']],
+    ],
+    [
+      'the async protocol of a dual-protocol iterable',
+      [
+        "import { target } from './target.js';",
+        'type SourceItem = { x: [typeof target] };',
+        'type Unrelated = { x: [string] };',
+        'declare const sink: { alias: unknown };',
+        'declare const items: { [Symbol.iterator](): Iterator<Unrelated>; [Symbol.asyncIterator](): AsyncIterator<SourceItem> };',
+        'async function run(): Promise<void> {',
+        '  for ({ x: [sink.alias] } of items) {}',
+        '  for await ({ x: [sink.alias] } of items) {}',
+        '}',
+      ].join('\n'),
+      [[8, 'sink.alias']],
+    ],
+    [
+      'the real Symbol.asyncIterator member after a same-named unique symbol member',
+      [
+        "import { target } from './target.js';",
+        'type SourceItem = { x: [typeof target] };',
+        'type Unrelated = { x: [string] };',
+        'declare const asyncIterator: unique symbol;',
+        'class Custom {',
+        '  [asyncIterator](): AsyncIterator<Unrelated> { throw new Error(); }',
+        '  [Symbol.asyncIterator](): AsyncIterator<SourceItem> { throw new Error(); }',
+        '}',
+        'declare const sink: { alias: unknown };',
+        'declare const iterable: Custom;',
+        'async function run(): Promise<void> {',
+        '  for await ({ x: [sink.alias] } of iterable) {}',
+        '}',
+      ].join('\n'),
+      [[12, 'sink.alias']],
+    ],
+  ] as const)('reports a for-await-of assignment head from %s', async (_name, source, unsafeReferences) => {
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], unsafeReferences);
+      expectUnsafeReferenceNodes(scan, unsafeReferences.map(([, marker]) => (
+        [marker, ts.SyntaxKind.PropertyAccessExpression] as const
+      )));
+    });
+  });
+
+  test.each([
+    [
+      'a precise unrelated AsyncIterable source',
+      [
+        "import { target } from './target.js';",
+        'type Unrelated = { x: [string] };',
+        'declare const sink: { alias: unknown };',
+        'declare const items: AsyncIterable<Unrelated>;',
+        'async function run(): Promise<void> {',
+        '  for await ({ x: [sink.alias] } of items) {}',
+        '}',
+      ].join('\n'),
+    ],
+    [
+      'a sync-only Set<Unrelated> fallback',
+      [
+        "import { target } from './target.js';",
+        'type Unrelated = { x: [string] };',
+        'declare const sink: { alias: unknown };',
+        'declare const items: Set<Unrelated>;',
+        'async function run(): Promise<void> {',
+        '  for await ({ x: [sink.alias] } of items) {}',
+        '}',
+      ].join('\n'),
+    ],
+    [
+      'an array of unrelated promises',
+      [
+        "import { target } from './target.js';",
+        'type Unrelated = { x: [string] };',
+        'declare const sink: { alias: unknown };',
+        'declare const promises: Promise<Unrelated>[];',
+        'async function run(): Promise<void> {',
+        '  for await ({ x: [sink.alias] } of promises) {}',
+        '}',
+      ].join('\n'),
+    ],
+    [
+      'a structural async iterator with a Promise-wrapped result',
+      [
+        "import { target } from './target.js';",
+        'type TargetShape = { x: [typeof target] };',
+        'declare const sink: { alias: unknown };',
+        'declare const items: { [Symbol.asyncIterator](): { next(): Promise<{ value: TargetShape; done: boolean }> } };',
+        'async function run(): Promise<void> {',
+        '  for await ({ x: [sink.alias] } of items) {}',
+        '}',
+      ].join('\n'),
+    ],
+    [
+      'a mixed-protocol union source',
+      [
+        "import { target } from './target.js';",
+        'declare const sink: { alias: unknown };',
+        'declare const items: AsyncIterable<{ x: [typeof target] }> | Iterable<{ x: [string] }>;',
+        'async function run(): Promise<void> {',
+        '  for await ({ x: [sink.alias] } of items) {}',
+        '}',
+      ].join('\n'),
+    ],
+    [
+      'a custom generic iterator whose yielded type is its second parameter',
+      [
+        "import { target } from './target.js';",
+        'type TargetShape = { x: [typeof target] };',
+        'class Weird<A, B> implements Iterator<B> {',
+        '  next(): IteratorResult<B> { throw new Error(); }',
+        '}',
+        'declare const sink: { alias: unknown };',
+        'declare const items: { [Symbol.iterator](): Weird<string, TargetShape> };',
+        'for ({ x: [sink.alias] } of items) {}',
+      ].join('\n'),
+    ],
+  ] as const)('keeps a for-of assignment head from reporting for %s', async (_name, source) => {
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], []);
+    });
+  });
+
+  test.each([
+    [
+      'a declaration head',
+      [
+        "import { target } from './target.js';",
+        'declare const arr: any[];',
+        'for (const { x: [alias] } of arr) {}',
+      ].join('\n'),
+      [[3, 'alias']],
+    ],
+    [
+      'a comma-expression plain assignment',
+      [
+        "import { target } from './target.js';",
+        'declare function sideEffect(): void;',
+        'declare const source: { x: [typeof target] };',
+        'declare const sink: { alias: unknown };',
+        '(sideEffect(), ({ x: [sink.alias] } = source));',
+      ].join('\n'),
+      [[5, '(sideEffect(),'], [5, 'sink.alias']],
+    ],
+  ] as const)('retains the existing nested-array behavior for %s', async (_name, source, unsafeReferences) => {
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], unsafeReferences);
+    });
+  });
+
+  test('propagates a computed property name through the nested array-object fallback', async () => {
+    const source = [
+      "import * as api from './target.js';",
+      "declare const key: 'target';",
+      'declare const source: { x: [typeof api] };',
+      'let alias: unknown;',
+      '({ x: [{ [key]: alias }] } = source);',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[5, '[key]']]);
+    });
+  });
+
+  test('propagates an any array element through the nested array-object fallback', async () => {
+    const source = [
+      "import * as api from './target.js';",
+      'declare const source: { x: any[] };',
+      'let alias: unknown;',
+      '({ x: [{ target: alias }] } = source);',
+    ].join('\n');
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], [[4, 'alias']]);
+    });
+  });
+
+  test.each([
+    [
+      'an array nested inside another array literal',
+      [
+        "import { target } from './target.js';",
+        'declare const source: { x: [[typeof target]] };',
+        'let alias: unknown;',
+        '({ x: [[alias]] } = source);',
+      ].join('\n'),
+    ],
+    [
+      'a direct array-literal spread element',
+      [
+        "import { target } from './target.js';",
+        'declare const source: { x: typeof target[] };',
+        'let rest: unknown[];',
+        '({ x: [...rest] } = source);',
+      ].join('\n'),
+    ],
+    [
+      'a nested object-rest target inside an array-literal element',
+      [
+        "import * as api from './target.js';",
+        'declare const source: { x: [typeof api] };',
+        'let rest: unknown;',
+        '({ x: [{ ...rest }] } = source);',
+      ].join('\n'),
+    ],
+    [
+      'a defaulted bare array element',
+      [
+        "import { target } from './target.js';",
+        'declare const source: { x: [typeof target] };',
+        'declare const sink: { alias: unknown };',
+        '({ x: [sink.alias = undefined] } = source);',
+      ].join('\n'),
+    ],
+    [
+      'a defaulted nested-object array element',
+      [
+        "import * as api from './target.js';",
+        'declare const source: { x: [typeof api] };',
+        'let alias: unknown;',
+        'declare const fallback: { target: unknown };',
+        '({ x: [{ target: alias } = fallback] } = source);',
+      ].join('\n'),
+    ],
+    [
+      'a plain array property-access read',
+      [
+        "import { target } from './target.js';",
+        'declare const sink: { alias: unknown };',
+        'const values: unknown[] = [sink.alias];',
+        'void values;',
+      ].join('\n'),
+    ],
+    [
+      'a wrapped bare top-level array assignment target',
+      [
+        "import { target } from './target.js';",
+        'declare const source: unknown;',
+        'declare const sink: { alias: unknown };',
+        '[(sink.alias)] = (source as [typeof target]);',
+      ].join('\n'),
+    ],
+    [
+      'a bare top-level array for-of assignment target',
+      [
+        "import { target } from './target.js';",
+        'declare const items: unknown;',
+        'declare const sink: { alias: unknown };',
+        'for ([(sink.alias)] of (items as Iterable<[typeof target]>)) {}',
+      ].join('\n'),
+    ],
+    [
+      'a bare top-level array for-await-of assignment target',
+      [
+        "import { target } from './target.js';",
+        'declare const items: unknown;',
+        'declare const sink: { alias: unknown };',
+        'async function run(): Promise<void> {',
+        '  for await ([(sink.alias)] of (items as AsyncIterable<[typeof target]>)) {}',
+        '}',
+      ].join('\n'),
+    ],
+    [
+      'a plain array element-access read outside the H3a-1 index-signature path',
+      [
+        "import { target } from './target.js';",
+        'declare const numericValues: number[];',
+        'const values: unknown[] = [numericValues[0]];',
+        'void values;',
+      ].join('\n'),
+    ],
+  ] as const)('keeps %s outside both inventories', async (_name, source) => {
+    await withCaller(source, (scan, names) => {
+      expectScan(scan, names['src/caller.ts'] ?? '', source, [], []);
     });
   });
 

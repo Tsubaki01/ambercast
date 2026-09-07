@@ -2,12 +2,12 @@
  * Composes the concrete services shared by the `generate` and `run` command
  * paths.
  *
- * Generation needs an AI executor and event delivery; replay needs browser
- * driver resolution, secret lookup, and the same event delivery; and both
- * commands share filesystem storage, layout, clock, and discovery. One
- * composer holds that real dependency set so command paths converge on the
- * same Ports-aligned application boundary instead of duplicating composition
- * policy in a parallel run-specific helper.
+ * Generation needs event delivery and the shared filesystem services while it
+ * resolves AI only for a real dispatch; replay needs browser driver resolution,
+ * secret lookup, and the same event delivery. One composer holds that real
+ * dependency set so command paths converge on the same Ports-aligned
+ * application boundary instead of duplicating composition policy in a
+ * parallel run-specific helper.
  */
 
 import { AI_EXECUTOR_FACTORIES } from '#adapters/ai/registry.js';
@@ -24,19 +24,20 @@ import type { Clock, EventSink, SecretsProvider } from '#ports/system.js';
 import { createFsTestFileDiscovery, type TestFileDiscovery } from './test-file-discovery.js';
 
 /**
- * The fully resolved inputs needed to compose the application for `generate`
- * and `run`.
+ * The inputs used to compose shared application services for `generate` and
+ * `run`.
  */
 export interface CreateAmbercastOptions {
-  /** Complete configuration, including already-resolved AI provider policy. */
+  /** Complete command configuration. */
   readonly config: ResolvedConfig;
 
   /**
-   * Concrete executor selection. Generation resolves `auto` before
-   * composition; replay supplies a fixed inert provider solely to satisfy the
-   * shared required composer shape.
+   * Optional concrete executor selection for callers that need an adapter in
+   * the composed result. Generation omits it and resolves provider policy only
+   * when an AI dispatch is needed; replay always supplies a fixed literal for
+   * the shared composer shape.
    */
-  readonly aiProvider: 'claude' | 'codex';
+  readonly aiProvider?: 'claude' | 'codex';
 
   /**
    * Driver resolver supplied for replay. Its `browserDriver` name exactly
@@ -70,8 +71,8 @@ export interface Ambercast {
   /** Companion-path resolver for the configured test tree. */
   readonly layout: LayoutResolver;
 
-  /** The selected provider adapter. */
-  readonly aiExecutor: InstructionCoveredAiExecutor;
+  /** The selected provider adapter when composition was asked to create one. */
+  readonly aiExecutor?: InstructionCoveredAiExecutor;
 
   /** Host clock used by command reporting and replay's per-case duration measurement. */
   readonly clock: Clock;
@@ -101,7 +102,7 @@ export interface Ambercast {
 /**
  * Composes dependencies for one configured command invocation.
  *
- * @param options - Resolved configuration, provider selection, and any replay ports.
+ * @param options - Configuration, optional provider selection, and any replay ports.
  * @returns The shared service set required by command composition and reporting.
  * @remarks
  * This is intentionally not a general ports factory. It serves the two real
@@ -113,15 +114,12 @@ export interface Ambercast {
  * instead of a speculative `createRunAmbercast()` split preserves a single,
  * visibly Ports-aligned application boundary.
  *
- * `aiProvider` and the resulting `aiExecutor` remain required because
- * `generate-command.ts` reads `ambercast.aiExecutor` directly. To compose a
- * replay, `run-command.ts` supplies a fixed inert literal such as
- * `aiProvider: 'claude'` solely for that shared shape. As the existing
- * `AI_EXECUTOR_FACTORIES` documentation specifies, its factories defer
- * construction and availability probing; this replay composition neither
- * resolves configured or `auto` provider policy nor probes a CLI. The created
- * executor is not read and is not passed to `run()`—`RunDeps` has no
- * `aiExecutor` field—so a grounded replay still requires no AI CLI.
+ * `aiProvider` is optional because generation resolves provider policy at its
+ * first real AI dispatch rather than while composing shared services.
+ * Omitting it leaves `aiExecutor` absent from the result; `run-command.ts`
+ * passes a fixed `aiProvider: 'claude'` literal for the shared composer shape.
+ * That executor is not passed to `run()`—`RunDeps`
+ * has no `aiExecutor` field—so a grounded replay still requires no AI CLI.
  *
  * `browserDriver` and `secrets` remain optional in both input and result
  * because generation supplies neither. Replay keeps local, non-optional
@@ -135,8 +133,12 @@ export function createAmbercast(options: CreateAmbercastOptions): Ambercast {
   return {
     storage: createFsStorage(),
     layout: createLayoutResolver(options.config),
-    aiExecutor: AI_EXECUTOR_FACTORIES[options.aiProvider]({
-      run: createSpawnCommandRunner({ env: readCommandEnvironment() }),
+    // Omission is a composition-time no-op: the result has no key, and
+    // composition performs neither factory construction nor an environment read.
+    ...(options.aiProvider === undefined ? {} : {
+      aiExecutor: AI_EXECUTOR_FACTORIES[options.aiProvider]({
+        run: createSpawnCommandRunner({ env: readCommandEnvironment() }),
+      }),
     }),
     clock: createSystemClock(),
     discoverTestFiles: createFsTestFileDiscovery(),

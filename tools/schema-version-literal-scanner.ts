@@ -53,7 +53,17 @@
  * checker-invisible mutation, unclassified syntax, and checker or scanner
  * defects. Reads from `any`/`unknown` index slots, dynamic keys on
  * name-identified sinks, and aggregates reachable only through an
- * externally-typed value's signature are outside the guarantee; none is an
+ * externally-typed value's signature are outside the guarantee. For
+ * consistency with the other architecture scanners built on this project's
+ * shared `StaticReferenceResolver`, this scanner also records two further
+ * shapes as outside its guarantee rather than closed: a union that includes a
+ * `schemaVersion`-typed slot on an externally declared value can escape
+ * detection, and its narrowed direct read is not reported (an in-program
+ * value reaches the same slot through its own construction site instead,
+ * which is already reported there).
+ * Unlike the sibling function-value scanners, this scanner has no
+ * call-signature matching at all, so it has no `void`-return-gate asymmetry
+ * to declare. None is an
  * allow-path, so a schema authority reached through one
  * requires scanner extension or explicit review.
  */

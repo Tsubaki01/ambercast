@@ -756,4 +756,117 @@ describe('main()', () => {
 
     expect(rendered).toContain(`\u001B[${color}mcompleted\u001B[0m login.test.md`);
   });
+
+  describe('renderHumanReport', () => {
+    it('renders normal filesystem and error text as exact report lines', () => {
+      const rendered = renderHumanReport({
+        ...CHECK_ENVELOPE,
+        results: [{
+          ...CHECK_ENVELOPE.results[0],
+          file: 'normal.test.md',
+          reason: 'The plan is current.',
+        }],
+        errors: [{ message: 'No control characters appear here.' }],
+      } as never, false);
+
+      expect(rendered).toBe('fresh normal.test.md: The plan is current.\nerror No control characters appear here.\n');
+    });
+
+    it.each([
+      ['backspace', '\u0008', '\\b'],
+      ['tab', '\u0009', '\\t'],
+      ['newline', '\u000a', '\\n'],
+      ['form feed', '\u000c', '\\f'],
+      ['carriage return', '\u000d', '\\r'],
+    ])('renders %s in a file as its named escape', (_name, character, escaped) => {
+      const rendered = renderHumanReport({
+        ...ENVELOPE,
+        results: [{ ...ENVELOPE.results[0], file: `prefix${character}suffix.test.md` }],
+      } as never, false);
+
+      expect(rendered).toBe(`listed prefix${escaped}suffix.test.md\n`);
+    });
+
+    it.each([
+      ['the lower C0 boundary', '\u0000', '\\u0000'],
+      ['the upper C0 boundary', '\u001f', '\\u001f'],
+      ['space immediately above C0', ' ', ' '],
+      ['DEL', '\u007f', '\\u007f'],
+      ['the lower C1 boundary', '\u0080', '\\u0080'],
+      ['the upper C1 boundary', '\u009f', '\\u009f'],
+      ['the character immediately above C1', '\u00a0', '\u00a0'],
+    ])('renders %s with the exact expected file text', (_name, character, expected) => {
+      const rendered = renderHumanReport({
+        ...ENVELOPE,
+        results: [{ ...ENVELOPE.results[0], file: `prefix${character}suffix.test.md` }],
+      } as never, false);
+
+      expect(rendered).toBe(`listed prefix${expected}suffix.test.md\n`);
+    });
+
+    it('escapes ESC embedded in a file value', () => {
+      const rendered = renderHumanReport({
+        ...ENVELOPE,
+        results: [{ ...ENVELOPE.results[0], file: 'unsafe\u001bname.test.md' }],
+      } as never, false);
+
+      expect(rendered).toBe('listed unsafe\\u001bname.test.md\n');
+    });
+
+    it('escapes a CRLF combination in a reason without splitting the output line', () => {
+      const rendered = renderHumanReport({
+        ...CHECK_ENVELOPE,
+        results: [{
+          ...CHECK_ENVELOPE.results[1],
+          file: 'stale.test.md',
+          reason: 'First line\r\nsecond line',
+        }],
+      } as never, false);
+
+      expect(rendered).toBe('stale stale.test.md: First line\\r\\nsecond line\n');
+    });
+
+    it('escapes a C1 control character in an error message', () => {
+      const rendered = renderHumanReport({
+        ...ENVELOPE,
+        errors: [{ message: 'Unexpected\u0085failure' }],
+      } as never, false);
+
+      expect(rendered).toBe('listed login.test.md\nerror Unexpected\\u0085failure\n');
+    });
+
+    it('escapes a control character in the id fallback when file is absent', () => {
+      const rendered = renderHumanReport({
+        ...ENVELOPE,
+        results: [{ ...ENVELOPE.results[0], id: 'fallback\u001bname.test.md', file: undefined }],
+      } as never, false);
+
+      expect(rendered).toBe('listed fallback\\u001bname.test.md\n');
+    });
+
+    it('preserves a literal backslash in a file value', () => {
+      const rendered = renderHumanReport({
+        ...ENVELOPE,
+        results: [{ ...ENVELOPE.results[0], file: 'folder\\name.test.md' }],
+      } as never, false);
+
+      expect(rendered).toBe('listed folder\\name.test.md\n');
+    });
+
+    it('writes control-character-bearing envelopes unchanged with --json', async () => {
+      const expectedJson = JSON.stringify({
+        ...ENVELOPE,
+        results: [{ ...ENVELOPE.results[0], file: 'unsafe\u001bname.test.md' }],
+      });
+      const envelope = {
+        ...ENVELOPE,
+        results: [{ ...ENVELOPE.results[0], file: 'unsafe\u001bname.test.md' }],
+      };
+      runGenerateCommand.mockResolvedValue({ exitCode: 0, envelope });
+
+      const result = await run(['generate', '--json']);
+
+      expect(result.stdout).toBe(`${expectedJson}\n`);
+    });
+  });
 });

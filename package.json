@@ -1,6 +1,6 @@
 {
   "name": "ambercast",
-  "version": "0.0.1",
+  "version": "0.3.1",
   "description": "Prompt-native E2E testing: AI generates a deterministic, lockfile-like execution plan from natural-language test prompts, replayed with zero AI calls. Under active development.",
   "keywords": [
     "e2e",
@@ -14,11 +14,11 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Tsubaki01/ambercast.git"
+    "url": "git+https://github.com/kotarotsubaki/ambercast.git"
   },
-  "homepage": "https://github.com/Tsubaki01/ambercast#readme",
+  "homepage": "https://github.com/kotarotsubaki/ambercast#readme",
   "bugs": {
-    "url": "https://github.com/Tsubaki01/ambercast/issues"
+    "url": "https://github.com/kotarotsubaki/ambercast/issues"
   },
   "bin": {
     "ambercast": "bin/ambercast.js"
