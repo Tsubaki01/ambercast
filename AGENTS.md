@@ -30,7 +30,7 @@ Test cases are written as natural-language Markdown prompts; the prompt is the s
 
 ## Conventions
 
-- English-native: all code, comments, docs, commit messages, and identifiers are in English. The only exception is the localized user-facing README set (`README.ja.md`, `README.zh-CN.md`) and the documentation site locales under `website/src/content/docs/`, which are translations of the English originals.
+- English-native: all code, comments, docs, commit messages, and identifiers are in English. The only exception is the localized user-facing README set (`README-ja.md`, `README-zh-CN.md`) and the documentation site locales under `website/src/content/docs/`, which are translations of the English originals.
 - TypeScript, Node >= 22.14, ESM-only (`"type": "module"`). Built with `tsdown`.
 - **TDD is mandatory**: write a failing test first (red), implement minimally (green), refactor. Cover normal, error, boundary, and edge cases. Run the full test suite before declaring any task done.
 - Validation: zod for runtime schemas (discriminated unions for step types), JSON Schema for the public spec.
