@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/kotarotsubaki/ambercast/compare/v0.3.0...v0.3.1) (2026-09-07)
+
+
+### Bug Fixes
+
+* **readme:** rename translated READMEs so npm serves README.md ([#290](https://github.com/kotarotsubaki/ambercast/issues/290)) ([6e6e669](https://github.com/kotarotsubaki/ambercast/commit/6e6e669533cdfa43b65045c9f04a3aa39d1738a9))
+
 ## [0.3.0](https://github.com/kotarotsubaki/ambercast/compare/v0.2.0...v0.3.0) (2026-09-06)
 
 
